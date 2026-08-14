@@ -4602,6 +4602,7 @@
         "reactions": {},
         "reactions_enabled": true,
         "show_thinking": true,
+        "dm_single_session": false,
         "home_tab_sessions_per_kind": 5,
         "use_tunnel_url": false,
         "session_folder": ""
@@ -4846,6 +4847,22 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
+    },
+    {
+      "path": "slack.dm_single_session",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "slack"
+      ],
+      "label": "DM Single Session",
+      "help": "Treat each 1:1 DM as one continuous conversation instead of starting a new session per top-level message. Replies post at channel root rather than in a thread. Threaded replies, group channels and group DMs are unaffected. Off by default: turning it on routes the next DM to a different session than the previous one.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "slack.home_tab_sessions_per_kind",
