@@ -7,7 +7,7 @@
  * Order in this file = order in the rail (within each group). Add new
  * built-in surfaces here; do not add hardcoded badge logic to `App.tsx`.
  */
-import { MessageSquare, Bell, Component, CalendarDays, Settings, ClipboardCheck, Compass, Webhook, BookOpen, Link2, Library, MessageSquareText, Workflow, ScrollText, Bot } from 'lucide-react'
+import { MessageSquare, Bell, Component, CalendarDays, Settings, ClipboardCheck, Compass, Webhook, BookOpen, Link2, Library, MessageSquareText, Workflow, ScrollText, Bot, LayoutDashboard } from 'lucide-react'
 import type { ReactElement } from 'react'
 import { createSelector } from '@reduxjs/toolkit'
 import { KiroGhostMark } from '../components/KiroGhostMark'
@@ -83,6 +83,28 @@ registerBuiltinSurface({
   slotMode: 'member',
   badgeLabel: 'unread member threads',
   previewFlag: PREVIEW_CREW,
+})
+
+// Today "Needs You" badge — slots awaiting human judgment (approval / decision /
+// input).
+const isNeedsYouSlot = (sl: RootState['dashboard']['slots'][number]) =>
+  (sl.pending_approval || sl.pending_approval_info || sl.needs_input)
+
+const selectNeedsYouCount = createSelector(
+  (s: RootState) => s.dashboard.slots,
+  slots => slots.filter(isNeedsYouSlot).length,
+)
+
+registerBuiltinSurface({
+  navId: 'today',
+  route: '/today',
+  label: surfaceMachineValue('Today'),
+  labelKey: 'nav.today',
+  icon: <LayoutDashboard size={16} />,
+  group: surfaceMachineValue('Main'),
+  // Non-slot surface: read-only mission-control view over existing slots.
+  unreadSelector: selectNeedsYouCount,
+  badgeLabel: 'needs you',
 })
 
 registerBuiltinSurface({

@@ -3501,7 +3501,8 @@
     "settings": "Settings",
     "task_runner": "Task Runner",
     "webhooks": "Webhooks",
-    "crew_members": "Crew Members"
+    "crew_members": "Crew Members",
+    "today": "Today"
   },
   "pages": {
     "aidlc": {
@@ -6967,6 +6968,52 @@
     },
     "membersPage": {
       "drawer_delegated_working": "Delegated work running"
+    },
+    "todayPage": {
+      "approval_actions": "Approval actions",
+      "approval_prompt": "This session is waiting for your approval to proceed.",
+      "approve": "Approve",
+      "approve_all": "Approve all",
+      "batch_selected": "{{count}} selected",
+      "batch_partial_error": "{{count}} could not be approved — still selected",
+      "batch_refresh_error": "The list could not refresh — reload to confirm the result",
+      "cancel": "Cancel",
+      "close": "Close",
+      "close_drawer": "Close drawer",
+      "completed": "Completed",
+      "crew_fallback": "Crew",
+      "decision_prompt": "This session needs your input to continue.",
+      "decision_required": "Decision required",
+      "deny": "Deny",
+      "deny_all": "Deny all",
+      "deselect": "Deselect",
+      "deselect_all": "Deselect all",
+      "empty_subtitle": "Start a session and your work will appear here.",
+      "empty_title": "No active work",
+      "idle": "Idle",
+      "items_need_you": "{{count}} items need you",
+      "needs_approval": "Needs approval",
+      "needs_you": "Needs You",
+      "none_in_bucket": "Nothing here right now.",
+      "nothing_needs_you": "Nothing needs your attention",
+      "open_session": "Open full session",
+      "open_to_respond": "Respond",
+      "resolve_error": "Action failed — try again",
+      "resolve_error_drawer": "Action failed. Please try again or open the full session.",
+      "select": "Select",
+      "select_all": "Select all",
+      "session_details": "Session details",
+      "slack_origin": "Slack · {{channel}}",
+      "status": "Status",
+      "stopping": "Stopping…",
+      "thread": "thread",
+      "title": "Today",
+      "tool_request": "Tool request",
+      "unknown_tool": "Unknown tool",
+      "untitled_session": "Untitled session",
+      "working": "Working",
+      "working_agents": "Running sub-agents",
+      "working_heading": "Working"
     }
   },
   "privacyDisclosure": {

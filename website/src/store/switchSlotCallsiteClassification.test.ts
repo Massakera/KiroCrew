@@ -45,6 +45,7 @@ const PINNED: Record<string, Counts> = {
   'src/pages/ChatPage.tsx': { announced: 2, keepTarget: 1, plain: 7, reason: 'flyout row + split-collapse announce; create path keeps target; the plain sites are deep-link restore, just-created slots, side-chat wiring and awaited flows with in-page error UI' },
   'src/pages/ChatSidebar.tsx': { announced: 4, keepTarget: 0, plain: 0, reason: 'sidebar rows and adopted-session activation announce' },
   'src/pages/ProjectsPage.tsx': { announced: 0, keepTarget: 0, plain: 1, reason: 'switches to a just-created slot' },
+  'src/pages/TodayPage.tsx': { announced: 0, keepTarget: 0, plain: 1, reason: 'openFullSession navigates to an existing slot from a Today row/drawer' },
   'src/pages/chat/SubagentRunCard.tsx': { announced: 1, keepTarget: 0, plain: 0, reason: 'run-card session link announces' },
   'src/pages/chat/WorkflowRunCard.tsx': { announced: 1, keepTarget: 0, plain: 0, reason: 'run-card session link announces' },
   'src/pages/chat/useChatPageSessionController.ts': { announced: 3, keepTarget: 0, plain: 6, reason: 'tab-strip select + foreground open-in-tab + late-frame deep-link recovery announce; the plain sites are close-tab successor selection, URL deep-link restore (x2), mount re-sync, tab fallback and app-launch activation with its own sidError notice' },
