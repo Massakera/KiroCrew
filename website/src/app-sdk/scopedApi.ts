@@ -84,7 +84,20 @@ export function useCtx(): AppSdkContextValue {
 }
 
 
-function createScopedApi(allowedPaths: string[], appName: string, sessionKey?: string): AppApi {
+/**
+ * Build a permission-scoped API client.
+ *
+ * `basePath` prefixes the FINAL request URL and is deliberately invisible to the
+ * permission check. The order is load-bearing: `check()` validates and
+ * normalizes the caller's LOGICAL path (`/api/chat/slots`), and only the
+ * already-vetted result is prefixed. Checking the prefixed path instead would
+ * force every consumer to declare the prefix in `allowedApiPaths` — and for the
+ * remote-crew case that means declaring `/api/instances`, which would hand the
+ * subtree the peer's whole control plane. The prefix is a transport detail; the
+ * allowlist stays a statement about the logical surface. `''` (the default)
+ * keeps every existing caller same-origin and byte-identical.
+ */
+function createScopedApi(allowedPaths: string[], appName: string, sessionKey?: string, basePath = ''): AppApi {
   const check = (path: string): string => {
     // Reject absolute and protocol-relative URLs to prevent SSRF. Backslashes
     // are rejected too: the URL parser treats `\` like `/`, so `/\evil.com` or
@@ -125,7 +138,9 @@ function createScopedApi(allowedPaths: string[], appName: string, sessionKey?: s
     } else if (headers.has('X-Session-Key')) {
       throw new Error('[app-sdk] X-Session-Key requires a host session binding')
     }
-    const res = await fetch(safePath, { ...init, headers })
+    // Prefix AFTER the check — see createScopedApi's docstring. `safePath` is
+    // normalized and allowlisted; `basePath` only decides where it is sent.
+    const res = await fetch(basePath + safePath, { ...init, headers })
     noteSessionExpiredResponse(res)
     if (!res.ok) {
       const text = await res.text().catch(() => res.statusText)
@@ -223,6 +238,7 @@ export function AppScopedApiProvider({
   subscribeFn = noopSubscribe,
   notifyFn = hostNotify,
   sessionKey,
+  basePath = '',
   children,
 }: {
   allowedApiPaths: string[]
@@ -242,6 +258,16 @@ export function AppScopedApiProvider({
    * restricted-session guard fire, since that guard fails open on absence.
    */
   sessionKey?: string
+  /**
+   * Optional prefix for every request URL this provider's `api` issues, e.g.
+   * `/api/instances/<id>/proxy` to reach a connected peer instead of this
+   * gateway. Additive: omitted (the default) is same-origin and unchanged.
+   *
+   * It does NOT widen `allowedApiPaths` — the permission check still runs on the
+   * unprefixed logical path, so a subtree pointed at a peer declares the same
+   * narrow surface it would declare locally.
+   */
+  basePath?: string
   children: ReactNode
 }) {
   const identity = useAppIdentity()
@@ -257,7 +283,7 @@ export function AppScopedApiProvider({
   const apiKey = JSON.stringify(allowedApiPaths)
   const eventsKey = JSON.stringify(allowedEvents)
   const value = React.useMemo<AppSdkContextValue>(() => ({
-    api: createScopedApi(allowedApiPaths, resolvedName, sessionKey),
+    api: createScopedApi(allowedApiPaths, resolvedName, sessionKey, basePath),
     info: {
       name: resolvedName,
       version: appVersion,
@@ -268,7 +294,7 @@ export function AppScopedApiProvider({
     navigate: navigateFn,
     notify: notifyFn,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [resolvedName, appVersion, apiKey, eventsKey, sessionKey, active, subscribeFn, navigateFn, notifyFn])
+  }), [resolvedName, appVersion, apiKey, eventsKey, sessionKey, basePath, active, subscribeFn, navigateFn, notifyFn])
 
   return React.createElement(AppSdkContext.Provider, { value }, children)
 }

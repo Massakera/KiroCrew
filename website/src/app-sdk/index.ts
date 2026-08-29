@@ -389,6 +389,7 @@ export function AppApiProvider({
   navigateFn,
   notifyFn,
   sessionKey,
+  basePath = '',
   origin = 'external',
   children,
 }: {
@@ -414,6 +415,14 @@ export function AppApiProvider({
    * provide the real key so the backend's restricted-session guard can run.
    */
   sessionKey?: string
+  /**
+   * Optional prefix for every request URL this provider's `api` issues, e.g.
+   * `/api/instances/<id>/proxy` to reach a connected peer instead of this
+   * gateway. Forwarded verbatim to the scoped layer, which documents why the
+   * permission check runs on the unprefixed logical path. Additive: omitted
+   * (the default) is same-origin and unchanged.
+   */
+  basePath?: string
   origin?: AppOrigin
   children: ReactNode
 }) {
@@ -428,6 +437,7 @@ export function AppApiProvider({
     navigateFn,
     notifyFn,
     sessionKey,
+    basePath,
     children,
   })
   if (existing) return scoped

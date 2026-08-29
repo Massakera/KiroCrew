@@ -84,6 +84,9 @@ import { DndContext, closestCenter, DragOverlay, type DragStartEvent, type DragE
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import ChatPage from './pages/ChatPage'
+// Lazy: the remote-crew view is reached only from a crew row, so it should not
+// ride in the initial bundle for the many sessions that never open it.
+const CrewChatPage = lazy(() => import('./pages/CrewChatPage'))
 import PopoutFrame from './pages/PopoutFrame'
 import ArtifactPopoutFrame from './pages/ArtifactPopoutFrame'
 import TerminalPopoutFrame from './pages/TerminalPopoutFrame'
@@ -4713,6 +4716,7 @@ export default function App() {
           <CrashReportNotice />
           <Routes>
             <Route path="/chat/:slug?" element={<ErrorBoundary><ChatPage /></ErrorBoundary>} />
+            <Route path="/crew/:crewId/chat/:sessionId?" element={<ErrorBoundary><Suspense fallback={null}><CrewChatPage /></Suspense></ErrorBoundary>} />
             <Route path="/orchestrated/:slug?" element={<OrchestratedRedirect />} />
             <Route path="/notifications" element={<ErrorBoundary><NotificationsPage /></ErrorBoundary>} />
             {/* Bookmarkable session chooser: neutral list, no auto-select; rows

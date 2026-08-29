@@ -18,6 +18,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useNavigate } from 'react-router-dom'
 import {
   Server,
   Rocket,
@@ -39,6 +40,7 @@ import {
   Play,
   Cloud,
   X,
+  MessageSquare,
 } from 'lucide-react'
 import {
   api,
@@ -335,6 +337,7 @@ function CrewRow({
   /** This row's Edit was refused because another row holds unsaved changes. */
   blocked: boolean
 }) {
+  const navigate = useNavigate()
   const connected = inst.status.state === 'connected'
   const isCloud = cloudTag !== null
   // Two persisted signals mark a row possibly-cloud when no launch job matches: an
@@ -402,9 +405,19 @@ function CrewRow({
             the primary action stands down; connecting is not what the user is
             being asked about at that moment. */}
         {transient ? null : connected ? (
-          <Btn onClick={() => onDisconnect(inst.id)} disabled={!!busy || deleting}>
-            <Unplug className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.disconnect')}
-          </Btn>
+          <>
+            {/* Chat is the primary reason to visit a CONNECTED crew, so it takes
+                the primary slot and Disconnect steps back to secondary. The row
+                still shows exactly two controls: chatting a disconnected crew is
+                impossible (the proxy requires a live tunnel), so this never
+                appears alongside Connect. */}
+            <Btn primary onClick={() => navigate(`/crew/${encodeURIComponent(inst.id)}/chat`)} disabled={!!busy || deleting}>
+              <MessageSquare className="lucide-inline" /> Chat
+            </Btn>
+            <Btn onClick={() => onDisconnect(inst.id)} disabled={!!busy || deleting}>
+              <Unplug className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.disconnect')}
+            </Btn>
+          </>
         ) : (
           <Btn primary onClick={() => onConnect(inst.id)} disabled={!!busy || deleting}>
             <Plug className="lucide-inline" /> {busy === `connect:${inst.id}` ? i18nT('pages.settings.instancesPanel.connecting') : i18nT('pages.settings.instancesPanel.connect')}
