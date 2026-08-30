@@ -16,7 +16,7 @@
  */
 import { useRef, useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
-import { ArrowUp, Loader2 } from 'lucide-react'
+import { ArrowUp, Loader2, Square } from 'lucide-react'
 import ChatMessageList, { type VirtualTranscriptHandle } from './ChatMessageList'
 import ErrorNotice from '../components/ErrorNotice'
 import { JumpToBottomButton } from './ChatScrollChrome'
@@ -66,6 +66,29 @@ export interface ChatEmbedProps {
    * fixed offset that breaks whenever the composer's height changes.
    */
   aboveComposer?: ReactNode
+  /**
+   * Content rendered in normal flow directly BELOW the input row, inside the
+   * embed's own column. This is where the main chat puts its "context shelf" —
+   * the full-width binding/state strip (agent, project, model, context usage) —
+   * so a host that wants shelf parity can supply the same strip here instead of
+   * this file growing a second composer. Omitted, nothing is rendered and the
+   * layout is byte-identical to before.
+   */
+  belowComposer?: ReactNode
+  /**
+   * Stop the in-flight turn. Supplied, the Send button is REPLACED by a Stop
+   * button while the slot is running, matching the main chat's composer, and the
+   * host owns the call (a remote host stops the turn on the crew that is running
+   * it, not locally). Omitted, the composer only ever sends — unchanged.
+   */
+  onStop?: () => Promise<unknown> | void
+  /**
+   * Notified whenever this embed's view of `running` flips. The embed already
+   * polls the slot at 1s while a turn is live, so a host that needs to drive its
+   * own activity indicator should read it from here rather than opening a second
+   * poll against the same slot.
+   */
+  onRunningChange?: (running: boolean) => void
 }
 
 /** Stable empty transcript. A fresh `[]` fallback would be a new identity on every
@@ -89,7 +112,7 @@ export const EMBED_PAGE_LIMIT = 200
 /** The handler clamps `limit` here; a wider ask is silently this. */
 export const EMBED_PAGE_LIMIT_MAX = 500
 
-function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSend, aboveComposer }: ChatEmbedProps) {
+function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSend, aboveComposer, belowComposer, onStop, onRunningChange }: ChatEmbedProps) {
   const api = useAppApi()
   const lastHashRef = useRef('')
   // The transcript is ChatMessageList's virtualized mount: it owns the scroller
@@ -154,6 +177,18 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
   }), [slotKey])
   // Retry re-issues the read at the limit that failed rather than widening again.
   const retryWiden = useCallback(() => { void refetch() }, [refetch])
+
+  // Report `running` upward on transition only. The embed polls this slot at 1s
+  // while a turn is live, so a host driving its own activity indicator reads it
+  // from here instead of opening a second poll against the same slot. Guarded by
+  // a ref because the callback identity is the host's business, not ours — an
+  // inline arrow must not turn this into a per-render notification.
+  const lastRunningRef = useRef<boolean | null>(null)
+  useEffect(() => {
+    if (lastRunningRef.current === running) return
+    lastRunningRef.current = running
+    onRunningChange?.(running)
+  }, [running, onRunningChange])
 
   /** Derived from the same helper the main chat and side panel use, so "options only
    *  after the answer settles" and "a later user message clears them" behave identically
@@ -376,16 +411,30 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
           placeholder={running ? i18nT('appSdk.chatEmbed.agent_is_working') : (placeholder || i18nT('appSdk.chatEmbed.message'))}
           disabled={sendMutation.isPending}
         />
-        <button
-          className="p-2 rounded-md bg-accent text-accent-fg disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-80 transition-opacity"
-          onClick={() => send()}
-          disabled={sendMutation.isPending || !draft.trim()}
-          title={i18nT('appSdk.chatEmbed.send')}
-          aria-label={i18nT('appSdk.chatEmbed.send_message')}
-        >
-          {sendMutation.isPending ? <Loader2 size={16} className="animate-spin" /> : <ArrowUp size={16} />}
-        </button>
+        {onStop && running ? (
+          <button
+            className="p-2 rounded-md border transition-colors"
+            style={{ borderColor: 'var(--danger)', color: 'var(--danger)', background: 'transparent' }}
+            onClick={() => void onStop()}
+            title="Stop"
+            aria-label="Stop the current turn"
+          >
+            <Square size={16} />
+          </button>
+        ) : (
+          <button
+            className="p-2 rounded-md bg-accent text-accent-fg disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-80 transition-opacity"
+            onClick={() => send()}
+            disabled={sendMutation.isPending || !draft.trim()}
+            title={i18nT('appSdk.chatEmbed.send')}
+            aria-label={i18nT('appSdk.chatEmbed.send_message')}
+          >
+            {sendMutation.isPending ? <Loader2 size={16} className="animate-spin" /> : <ArrowUp size={16} />}
+          </button>
+        )}
       </div>
+
+      {belowComposer && <div className="shrink-0">{belowComposer}</div>}
     </div>
   )
 }

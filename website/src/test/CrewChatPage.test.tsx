@@ -22,6 +22,7 @@ import { render, screen, waitFor, act } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import CrewChatPage from '../pages/CrewChatPage'
+import { PREVIEW_REMOTE_CREW_CHAT } from '../utils/previewFlags'
 
 class FakeEventSource {
   static last: FakeEventSource | null = null
@@ -59,6 +60,8 @@ function renderPage(path = '/crew/chick/chat') {
       <MemoryRouter initialEntries={[path]}>
         <Routes>
           <Route path="/crew/:crewId/chat/:sessionId?" element={<CrewChatPage />} />
+          {/* Where the hard preview gate sends an opted-out visitor. */}
+          <Route path="/chat" element={<div data-testid="redirected-home" />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -74,12 +77,26 @@ describe('CrewChatPage', () => {
   let fetchMock: ReturnType<typeof stubFetch>
 
   beforeEach(() => {
+    // Every case below asserts the page RENDERS, so it must be past the hard
+    // preview gate. The dedicated off-state case clears this again.
+    localStorage.setItem(PREVIEW_REMOTE_CREW_CHAT, '1')
     fetchMock = stubFetch(SLOTS)
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource)
     FakeEventSource.last = null
   })
-  afterEach(() => { vi.unstubAllGlobals() })
+  afterEach(() => { vi.unstubAllGlobals(); localStorage.clear() })
+
+  it('redirects out when the remote-crew-chat preview is off, never rendering the proxied view', () => {
+    // Hard gate: an opted-out visitor (including a bookmarked URL) must not reach
+    // the unreleased view at all. No slot fetch fires, and the router lands on
+    // the redirect target instead of the chat page.
+    localStorage.removeItem(PREVIEW_REMOTE_CREW_CHAT)
+    renderPage()
+    expect(screen.getByTestId('redirected-home')).toBeInTheDocument()
+    expect(screen.queryByText('proxy allowlist review')).not.toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(c => String(c[0]).endsWith('/api/chat/slots'))).toBe(false)
+  })
 
   it('seeds the rail from the slot list, because the stream sends no snapshot', async () => {
     renderPage()
@@ -125,8 +142,8 @@ describe('CrewChatPage', () => {
   it('hard-fails with a retry when the slot list cannot be read', async () => {
     vi.stubGlobal('fetch', stubFetch(null, { slotsStatus: 502 }))
     renderPage()
-    expect(await screen.findByTestId('crew-chat-unreachable')).toBeInTheDocument()
-    expect(screen.getByText(/never falls back to running the turn locally/i)).toBeInTheDocument()
+    expect(await screen.findByTestId('chat-surface-unreachable')).toBeInTheDocument()
+    expect(screen.getByText(/never silently falls back to another one/i)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument()
   })
 
@@ -137,7 +154,7 @@ describe('CrewChatPage', () => {
     await screen.findByText('proxy allowlist review')
     act(() => { FakeEventSource.last!.onerror?.() })
     expect(await screen.findByText(/reconnecting/i)).toBeInTheDocument()
-    expect(screen.queryByTestId('crew-chat-unreachable')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('chat-surface-unreachable')).not.toBeInTheDocument()
     expect(screen.getByText(/Messages still send/i)).toBeInTheDocument()
   })
 

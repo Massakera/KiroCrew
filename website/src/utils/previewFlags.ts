@@ -72,19 +72,30 @@ export const PREVIEW_WEBHOOKS = `${PREVIEW_FLAG_PREFIX}webhooks`
 export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
 
 /**
- * Creating a chat that RUNS ON a connected remote crew — the "New chat on crew"
- * entry in the sidebar's create menu.
+ * Chatting with a connected remote crew. Two doors, one flag: the "New chat on
+ * crew" entry in the sidebar's create menu, which DISPATCHES a session onto the
+ * peer, and the native remote chat view (`/crew/:crewId/chat`, reached from the
+ * Chat button on a connected crew in Settings > Remote crews), which talks to the
+ * peer's own gateway over the tunnel proxy with nothing persisted locally.
  *
  * Its own flag, deliberately NOT {@link PREVIEW_CREW}. The word "crew" carries
  * two unrelated meanings here: `PREVIEW_CREW` holds the Crew Members page, while
- * this holds sessions dispatched to another MACHINE over the instances tunnel.
+ * this holds sessions that run on another MACHINE over the instances tunnel.
  * Sharing one key would release or hold both at once, which is the same
  * half-ship failure a per-feature flag exists to prevent.
  *
- * Held because the LANDING is unfinished, not the dispatch: the session really is
- * created on the peer, but there is no native remote chat view yet, so it opens
- * by switching to that crew's pane, and the local session list does not show
- * live remote sessions — so the session is hard to return to afterwards.
+ * The two doors share this key rather than splitting it, because they are two
+ * entrances to one unreleased capability. This flag used to be held precisely
+ * BECAUSE the landing was unfinished — a dispatched session opened by switching
+ * to the peer's pane, there being no native view to land in. The view is what
+ * that reason was waiting for, so gating it behind a second, near-identically
+ * named key would reproduce the half-ship split this comment warns about one
+ * paragraph up: an operator who opted in would find the dispatch still pointing
+ * at the peer's pane and no indication a second switch exists.
+ *
+ * Still held because the view is unpolished, and because a dispatched session is
+ * not listed in this dashboard's sessions — that listing is
+ * {@link PREVIEW_INSTANCE_SESSIONS}'s own surface and its own opt-in.
  *
  * Its toggle lives in Settings > Developer > Feature Previews, alongside every other
  * unreleased surface, and NOT on Settings > Remote Instances where it started: a
@@ -93,9 +104,12 @@ export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
  * reader who wants it. It keeps its own card there rather than sharing
  * {@link PREVIEW_CREW}'s, for the two-meanings reason above.
  *
- * Gating the INGRESS only. A session already created on a peer keeps running
- * there and stays reachable through that crew's own dashboard; turning the flag
- * off only stops offering the menu entry.
+ * The two doors are gated differently, on purpose. For the create-menu entry this
+ * is INGRESS only: a session already created on a peer keeps running there and
+ * stays reachable through that crew's own dashboard, so turning the flag off only
+ * stops offering the entry. For the view it is a HARD gate — `CrewChatPage`
+ * redirects out when the flag is off, so a bookmarked `/crew/.../chat` does not
+ * resolve into an unreleased surface either.
  */
 export const PREVIEW_REMOTE_CREW_CHAT = `${PREVIEW_FLAG_PREFIX}remote-crew-chat`
 

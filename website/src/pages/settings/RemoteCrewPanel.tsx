@@ -19,6 +19,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
+import { usePreviewFlag } from '../../hooks/usePreviewFlag'
+import { PREVIEW_REMOTE_CREW_CHAT } from '../../utils/previewFlags'
 import {
   Server,
   Rocket,
@@ -338,6 +340,10 @@ function CrewRow({
   blocked: boolean
 }) {
   const navigate = useNavigate()
+  // The Chat button is the only door into the unreleased remote-crew chat view.
+  // Keep it dark until an operator opts in from Developer → Feature Previews, so
+  // this "don't advertise" gate matches the hard redirect in CrewChatPage.
+  const crewChatOn = usePreviewFlag(PREVIEW_REMOTE_CREW_CHAT)
   const connected = inst.status.state === 'connected'
   const isCloud = cloudTag !== null
   // Two persisted signals mark a row possibly-cloud when no launch job matches: an
@@ -410,10 +416,14 @@ function CrewRow({
                 the primary slot and Disconnect steps back to secondary. The row
                 still shows exactly two controls: chatting a disconnected crew is
                 impossible (the proxy requires a live tunnel), so this never
-                appears alongside Connect. */}
-            <Btn primary onClick={() => navigate(`/crew/${encodeURIComponent(inst.id)}/chat`)} disabled={!!busy || deleting}>
-              <MessageSquare className="lucide-inline" /> Chat
-            </Btn>
+                appears alongside Connect. While the remote-crew-chat preview is
+                off, the button is hidden entirely (the page it opens is hard-
+                gated) and Disconnect is the row's only connected-state control. */}
+            {crewChatOn && (
+              <Btn primary onClick={() => navigate(`/crew/${encodeURIComponent(inst.id)}/chat`)} disabled={!!busy || deleting}>
+                <MessageSquare className="lucide-inline" /> Chat
+              </Btn>
+            )}
             <Btn onClick={() => onDisconnect(inst.id)} disabled={!!busy || deleting}>
               <Unplug className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.disconnect')}
             </Btn>
