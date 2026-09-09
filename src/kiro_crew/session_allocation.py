@@ -1513,7 +1513,14 @@ class SessionAllocationService:
             or any(key.startswith(prefix) for prefix in constants.stateless_prefixes)
         ) and not owner._is_continuable_key(key)
         if not is_stateless:
-            resume_sid = owner._session_map.get(key)
+            from kiro_crew.session_map import resolve_resume_sid
+
+            # ``get`` is the cheap guarded liveness read; a transcript still in
+            # the host ``~/.kiro`` (an install that predates its isolated kiro
+            # home) is moved on a worker thread, outside the map lock, before
+            # the sid is handed to kiro-cli. A failed move leaves the mapping
+            # and the host pair in place for the next open.
+            resume_sid = await resolve_resume_sid(owner._session_map, key)
         if speculative and resume_sid and not speculative_resume:
             raise SpeculativeResumeRefused(key)
 

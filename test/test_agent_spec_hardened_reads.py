@@ -934,7 +934,12 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     "kiro_crew/apps/builtins/auto_improvement/spine/crew_runner.py": [
         ("auto_improvement_assignment", "unknown")
     ],
-    "kiro_crew/cli_doctor.py": [("doctor", "cli"), ("doctor", "cli"), ("doctor", "cli")],
+    "kiro_crew/cli_doctor.py": [
+        ("doctor", "cli"),
+        ("doctor", "cli"),
+        ("doctor", "cli"),
+        ("doctor", "cli"),
+    ],
     "kiro_crew/config/loader.py": [("load_config", "unknown")],
     "kiro_crew/connections/mint.py": [
         ("connections_mint", "dashboard"),
@@ -948,6 +953,9 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("agent_prompt", "context"),
         ("steering_resources", "unknown"),
     ],
+    # doctor's spec-home drift check reads every spec in the agents dir it
+    # inspects; same surface labels as cli_doctor's own reads.
+    "kiro_crew/doctor_spec_home.py": [("doctor", "cli")],
     "kiro_crew/cron_script.py": [("cron_resolve_mcp_server", "cron")],
     # The templates tab's read-only rule for a definition PATCH reads the spec
     # file the PATCH targets, so it labels itself as that PATCH; create re-reads

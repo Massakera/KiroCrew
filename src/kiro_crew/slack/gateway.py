@@ -13853,12 +13853,17 @@ class GatewayOrchestrator:
         async def _start_bg_session() -> None:
             try:
                 assert self.sessions is not None
+                # ``start_pool`` performs the initial prune. Host-side adopted
+                # transcripts stay live through the shared two-location fence
+                # until their individual session is opened and migrated.
                 await self.sessions.start_pool(blocking=False)
                 logger.info("Background session starting")
             except Exception:
                 logger.warning("Background session start failed", exc_info=True)
 
-        asyncio.create_task(_start_bg_session())
+        _bg_session_task = asyncio.create_task(_start_bg_session())
+        self._background_tasks.add(_bg_session_task)
+        _bg_session_task.add_done_callback(self._background_tasks.discard)
 
         # Stale-asset watchdog: detects when an update prunes the running
         # install's static assets and triggers graceful shutdown so the
