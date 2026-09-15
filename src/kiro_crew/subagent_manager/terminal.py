@@ -33,6 +33,57 @@ class TerminalCoordinator(ManagerComponent):
 
     __slots__ = ()
 
+    def _record_ledger_terminal(self, info: SubagentInfo) -> None:
+        """Close *info*'s entry in the PARENT session's ledger, once.
+
+        Called from the exclusive one-shot terminal report, so a child cannot be
+        closed twice however the race between the reaper and ``_run``'s ``finally``
+        resolves.
+
+        The closer is chosen from the runtime's own three-way ``outcome`` and never
+        re-derived from error-nullability: ``completed`` closes as a completion, and
+        ``stopped`` and ``failed`` both close through ``subagent/failed`` carrying
+        which one it was. A stop is not a success and must not read as one, and it
+        is not an error either.
+
+        The parent session and the turn that asked are read back from the origin
+        pinned at the dispatch, and released here -- the parent is very likely on a
+        different turn by now, and asking which one would file this outcome under a
+        turn that did not cause it. An unknown origin means the dispatch was never
+        recorded (the flag was off then, or the parent could not be resolved), and
+        the emitter's empty-session-id no-op drops the closer rather than inventing
+        an opener for it.
+
+        Every name is imported inside the body: this method does not end in
+        ``_impl``, so it keeps this module's globals, where the facade's imports
+        exist only under ``TYPE_CHECKING``.
+        """
+        from kiro_crew import session_ledger_emit
+        from kiro_crew.subagent import logger as _logger
+
+        try:
+            if not session_ledger_emit.enabled():
+                return
+            sid, _asking_turn = session_ledger_emit.forget_child_origin(info.id)
+            if not sid:
+                return
+            elapsed_ms = int(max(0.0, float(info.elapsed or 0.0)) * 1000)
+            outcome = info.outcome
+            if outcome == "completed":
+                session_ledger_emit.on_subagent_completed(
+                    sid, agent_id=info.id, duration_ms=elapsed_ms
+                )
+            else:
+                session_ledger_emit.on_subagent_failed(
+                    sid,
+                    agent_id=info.id,
+                    reason=info.error or "",
+                    outcome=outcome,
+                    duration_ms=elapsed_ms,
+                )
+        except Exception:
+            _logger.debug("session ledger: closing a subagent entry failed", exc_info=True)
+
     def _claim_finalize_impl(self, info: SubagentInfo, *, supersede_recovery: bool = False) -> bool:
         """Claim the exclusive right to report ``info``'s terminal outcome.
 
@@ -119,6 +170,7 @@ class TerminalCoordinator(ManagerComponent):
         # exclusive report task owns the terminal transition; flipping here
         # means only the last sibling can observe the batch as fully settled.
         info.done = True
+        self._record_ledger_terminal(info)
         await self._manager._fire_event(
             "subagent_done",
             info,

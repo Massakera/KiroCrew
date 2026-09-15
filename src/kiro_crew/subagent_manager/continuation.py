@@ -38,6 +38,72 @@ class ContinuationCoordinator(ManagerComponent):
     _persistence = persistence
     __slots__ = ()
 
+    def _record_ledger_steer(self, info: SubagentInfo, mode: str) -> None:
+        """Record a correction sent into *info*'s run, in the PARENT's ledger.
+
+        Called only where the steer SUCCEEDED -- after the provider accepted an
+        interrupt, or after a follow-up was queued and its watcher armed. A refused
+        steer sent nothing and is not a fact about the run.
+
+        ``mode`` separates the two, because they are different events: an interrupt
+        lands inside the running turn, a follow-up is delivered as a continuation
+        after it ends.
+
+        The parent is read from the origin pinned at the dispatch rather than
+        resolved again -- the parent has almost certainly moved on to another turn,
+        and this entry belongs to the session, not to whatever it is doing now. An
+        unrecorded dispatch yields an empty session id and the emitter writes
+        nothing, so a steer cannot appear without the spawn that preceded it.
+
+        Every name is imported inside the body: this method does not end in
+        ``_impl``, so it keeps this module's globals, where the facade's imports
+        exist only under ``TYPE_CHECKING``.
+        """
+        from kiro_crew import session_ledger_emit
+        from kiro_crew.subagent import logger as _logger
+
+        try:
+            if not session_ledger_emit.enabled():
+                return
+            sid, _asking_turn = session_ledger_emit.child_origin(info.id)
+            if not sid:
+                return
+            session_ledger_emit.on_subagent_steered(sid, agent_id=info.id, mode=mode)
+        except Exception:
+            _logger.debug("session ledger: recording a subagent steer failed", exc_info=True)
+
+    def _pin_followup_ledger_origin(self, info: SubagentInfo) -> None:
+        """Remember which parent turn asked for *info*'s queued follow-up.
+
+        A follow-up is DISPATCHED by the watcher, after the run it continues has
+        finished. By then the parent's turn has ended and it may well be running a
+        different one, so the dispatch site cannot read the asking turn -- reading
+        it there would file the continuation under a turn that did not ask for it.
+        This site can: ``spawn_steer`` arrives as a tool call inside the asking
+        turn, so the ordinal is live right here.
+
+        Carried on the record rather than in the emitter's origin map because the
+        continuation is a DIFFERENT child with an id that does not exist yet; the
+        watcher reads it back off ``info`` and hands it to the dispatch, the same
+        way ``_preassigned_id`` and the context triple already ride that call.
+
+        Best-effort: an absent pin makes the continuation's dispatch record nothing,
+        which is the honest outcome rather than a guessed turn.
+        """
+        from kiro_crew import session_ledger_emit
+        from kiro_crew.session_ledger_resolve import unit_for_session_key
+        from kiro_crew.subagent import logger as _logger
+
+        try:
+            if not session_ledger_emit.enabled():
+                return
+            sid = unit_for_session_key(self._manager._sessions, info.parent_session_key)
+            if not sid:
+                return
+            setattr(info, "_ledger_followup_asked", (sid, session_ledger_emit.live_turn(sid)))
+        except Exception:
+            _logger.debug("session ledger: pinning a follow-up origin failed", exc_info=True)
+
     def _conversation_busy_impl(self, conv_key: str) -> SubagentInfo | None:
         """Return the live or QUEUED run on *conv_key*, or None.
 
@@ -297,6 +363,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _ledger_asked: "tuple[str, int] | None" = None,
     ) -> SubagentInfo | None:
         """Dispatch a follow-up *task* into conversation *conv_id* (sync callers).
 
@@ -327,6 +394,7 @@ class ContinuationCoordinator(ManagerComponent):
             cwd,
             _preassigned_id,
             _memory_mode,
+            _ledger_asked,
         )
         if not isinstance(prelude, dict):
             return prelude
@@ -343,6 +411,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _ledger_asked: "tuple[str, int] | None" = None,
     ) -> SubagentInfo | None:
         """:meth:`continue_conversation_impl` for event-loop callers: the same
         prelude, then ``spawn_async`` (write-before-ack with the store write on
@@ -357,6 +426,7 @@ class ContinuationCoordinator(ManagerComponent):
             cwd,
             _preassigned_id,
             _memory_mode,
+            _ledger_asked,
         )
         if not isinstance(prelude, dict):
             return prelude
@@ -373,6 +443,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
+        _ledger_asked: "tuple[str, int] | None" = None,
     ) -> "SubagentInfo | dict[str, Any] | None":
         """Dispatch a follow-up *task* into conversation *conv_id*.
 
@@ -543,6 +614,7 @@ class ContinuationCoordinator(ManagerComponent):
         return dict(
             task=task,
             _preassigned_id=_preassigned_id,
+            _ledger_asked=_ledger_asked,
             parent_session_key=parent_session_key,
             agent=agent,
             model=model,
@@ -681,6 +753,7 @@ class ContinuationCoordinator(ManagerComponent):
             logger.warning("steer_run %s failed", agent_id, exc_info=True)
             return False, f"steer failed: {exc}"
         if ok:
+            self._record_ledger_steer(info, "interrupt")
             try:
                 sel().log_tool_invocation(
                     session_key=info.parent_session_key or "",
@@ -726,6 +799,8 @@ class ContinuationCoordinator(ManagerComponent):
         info.pending_followups.append(message)
         if not info._followup_watcher:
             self._manager._arm_followup_watcher(info)
+        self._record_ledger_steer(info, "follow_up")
+        self._pin_followup_ledger_origin(info)
         try:
             sel().log_tool_invocation(
                 session_key=info.parent_session_key or "",
@@ -868,6 +943,10 @@ class ContinuationCoordinator(ManagerComponent):
                 task,
                 parent_session_key=info.parent_session_key,
                 agent=info.agent,
+                # The turn that ASKED for this follow-up, pinned when it was
+                # queued. This dispatch runs after the continued run finished, so
+                # the asking ordinal is not readable here.
+                _ledger_asked=getattr(info, "_ledger_followup_asked", None),
             )
             err = "spawn_failed" if child is None else str(getattr(child, "error", "") or "")
             if not err.startswith("conversation_busy"):
