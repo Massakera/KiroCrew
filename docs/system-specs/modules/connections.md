@@ -1086,6 +1086,28 @@ exfiltration-URL scanners over the whole string BEFORE the slice — truncating
 first would bisect a credential straddling the boundary and leak the prefix past
 the regex. There is no un-redacted path onto `detail`.
 
+### The binding record (L02 · AUTH-01)
+
+`control_plane/binding.py` is what a context's `binding_ref` points AT: the
+`Binding` record for one authorized account. Still pure types with zero IO — it
+MINTS and INCREMENTS a record; it does not persist one, resolve one to a
+credential, or reach kiro-cli. Four properties, each a distinct defence:
+
+| Property | How it is enforced |
+|---|---|
+| **Random `binding_id`** | Minted from `secrets.token_hex(16)` (128 bits) — unguessable and NOT derived from the provider slug, tenant, or subject. A derived id would let anyone who knows the (often public) slug/tenant reconstruct or enumerate binding ids. The id carries no meaning; it is a name resolved through a later leaf's table, never parsed. |
+| **Verified subject + tenant** | `create_binding(...)` takes a required `SubjectTenantVerifier` and stores ONLY the `VerifiedIdentity` it returns — never the caller's raw `claimed_*` inputs. A failed verification raises `BindingVerificationError` and no record is built (verification runs BEFORE anything is minted, so there is no partial or unverified binding). There is no path from a claimed identity to a stored one that skips the verifier. |
+| **Monotonic `generation`** | A fresh binding starts at `INITIAL_GENERATION`; `next_generation(binding)` returns a new record with `generation` incremented by one and every other field carried through unchanged (the input is not mutated). Its PURPOSE is L04's revoke fencing — a revoke raises the generation so anything stamped with an older one is fenced off — but **this slice lands the field and the increment semantics only; it implements neither refresh nor revoke**, and nothing here decides what a bumped generation invalidates. |
+| **`secret_ref` metadata, never a value** | A binding records a `SecretRef` — the vault entry `name` plus metadata (`backend`, `bound_at`) — and it is a hard invariant of the type that no plaintext lives on it. The name follows the same `CONNECTIONS_<SLUG>_...` family `oauth_clients.client_secret_name` uses (via `binding_secret_ref`, with a distinct `_BINDING_SECRET` suffix so a per-binding grant secret never collides with the operator's `_CLIENT_SECRET` application credential). Resolving the name to a `SecretVault` / `SecretValue` is a later leaf's job. |
+
+**The old-custody invariant, at its sharpest.** Under the pre-native model the
+OAuth token chain lives entirely inside kiro-cli and the backend only `stat()`s
+to probe whether a grant exists. `binding.py` **never reads, copies, or
+references an old kiro-cli OAuth token.** A `SecretRef` names a NEW authorization
+grant's secret under a NEW trusted owner — it carries only a vault-entry name,
+not a filesystem path into kiro-cli's token store, so it is not a place to
+smuggle a moved-over legacy token.
+
 ### Two orthogonal axes, the same word in this repo, kept apart on purpose
 
 Two independent questions wear the word "mode" in this subsystem today, and this
