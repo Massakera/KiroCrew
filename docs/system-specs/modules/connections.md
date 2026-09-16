@@ -1109,6 +1109,84 @@ grant's secret under a NEW trusted owner — it carries only a vault-entry name,
 not a filesystem path into kiro-cli's token store, so it is not a place to
 smuggle a moved-over legacy token.
 
+### The derived handle (L08)
+
+`control_plane/handle.py` derives a `DerivedHandle` from a trusted `Binding`.
+Where a binding is a LONG-LIVED, FULL-AUTHORITY record — it names the connection
+and references its secret and never expires — a handle is what a call site
+should actually hold: a capability strictly NARROWER than the binding, that
+EXPIRES, and that cannot be turned back into the binding. It MINTS a handle
+(`derive_handle`) and DECIDES whether one may be used (`ensure_usable`); it does
+not persist across processes, resolve to a credential, revoke, or reach
+kiro-cli.
+
+**The handle is a CLAIM; the issuance record is the authority.** A
+`DerivedHandle` is an ordinary mutable `TypedDict` a caller holds — so it is not
+trusted. A caller can edit its `scopes`, push its `not_after`, or change its
+`generation` in the dict. Therefore NO enforcement decision is read off the
+handle's own fields. Every mint records the authoritative facts (scope set,
+expiry, generation, binding fingerprint) in a module-private ISSUANCE REGISTRY
+keyed by the random `handle_id`, and `ensure_usable(handle, now=…)` judges ONLY
+against that record. A consumer **MUST NOT** read `scopes` / `not_after` /
+`generation` off the handle to make its own allow/deny decision — it MUST call
+`ensure_usable`; reading the fields directly re-opens exactly the hole this
+design closes.
+
+Three invariants, each enforced by real code with a real refusal path (never a
+docstring), each with a counterexample test:
+
+| Invariant | How it is enforced |
+|---|---|
+| **Scope only narrows** | *At mint:* `derive_handle(binding, granted_scopes=…, requested_scopes=…, …)` refuses any requested scope the binding does not grant with a typed RUN-01 `scope` error (`HandleScopeError`) and mints NO handle — never silently dropped to what is granted. *At use:* `ensure_usable` refuses a handle whose presented `scopes` are not a subset of the RECORD's scopes (`HandleTamperedError`, typed `auth`) — a caller who widens the dict after minting is refused, not obeyed. The binding record itself carries no scope set; the authorized-scope set is supplied by the layer that owns it (e.g. L06 governance) and passed in, and this module treats scopes as opaque strings — it never consults or mutates `platform/governance.SCOPE_CATALOG`. |
+| **Expiry is enforced** | `ensure_usable` first refuses a non-finite `now` (a `NaN` clock would make `now >= not_after` silently False and let an expired handle through), then compares the caller's `now` against the RECORD's `not_after` (inclusive) and refuses an expired handle with a typed RUN-01 `input` error (`HandleExpiredError`) — pushing the handle's own `not_after` changes nothing, and a claimed expiry later than the record's is itself a tamper refusal. At mint, `ttl_seconds`/`now` must be FINITE and `ttl_seconds > 0`, and `now + ttl_seconds` must not overflow to `inf`; otherwise `ValueError`. |
+| **Routing/auth axes are trusted, not caller-chosen** | `ensure_usable` also checks the handle's `service_id` and `credential_mode` against the record and refuses a mismatch (`HandleTamperedError`, typed `auth`) — a caller cannot flip `service_id` to redirect a Graph handle at another provider, or swap the credential mode. And it does not return `None`: on success it returns a **`TrustedHandleView`** built from the RECORD. |
+| **Cannot reconstruct the binding** | The handle carries NOTHING that rebuilds its binding: no `binding_id`, no `subject_ref` / `tenant_ref`, no `secret_ref` (the handle deliberately carries no secret reference at all). Its own `handle_id` is random (`secrets.token_hex(16)`), independent of the binding. The sole link back is `binding_fingerprint` — a ONE-WAY keyed digest (HMAC-SHA256 under a per-process random key) of `binding_id`, which L04 revoke fencing can MATCH against a candidate binding but which no handle holder can INVERT to recover the id. |
+
+**A consumer routes on the returned view, never on the handle fields.**
+`ensure_usable(handle, now=…)` returns a frozen `TrustedHandleView` whose
+`service_id` / `credential_mode` / `scopes` / `generation` / `not_after` are
+copied from the trusted issuance record. **W05 / L09 MUST decide where to send
+the call and which credential to use from this returned view, and MUST NOT read
+`service_id` / `credential_mode` / `scopes` off the `DerivedHandle` dict.**
+Reading them off the handle re-opens the "validate, then use the unvalidated
+value" hole the whole design closes — a caller who edited `service_id` on the
+dict would route the call to the wrong provider even though `ensure_usable`
+verified a different one. The handle is a claim; the returned view is the answer.
+L09's real entry point may re-assert this check at its boundary; it must not fall
+back to trusting the handle.
+
+**Cross-process and restart: a fail-closed contract, not undefined behavior.**
+The issuance registry is process-local and in-memory; it starts empty at import
+and is never persisted. So two things are guaranteed: (1) **after a restart,
+every handle minted before the restart is refused** — the new process's registry
+is empty, so no prior `handle_id` resolves and `ensure_usable` fails closed with
+a typed `auth` refusal (`HandleNotIssuedError`), never silently accepted; (2) **a
+handle minted in another process is refused here** — each process has its own
+registry. The capability boundary is therefore explicit: a derived handle is
+usable ONLY within the process that issued it, while that process lives and the
+record has not expired. A handle is not a bearer token that survives
+serialization to another process — that is deliberate and enforced by the
+lookup. (A cross-process handoff, if a later slice needs it, is a signed-record
+or shared-store design that is out of this slice.)
+
+**Why `generation` rides along but `binding_id` does not.** L04's revoke fencing
+(NOT implemented here) needs both the handle's `generation` (to compare against
+the binding's current one) and WHICH binding it came from. Carrying the raw
+`binding_id` would answer the second but break the no-reconstruction invariant,
+so the record and handle carry the non-invertible `binding_fingerprint` instead:
+L04 recomputes the fingerprint of a candidate binding under the same process key,
+matches, and fences off any handle whose `generation` is older than that
+binding's current one. This slice lands `generation` + the fingerprint and proves
+they are preserved; it makes no revoke decision.
+
+**Secret custody stays where it is.** This module handles references and
+derivation only. Secret storage remains the existing mechanism — the
+`secrets/vault.py` `SecretVault` / `SecretValue` machinery and the
+`oauth_clients.client_secret_name(slug)` naming convention — and a handle
+carries no secret reference, so resolving a binding's secret is still a later
+leaf's job, gated by the handle's scope and expiry rather than reachable from
+the handle itself.
+
 ### Two orthogonal axes, the same word in this repo, kept apart on purpose
 
 Two independent questions wear the word "mode" in this subsystem today, and this

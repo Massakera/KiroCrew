@@ -22,6 +22,14 @@ deny-by-default check
 which of the L01 credential modes it permits, and a caller-offered mode is
 allowed or denied against that declaration (unstated == denied).
 
+W01 · L08 adds :class:`~kiro_crew.connections.control_plane.handle.DerivedHandle`
+-- a restricted, short-lived capability DERIVED from a trusted binding: its
+scope set is a proven SUBSET of the binding's granted scopes, it carries an
+absolute ``not_after`` TTL that :func:`~kiro_crew.connections.control_plane.handle.ensure_usable`
+enforces, and it carries NOTHING that reconstructs the binding (no
+``binding_id`` / subject / tenant / secret) -- only a one-way keyed
+``binding_fingerprint`` and the ``generation``, both for L04 revoke fencing.
+
 Pure types, zero IO. This module is the control plane's own export face, and it
 is the CANONICAL one: the wider ``kiro_crew.connections`` package does NOT
 re-export these symbols, so consumers import them from
@@ -63,6 +71,18 @@ from kiro_crew.connections.control_plane.errors import (
     OperationError,
     operation_error,
     redacted_detail,
+)
+from kiro_crew.connections.control_plane.handle import (
+    HANDLE_SCHEMA_VERSION,
+    DerivedHandle,
+    HandleExpiredError,
+    HandleNotIssuedError,
+    HandleScopeError,
+    HandleTamperedError,
+    TrustedHandleView,
+    derive_handle,
+    ensure_usable,
+    is_expired,
 )
 from kiro_crew.connections.control_plane.operation import (
     CREDENTIAL_MODES,
@@ -114,6 +134,7 @@ __all__ = [
     "EFFECTS",
     "ERRORS_SCHEMA_VERSION",
     "ERROR_CLASSES",
+    "HANDLE_SCHEMA_VERSION",
     "INITIAL_GENERATION",
     "LAYERS",
     "MAX_ERROR_CHARS",
@@ -132,8 +153,13 @@ __all__ = [
     "Binding",
     "BindingVerificationError",
     "CredentialMode",
+    "DerivedHandle",
     "Effect",
     "ErrorClass",
+    "HandleExpiredError",
+    "HandleNotIssuedError",
+    "HandleScopeError",
+    "HandleTamperedError",
     "LayerCeilings",
     "LayerName",
     "OperationContext",
@@ -149,6 +175,7 @@ __all__ = [
     "SecretRef",
     "ServiceId",
     "SubjectTenantVerifier",
+    "TrustedHandleView",
     "VerifiedIdentity",
     "approval_applies",
     "args_fingerprint",
@@ -156,7 +183,10 @@ __all__ = [
     "create_binding",
     "decide",
     "declare_permitted_modes",
+    "derive_handle",
     "effective_permitted_modes",
+    "ensure_usable",
+    "is_expired",
     "next_generation",
     "operation_error",
     "permit_operation",
