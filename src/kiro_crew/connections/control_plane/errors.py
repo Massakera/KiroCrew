@@ -137,8 +137,14 @@ def redacted_detail(detail: str) -> str:
 def operation_error(error_class: ErrorClass, detail: str) -> OperationError:
     """Build an :class:`OperationError`, redacting ``detail`` on the way in.
 
-    A convenience constructor so a caller cannot accidentally place raw text in
-    ``detail``: the redaction is not optional, it happens here.
+    This is the redaction boundary: it runs ``detail`` through
+    :func:`redacted_detail` so callers who go through this constructor cannot
+    place raw text in the field. The redaction is NOT enforced by the type
+    itself -- :class:`OperationError` is a plain ``TypedDict``, so constructing
+    one directly (``{"error_class": ..., "detail": ...}``) bypasses this and
+    stores whatever ``detail`` it is given. Build every ``OperationError``
+    through this function (or pre-redact with :func:`redacted_detail`); a bare
+    dict literal is the one path that is not automatically scrubbed.
     """
 
     return {"error_class": error_class, "detail": redacted_detail(detail)}

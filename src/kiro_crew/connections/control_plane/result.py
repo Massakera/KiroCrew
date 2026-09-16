@@ -7,7 +7,7 @@ does no IO: it describes the OUTCOME of a call, so a downstream stream and a
 runtime dispatch read one vocabulary for "did it fully succeed, partly succeed,
 or is there more to fetch" instead of each inventing its own.
 
-The ``status`` axis is three-valued and deliberately distinct from the
+The ``status`` axis is two-valued and deliberately distinct from the
 error taxonomy in :mod:`kiro_crew.connections.control_plane.errors`:
 
 - ``ok`` -- the operation completed and returned everything it was asked for.

@@ -9,8 +9,11 @@ references one call is made under -- never a credential value), an
 success/partial envelope with an opaque pagination cursor), and the RUN-01
 :class:`~kiro_crew.connections.control_plane.errors.OperationError` taxonomy.
 
-Pure types, zero IO. This module is the control plane's own export face; the
-wider ``kiro_crew.connections`` package re-exports a curated subset additively.
+Pure types, zero IO. This module is the control plane's own export face, and it
+is the CANONICAL one: the wider ``kiro_crew.connections`` package does NOT
+re-export these symbols, so consumers import them from
+``kiro_crew.connections.control_plane`` (or its submodules), never as
+``kiro_crew.connections.<name>`` aliases.
 """
 
 from kiro_crew.connections.control_plane.context import (
