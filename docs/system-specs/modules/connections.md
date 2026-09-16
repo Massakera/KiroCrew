@@ -1331,17 +1331,23 @@ attempt and decides whether replaying it now is allowed:
   A refusal is always a typed rejection built through `operation_error(…)`,
   never a bare boolean.
 
-**The idempotent-write exception.** Whether `unknown` is safe to replay is a
-property of the OPERATION, read from its descriptor's `effect` — never inferred
-from the operation's name or from the mere presence of an idempotency key.
-`read` is not a mutation and `delete` is naturally idempotent (deleting an
-already-deleted resource leaves the same end state), so an `unknown` replay of
-either is **allowed**; `write` / `share` / `external_send` / `admin` /
-`billable` are non-idempotent by default and must be gated. An operation that
-genuinely IS idempotent despite a non-idempotent effect (a fixed-key upsert, a
-provider-honored idempotency token) declares that with the explicit
-`idempotent` override on its attempt record — an assertion the caller states,
-never a default the gate guesses.
+**The idempotent-write exception is decided only by an explicit assertion.**
+Whether `unknown` is safe to replay is decided ONLY by an explicit, trusted
+`idempotent` assertion the caller places on the attempt record (a fixed-key
+upsert, a provider-honored idempotency token). It is **never** inferred from the
+descriptor's `effect` — in particular `effect=delete` is NOT treated as
+idempotent: a second `delete` can land on a resource RECREATED in the interim
+(deleting someone else's new resource), and a given API's delete may itself not
+be idempotent. The safe default is refuse; the exception is something the caller
+must state.
+
+**Attribution comes first.** Before any outcome is honored, the gate checks the
+record BELONGS to this request: `operation_id` must equal the descriptor's, and
+the `args_fingerprint` / `idempotency_key` must equal the request's own. A
+record for another operation, or another argument set, is refused — never
+allowed, never reused. The stored fingerprint and key are compared, not merely
+retained. A `succeeded` record with no recorded result is likewise refused
+rather than reused (reuse would return an empty result).
 
 Like every other symbol on this seam, the L07 exports live on the canonical
 `kiro_crew.connections.control_plane` subpackage only; they are **not**

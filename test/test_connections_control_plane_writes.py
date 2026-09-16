@@ -73,6 +73,22 @@ def _record(outcome: str, *, idempotent: bool = False, result=None) -> AttemptRe
     )
 
 
+# The canonical request identity for the `_record`-based tests: the SAME args
+# and key `_record` fingerprints. Passed explicitly on every call because the
+# gate requires them -- there is no way to skip the argument comparison.
+_CANON_ARGS = {"title": "bug", "body": "x"}
+_CANON_KEY = "idem-key-1"
+
+
+def _decide(descriptor, record, *, args=None, key=None):
+    return replay_decision(
+        descriptor,
+        record,
+        request_args=_CANON_ARGS if args is None else args,
+        request_idempotency_key=_CANON_KEY if key is None else key,
+    )
+
+
 # --- the counterexample that decides this slice ----------------------------
 
 
@@ -84,7 +100,7 @@ def test_a_write_with_unknown_outcome_is_NOT_blindly_replayed() -> None:
     descriptor = _non_idempotent_descriptor()
     record = _record("unknown")
 
-    decision = replay_decision(descriptor, record)
+    decision = _decide(descriptor, record)
 
     assert decision["verdict"] == "refuse"
     assert decision["reuse_result"] is None
@@ -104,7 +120,7 @@ def test_failed_not_applied_is_allowed_to_replay() -> None:
     descriptor = _non_idempotent_descriptor()
     record = _record("failed_not_applied")
 
-    decision = replay_decision(descriptor, record)
+    decision = _decide(descriptor, record)
 
     assert decision["verdict"] == "allow"
     assert decision["reuse_result"] is None
@@ -117,7 +133,7 @@ def test_succeeded_reuses_the_recorded_result_instead_of_replaying() -> None:
     recorded: OperationResult = {"status": "ok", "next_cursor": None}
     record = _record("succeeded", result=recorded)
 
-    decision = replay_decision(descriptor, record)
+    decision = _decide(descriptor, record)
 
     assert decision["verdict"] == "reuse"
     assert decision["reuse_result"] == recorded
@@ -125,8 +141,9 @@ def test_succeeded_reuses_the_recorded_result_instead_of_replaying() -> None:
 
 
 def test_idempotent_operation_may_replay_after_unknown() -> None:
-    # A naturally-idempotent operation (effect `delete`) after `unknown` is
-    # SAFE to replay -- the exception the descriptor's effect declares.
+    # An operation the caller EXPLICITLY asserts idempotent (a provider-honored
+    # idempotency token) after `unknown` is SAFE to replay. Idempotency is
+    # decided ONLY by this explicit trusted assertion -- NOT by effect=delete.
     descriptor = _idempotent_delete_descriptor()
     record = record_attempt(
         operation_id="github.delete_label",
@@ -134,10 +151,10 @@ def test_idempotent_operation_may_replay_after_unknown() -> None:
         idempotency_key="idem-del-1",
         outcome="unknown",
         recorded_result=None,
-        idempotent=False,
+        idempotent=True,
     )
 
-    decision = replay_decision(descriptor, record)
+    decision = _decide(descriptor, record, args={"name": "wontfix"}, key="idem-del-1")
 
     assert decision["verdict"] == "allow"
     assert decision["error"] is None
@@ -149,7 +166,7 @@ def test_explicit_idempotent_override_allows_unknown_replay() -> None:
     descriptor = _non_idempotent_descriptor()
     record = _record("unknown", idempotent=True)
 
-    decision = replay_decision(descriptor, record)
+    decision = _decide(descriptor, record)
 
     assert decision["verdict"] == "allow"
     assert decision["error"] is None
@@ -168,7 +185,7 @@ def test_external_send_unknown_is_refused_without_override() -> None:
         idempotent=False,
     )
 
-    decision = replay_decision(descriptor, record)
+    decision = _decide(descriptor, record, args={"channel": "C1", "text": "hi"}, key="idem-send-1")
 
     assert decision["verdict"] == "refuse"
     assert decision["error"] is not None
@@ -208,7 +225,7 @@ def test_refusal_detail_is_redacted_and_typed() -> None:
     # A refusal detail goes through operation_error's redaction discipline like
     # every other typed rejection on the seam.
     descriptor = _non_idempotent_descriptor()
-    decision = replay_decision(descriptor, _record("unknown"))
+    decision = _decide(descriptor, _record("unknown"))
     error = decision["error"]
     assert error is not None
     # detail is a plain str, capped like every OperationError detail.
@@ -244,3 +261,123 @@ def test_writes_symbols_live_on_the_canonical_subpackage_only() -> None:
         assert not hasattr(
             connections, name
         ), f"{name} must not be attribute-reachable at top level"
+
+
+# --- round 14 counterexamples: three real defects --------------------------
+
+
+def test_effect_delete_alone_is_not_treated_as_idempotent() -> None:
+    # DEFECT 1: a delete's second attempt can hit a resource RECREATED in the
+    # interim (deleting someone else's new resource), or the API's delete may
+    # itself not be idempotent. Idempotency must NOT be inferred from
+    # `effect=delete`; only an explicit trusted assertion permits an `unknown`
+    # replay. A delete with `unknown` and NO explicit idempotent flag must be
+    # REFUSED.
+    descriptor = _idempotent_delete_descriptor()
+    record = record_attempt(
+        operation_id="github.delete_label",
+        args_fingerprint=args_fingerprint({"name": "wontfix"}),
+        idempotency_key="idem-del-1",
+        outcome="unknown",
+        recorded_result=None,
+        idempotent=False,
+    )
+
+    decision = _decide(descriptor, record, args={"name": "wontfix"}, key="idem-del-1")
+
+    assert decision["verdict"] == "refuse"
+    assert decision["error"] is not None
+    assert decision["error"]["error_class"] == "conflict"
+
+
+def test_record_for_a_different_operation_is_refused_not_allowed() -> None:
+    # DEFECT 2: the gate must verify the record BELONGS to this request. A
+    # record whose operation_id differs from the descriptor's must be refused,
+    # never allow/reuse -- otherwise another operation's record is honored.
+    descriptor = _non_idempotent_descriptor()  # github.create_issue
+    # A record for a DIFFERENT operation that on its own would `allow`.
+    alien = record_attempt(
+        operation_id="slack.post_message",
+        args_fingerprint=args_fingerprint({"title": "bug", "body": "x"}),
+        idempotency_key="idem-key-1",
+        outcome="failed_not_applied",
+        recorded_result=None,
+        idempotent=False,
+    )
+
+    decision = _decide(descriptor, alien)
+
+    assert decision["verdict"] == "refuse"
+    assert decision["error"] is not None
+
+
+def test_record_for_different_args_or_key_is_refused_not_reused() -> None:
+    # DEFECT 2 (cont): same operation but a DIFFERENT args fingerprint / key
+    # must not have its recorded result reused. A `succeeded` record for other
+    # args would otherwise reuse the wrong result.
+    descriptor = _non_idempotent_descriptor()
+    recorded: OperationResult = {"status": "ok", "next_cursor": None}
+    wrong_args = {
+        "operation_id": "github.create_issue",
+        "args_fingerprint": args_fingerprint({"title": "OTHER", "body": "z"}),
+        "idempotency_key": "idem-key-1",
+        "outcome": "succeeded",
+        "recorded_result": recorded,
+        "idempotent": False,
+    }
+    request = _non_idempotent_descriptor()
+    # The request's own identity is supplied; the gate fingerprints it itself.
+    decision = replay_decision(
+        descriptor,
+        wrong_args,  # type: ignore[arg-type]
+        request_args={"title": "bug", "body": "x"},
+        request_idempotency_key="idem-key-1",
+    )
+    assert request is not None
+    assert decision["verdict"] == "refuse"
+    assert decision["error"] is not None
+
+
+def test_succeeded_without_a_recorded_result_is_refused_not_empty_reuse() -> None:
+    # DEFECT 3: a `succeeded` record with NO recorded_result cannot be reused --
+    # reuse would hand back an empty result. It must be refused, not silently
+    # allowed/reused-as-None.
+    descriptor = _non_idempotent_descriptor()
+    record = _record("succeeded", result=None)
+
+    decision = _decide(descriptor, record)
+
+    assert decision["verdict"] == "refuse"
+    assert decision["error"] is not None
+    assert decision["reuse_result"] is None
+
+
+def test_args_attribution_cannot_be_silently_skipped() -> None:
+    # RESIDUAL DEFECT (round 15): with the same operation_id but a DIFFERENT
+    # args fingerprint, a caller that does not opt into the args check must NOT
+    # be able to get allow/reuse. The gate must compare the request's args
+    # unconditionally -- there is no way to call it without supplying them.
+    descriptor = _non_idempotent_descriptor()  # github.create_issue
+    recorded: OperationResult = {"status": "ok", "next_cursor": None}
+    # A succeeded record for a DIFFERENT argument set, same operation + key.
+    other_args_record: AttemptRecord = {
+        "operation_id": "github.create_issue",
+        "args_fingerprint": args_fingerprint({"title": "OTHER", "body": "z"}),
+        "idempotency_key": "idem-key-1",
+        "outcome": "succeeded",
+        "recorded_result": recorded,
+        "idempotent": False,
+    }
+
+    # THIS request is for different args. The gate must refuse -- and there must
+    # be no way to invoke it that skips the args comparison.
+    decision = replay_decision(
+        descriptor,
+        other_args_record,
+        request_args={"title": "bug", "body": "x"},
+        request_idempotency_key="idem-key-1",
+    )
+
+    assert decision["verdict"] == "refuse"
+    assert decision["error"] is not None
+    assert decision["reuse_result"] is None

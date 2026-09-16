@@ -36,30 +36,29 @@ The three attempt outcomes
 
 The idempotent-write exception
 ------------------------------
-Whether ``unknown`` is safe to replay is a property of the OPERATION, read from
-its descriptor's ``effect``. An idempotent write -- one whose repetition is
-indistinguishable from a single application -- can be replayed after ``unknown``
-without risking a double effect, so the gate ALLOWS it. Idempotency is NOT
-inferred from the operation's name or from the presence of an idempotency key;
-it is declared by the descriptor. The manifest's ``effect`` closed set
-(``read`` / ``write`` / ``delete`` / ``share`` / ``external_send`` / ``admin``
-/ ``billable``) is the vocabulary this decision reads:
+Whether an ``unknown`` outcome is safe to replay is decided ONLY by an explicit,
+trusted idempotency assertion the caller places on the attempt record
+(``idempotent=True``) -- a PUT-to-a-fixed-key upsert, a create carrying a
+provider-honored idempotency token the caller vouches for. When set, an
+``unknown`` replay is allowed; otherwise it is refused.
 
-- ``read`` is not a mutation at all: replay is always safe.
-- ``delete`` is naturally idempotent -- deleting an already-deleted resource
-  leaves the same end state -- so an ``unknown`` delete is safe to replay.
-- ``write`` / ``share`` / ``external_send`` / ``admin`` / ``billable`` are
-  treated as NON-idempotent: a second ``write`` can create a second resource, a
-  second ``external_send`` sends a second message, a second ``billable`` charges
-  twice. These are exactly the effects an ``unknown`` outcome must gate.
+Idempotency is NEVER inferred from the descriptor's ``effect``. In particular
+``effect=delete`` is NOT treated as idempotent: a second ``delete`` can land on
+a resource that was RECREATED in the interim (deleting someone else's new
+resource), and a given API's delete may itself not be idempotent -- so
+``effect`` cannot stand in for a trusted idempotency guarantee. This keeps the
+safe default (refuse) and makes the exception something a caller must explicitly
+state, not something the gate guesses from an effect label.
 
-An operation that genuinely IS idempotent despite a non-idempotent effect (a
-PUT-to-a-fixed-key upsert, a create carrying a provider-honored idempotency
-token) declares that with the explicit ``idempotent`` flag on its attempt
-record; the flag is an OVERRIDE the caller asserts, never a default. When set,
-an ``unknown`` replay is allowed regardless of effect. This keeps the safe
-default (refuse) and makes the exception something a caller must state, not
-something the gate guesses.
+Attribution: a record must belong to THIS request
+--------------------------------------------------
+An attempt record carries an identity -- ``operation_id`` plus an
+``args_fingerprint`` and an ``idempotency_key`` -- and the gate CHECKS that
+identity before honoring any outcome. A record whose ``operation_id`` differs
+from the descriptor's, or whose fingerprint/key differ from the request's own,
+is refused: another operation's record, or another argument set's recorded
+result, is never a basis to allow a replay or reuse a result. The stored
+fingerprint and key are compared, not merely retained.
 """
 
 from __future__ import annotations
@@ -69,7 +68,7 @@ import json
 from typing import Any, Literal, TypedDict
 
 from kiro_crew.connections.control_plane.errors import OperationError, operation_error
-from kiro_crew.connections.control_plane.operation import Effect, OperationDescriptor
+from kiro_crew.connections.control_plane.operation import OperationDescriptor
 from kiro_crew.connections.control_plane.result import OperationResult
 
 #: Bumped when this module's shapes change, mirroring the sibling modules'
@@ -112,14 +111,6 @@ ReplayVerdict = Literal["allow", "reuse", "refuse"]
 
 #: Tuple form of :data:`ReplayVerdict`'s closed set.
 REPLAY_VERDICTS: tuple[ReplayVerdict, ...] = ("allow", "reuse", "refuse")
-
-#: The effects treated as naturally safe to replay after an ``unknown`` outcome
-#: WITHOUT an explicit idempotency assertion. ``read`` is not a mutation;
-#: ``delete`` is naturally idempotent (deleting an already-deleted resource
-#: leaves the same end state). Every other effect is non-idempotent by default
-#: and an ``unknown`` replay of it must be gated. This is the DEFAULT, widened
-#: per-attempt by the explicit ``idempotent`` override flag.
-_REPLAY_SAFE_EFFECTS: frozenset[Effect] = frozenset({"read", "delete"})
 
 
 class AttemptRecord(TypedDict):
@@ -217,40 +208,97 @@ def record_attempt(
     }
 
 
-def _is_replay_safe_after_unknown(descriptor: OperationDescriptor, record: AttemptRecord) -> bool:
+def _is_replay_safe_after_unknown(record: AttemptRecord) -> bool:
     """Whether an ``unknown`` outcome is safe to replay for this operation.
 
-    Safe when the operation's declared ``effect`` is naturally replay-safe
-    (``read`` / ``delete``) OR the caller explicitly asserted idempotency on the
-    attempt record. The effect is READ from the descriptor -- never inferred
-    from the operation's name or from the mere presence of an idempotency key.
+    Safe ONLY when the caller explicitly, trustworthily asserted idempotency on
+    the attempt record (``idempotent=True``) -- a fixed-key upsert or a
+    provider-honored idempotency token the caller vouches for. Idempotency is
+    NEVER inferred from the descriptor's ``effect``: an ``effect=delete`` second
+    attempt can hit a resource RECREATED in the interim (deleting someone else's
+    new resource), and a given API's delete may itself not be idempotent, so
+    ``effect`` cannot stand in for a trusted idempotency guarantee. The safe
+    default is that an ``unknown`` write is not replayable; the exception is
+    something the caller must state, not something the gate presumes.
     """
 
-    if record["idempotent"]:
-        return True
-    return descriptor["effect"] in _REPLAY_SAFE_EFFECTS
+    return record["idempotent"]
 
 
-def replay_decision(descriptor: OperationDescriptor, record: AttemptRecord) -> ReplayDecision:
+def replay_decision(
+    descriptor: OperationDescriptor,
+    record: AttemptRecord,
+    *,
+    request_args: dict[str, Any],
+    request_idempotency_key: str,
+) -> ReplayDecision:
     """Decide whether replaying the recorded attempt is allowed.
 
-    The gate over the core invariant. Given the operation's descriptor (which
-    declares its ``effect``, hence whether it is naturally idempotent) and a
-    record of what is known about the prior attempt:
+    The gate over the core invariant. ``descriptor`` identifies the operation
+    THIS request is for; ``record`` is what is known about a prior attempt;
+    ``request_args`` is THIS request's own argument mapping and
+    ``request_idempotency_key`` its own idempotency key. All three identity
+    facets are checked FIRST -- a record that does not belong to this request is
+    refused before any outcome is honored.
+
+    Attribution (step 1) is UNCONDITIONAL and UNSKIPPABLE. Both identity inputs
+    are REQUIRED keyword arguments, and the argument fingerprint is computed
+    HERE from ``request_args`` rather than accepted pre-computed -- so there is
+    no way to invoke the gate that gets ``allow`` or ``reuse`` without the
+    argument comparison actually running. A record is refused (typed rejection,
+    never allow/reuse) when any of these differ:
+
+    - ``record["operation_id"]`` != ``descriptor["operation_id"]`` -- a record
+      for another operation.
+    - ``record["args_fingerprint"]`` != ``fingerprint(request_args)`` -- a
+      record for another argument set. This is the residual hole the earlier
+      optional-parameter shape left open: honoring a different argument set's
+      recorded result is exactly the mis-attribution the gate exists to prevent,
+      and it can no longer be silently skipped.
+    - ``record["idempotency_key"]`` != ``request_idempotency_key`` -- a record
+      for another key. The key is a REQUIRED argument (not optional): a caller
+      that uses no key passes ``""`` explicitly, and the comparison still runs
+      (a record carrying a key against a ``""`` request correctly refuses).
+      Absence must be an explicit empty key, never an omitted parameter that
+      silently disables the check.
+
+    Then, for a record that belongs to this request:
 
     - ``failed_not_applied`` -> ``allow``: the prior write provably did not
       land, so a reissue cannot duplicate an effect.
-    - ``succeeded`` -> ``reuse``: the write took effect; hand back the recorded
-      result rather than reissue and duplicate it.
-    - ``unknown`` -> ``refuse`` for a non-idempotent operation: the outcome is
-      uncertain and nothing proves the effect did not land, so a blind reissue
-      risks doing it twice. The refusal is a typed
-      :class:`OperationError` (``conflict``) whose detail says the outcome is
-      uncertain.
-    - ``unknown`` for an idempotent operation (declared by ``effect`` or the
-      explicit ``idempotent`` override) -> ``allow``: replay is safe because a
-      second application is indistinguishable from one.
+    - ``succeeded`` WITH a recorded result -> ``reuse``: hand back the recorded
+      result rather than reissue and duplicate it. ``succeeded`` with NO
+      recorded result -> ``refuse``: there is nothing to reuse, and reusing an
+      empty result would silently return nothing.
+    - ``unknown`` -> ``refuse`` UNLESS the caller explicitly asserted
+      idempotency on the record (``idempotent=True``). The outcome is uncertain
+      and nothing proves the effect did not land, so a blind reissue risks doing
+      it twice. Idempotency is decided ONLY by that explicit trusted assertion,
+      never by the descriptor's ``effect``.
     """
+
+    # --- step 1: attribution -- does this record belong to this request? ----
+    # Unconditional and unskippable: the fingerprint is computed here, so a
+    # caller cannot reach allow/reuse without the argument comparison running.
+    if record["operation_id"] != descriptor["operation_id"]:
+        return _refuse(
+            "replay refused: the attempt record is for operation "
+            f"{record['operation_id']} but this request is for "
+            f"{descriptor['operation_id']}; a record for another operation is "
+            "never a basis to allow or reuse"
+        )
+    if record["args_fingerprint"] != args_fingerprint(request_args):
+        return _refuse(
+            "replay refused: the attempt record's argument fingerprint does not "
+            f"match this request's for operation {descriptor['operation_id']}; a "
+            "record for another argument set is never a basis to allow or reuse"
+        )
+    if record["idempotency_key"] != request_idempotency_key:
+        return _refuse(
+            "replay refused: the attempt record's idempotency key does not match "
+            f"this request's for operation {descriptor['operation_id']}; a record "
+            "for another key is never a basis to allow or reuse"
+        )
 
     outcome = record["outcome"]
 
@@ -258,27 +306,45 @@ def replay_decision(descriptor: OperationDescriptor, record: AttemptRecord) -> R
         return {"verdict": REPLAY_ALLOW, "reuse_result": None, "error": None}
 
     if outcome == ATTEMPT_SUCCEEDED:
+        recorded = record["recorded_result"]
+        if recorded is None:
+            # Nothing to reuse: a succeeded attempt with no recorded result
+            # cannot be replayed (would duplicate) nor reused (would return
+            # empty). Refuse rather than silently hand back nothing.
+            return _refuse(
+                "replay refused: the prior attempt for operation "
+                f"{descriptor['operation_id']} is recorded as succeeded but "
+                "carries no recorded result to reuse; reissuing could duplicate "
+                "the effect and reusing would return an empty result"
+            )
         return {
             "verdict": REPLAY_REUSE,
-            "reuse_result": record["recorded_result"],
+            "reuse_result": recorded,
             "error": None,
         }
 
     # outcome == ATTEMPT_UNKNOWN -- the case blind retry gets wrong.
-    if _is_replay_safe_after_unknown(descriptor, record):
+    if _is_replay_safe_after_unknown(record):
         return {"verdict": REPLAY_ALLOW, "reuse_result": None, "error": None}
+
+    return _refuse(
+        "replay refused: the prior attempt for operation "
+        f"{descriptor['operation_id']} left an uncertain (unknown) outcome and "
+        "this operation is not asserted idempotent, so reissuing it could apply "
+        "the effect a second time; no evidence proves the prior attempt did not "
+        "take effect"
+    )
+
+
+def _refuse(detail: str) -> ReplayDecision:
+    """A typed ``refuse`` decision, built through :func:`operation_error`.
+
+    Every refusal on this gate is a typed :class:`OperationError` (``conflict``)
+    with a redacted detail -- never a bare boolean or an untyped None.
+    """
 
     return {
         "verdict": REPLAY_REFUSE,
         "reuse_result": None,
-        "error": operation_error(
-            "conflict",
-            (
-                "replay refused: the prior attempt for operation "
-                f"{descriptor['operation_id']} left an uncertain (unknown) "
-                "outcome and this operation is not idempotent, so reissuing it "
-                "could apply the effect a second time; no evidence proves the "
-                "prior attempt did not take effect"
-            ),
-        ),
+        "error": operation_error("conflict", detail),
     }
