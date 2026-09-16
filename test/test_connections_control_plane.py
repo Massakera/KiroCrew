@@ -576,9 +576,13 @@ def test_binding_credential_mode_is_axis_b_from_l01() -> None:
     assert binding["credential_mode"] in CREDENTIAL_MODES
 
 
-def test_binding_names_are_exported_additively_from_the_package() -> None:
-    # L02's public names reach the wider connections package (additive-only).
-    for name in (
+def test_binding_symbols_are_reachable_via_control_plane_not_the_top_level() -> None:
+    # The canonical home for the L02 binding names is the control_plane
+    # subpackage; the top-level connections package deliberately carries NO
+    # control-plane symbol (the 14-alias second-spelling was a rename trap and
+    # was converged away). Same shape as L01's registration-mode guard: pin
+    # where a name lives, and pin where it must NOT be aliased.
+    binding_names = (
         "Binding",
         "SecretRef",
         "VerifiedIdentity",
@@ -588,6 +592,11 @@ def test_binding_names_are_exported_additively_from_the_package() -> None:
         "next_generation",
         "binding_secret_ref",
         "INITIAL_GENERATION",
-    ):
-        assert name in connections.__all__
-        assert hasattr(connections, name)
+    )
+    for name in binding_names:
+        # Reachable through the canonical control_plane subpackage...
+        assert name in cp.__all__, f"{name} missing from control_plane.__all__"
+        assert hasattr(cp, name), f"{name} not reachable via control_plane"
+        # ...and NOT re-exported as a top-level connections alias.
+        assert name not in connections.__all__, f"{name} leaked into connections.__all__"
+        assert not hasattr(connections, name), f"{name} is a top-level connections alias"
