@@ -68,12 +68,27 @@ have asserted.
 this module, but a chain that authorizes perfectly and then returns nothing is
 not a dispatch. So the 2xx envelope carries a
 :data:`~kiro_crew.connections.control_plane.result.OperationPayload` -- a
-collection (items PLUS their cursor), a single object, or raw bytes -- and
+collection of items, a single object, or raw bytes -- and
 :attr:`ExecutionOutcome.payload` is where a consumer reads it. The executor does
 not INTERPRET that payload: the injected
 :data:`~kiro_crew.connections.control_plane.production.ResultDecode` produces it
 (the neutral default carries the body's raw bytes verbatim; a vendor decode turns
 them into items/object/cursor), and this module only carries it through unchanged.
+
+**ONE cursor.** Pagination advances on
+:attr:`~kiro_crew.connections.control_plane.result.OperationResult.next_cursor`
+and on nothing else -- :class:`PageWalk` reads it there, and the collection
+payload does not carry a copy. A second copy is a second thing that can be wrong,
+and a disagreement between them shows up as a walk that stops while pages remain
+or refetches one it already has, neither of which is distinguishable from a
+correct result at this seam.
+
+**Response metadata is ALLOWLISTED.** The rate-limit family reaches a caller
+through :attr:`ExecutionOutcome.metadata` (see :data:`ResponseMetadata`) and
+through nothing else. A response header set is a credential surface --
+``Set-Cookie`` mints a session, ``WWW-Authenticate`` carries challenge material --
+so the transport copies only the names on a closed allowlist and drops the rest,
+which is the response-side counterpart of the redirect credential strip.
 
 **Boundaries.** Decision + dispatch glue. The transport is an injected callable
 -- an in-memory fake in every unit test, and the REAL composition (vault-resolved
@@ -93,6 +108,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Tuple
 
 from kiro_crew.connections.control_plane.auth_modes import (
@@ -155,7 +171,22 @@ from kiro_crew.connections.control_plane.writes import (
 #: a success as carrying status + cursor and nothing else, which is exactly what
 #: the whole success path used to be -- so a consumer written against ``2`` drops
 #: every item, object and byte the operation returned rather than failing loudly.
-EXECUTOR_SCHEMA_VERSION = 3
+#:
+#: ``4`` is two more outer-shape changes:
+#:
+#: * :class:`TransportResponse` and :class:`ExecutionOutcome` grew ``metadata``
+#:   -- the ONE allowlisted surface response metadata (the rate-limit family)
+#:   reaches a caller through. A ``3`` pin has no field for it, so a caller that
+#:   needs to back off keeps reading the header set it should never have been
+#:   handed, or nothing at all;
+#: * the result envelope's cursor is now SINGLE-SOURCED:
+#:   ``CollectionPayload.next_cursor`` is gone and
+#:   :data:`~kiro_crew.connections.control_plane.result.RESULT_SCHEMA_VERSION` is
+#:   ``3``. A ``3``-era producer that set the cursor only on the collection now
+#:   builds an envelope with ``next_cursor=None``, which stops a
+#:   :class:`PageWalk` after page one and reports it as a complete result -- a
+#:   silent drop, so the number has to move for it.
+EXECUTOR_SCHEMA_VERSION = 4
 
 # --- effects that are non-idempotent by default (the write-replay gate runs) --
 #: Effects whose ``unknown``-outcome replay must be gated by L07. Read from the
@@ -186,6 +217,39 @@ def is_non_idempotent_effect(effect: str) -> bool:
     """
 
     return effect in _NON_IDEMPOTENT_EFFECTS
+
+
+# --- the ONE controlled surface response metadata reaches a caller through -----
+#: Allowlisted response metadata, as a read-only mapping with LOWERCASE keys.
+#:
+#: The rate-limit family is the reason this exists: a caller that has to back off
+#: needs ``retry-after`` / ``x-ratelimit-remaining``, and today the only way to get
+#: at a response header is to have the transport hand the whole header set over.
+#: That is not acceptable, because a response header set is a CREDENTIAL SURFACE:
+#: ``Set-Cookie`` mints a session, ``WWW-Authenticate`` / ``Proxy-Authenticate``
+#: carry challenge material, and an echoed ``Authorization`` is the bearer token
+#: itself. Handing them to a caller (which logs, serializes and forwards its
+#: results) is the same defect as forwarding a credential across a redirect hop,
+#: on the response side.
+#:
+#: So this is a CLOSED ALLOWLIST, not a denylist: the transport copies only the
+#: names on
+#: :data:`~kiro_crew.connections.control_plane.production.RESPONSE_METADATA_ALLOWLIST`
+#: and DROPS everything else, so a header nobody has thought about yet -- a
+#: provider's new session cookie spelling included -- is absent by default rather
+#: than present until someone notices. A denylist would have the opposite failure
+#: direction.
+#:
+#: Keys are canonicalized to lowercase (HTTP header names are case-insensitive, so
+#: a caller must not have to guess ``Retry-After`` vs ``retry-after``). The mapping
+#: is read-only: a caller cannot edit one call's metadata and have it seen
+#: elsewhere.
+ResponseMetadata = Mapping[str, str]
+
+#: The metadata of a call that produced no response at all -- a denied gate, a
+#: reused prior result, a failure before a socket existed. Empty and immutable, so
+#: it is safe as a shared default on a frozen dataclass.
+EMPTY_RESPONSE_METADATA: ResponseMetadata = MappingProxyType({})
 
 
 # --- the structured transport outcome the injected transport returns ----------
@@ -221,6 +285,14 @@ class TransportResponse:
     timeout would license a second ``sendMail``. A transport that cannot know
     says ``unknown`` here, and L07 then refuses to blind-replay unless the caller
     explicitly asserts the operation is idempotent.
+
+    ``metadata`` -- the ALLOWLISTED response metadata (see
+    :data:`ResponseMetadata`), lowercase-keyed and read-only. It is how the
+    rate-limit family reaches a caller, and it is an allowlist precisely so that
+    ``Set-Cookie`` / ``WWW-Authenticate`` / an echoed ``Authorization`` cannot: a
+    response header set is a credential surface, and a transport that handed the
+    whole set over would leak session material into whatever a caller does with
+    its results. Empty on any path that produced no response.
     """
 
     http_status: int
@@ -230,6 +302,7 @@ class TransportResponse:
     retry_after_seconds: Optional[float] = None
     detail: str = ""
     write_outcome: Optional[str] = None
+    metadata: ResponseMetadata = EMPTY_RESPONSE_METADATA
 
 
 # --- the structured 412 signal the caller consumes (NOT flattened) ------------
@@ -280,8 +353,8 @@ class ExecutionOutcome:
     Exactly one of ``result`` / ``error`` / ``precondition`` is set.
 
     ``result`` -- the success envelope when the call was authorized, emitted, and
-    returned 2xx. It carries the pagination ``next_cursor`` AND the ``payload``:
-    the items / object / bytes the operation returned (see
+    returned 2xx. It carries the single authoritative pagination ``next_cursor``
+    AND the ``payload``: the items / object / bytes the operation returned (see
     :data:`~kiro_crew.connections.control_plane.result.OperationPayload`). Read
     the payload through :attr:`payload` rather than indexing ``result``.
     ``error`` -- a typed
@@ -301,6 +374,14 @@ class ExecutionOutcome:
     for the next attempt. Carrying it is the point: an executor that dropped it
     would leave the caller inferring "not applied" from a 5xx, which is the
     precise inference L07 exists to refuse.
+
+    ``metadata`` -- the transport's :attr:`TransportResponse.metadata` carried
+    through unchanged: the ALLOWLISTED response metadata (rate-limit family and a
+    few benign headers), lowercase-keyed and read-only. This is the ONE surface
+    response headers reach a caller through, and everything not on
+    :data:`~kiro_crew.connections.control_plane.production.RESPONSE_METADATA_ALLOWLIST`
+    -- every credential and session header included -- is absent by construction.
+    Empty on a denied gate, since no response exists to describe.
     """
 
     result: Optional[OperationResult] = None
@@ -308,6 +389,7 @@ class ExecutionOutcome:
     precondition: Optional[PreconditionFailure] = None
     view: Optional[TrustedHandleView] = None
     write_outcome: Optional[str] = None
+    metadata: ResponseMetadata = EMPTY_RESPONSE_METADATA
 
     @property
     def ok(self) -> bool:
@@ -612,6 +694,7 @@ def execute(
             precondition=_precondition_failure(response),
             view=view,
             write_outcome=response.write_outcome,
+            metadata=response.metadata,
         )
 
     error = classify_error(response)
@@ -620,9 +703,23 @@ def execute(
         # the case that matters: a timeout on a non-idempotent write is a typed
         # `temporary` error AND an `unknown` outcome, and dropping the second
         # would let the caller record the first as "not applied".
-        return ExecutionOutcome(error=error, view=view, write_outcome=response.write_outcome)
+        #
+        # The metadata rides along too, and the FAILURE path is where it earns
+        # its keep: a 429's `retry-after` and `x-ratelimit-reset` are only ever
+        # on a response the caller is about to back off from.
+        return ExecutionOutcome(
+            error=error,
+            view=view,
+            write_outcome=response.write_outcome,
+            metadata=response.metadata,
+        )
 
-    return ExecutionOutcome(result=response.result, view=view, write_outcome=response.write_outcome)
+    return ExecutionOutcome(
+        result=response.result,
+        view=view,
+        write_outcome=response.write_outcome,
+        metadata=response.metadata,
+    )
 
 
 def _precondition_failure(response: TransportResponse) -> PreconditionFailure:
@@ -678,6 +775,16 @@ class PageWalk:
     cursor. It advances on the response's ``next_cursor``, stops when that is
     ``None``, and refuses to loop forever on a repeated cursor -- so it neither
     drops nor duplicates a page and always terminates.
+
+    **ONE cursor source.** That ``next_cursor`` is read from
+    :attr:`~kiro_crew.connections.control_plane.result.OperationResult.next_cursor`
+    -- the envelope -- and from nowhere else. The collection payload does not
+    carry a second copy to read instead (see
+    :class:`~kiro_crew.connections.control_plane.result.CollectionPayload`),
+    because a walk with two candidate cursors has a losing branch that is
+    invisible from here: reading the one that a middle layer did not update stops
+    the walk early (records silently dropped) or repeats a page (records silently
+    duplicated), and both look exactly like a correct walk to this class.
 
     **The walk holds a ``clock``, not an instant.** It stores no frozen ``now``:
     every page re-reads ``clock()`` and re-runs the gate chain against that fresh
@@ -757,6 +864,9 @@ class PageWalk:
             return outcome
 
         self.pages += 1
+        # The SINGLE authoritative cursor: the envelope's. Never a payload's -- a
+        # CollectionPayload has none, and that absence is what makes this line the
+        # only place a walk can learn where to resume.
         next_cursor = outcome.result["next_cursor"] if outcome.result else None
         if next_cursor is None:
             self.done = True
@@ -772,11 +882,13 @@ def advance_page(walk: PageWalk) -> ExecutionOutcome:
 
 
 __all__ = [
+    "EMPTY_RESPONSE_METADATA",
     "EXECUTOR_SCHEMA_VERSION",
     "Clock",
     "ExecutionOutcome",
     "PageWalk",
     "PreconditionFailure",
+    "ResponseMetadata",
     "Transport",
     "TransportResponse",
     "advance_page",

@@ -74,6 +74,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import (
     Any,
     Callable,
@@ -91,6 +92,7 @@ from kiro_crew.connections.control_plane.binding import (
     binding_secret_ref,
 )
 from kiro_crew.connections.control_plane.executor import (
+    ResponseMetadata,
     Transport,
     TransportResponse,
     is_non_idempotent_effect,
@@ -123,7 +125,15 @@ from kiro_crew.secrets import SecretValue
 #: keyword-only with safe defaults, so an existing caller keeps working, but the
 #: sender's observable behaviour on a redirect changed and that is a shape change
 #: in every sense a downstream pin cares about.
-PRODUCTION_SCHEMA_VERSION = 2
+#:
+#: ``3``: the transport now populates
+#: :attr:`~kiro_crew.connections.control_plane.executor.TransportResponse.metadata`
+#: from :data:`RESPONSE_METADATA_ALLOWLIST` on every reply-bearing branch (2xx,
+#: 412, other), and :func:`response_metadata` is a new public surface. A pin at
+#: ``2`` sees no metadata at all, so a caller that should be reading
+#: ``retry-after`` off the controlled surface goes looking for a header set this
+#: composition deliberately does not hand out.
+PRODUCTION_SCHEMA_VERSION = 3
 
 #: Default per-socket-operation HTTP timeout. A transport with no timeout can hang
 #: a dispatch forever, which is a worse failure than a typed ``temporary`` error.
@@ -171,6 +181,80 @@ _CREDENTIAL_HEADERS: FrozenSet[str] = frozenset(
         "x-api-key",
         "api-key",
         "x-auth-token",
+    }
+)
+
+#: The RESPONSE headers a caller may see, as a CLOSED ALLOWLIST.
+#:
+#: This is the only path a response header takes to a caller (through
+#: :attr:`~kiro_crew.connections.control_plane.executor.ExecutionOutcome.metadata`).
+#: Its shape is an allowlist and not a denylist because the two fail in opposite
+#: directions: an allowlist drops a header nobody has thought about yet, and a
+#: denylist forwards it. A response header set is a CREDENTIAL SURFACE --
+#: ``Set-Cookie`` mints a session, ``WWW-Authenticate`` / ``Proxy-Authenticate``
+#: carry challenge material, an echoed ``Authorization`` is the bearer token
+#: itself -- and a caller serializes, logs and forwards what it is handed, so
+#: forwarding the set wholesale is the response-side twin of forwarding a
+#: credential across a redirect hop (:data:`_CREDENTIAL_HEADERS`).
+#:
+#: Every name is lowercase, which is also the key a caller reads it back under.
+#: The two groups, and why each is here:
+#:
+#: * **the rate-limit family** -- the reason this surface exists at all. A caller
+#:   that must back off needs the numbers, and there are three live spellings in
+#:   the providers this plane serves (the RFC draft's ``ratelimit-*``, GitHub's
+#:   ``x-ratelimit-*`` including ``used`` / ``resource``, and the older
+#:   ``x-rate-limit-*``), plus ``retry-after``, which is the one every provider
+#:   agrees on;
+#: * **three benign descriptors** -- ``content-type`` (what the body claims to be,
+#:   on a non-2xx where no payload carries it), ``etag`` and ``last-modified``
+#:   (what a caller re-derives an ``If-Match`` / ``If-Unmodified-Since``
+#:   precondition against on a readback, which is exactly the loop a structured
+#:   412 asks for).
+#:
+#: Nothing here carries a credential, a cookie, a challenge or a principal, and
+#: ``test_connections_control_plane_metadata`` pins that this set and
+#: :data:`_CREDENTIAL_RESPONSE_HEADERS` stay disjoint so a later edit cannot add
+#: one quietly.
+RESPONSE_METADATA_ALLOWLIST: FrozenSet[str] = frozenset(
+    {
+        # rate-limit family
+        "retry-after",
+        "ratelimit-limit",
+        "ratelimit-remaining",
+        "ratelimit-reset",
+        "ratelimit-policy",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "x-ratelimit-used",
+        "x-ratelimit-resource",
+        "x-rate-limit-limit",
+        "x-rate-limit-remaining",
+        "x-rate-limit-reset",
+        # benign descriptors a caller genuinely needs
+        "content-type",
+        "etag",
+        "last-modified",
+    }
+)
+
+#: Response headers that carry credential, session or challenge material. NOT the
+#: mechanism that drops them -- :data:`RESPONSE_METADATA_ALLOWLIST` being closed is
+#: what drops them, and it would drop these even if this set were empty. This set
+#: exists to be ASSERTED against: a test pins the two disjoint, so an edit that
+#: adds ``set-cookie`` to the allowlist fails a check instead of shipping.
+_CREDENTIAL_RESPONSE_HEADERS: FrozenSet[str] = frozenset(
+    {
+        "set-cookie",
+        "set-cookie2",
+        "cookie",
+        "authorization",
+        "proxy-authorization",
+        "www-authenticate",
+        "proxy-authenticate",
+        "authentication-info",
+        "proxy-authentication-info",
     }
 )
 
@@ -406,12 +490,13 @@ RequestLocator = Callable[..., HttpRequest]
 #: Maps a 2xx :class:`HttpReply` to the L01 success envelope -- INCLUDING its
 #: ``payload``, which is where the caller's data comes from. VENDOR-OWNED for
 #: anything structured: a decode that knows the provider builds a
-#: :class:`~kiro_crew.connections.control_plane.result.CollectionPayload` (items +
-#: that provider's cursor) or an
-#: :class:`~kiro_crew.connections.control_plane.result.ObjectPayload`, and should
-#: build it with
-#: :func:`~kiro_crew.connections.control_plane.result.result_with_payload` so the
-#: envelope's ``next_cursor`` cannot disagree with the collection's.
+#: :class:`~kiro_crew.connections.control_plane.result.CollectionPayload` (items)
+#: or an
+#: :class:`~kiro_crew.connections.control_plane.result.ObjectPayload`, and builds
+#: it with
+#: :func:`~kiro_crew.connections.control_plane.result.result_with_payload`, passing
+#: that provider's cursor as the explicit ``next_cursor`` keyword -- the ONE place
+#: a cursor lives.
 #: :func:`neutral_decode` is the default and carries the body as raw bytes.
 ResultDecode = Callable[..., OperationResult]
 
@@ -424,6 +509,40 @@ def _header(headers: Mapping[str, str], name: str) -> Optional[str]:
         if key.lower() == lowered:
             return value
     return None
+
+
+def response_metadata(headers: Mapping[str, str]) -> ResponseMetadata:
+    """Project ``headers`` onto :data:`RESPONSE_METADATA_ALLOWLIST`.
+
+    The ONE place a response header becomes something a caller can read. It walks
+    the headers the provider sent, keeps a name only if its lowercase form is on
+    the allowlist, and returns a READ-ONLY mapping keyed by that lowercase form.
+
+    Three properties, each load-bearing:
+
+    * **allowlist, not denylist.** A name that is not listed is dropped, so a
+      provider's new session-cookie spelling is absent the day it appears rather
+      than forwarded until somebody notices. Nothing here consults
+      :data:`_CREDENTIAL_RESPONSE_HEADERS` -- it does not need to, and a
+      belt-and-braces second filter would invite the next reader to believe the
+      denylist is what protects them and relax the allowlist;
+    * **lowercase keys.** HTTP header names are case-insensitive, so a caller must
+      not have to try ``Retry-After`` and then ``retry-after``;
+    * **read-only.** A caller cannot mutate one call's metadata into something
+      another reader of the same mapping will see.
+
+    A repeated header keeps the FIRST value. ``Set-Cookie`` is the header that
+    legitimately repeats, and it is not on the allowlist; for the rate-limit family
+    a second value is a malformed response, and picking the first is at least
+    deterministic.
+    """
+
+    kept: dict[str, str] = {}
+    for name, value in headers.items():
+        key = name.strip().lower()
+        if key in RESPONSE_METADATA_ALLOWLIST and key not in kept:
+            kept[key] = value
+    return MappingProxyType(kept)
 
 
 #: What a 2xx reply says about its own content, independently of any vendor's
@@ -494,13 +613,14 @@ def _envelope(status: ResultStatus, payload: Optional[OperationPayload] = None) 
     :data:`~kiro_crew.connections.control_plane.result.ResultStatus` set -- a typo
     is a type error here rather than an invalid envelope handed downstream.
 
-    ``next_cursor`` is never passed: :func:`result_with_payload` DERIVES it from
-    the payload, and the neutral path never produces a
-    :class:`~kiro_crew.connections.control_plane.result.CollectionPayload`, so it
-    is always ``None`` here. That is the same property as before -- a cursor is the
-    vendor's to name, never this module's -- now enforced by the constructor
-    instead of by a literal. :func:`neutral_decode_detail` reports the UNCERTAINTY
-    about paging through ``status`` and ``cursor_determined``, not through a guess.
+    ``next_cursor`` is never passed, so every envelope this neutral path builds
+    reports ``None``: a cursor is the VENDOR's to name -- ``@odata.nextLink`` on
+    one provider, ``page``/``perPage`` on another -- and this module never reads a
+    body, so it has nothing to name one from. The uncertainty that creates is
+    reported honestly through ``status`` and ``cursor_determined`` (see
+    :func:`neutral_decode_detail`), never through a guessed cursor. It would also
+    be REFUSED here for the two non-collection shapes:
+    :func:`result_with_payload` raises on a cursor handed with an object or bytes.
     """
 
     return result_with_payload(payload, status=status)
@@ -1025,6 +1145,17 @@ def build_production_transport(
     ``ETag`` -- and NOTHING when it asserted none, which is what lets the executor
     set ``condition_unknown`` instead of inventing an ``If-Match``.
 
+    **Response metadata is allowlisted, on every reply branch.** A reply that came
+    from the provider (2xx, 412, or any other status) carries
+    :func:`response_metadata` of its headers on
+    :attr:`~kiro_crew.connections.control_plane.executor.TransportResponse.metadata`
+    -- the rate-limit family plus three benign descriptors, and NOTHING else. The
+    raw header set never leaves this closure. That matters most on the failure
+    branch, which is the one a caller reads ``retry-after`` off, and it is also the
+    branch where a provider is most likely to send ``WWW-Authenticate`` on a 401 or
+    ``Set-Cookie`` on a redirect-ish 3xx; those are dropped because they are not on
+    the allowlist, not because anything here recognized them.
+
     Nothing is cached: the secret is re-resolved every call, so a rotated or
     deleted secret takes effect immediately and no plaintext outlives the call.
     Failures are returned, never raised -- because the transport contract is a
@@ -1175,20 +1306,29 @@ def build_production_transport(
                 write_outcome=unknown,
             )
 
+        # The provider answered, so there is response metadata to project. ONE
+        # call, reused by all three reply branches below, so a branch cannot be
+        # added later that forgets it -- or that reaches for reply.headers raw.
+        metadata = response_metadata(reply.headers)
+
         if 200 <= reply.status < 300:
-            return TransportResponse(http_status=reply.status, result=decode(reply))
+            return TransportResponse(
+                http_status=reply.status, result=decode(reply), metadata=metadata
+            )
         if reply.status == 412:
             return TransportResponse(
                 http_status=412,
                 preconditions=_asserted_preconditions(headers),
                 etag=_header(reply.headers, "ETag"),
                 detail=f"precondition failed for operation {operation_id}",
+                metadata=metadata,
             )
         return TransportResponse(
             http_status=reply.status,
             retry_after_seconds=_retry_after(reply.headers),
             detail=f"{service_id} returned HTTP {reply.status} for operation {operation_id}",
             write_outcome=unknown if reply.status in _AMBIGUOUS_TRANSIT_STATUSES else None,
+            metadata=metadata,
         )
 
     return _transport
@@ -1215,6 +1355,7 @@ __all__ = [
     "DEFAULT_MAX_RESPONSE_BYTES",
     "DEFAULT_TIMEOUT_SECONDS",
     "PRODUCTION_SCHEMA_VERSION",
+    "RESPONSE_METADATA_ALLOWLIST",
     "BindingIdentityMismatchError",
     "BindingSecretSelector",
     "Decoded2xx",
@@ -1234,5 +1375,6 @@ __all__ = [
     "neutral_decode",
     "neutral_decode_detail",
     "resolve_binding_secret",
+    "response_metadata",
     "urllib_http_send",
 ]

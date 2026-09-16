@@ -16,16 +16,24 @@ download -- the bytes, byte for byte. A test that asserted presence rather than
 content would pass just as happily on a payload carrying the wrong bytes, which is
 the failure mode that makes a binary channel worthless.
 
-The sender is injected (``http_send``) rather than a loopback TLS server: the wire
-properties -- redirects, credential stripping, the body cap, the deadline -- are
-already proven against real sockets in
-``test_connections_control_plane_production.py``, and re-proving them here would
-only slow this suite down. What is under test here is the DATA CHANNEL: what the
-decode produces and what survives to the consumer.
+The sender is injected (``http_send`` ) here rather than a loopback TLS server:
+this is the FAST UNIT LANE for the data channel -- what the decode produces and
+what survives to the consumer -- and it stays that way deliberately. It is NOT
+the evidence that a payload travels a real sender: an injected callable cannot
+prove that, and
+``test_connections_control_plane_real_tls_e2e.py`` is where all three shapes are
+proven end to end over a REAL TLS loopback through the unmodified
+:func:`~kiro_crew.connections.control_plane.production.urllib_http_send`, in a
+fresh-install posture, with a readback against the exact bytes the server served.
+The wire properties themselves -- redirects, credential stripping, the body cap,
+the deadline -- are proven against real sockets in
+``test_connections_control_plane_production.py``.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, get_args
 
@@ -202,16 +210,20 @@ def _graph_collection_decode(reply: HttpReply) -> OperationResult:
     """A VENDOR-shaped decode: it knows this provider's cursor spelling.
 
     Exactly the injection seam the neutral module documents. It reads ``value``
-    for the items and ``@odata.nextLink`` for the continuation, and builds the
-    envelope with :func:`result_with_payload` so the collection's cursor and the
-    envelope's cannot disagree.
+    for the items and ``@odata.nextLink`` for the continuation, and passes that
+    continuation to :func:`result_with_payload` as the explicit ``next_cursor`` --
+    the ONE place a cursor lives. The payload carries items only.
     """
 
     body = decode_json_body(reply)
     items = tuple(item for item in body.get("value", []) if isinstance(item, Mapping))
     link = body.get("@odata.nextLink")
-    payload = CollectionPayload(items=items, next_cursor=link if isinstance(link, str) else None)
-    return result_with_payload(payload, status="partial" if payload.next_cursor else "ok")
+    cursor = link if isinstance(link, str) else None
+    return result_with_payload(
+        CollectionPayload(items=items),
+        status="partial" if cursor else "ok",
+        next_cursor=cursor,
+    )
 
 
 def test_a_consumer_receives_the_items_and_the_cursor_of_every_page(
@@ -279,10 +291,10 @@ def test_a_consumer_receives_the_items_and_the_cursor_of_every_page(
         # Every page carried DATA -- this is the assertion the old path failed.
         assert payload.items, "a page arrived with no items"
         collected.extend(payload.items)
-        cursors.append(payload.next_cursor)
-        # The cursor travels WITH the collection and agrees with the envelope's.
+        # The ONE cursor: read off the envelope, because the payload has none.
         assert outcome.result is not None
-        assert outcome.result["next_cursor"] == payload.next_cursor
+        assert not hasattr(payload, "next_cursor")
+        cursors.append(outcome.result["next_cursor"])
 
     # The exact records, in order, by value -- not a count, not a not-None.
     assert collected == [
@@ -298,20 +310,109 @@ def test_a_consumer_receives_the_items_and_the_cursor_of_every_page(
     assert sender.urls == [base, f"{base}?page=CURSOR-P2", f"{base}?page=CURSOR-P3"]
 
 
-def test_a_collections_cursor_cannot_disagree_with_the_envelopes() -> None:
-    """The duplication is safe because ONE constructor writes both copies."""
+def test_the_cursor_lives_on_the_envelope_and_nowhere_else() -> None:
+    """ITEM 1's pin: there is exactly ONE cursor, and it is the envelope's.
 
-    page = CollectionPayload(items=({"id": "a"},), next_cursor="NEXT-1")
-    envelope = result_with_payload(page, status="partial")
-    assert envelope["next_cursor"] == "NEXT-1" == page.next_cursor
-    # A terminal page: no cursor on either copy.
-    terminal = result_with_payload(CollectionPayload(items=({"id": "b"},)))
-    assert terminal["next_cursor"] is None
-    # result_with_payload takes NO next_cursor argument, which is what makes the
-    # two copies unable to drift -- a caller cannot set them independently.
-    import inspect
+    ``CollectionPayload`` used to carry a second copy, defended as "deliberate
+    duplication written by one constructor". That defence only covered envelopes
+    built through that constructor: an ``OperationResult`` is a ``TypedDict``, so a
+    producer can build one literally and a middle layer can reassign
+    ``next_cursor`` on the mapping it was handed. When the two disagree a walk
+    stops early (records dropped) or repeats a page (records duplicated), and
+    neither is distinguishable from a correct result at the seam. One field cannot
+    disagree with itself.
+    """
 
-    assert "next_cursor" not in inspect.signature(result_with_payload).parameters
+    # The attribute is GONE -- not None, not deprecated. Both spellings pinned,
+    # because a dataclass field is visible on the class and on an instance.
+    assert not hasattr(CollectionPayload, "next_cursor")
+    assert not hasattr(CollectionPayload(items=({"id": "a"},)), "next_cursor")
+    assert "next_cursor" not in {f.name for f in dataclasses.fields(CollectionPayload)}
+    assert [f.name for f in dataclasses.fields(CollectionPayload)] == ["items"]
+
+    # The cursor is an EXPLICIT argument, and it lands on the envelope only.
+    envelope = result_with_payload(
+        CollectionPayload(items=({"id": "a"},)), status="partial", next_cursor="NEXT-1"
+    )
+    assert envelope["next_cursor"] == "NEXT-1"
+    assert isinstance(envelope["payload"], CollectionPayload)
+    assert "next_cursor" not in dataclasses.asdict(envelope["payload"])
+
+    # A terminal page: no cursor at all.
+    assert result_with_payload(CollectionPayload(items=({"id": "b"},)))["next_cursor"] is None
+
+    # The signature now HAS next_cursor -- keyword-only, defaulting to None.
+    parameters = inspect.signature(result_with_payload).parameters
+    assert parameters["next_cursor"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["next_cursor"].default is None
+
+
+def test_a_cursor_on_a_shape_that_cannot_be_paged_is_refused() -> None:
+    """A cursor with an object / bytes / nothing raises instead of being ignored.
+
+    Quietly dropping it would lose a continuation a caller believed it returned;
+    quietly keeping it would point a caller at a page that does not exist. Both are
+    silent, so this is loud.
+    """
+
+    for payload in (ObjectPayload(object={"id": "m1"}), BytesPayload(data=b"PK"), None):
+        with pytest.raises(ValueError, match="only meaningful for a CollectionPayload"):
+            result_with_payload(payload, next_cursor="NOPE")
+        # ... and with no cursor the same call is fine and reports None.
+        assert result_with_payload(payload)["next_cursor"] is None
+
+
+def test_a_page_walk_advances_purely_on_the_envelope_cursor(real_vault: SecretVault) -> None:
+    """ITEM 1's second pin: the walk's only cursor source is the envelope.
+
+    Driven with a decode that puts a cursor on the ENVELOPE and returns a payload
+    that (by construction, since the field is gone) carries none. If ``PageWalk``
+    consulted anything but ``OperationResult.next_cursor`` it would stop at page
+    one; it reaches page two, and the URL proves the envelope's cursor is what it
+    resumed on.
+    """
+
+    base = "https://graph.example.invalid/v1.0/me/messages"
+    sender = _Sender(
+        {
+            base: HttpReply(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=b'{"value":[{"id":"m1"}],"@odata.nextLink":"ONLY-ON-THE-ENVELOPE"}',
+            ),
+            f"{base}?page=ONLY-ON-THE-ENVELOPE": HttpReply(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                body=b'{"value":[{"id":"m2"}]}',
+            ),
+        }
+    )
+    handle = _handle()
+    walk = PageWalk(
+        descriptor=_descriptor(),
+        handle=handle,
+        transport=build_production_transport(
+            selector=_selector_for(handle),
+            vault=real_vault,
+            locator=_cursor_locator(base),
+            http_send=sender,
+            decode=_graph_collection_decode,
+        ),
+        offered_mode="oauth_user",
+        permitted=declare_permitted_modes(("oauth_user",)),
+        layers=LayerCeilings(),
+        governance_scope="tools",
+        governance_item="messages.list",
+        clock=lambda: _T0,
+    )
+    first = walk.next()
+    assert first.ok and first.result is not None
+    assert first.result["next_cursor"] == "ONLY-ON-THE-ENVELOPE"
+    assert not walk.done
+    second = walk.next()
+    assert second.ok and second.result is not None and second.result["next_cursor"] is None
+    assert walk.done and walk.pages == 2
+    assert sender.urls == [base, f"{base}?page=ONLY-ON-THE-ENVELOPE"]
 
 
 # =============================================================================
@@ -498,8 +599,8 @@ def test_a_denied_gate_reaches_neither_the_sender_the_vault_nor_a_payload(
 
 
 def test_the_schema_versions_the_downstreams_pin() -> None:
-    assert RESULT_SCHEMA_VERSION == 2
-    assert EXECUTOR_SCHEMA_VERSION == 3
+    assert RESULT_SCHEMA_VERSION == 3
+    assert EXECUTOR_SCHEMA_VERSION == 4
 
 
 def test_the_kind_constants_match_the_kinds_the_classes_actually_carry() -> None:

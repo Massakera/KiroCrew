@@ -6,9 +6,10 @@ through: an :class:`~kiro_crew.connections.control_plane.operation.OperationDesc
 :class:`~kiro_crew.connections.control_plane.context.OperationContext` (the
 references one call is made under -- never a credential value), an
 :class:`~kiro_crew.connections.control_plane.result.OperationResult` (the
-success/partial envelope with an opaque pagination cursor AND the
-:data:`~kiro_crew.connections.control_plane.result.OperationPayload` carrying the
-data -- a collection with its cursor, a single object, or raw bytes), and the
+success/partial envelope carrying the SINGLE authoritative opaque pagination
+cursor AND the
+:data:`~kiro_crew.connections.control_plane.result.OperationPayload` holding the
+data -- a collection of items, a single object, or raw bytes), and the
 RUN-01
 :class:`~kiro_crew.connections.control_plane.errors.OperationError` taxonomy.
 
@@ -87,11 +88,13 @@ from kiro_crew.connections.control_plane.errors import (
     redacted_detail,
 )
 from kiro_crew.connections.control_plane.executor import (
+    EMPTY_RESPONSE_METADATA,
     EXECUTOR_SCHEMA_VERSION,
     Clock,
     ExecutionOutcome,
     PageWalk,
     PreconditionFailure,
+    ResponseMetadata,
     Transport,
     TransportResponse,
     advance_page,
@@ -138,6 +141,7 @@ from kiro_crew.connections.control_plane.production import (
     DEFAULT_MAX_RESPONSE_BYTES,
     DEFAULT_TIMEOUT_SECONDS,
     PRODUCTION_SCHEMA_VERSION,
+    RESPONSE_METADATA_ALLOWLIST,
     BindingIdentityMismatchError,
     BindingSecretSelector,
     Decoded2xx,
@@ -157,6 +161,7 @@ from kiro_crew.connections.control_plane.production import (
     neutral_decode,
     neutral_decode_detail,
     resolve_binding_secret,
+    response_metadata,
     urllib_http_send,
 )
 from kiro_crew.connections.control_plane.result import (
@@ -200,6 +205,7 @@ __all__ = [
     "DEFAULT_MEDIA_TYPE",
     "DEFAULT_TIMEOUT_SECONDS",
     "EFFECTS",
+    "EMPTY_RESPONSE_METADATA",
     "ERRORS_SCHEMA_VERSION",
     "ERROR_CLASSES",
     "EXECUTOR_SCHEMA_VERSION",
@@ -216,6 +222,7 @@ __all__ = [
     "POLICY_SCHEMA_VERSION",
     "PRODUCTION_SCHEMA_VERSION",
     "REPLAY_VERDICTS",
+    "RESPONSE_METADATA_ALLOWLIST",
     "RESULT_SCHEMA_VERSION",
     "RESULT_STATUSES",
     "SECRET_BACKEND_VAULT",
@@ -264,6 +271,7 @@ __all__ = [
     "ReplayVerdict",
     "RequestLocator",
     "ResponseTooLargeError",
+    "ResponseMetadata",
     "ResultDecode",
     "ResultStatus",
     "SecretRef",
@@ -303,6 +311,7 @@ __all__ = [
     "replay_decision",
     "resolve_binding_secret",
     "resolve_layers",
+    "response_metadata",
     "result_with_payload",
     "urllib_http_send",
 ]

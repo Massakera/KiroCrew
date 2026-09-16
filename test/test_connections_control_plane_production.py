@@ -1242,12 +1242,22 @@ def test_both_schema_versions_were_bumped_for_these_shape_changes() -> None:
     # TransportResponse/ExecutionOutcome grew write_outcome and the Transport
     # contract grew trusted_view; the composition signature changed. Then the
     # success envelope grew a payload, which moved the executor to 3 (see
-    # RESULT_SCHEMA_VERSION 2). PRODUCTION_SCHEMA_VERSION stays at 2: the payload
-    # is a shape change in the L01 envelope this module RETURNS, not in this
-    # module's own composition signature, which is byte-identical.
-    assert EXECUTOR_SCHEMA_VERSION == 3
-    assert RESULT_SCHEMA_VERSION == 2
-    assert PRODUCTION_SCHEMA_VERSION == 2
+    # RESULT_SCHEMA_VERSION 2).
+    #
+    # All three then moved again, for two changes:
+    #   * the cursor is SINGLE-SOURCED -- CollectionPayload.next_cursor is gone and
+    #     result_with_payload takes an explicit next_cursor -- so RESULT went to 3,
+    #     and the executor to 4 because a 3-era producer that set the cursor only on
+    #     the collection now silently builds a one-page walk;
+    #   * response metadata reaches a caller through an ALLOWLIST on
+    #     TransportResponse.metadata / ExecutionOutcome.metadata, which is a new
+    #     executor field (4) AND new behaviour in this module's transport on every
+    #     reply branch, so PRODUCTION went to 3 as well. Unlike the payload -- which
+    #     was a change in the L01 envelope this module merely returns -- the metadata
+    #     is populated HERE, from this module's own allowlist.
+    assert EXECUTOR_SCHEMA_VERSION == 4
+    assert RESULT_SCHEMA_VERSION == 3
+    assert PRODUCTION_SCHEMA_VERSION == 3
 
 
 def test_the_production_symbols_stay_off_the_connections_top_level() -> None:

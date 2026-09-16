@@ -41,16 +41,27 @@ are done". A ``next_cursor`` is meaningful for both ``ok`` and ``partial``: a
 fully-successful page can still have a successor, and the terminal page carries
 ``None``.
 
-``next_cursor`` stays the machinery a paging walk advances on -- but a COLLECTION
-payload carries the SAME cursor a second time, on
-:attr:`CollectionPayload.next_cursor`. That is deliberate duplication, not an
-oversight: a consumer that receives a collection and hands it on must be able to
-hand the cursor on WITH it, and a cursor that lives only on the outer envelope
-gets dropped the moment the items are passed to something else -- which is
-silent truncation, indistinguishable from a complete result. To keep the two from
-ever disagreeing, both are written by ONE constructor,
-:func:`result_with_payload`, which DERIVES the envelope's cursor from the
-payload rather than accepting it separately.
+``OperationResult.next_cursor`` is the SINGLE AUTHORITATIVE cursor, and the ONLY
+place a cursor lives. :class:`CollectionPayload` carries items and nothing else.
+
+An earlier shape put the cursor on BOTH -- the envelope and the collection -- and
+called it deliberate duplication, on the argument that a consumer handed only the
+items would lose the continuation. That argument does not survive the failure it
+creates. :class:`OperationResult` is a ``TypedDict``, so nothing stops a producer
+from building one by hand, or a middle layer from editing ``next_cursor`` on the
+mapping it was handed; the moment the two copies disagree a paging walk either
+STOPS while pages remain (silently dropped records) or re-fetches a page it
+already has (silently duplicated records), and neither is visible at the seam --
+both look exactly like a correct result. One field cannot disagree with itself,
+which is the only durable form of the guarantee, so the second copy is gone and
+:class:`~kiro_crew.connections.control_plane.executor.PageWalk` reads and advances
+on ``OperationResult.next_cursor`` alone.
+
+The consumer-hands-the-items-on concern is real and is answered by handing on the
+ENVELOPE (or the ``(items, next_cursor)`` pair) rather than the bare payload: a
+caller that drops the envelope has dropped the continuation on purpose, visibly,
+in its own code -- as opposed to inheriting a truncation from two fields that
+drifted somewhere upstream.
 """
 
 from __future__ import annotations
@@ -67,7 +78,16 @@ from typing import Any, ClassVar, Literal, Mapping, Optional, Tuple, TypedDict, 
 #: alternative and was rejected: a silently-absent payload is the exact defect
 #: being fixed, and a required key forces every producer to say ``None`` on
 #: purpose instead of omitting it by accident.
-RESULT_SCHEMA_VERSION = 2
+#:
+#: ``3`` REMOVED ``CollectionPayload.next_cursor`` and moved
+#: :func:`result_with_payload`'s cursor to an explicit keyword argument. Two
+#: shape changes an old pin decodes wrong, in opposite directions: a v2 consumer
+#: reading ``payload.next_cursor`` now raises ``AttributeError`` (loud, and the
+#: cheap half), while a v2 PRODUCER that passes the cursor only on the collection
+#: silently builds an envelope whose ``next_cursor`` is ``None`` -- a walk that
+#: stops after page one and reports a complete result. The second is why this
+#: number had to move rather than ride along on ``2``.
+RESULT_SCHEMA_VERSION = 3
 
 #: The operation completed and returned everything asked for.
 RESULT_STATUS_OK = "ok"
@@ -103,26 +123,26 @@ DEFAULT_MEDIA_TYPE = "application/octet-stream"
 
 @dataclass(frozen=True)
 class CollectionPayload:
-    """A page of records AND the cursor that continues it.
+    """A page of records. ITEMS ONLY -- the cursor is NOT here.
 
     ``items`` -- the records this page returned, in the provider's order. A tuple
     because the envelope is handed across a seam and a caller must not be able to
     mutate another caller's page.
 
-    ``next_cursor`` -- the opaque continuation token for the page AFTER this one,
-    or ``None`` on the terminal page. It is here, and not only on the outer
-    :class:`OperationResult`, because the items and their continuation are one
-    fact: a consumer handed just ``items`` cannot tell a complete collection from
-    the first page of a hundred, and would report a truncation as a result. Both
-    copies are written by :func:`result_with_payload` from this one field, so they
-    cannot drift.
+    There is deliberately NO ``next_cursor`` on this class. The continuation lives
+    on :attr:`OperationResult.next_cursor` and NOWHERE else, because a second copy
+    of a cursor is a second thing that can be wrong: an envelope is a mutable
+    ``TypedDict``, either copy can be written independently, and a disagreement
+    surfaces as a walk that stops early (dropped records) or repeats a page
+    (duplicated records) with nothing at the seam to distinguish it from a correct
+    result. A consumer that needs to hand the continuation on hands on the
+    ENVELOPE, not the bare payload.
 
     ``kind`` -- the closed discriminant, so a consumer can switch on it instead of
     ``isinstance`` when it is routing rather than unpacking.
     """
 
     items: Tuple[Mapping[str, Any], ...] = ()
-    next_cursor: Optional[str] = None
     kind: ClassVar[PayloadKind] = "collection"
 
 
@@ -187,12 +207,14 @@ class OperationResult(TypedDict):
 
     ``status`` -- ``ok`` or ``partial`` (success axis; a failure is carried by
     :mod:`kiro_crew.connections.control_plane.errors`, not by this envelope).
-    ``next_cursor`` -- an opaque continuation token when more results remain, or
-    ``None`` when the result is complete.
+    ``next_cursor`` -- the SINGLE authoritative continuation token: an opaque
+    string when more results remain, ``None`` when the result is complete. It is
+    the only cursor in the plane, and
+    :class:`~kiro_crew.connections.control_plane.executor.PageWalk` advances on it
+    alone.
     ``payload`` -- the DATA the operation returned, as exactly one of the three
-    :data:`OperationPayload` shapes, or ``None`` when it returned none. Build it
-    with :func:`result_with_payload` so a collection's cursor cannot disagree with
-    ``next_cursor``.
+    :data:`OperationPayload` shapes, or ``None`` when it returned none. Build both
+    with :func:`result_with_payload`.
     """
 
     status: ResultStatus
@@ -204,23 +226,32 @@ def result_with_payload(
     payload: Optional[OperationPayload],
     *,
     status: ResultStatus = "ok",
+    next_cursor: Optional[str] = None,
 ) -> OperationResult:
-    """Build an envelope whose ``next_cursor`` is DERIVED from ``payload``.
+    """Build an envelope carrying ``payload`` and, for a collection, its cursor.
 
-    The one constructor for a result carrying data, and the reason
-    :attr:`CollectionPayload.next_cursor` and
-    :attr:`OperationResult.next_cursor` cannot drift: the cursor is passed ONCE,
-    on the collection, and copied out to the envelope here. There is deliberately
-    no ``next_cursor`` parameter -- accepting one would re-create the two
-    independently-settable copies this exists to prevent, and the disagreement
-    would be silent (a paging walk would stop while the collection still claimed
-    a successor, or walk on while the collection claimed to be terminal).
+    ``next_cursor`` is an EXPLICIT argument and lands in exactly one place: the
+    envelope. It used to be derived from ``CollectionPayload.next_cursor``, which
+    read as safe -- one constructor wrote both copies -- but only for envelopes
+    that went through this function. An :class:`OperationResult` is a
+    ``TypedDict``; a producer can build one literally and a middle layer can
+    reassign ``next_cursor`` on the mapping, so "constructed consistently here"
+    never covered the paths that matter. With one field there is nothing to keep
+    consistent.
 
-    An :class:`ObjectPayload`, a :class:`BytesPayload` and ``None`` have no
-    continuation, so the envelope's cursor is ``None`` for all three: a single
-    object and a byte stream are not paged shapes, and inventing a cursor for them
-    would tell a caller to fetch a page that does not exist.
+    A cursor is only meaningful for a COLLECTION. An :class:`ObjectPayload`, a
+    :class:`BytesPayload` and ``None`` are not paged shapes, so passing a cursor
+    with one raises :class:`ValueError` rather than being quietly ignored: a
+    caller that believed it was returning a continuation must not have it dropped,
+    and a caller that reused this constructor with the wrong shape has a bug that
+    should be loud here instead of surfacing as a walk fetching a page that does
+    not exist.
     """
 
-    next_cursor = payload.next_cursor if isinstance(payload, CollectionPayload) else None
+    if next_cursor is not None and not isinstance(payload, CollectionPayload):
+        raise ValueError(
+            "next_cursor is only meaningful for a CollectionPayload; a single "
+            "object, raw bytes and an empty result are not paged shapes, so a "
+            "cursor here would point a caller at a page that does not exist"
+        )
     return {"status": status, "next_cursor": next_cursor, "payload": payload}
