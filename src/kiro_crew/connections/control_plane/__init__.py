@@ -16,6 +16,12 @@ counter (for L04 revoke fencing; field + increment only here), and a
 ``secret_ref`` that carries the secret's location and metadata but never its
 value.
 
+L05 adds the per-operation permitted-credential-mode declaration and its
+deny-by-default check
+(:mod:`~kiro_crew.connections.control_plane.auth_modes`): an operation declares
+which of the L01 credential modes it permits, and a caller-offered mode is
+allowed or denied against that declaration (unstated == denied).
+
 Pure types, zero IO. This module is the control plane's own export face, and it
 is the CANONICAL one: the wider ``kiro_crew.connections`` package does NOT
 re-export these symbols, so consumers import them from
@@ -23,6 +29,15 @@ re-export these symbols, so consumers import them from
 ``kiro_crew.connections.<name>`` aliases.
 """
 
+from kiro_crew.connections.control_plane.auth_modes import (
+    AUTH_MODES_SCHEMA_VERSION,
+    PermittedModeRegistry,
+    PermittedModes,
+    declare_permitted_modes,
+    effective_permitted_modes,
+    permit_operation,
+    permit_registered_operation,
+)
 from kiro_crew.connections.control_plane.binding import (
     BINDING_SCHEMA_VERSION,
     INITIAL_GENERATION,
@@ -69,6 +84,7 @@ from kiro_crew.connections.control_plane.result import (
 )
 
 __all__ = [
+    "AUTH_MODES_SCHEMA_VERSION",
     "BINDING_SCHEMA_VERSION",
     "CONTEXT_SCHEMA_VERSION",
     "CREDENTIAL_MODES",
@@ -93,6 +109,8 @@ __all__ = [
     "OperationError",
     "OperationKind",
     "OperationResult",
+    "PermittedModeRegistry",
+    "PermittedModes",
     "ResultStatus",
     "SecretRef",
     "ServiceId",
@@ -100,7 +118,11 @@ __all__ = [
     "VerifiedIdentity",
     "binding_secret_ref",
     "create_binding",
+    "declare_permitted_modes",
+    "effective_permitted_modes",
     "next_generation",
     "operation_error",
+    "permit_operation",
+    "permit_registered_operation",
     "redacted_detail",
 ]

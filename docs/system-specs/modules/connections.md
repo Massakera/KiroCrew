@@ -1075,6 +1075,7 @@ rest of this subsystem uses (`l0_probe.ProbeResult`, `l1_smoke.SmokeResult`,
 | `context.py` | `OperationContext` — the per-call references: `binding_ref`, `tenant_ref`, `subject_ref`, `deadline`, plus `credential_mode` (singular). No field is a credential VALUE; `binding_ref`/`tenant_ref`/`subject_ref` are references, `deadline` is an absolute POSIX-seconds UTC cutoff, and `credential_mode` is the single SELECTED mode identifier for this call (a mode *type*, never a token), chosen from — and never outside — the descriptor's declared `credential_modes` set. |
 | `result.py` | `OperationResult` — the outcome envelope: `status` (`ok` / `partial`) and `next_cursor` (an opaque continuation token, or `None` when complete). `next_cursor` is deliberately opaque: the manifest declares each operation's own `pagination` contract, and the envelope only says "resume here, or you are done". |
 | `errors.py` | `OperationError` — the RUN-01 typed error taxonomy: a twelve-value closed set (`auth`, `scope`, `consent`, `not_found`, `forbidden`, `quota`, `throttle`, `conflict`, `input`, `temporary`, `partial`, `ambiguous`) copied verbatim from the manifest, plus `detail`. |
+| `auth_modes.py` | Per-operation *permitted* credential modes + a single deny-by-default authorization path bounded by the descriptor (W01 · L05): the descriptor's `credential_modes` is the outer bound, a policy `PermittedModes` may only narrow within it, and `permit_operation` / `permit_registered_operation` (both REQUIRE a descriptor) deny a mode the descriptor did not declare **even if a registry permits it**, and deny an unknown mode **even if descriptor and policy both carry it** (real `policy ∩ descriptor ∩ CREDENTIAL_MODES` intersection in `effective_permitted_modes`, not a docstring). No public policy-only bypass. Mode identifiers and `operation_id` references only, never a credential value. See "Per-operation permitted credential modes, denied by default" below. |
 
 **`detail` reuses the subsystem's redaction discipline, opening no new
 channel.** A typed error's `detail` can reflect provider-returned text, so it
@@ -1156,6 +1157,65 @@ classifying a failure by sniffing substrings out of a free-text message — the
 `"forbidden"` is the in-repo example of the anti-pattern it supersedes.
 **Reconnecting that classifier to RUN-01 is a separate later slice; W01 only
 fixes the taxonomy it will target and does not touch `l1_smoke`.**
+
+### Per-operation permitted credential modes, denied by default
+
+`control_plane/auth_modes.py` (W01 · L05) adds the call-time counterpart to the
+descriptor's `credential_modes`. Where `operation.py` fixes the Axis-B closed
+set and carries the SET a descriptor declares, this module lets a governance
+policy declare which of those modes it *permits*, and decides allow/deny for a
+caller-offered mode against BOTH the descriptor's declared set and the policy.
+
+- **Declaration.** `declare_permitted_modes(modes)` builds an immutable
+  `PermittedModes` (`frozenset[CredentialMode]`) from a subset of the L01 closed
+  set. A value outside `CREDENTIAL_MODES` is rejected with `ValueError`: this
+  slice never mints a fourth credential mode, exactly as `operation.py` never
+  does — a genuinely new mode is a scoped revision of the manifest's `auth_modes`
+  vocabulary, not a value smuggled in through a declaration.
+- **Decision (the ONE authorization path).** `permit_operation(descriptor,
+  offered_mode, permitted)` is the module's single authorization decision. It
+  REQUIRES the descriptor and returns `None` on allow, or a RUN-01 `auth`
+  `OperationError` on deny — built with `operation_error(...)`, so `detail` is
+  unconditionally redacted-then-truncated and this module opens no un-redacted
+  error channel. `permit_registered_operation(descriptor, offered_mode,
+  registry)` does the same against a whole `PermittedModeRegistry`
+  (`Mapping[str, PermittedModes]`). There is deliberately NO public policy-only
+  sibling that skips the descriptor: a function named like an authz decision
+  that did not consult the descriptor would be a bypass waiting to be used, so
+  the descriptor is required. (The bare policy-membership predicate is kept
+  PRIVATE as `_is_mode_permitted`, out of `__all__`.)
+- **Enforcing the descriptor bound + closed set (real code, not a docstring).**
+  `context.py` *says* the selected mode must come from within the descriptor's
+  declared `credential_modes`, but a `TypedDict` validates nothing at runtime,
+  so that sentence needs code behind it. `effective_permitted_modes(descriptor,
+  permitted)` is that code: it returns `permitted ∩ descriptor["credential_modes"]
+  ∩ CREDENTIAL_MODES`. The descriptor factor drops a mode the descriptor did not
+  declare **even if the policy named it** (the counter-example the slice is
+  judged on, deny reason `not DECLARED`). The closed-set factor is NOT redundant:
+  a descriptor's `credential_modes` and a policy set are both un-validated at
+  runtime, so an out-of-closed-set string (a typo, a fabricated fourth mode) can
+  sit in BOTH and a bare `policy ∩ declared` would keep it — intersecting with
+  `CREDENTIAL_MODES` makes an unknown mode fall out no matter how many places
+  carry it, so "an unknown mode is always denied" holds structurally.
+- **Deny-by-default.** An operation that declares no permitted mode — an empty
+  `PermittedModes`, an empty descriptor `credential_modes`, or an `operation_id`
+  absent from a `PermittedModeRegistry` — is DENIED, never allowed. The absence
+  of a declaration is not an open door: a registry is the complete statement of
+  what is permitted, and anything unstated is nothing, so an operation nobody
+  configured fails closed. This is pinned by tests.
+- **Zero credential values.** The whole API accepts and returns only mode
+  IDENTIFIERS (`CredentialMode`) and reference strings (`operation_id`). It never
+  accepts, stores, or returns a token, a client secret, or any credential
+  plaintext — the same "references, never a value" invariant `context.py`
+  carries. A permitted mode says which KIND of credential is allowed; resolving a
+  kind to a live credential is a later leaf in kiro-cli custody, not here.
+
+This gate operates on **Axis B only**. It never reads a provider's registration
+mode (Axis A, `dcr` / `preregistered`) and never infers a permitted credential
+mode from one — the two value sets are disjoint (`{dcr, preregistered}` vs
+`{oauth_user, fine_grained_pat, service_to_service}`), and a companion test
+asserts they do not intersect, so the collapse the manifest's two-axis design
+forbids cannot creep in through this slice.
 
 ### The `vendors/` container anchor
 
