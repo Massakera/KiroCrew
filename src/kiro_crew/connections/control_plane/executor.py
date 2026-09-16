@@ -122,7 +122,21 @@ from kiro_crew.connections.control_plane.writes import (
 #: error-classification surface. Two downstreams (W02 GitHub, W05 Graph) encode
 #: against these shapes, so they pin this number; a shape change that would make
 #: an old pin decode wrong MUST bump it.
-EXECUTOR_SCHEMA_VERSION = 1
+#:
+#: ``2`` added two shape changes that an old pin WOULD decode wrong, so both had
+#: to bump it rather than ride along on ``1``:
+#:
+#: * :class:`TransportResponse` and :class:`ExecutionOutcome` grew
+#:   ``write_outcome`` -- the transport's way of saying "the effect of this
+#:   non-idempotent write is UNKNOWN", which a consumer must record instead of
+#:   L07's ``failed_not_applied`` or it hands ``replay_decision`` a determinate
+#:   answer the wire never gave and gets a DOUBLE WRITE waved through;
+#: * :data:`Transport` now also receives ``trusted_view`` -- the
+#:   :class:`TrustedHandleView` itself -- so a transport can bind its credential
+#:   custody to the identity the call was actually authorized for instead of one
+#:   fixed at composition time (see
+#:   :class:`~kiro_crew.connections.control_plane.production.BindingSecretSelector`).
+EXECUTOR_SCHEMA_VERSION = 2
 
 # --- effects that are non-idempotent by default (the write-replay gate runs) --
 #: Effects whose ``unknown``-outcome replay must be gated by L07. Read from the
@@ -139,6 +153,20 @@ EXECUTOR_SCHEMA_VERSION = 1
 _NON_IDEMPOTENT_EFFECTS = frozenset(
     {"write", "delete", "share", "external_send", "admin", "billable"}
 )
+
+
+def is_non_idempotent_effect(effect: str) -> bool:
+    """True when ``effect`` is one whose replay L07 must gate.
+
+    The ONE reading of :data:`_NON_IDEMPOTENT_EFFECTS`, made public because a
+    second reader exists: the production transport has to decide, on an
+    ambiguous mid-flight failure, whether the outcome is merely a failure or an
+    UNKNOWN that must not be blind-replayed -- and that turns on the same
+    question :func:`_authorize` step 4 asks. Two copies of this set would drift,
+    and the copy that drifted low would silently ungate an effect.
+    """
+
+    return effect in _NON_IDEMPOTENT_EFFECTS
 
 
 # --- the structured transport outcome the injected transport returns ----------
@@ -159,6 +187,20 @@ class TransportResponse:
     server's advisory backoff on a 429/503, else ``None``. ``detail`` -- a short
     provider message; it is redacted by :func:`operation_error` before it ever
     leaves the executor.
+
+    ``write_outcome`` -- what is now KNOWN about whether a non-idempotent
+    write's effect landed, as one of L07's :data:`AttemptOutcome` values, or
+    ``None`` when the transport makes no claim. It exists because the wire can
+    fail in a way that answers NOTHING: a socket timeout or a connection dropped
+    mid-flight means the request may have been received and applied, or may never
+    have arrived, and the transport is the only layer positioned to tell that
+    apart from a status the provider deliberately returned. Recording such a
+    failure as ``failed_not_applied`` would hand
+    :func:`~kiro_crew.connections.control_plane.writes.replay_decision` a
+    determinate "it did not land" -- the one branch L07 ALLOWS replaying -- so a
+    timeout would license a second ``sendMail``. A transport that cannot know
+    says ``unknown`` here, and L07 then refuses to blind-replay unless the caller
+    explicitly asserts the operation is idempotent.
     """
 
     http_status: int
@@ -167,6 +209,7 @@ class TransportResponse:
     etag: Optional[str] = None
     retry_after_seconds: Optional[float] = None
     detail: str = ""
+    write_outcome: Optional[str] = None
 
 
 # --- the structured 412 signal the caller consumes (NOT flattened) ------------
@@ -224,12 +267,23 @@ class ExecutionOutcome:
     :class:`TrustedHandleView` the routing decision used, present whenever the
     gate chain got far enough to resolve it (so a caller/audit can see the
     trusted axes); ``None`` when the handle itself was rejected.
+
+    ``write_outcome`` -- the transport's
+    :attr:`TransportResponse.write_outcome` carried through unchanged: the L07
+    :data:`~kiro_crew.connections.control_plane.writes.AttemptOutcome` a caller
+    must record for THIS attempt, or ``None`` when nothing was claimed (a gate
+    denial, a read, a clean 2xx). This is what a caller writes into the
+    :class:`~kiro_crew.connections.control_plane.writes.AttemptRecord` it keeps
+    for the next attempt. Carrying it is the point: an executor that dropped it
+    would leave the caller inferring "not applied" from a 5xx, which is the
+    precise inference L07 exists to refuse.
     """
 
     result: Optional[OperationResult] = None
     error: Optional[OperationError] = None
     precondition: Optional[PreconditionFailure] = None
     view: Optional[TrustedHandleView] = None
+    write_outcome: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -242,6 +296,17 @@ class ExecutionOutcome:
 #: executor passes the TRUSTED ``service_id`` / ``credential_mode`` from the
 #: handle view -- never the handle's own -- so the thing that reaches the network
 #: cannot be pointed elsewhere by a mutated handle.
+#:
+#: It is also handed ``trusted_view``, the :class:`TrustedHandleView` itself, so
+#: a transport whose custody is per-binding can bind the credential it resolves
+#: to the identity this call was AUTHORIZED for. Passing only the two routing
+#: axes was not enough: two bindings can share a ``service_id`` and a
+#: ``credential_mode`` and still be different accounts/tenants, so a transport
+#: given only those cannot tell whose secret it should be reaching for and would
+#: reuse whichever one it was composed with. The view's ``binding_fingerprint``
+#: is the trusted, non-invertible link back to the binding, and it is what
+#: :class:`~kiro_crew.connections.control_plane.production.BindingSecretSelector`
+#: matches on before any secret is resolved.
 Transport = Callable[..., TransportResponse]
 
 #: A SERVER-SIDE clock: called with no arguments, returns POSIX seconds. This is
@@ -399,7 +464,7 @@ def _authorize(
     # (4) Write-replay gate -- only for a non-idempotent write that carries a
     # prior attempt record. A first attempt (no record) is not a replay.
     replay: Optional[ReplayDecision] = None
-    if descriptor["effect"] in _NON_IDEMPOTENT_EFFECTS and attempt_record is not None:
+    if is_non_idempotent_effect(descriptor["effect"]) and attempt_record is not None:
         replay = replay_decision(
             descriptor,
             attempt_record,
@@ -478,11 +543,15 @@ def execute(
     if replay is not None and replay["verdict"] == REPLAY_REUSE:
         return ExecutionOutcome(result=replay["reuse_result"], view=view)
 
-    # Emit exactly one call, routed on the TRUSTED axes.
+    # Emit exactly one call, routed on the TRUSTED axes. The view goes along too:
+    # a per-binding transport must be able to bind its credential custody to the
+    # identity this call was authorized for, and the two routing axes alone do
+    # not identify a binding (two bindings can share both).
     assert view is not None  # invariant: no error means the view resolved
     response = transport(
         service_id=view.service_id,
         credential_mode=view.credential_mode,
+        trusted_view=view,
         descriptor=descriptor,
         request_args=dict(args),
         request_idempotency_key=request_idempotency_key,
@@ -493,13 +562,18 @@ def execute(
         return ExecutionOutcome(
             precondition=_precondition_failure(response),
             view=view,
+            write_outcome=response.write_outcome,
         )
 
     error = classify_error(response)
     if error is not None:
-        return ExecutionOutcome(error=error, view=view)
+        # The transport's outcome claim rides along with the failure -- this is
+        # the case that matters: a timeout on a non-idempotent write is a typed
+        # `temporary` error AND an `unknown` outcome, and dropping the second
+        # would let the caller record the first as "not applied".
+        return ExecutionOutcome(error=error, view=view, write_outcome=response.write_outcome)
 
-    return ExecutionOutcome(result=response.result, view=view)
+    return ExecutionOutcome(result=response.result, view=view, write_outcome=response.write_outcome)
 
 
 def _precondition_failure(response: TransportResponse) -> PreconditionFailure:
@@ -659,4 +733,5 @@ __all__ = [
     "advance_page",
     "classify_error",
     "execute",
+    "is_non_idempotent_effect",
 ]

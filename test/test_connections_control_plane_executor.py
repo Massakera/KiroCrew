@@ -43,10 +43,12 @@ from kiro_crew.connections.control_plane.executor import (
 from kiro_crew.connections.control_plane.handle import (
     DerivedHandle,
     derive_handle,
+    ensure_usable,
 )
 from kiro_crew.connections.control_plane.operation import OperationDescriptor
 from kiro_crew.connections.control_plane.policy import LayerCeilings
 from kiro_crew.connections.control_plane.production import (
+    BindingSecretSelector,
     HttpReply,
     HttpRequest,
     SecretResolutionError,
@@ -790,6 +792,23 @@ def _locator(**kwargs) -> HttpRequest:
     )
 
 
+def _selector_for(handle: DerivedHandle, *, slug: str = "outlook") -> BindingSecretSelector:
+    """The selector a transport is composed with FOR ``handle``'s binding.
+
+    Built from the TRUSTED view, which is the only place the binding fingerprint
+    can honestly come from: the transport must be composed for the same binding
+    identity that ``ensure_usable`` will hand it at call time, or it refuses.
+    """
+
+    view = ensure_usable(handle, now=_T0)
+    return BindingSecretSelector(
+        slug=slug,
+        binding_fingerprint=view.binding_fingerprint,
+        service_id=view.service_id,
+        credential_mode=view.credential_mode,
+    )
+
+
 def test_the_module_no_longer_claims_it_performs_no_network() -> None:
     # The claim was false once a real transport existed, and a delivery that
     # misdescribes itself is the defect, not the docstring wording.
@@ -809,13 +828,14 @@ def test_production_transport_resolves_the_secret_through_the_vault() -> None:
         sent.append(request)
         return HttpReply(status=200, headers={}, body=b"{}")
 
+    handle = _handle()
     transport = build_production_transport(
-        secret_ref=secret_ref,
+        selector=_selector_for(handle),
         vault=vault,
         locator=_locator,
         http_send=_send,
     )
-    outcome = execute(_descriptor(), _handle(), transport, **_kw())
+    outcome = execute(_descriptor(), handle, transport, **_kw())
     assert outcome.ok
     # The vault was asked for the BINDING's recorded entry name -- the existing
     # CONNECTIONS_<SLUG>_BINDING_SECRET family, not a new naming scheme.
@@ -845,10 +865,11 @@ def test_production_transport_missing_secret_is_a_typed_auth_failure() -> None:
     def _send(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
         raise AssertionError("must not send without a credential")
 
+    handle = _handle()
     transport = build_production_transport(
-        secret_ref=secret_ref, vault=vault, locator=_locator, http_send=_send
+        selector=_selector_for(handle), vault=vault, locator=_locator, http_send=_send
     )
-    outcome = execute(_descriptor(), _handle(), transport, **_kw())
+    outcome = execute(_descriptor(), handle, transport, **_kw())
     assert outcome.error is not None
     assert outcome.error["error_class"] == "auth"
     # The vault entry name is not echoed into the caller-visible detail.
@@ -877,12 +898,11 @@ def test_production_transport_maps_a_412_to_the_preconditions_it_asserted() -> N
     def _send(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
         return HttpReply(status=412, headers={"ETag": 'W/"v2"'}, body=b"")
 
+    handle = _handle(requested=("mail.send",))
     transport = build_production_transport(
-        secret_ref=secret_ref, vault=vault, locator=_if_match_locator, http_send=_send
+        selector=_selector_for(handle), vault=vault, locator=_if_match_locator, http_send=_send
     )
-    outcome = execute(
-        _descriptor(effect="write"), _handle(requested=("mail.send",)), transport, **_kw()
-    )
+    outcome = execute(_descriptor(effect="write"), handle, transport, **_kw())
     assert outcome.precondition is not None
     # Reported because the REQUEST sent it -- not because 412 defaults to it.
     assert outcome.precondition.preconditions == ("If-Match",)
@@ -897,12 +917,11 @@ def test_production_transport_412_without_an_asserted_precondition_is_unknown() 
     def _send(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
         return HttpReply(status=412, headers={}, body=b"")
 
+    handle = _handle(requested=("mail.send",))
     transport = build_production_transport(
-        secret_ref=secret_ref, vault=vault, locator=_locator, http_send=_send
+        selector=_selector_for(handle), vault=vault, locator=_locator, http_send=_send
     )
-    outcome = execute(
-        _descriptor(effect="write"), _handle(requested=("mail.send",)), transport, **_kw()
-    )
+    outcome = execute(_descriptor(effect="write"), handle, transport, **_kw())
     assert outcome.precondition is not None
     assert outcome.precondition.preconditions == ()
     assert outcome.precondition.condition_unknown is True
@@ -915,10 +934,11 @@ def test_production_transport_refuses_a_non_https_url_without_sending() -> None:
     def _plain_http_locator(**kwargs) -> HttpRequest:
         return HttpRequest(method="GET", url="http://graph.example.invalid/v1.0/me")
 
+    handle = _handle()
     transport = build_production_transport(
-        secret_ref=secret_ref, vault=vault, locator=_plain_http_locator
+        selector=_selector_for(handle), vault=vault, locator=_plain_http_locator
     )
-    outcome = execute(_descriptor(), _handle(), transport, **_kw())
+    outcome = execute(_descriptor(), handle, transport, **_kw())
     # urllib_http_send refuses before opening a socket; the executor sees input.
     assert outcome.error is not None
     assert outcome.error["error_class"] == "input"
