@@ -104,7 +104,7 @@ class TestNextStep:
         assert step.next_cursor == "https://graph/next?$skiptoken=t"
         assert "$top" not in step.next_cursor.split("?", 1)[1]
 
-    @pytest.mark.parametrize("mode", DELTA_TERMINATED_MODES)
+    @pytest.mark.parametrize("mode", sorted(DELTA_TERMINATED_MODES, key=lambda m: m.value))
     def test_delta_terminated_mode_terminates_on_delta(self, mode):
         # nextLink absent, deltaLink present -> done, but resumable via the
         # delta cursor (not discarded).
@@ -113,7 +113,7 @@ class TestNextStep:
         assert step.done is True
         assert step.delta_cursor == "https://graph/deltatoken=d"
 
-    @pytest.mark.parametrize("mode", DELTA_TERMINATED_MODES)
+    @pytest.mark.parametrize("mode", sorted(DELTA_TERMINATED_MODES, key=lambda m: m.value))
     def test_delta_terminated_mode_requires_terminal_delta_link(self, mode):
         with pytest.raises(PagingError, match="@odata.deltaLink"):
             next_step(mode, GraphPage(value=[]))
