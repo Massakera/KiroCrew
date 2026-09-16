@@ -1298,3 +1298,53 @@ Exports for these symbols (`LAYERS`, `POLICY_SCHEMA_VERSION`, `Approval`,
 are added ONLY to `control_plane/__init__.py`; they are NOT re-exported as
 top-level `kiro_crew.connections` aliases — a zero-consumer second spelling is a
 rename hazard, not a convenience.
+
+### An uncertain non-idempotent write is not blindly replayed (L07)
+
+A non-idempotent write — a POST that creates a resource, an
+`external_send` that posts a message — that is issued and then leaves its
+caller with an **uncertain** outcome (a timeout, a dropped connection, a 5xx
+with no usable body) is the case a naive retry gets wrong: reissuing it can
+apply the effect **twice** — two issues created, two messages sent. The
+core invariant `control_plane/writes.py` fixes is:
+
+> When a non-idempotent write's outcome is `unknown`, a replay MUST be refused
+> unless there is evidence the prior attempt did not take effect (or its
+> recorded result can be reused).
+
+The module is pure decision logic, zero IO — it neither issues the write nor
+holds a client nor resolves a credential. It records what is KNOWN about a prior
+attempt and decides whether replaying it now is allowed:
+
+- An `AttemptRecord` gives one attempt an identity — the triple
+  `(operation_id, args_fingerprint, idempotency_key)`, so a retry is recognized
+  as a replay of a known prior attempt — and one of three **outcome** states
+  (`AttemptOutcome`, a closed set distinct from the success envelope's
+  `ResultStatus` and the RUN-01 `ErrorClass`, which classify what a call
+  RETURNED; this records whether the effect LANDED): `succeeded`,
+  `failed_not_applied`, or `unknown`.
+- `replay_decision(descriptor, record)` is the gate. `failed_not_applied` →
+  **allow** (the write provably did not land, so a reissue cannot duplicate it);
+  `succeeded` → **reuse** the recorded result (do not reissue and duplicate);
+  `unknown` for a non-idempotent operation → **refuse**, a typed
+  `operation_error("conflict", …)` whose detail says the outcome is uncertain.
+  A refusal is always a typed rejection built through `operation_error(…)`,
+  never a bare boolean.
+
+**The idempotent-write exception.** Whether `unknown` is safe to replay is a
+property of the OPERATION, read from its descriptor's `effect` — never inferred
+from the operation's name or from the mere presence of an idempotency key.
+`read` is not a mutation and `delete` is naturally idempotent (deleting an
+already-deleted resource leaves the same end state), so an `unknown` replay of
+either is **allowed**; `write` / `share` / `external_send` / `admin` /
+`billable` are non-idempotent by default and must be gated. An operation that
+genuinely IS idempotent despite a non-idempotent effect (a fixed-key upsert, a
+provider-honored idempotency token) declares that with the explicit
+`idempotent` override on its attempt record — an assertion the caller states,
+never a default the gate guesses.
+
+Like every other symbol on this seam, the L07 exports live on the canonical
+`kiro_crew.connections.control_plane` subpackage only; they are **not**
+re-exported as top-level `kiro_crew.connections` aliases (a second spelling with
+zero consumers is a rename hazard, not a convenience).
+
