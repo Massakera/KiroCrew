@@ -30,11 +30,22 @@ enforces, and it carries NOTHING that reconstructs the binding (no
 ``binding_id`` / subject / tenant / secret) -- only a one-way keyed
 ``binding_fingerprint`` and the ``generation``, both for L04 revoke fencing.
 
-Pure types, zero IO. This module is the control plane's own export face, and it
-is the CANONICAL one: the wider ``kiro_crew.connections`` package does NOT
-re-export these symbols, so consumers import them from
-``kiro_crew.connections.control_plane`` (or its submodules), never as
-``kiro_crew.connections.<name>`` aliases.
+W01 · L09 adds the EXECUTOR
+(:mod:`~kiro_crew.connections.control_plane.executor`) -- the caller that runs the
+four judgments in one order before any transport call is emitted -- and its
+PRODUCTION COMPOSITION
+(:mod:`~kiro_crew.connections.control_plane.production`), which builds a real
+transport out of the existing :class:`kiro_crew.secrets.SecretVault` custody and
+a stdlib ``urllib.request`` client. Vendor request shaping is injected, not
+implemented there.
+
+Everything except :mod:`~kiro_crew.connections.control_plane.production` is pure
+types and decisions with zero IO; that one module is where the seam actually
+reaches a network, and it performs none at import time. This module is the control
+plane's own export face, and it is the CANONICAL one: the wider
+``kiro_crew.connections`` package does NOT re-export these symbols, so consumers
+import them from ``kiro_crew.connections.control_plane`` (or its submodules),
+never as ``kiro_crew.connections.<name>`` aliases.
 """
 
 from kiro_crew.connections.control_plane.auth_modes import (
@@ -74,6 +85,7 @@ from kiro_crew.connections.control_plane.errors import (
 )
 from kiro_crew.connections.control_plane.executor import (
     EXECUTOR_SCHEMA_VERSION,
+    Clock,
     ExecutionOutcome,
     PageWalk,
     PreconditionFailure,
@@ -117,6 +129,22 @@ from kiro_crew.connections.control_plane.policy import (
     decide,
     resolve_layers,
 )
+from kiro_crew.connections.control_plane.production import (
+    DEFAULT_TIMEOUT_SECONDS,
+    PRODUCTION_SCHEMA_VERSION,
+    HttpReply,
+    HttpRequest,
+    HttpSend,
+    RequestLocator,
+    ResultDecode,
+    SecretResolutionError,
+    SecretStore,
+    build_production_transport,
+    decode_json_body,
+    neutral_decode,
+    resolve_binding_secret,
+    urllib_http_send,
+)
 from kiro_crew.connections.control_plane.result import (
     RESULT_SCHEMA_VERSION,
     RESULT_STATUSES,
@@ -142,6 +170,7 @@ __all__ = [
     "BINDING_SCHEMA_VERSION",
     "CONTEXT_SCHEMA_VERSION",
     "CREDENTIAL_MODES",
+    "DEFAULT_TIMEOUT_SECONDS",
     "EFFECTS",
     "ERRORS_SCHEMA_VERSION",
     "ERROR_CLASSES",
@@ -153,6 +182,7 @@ __all__ = [
     "OPERATION_KINDS",
     "OPERATION_SCHEMA_VERSION",
     "POLICY_SCHEMA_VERSION",
+    "PRODUCTION_SCHEMA_VERSION",
     "REPLAY_VERDICTS",
     "RESULT_SCHEMA_VERSION",
     "RESULT_STATUSES",
@@ -164,6 +194,7 @@ __all__ = [
     "AttemptRecord",
     "Binding",
     "BindingVerificationError",
+    "Clock",
     "CredentialMode",
     "DerivedHandle",
     "Effect",
@@ -173,6 +204,9 @@ __all__ = [
     "HandleNotIssuedError",
     "HandleScopeError",
     "HandleTamperedError",
+    "HttpReply",
+    "HttpRequest",
+    "HttpSend",
     "LayerCeilings",
     "LayerName",
     "OperationContext",
@@ -186,8 +220,12 @@ __all__ = [
     "PreconditionFailure",
     "ReplayDecision",
     "ReplayVerdict",
+    "RequestLocator",
+    "ResultDecode",
     "ResultStatus",
     "SecretRef",
+    "SecretResolutionError",
+    "SecretStore",
     "ServiceId",
     "SubjectTenantVerifier",
     "Transport",
@@ -198,15 +236,18 @@ __all__ = [
     "approval_applies",
     "args_fingerprint",
     "binding_secret_ref",
+    "build_production_transport",
     "classify_error",
     "create_binding",
     "decide",
     "declare_permitted_modes",
+    "decode_json_body",
     "derive_handle",
     "effective_permitted_modes",
     "ensure_usable",
     "execute",
     "is_expired",
+    "neutral_decode",
     "next_generation",
     "operation_error",
     "permit_operation",
@@ -214,5 +255,7 @@ __all__ = [
     "record_attempt",
     "redacted_detail",
     "replay_decision",
+    "resolve_binding_secret",
     "resolve_layers",
+    "urllib_http_send",
 ]

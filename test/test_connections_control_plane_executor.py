@@ -2,19 +2,33 @@
 
 These pin the properties the whole control-plane rests on: the four judgments run
 BEFORE any transport call, a denied gate emits ZERO calls, routing reads the
-TRUSTED handle view (never the mutable handle), a 412 is preserved as a
-structured signal instead of flattened, and pagination advances for real.
+TRUSTED handle view (never the mutable handle) AND the caller's own claims about
+those axes must agree with it, time comes from a server-side clock re-read per
+call and per page, a delete is replay-gated like any other effect, a paging walk
+carries its original arguments on every page, a 412 is preserved as a structured
+signal instead of flattened (and never fabricates a precondition), and pagination
+advances for real.
+
+The transport is an in-memory fake throughout -- that is the point of injecting
+it. The one exception is the production-composition block at the bottom, which
+proves the REAL secret custody wiring with an injected vault and an injected
+sender, so it too opens no socket.
 """
 
 from __future__ import annotations
 
 import math
 
+import pytest
+
 import kiro_crew.connections.control_plane as cp
+from kiro_crew.connections.control_plane import executor as executor_mod
+from kiro_crew.connections.control_plane import production as production_mod
 from kiro_crew.connections.control_plane.auth_modes import declare_permitted_modes
 from kiro_crew.connections.control_plane.binding import (
     Binding,
     VerifiedIdentity,
+    binding_secret_ref,
     create_binding,
 )
 from kiro_crew.connections.control_plane.executor import (
@@ -32,6 +46,13 @@ from kiro_crew.connections.control_plane.handle import (
 )
 from kiro_crew.connections.control_plane.operation import OperationDescriptor
 from kiro_crew.connections.control_plane.policy import LayerCeilings
+from kiro_crew.connections.control_plane.production import (
+    HttpReply,
+    HttpRequest,
+    SecretResolutionError,
+    build_production_transport,
+    resolve_binding_secret,
+)
 from kiro_crew.connections.control_plane.result import OperationResult
 from kiro_crew.connections.control_plane.writes import (
     ATTEMPT_FAILED_NOT_APPLIED,
@@ -39,6 +60,7 @@ from kiro_crew.connections.control_plane.writes import (
     args_fingerprint,
     record_attempt,
 )
+from kiro_crew.secrets import SecretValue
 
 _T0 = 1_000_000.0
 _GRANTED = ("mail.read", "mail.send")
@@ -95,10 +117,10 @@ def _handle(
     )
 
 
-def _descriptor(effect="read", modes=("oauth_user",)) -> OperationDescriptor:
+def _descriptor(effect="read", modes=("oauth_user",), service="outlook") -> OperationDescriptor:
     return {
         "operation_id": "outlook.messages.list",
-        "service_id": "outlook",
+        "service_id": service,
         "operation_kind": "list",
         "effect": effect,
         "credential_modes": tuple(modes),
@@ -339,7 +361,7 @@ def test_pagination_walks_all_pages_and_terminates() -> None:
         descriptor=_descriptor(),
         handle=_handle(),
         transport=transport,
-        now=_T0,
+        clock=lambda: _T0,
         offered_mode="oauth_user",
         permitted=declare_permitted_modes(("oauth_user",)),
         layers=LayerCeilings(),
@@ -364,7 +386,7 @@ def test_pagination_refuses_to_loop_on_a_repeated_cursor() -> None:
         descriptor=_descriptor(),
         handle=_handle(),
         transport=transport,
-        now=_T0,
+        clock=lambda: _T0,
         offered_mode="oauth_user",
         permitted=declare_permitted_modes(("oauth_user",)),
         layers=LayerCeilings(),
@@ -387,7 +409,7 @@ def test_pagination_stops_on_a_denied_gate_without_emitting() -> None:
         descriptor=_descriptor(),
         handle=_handle(),
         transport=transport,
-        now=_T0,
+        clock=lambda: _T0,
         offered_mode="oauth_user",
         permitted=declare_permitted_modes(()),  # deny-by-default
         layers=LayerCeilings(),
@@ -430,5 +452,504 @@ def test_executor_symbols_are_not_top_level_connections_reexports() -> None:
         "PageWalk",
         "PreconditionFailure",
         "TransportResponse",
+        "build_production_transport",
+        "resolve_binding_secret",
+        "urllib_http_send",
     ):
         assert not hasattr(c, name), f"{name} leaked to top-level connections"
+
+
+# =============================================================================
+# Regressions: the caller's claims must AGREE with the trusted view (defect 1)
+# =============================================================================
+def test_offered_mode_disagreeing_with_the_view_emits_zero_calls() -> None:
+    # The handle was issued for oauth_user. The descriptor declares BOTH modes,
+    # so permit_operation alone would ALLOW an offered service_to_service -- it
+    # never sees the handle. The call would then be emitted under the handle's
+    # oauth_user credential: validated one mode, used another.
+    transport = FakeTransport(_ok_response())
+    outcome = execute(
+        _descriptor(modes=("oauth_user", "service_to_service")),
+        _handle(),
+        transport,
+        **_kw(
+            offered_mode="service_to_service",
+            permitted=declare_permitted_modes(("oauth_user", "service_to_service")),
+        ),
+    )
+    assert not outcome.ok
+    assert outcome.error is not None
+    assert outcome.error["error_class"] == "auth"
+    assert len(transport.calls) == 0  # THE assertion: nothing was emitted
+    # The view still resolved, so an audit can see which mode was actually issued.
+    assert outcome.view is not None
+    assert outcome.view.credential_mode == "oauth_user"
+
+
+def test_descriptor_service_disagreeing_with_the_view_emits_zero_calls() -> None:
+    # A handle for outlook must not authorize a github operation, even though the
+    # executor would have routed the emit at the trusted outlook service: the
+    # operation being authorized and the service being reached must be the same.
+    transport = FakeTransport(_ok_response())
+    outcome = execute(
+        _descriptor(service="github"),
+        _handle(),
+        transport,
+        **_kw(),
+    )
+    assert not outcome.ok
+    assert outcome.error is not None
+    assert outcome.error["error_class"] == "auth"
+    assert len(transport.calls) == 0
+    assert outcome.view is not None
+    assert outcome.view.service_id == "outlook"
+
+
+def test_agreeing_mode_and_service_still_pass() -> None:
+    # The cross-check must not deny the ordinary case.
+    transport = FakeTransport(_ok_response())
+    outcome = execute(_descriptor(), _handle(), transport, **_kw())
+    assert outcome.ok
+    assert len(transport.calls) == 1
+
+
+# =============================================================================
+# Regressions: time comes from a SERVER-SIDE clock, re-read per call (defect 2)
+# =============================================================================
+class Ticker:
+    """A deterministic clock: hands back each queued instant, then holds the last."""
+
+    def __init__(self, *instants: float):
+        self._instants = list(instants)
+        self.reads = 0
+
+    def __call__(self) -> float:
+        instant = self._instants[min(self.reads, len(self._instants) - 1)]
+        self.reads += 1
+        return instant
+
+
+def _kw_no_now(**over):
+    kw = _kw(**over)
+    kw.pop("now", None)
+    return kw
+
+
+def test_execute_reads_the_clock_when_no_now_is_pinned() -> None:
+    clock = Ticker(_T0)
+    transport = FakeTransport(_ok_response())
+    outcome = execute(_descriptor(), _handle(), transport, **_kw_no_now(clock=clock))
+    assert outcome.ok
+    assert clock.reads == 1  # the instant came from the clock, not the caller
+
+
+def test_execute_clock_reading_decides_expiry_not_the_callers_word() -> None:
+    # A caller-asserted PAST instant is perfectly finite, so the finiteness check
+    # cannot catch it. The clock is what says the handle is expired.
+    handle = _handle(ttl=100.0)
+    transport = FakeTransport(_ok_response())
+    outcome = execute(_descriptor(), handle, transport, **_kw_no_now(clock=Ticker(_T0 + 500.0)))
+    assert outcome.error is not None
+    assert outcome.error["error_class"] == "input"  # expired
+    assert len(transport.calls) == 0
+
+
+def test_pagewalk_holds_a_clock_not_a_frozen_now() -> None:
+    import dataclasses
+
+    fields = {f.name for f in dataclasses.fields(PageWalk)}
+    assert "clock" in fields
+    assert "now" not in fields, "a cached instant makes every page reuse page 1's expiry"
+
+
+def test_pagewalk_rejudges_expiry_on_every_page() -> None:
+    # The handle lives 100s. Page 1 at T0 is fine; by page 2 the clock has moved
+    # past the expiry, so the walk STOPS instead of running the rest of a long
+    # pagination on the judgment made at page 1.
+    clock = Ticker(_T0, _T0 + 500.0)
+    transport = FakeTransport([_ok_response(next_cursor="c1"), _ok_response(next_cursor=None)])
+    walk = PageWalk(
+        descriptor=_descriptor(),
+        handle=_handle(ttl=100.0),
+        transport=transport,
+        clock=clock,
+        offered_mode="oauth_user",
+        permitted=declare_permitted_modes(("oauth_user",)),
+        layers=LayerCeilings(),
+        governance_scope="tools",
+        governance_item="messages.list",
+    )
+    first = advance_page(walk)
+    assert first.ok
+    assert walk.pages == 1
+    second = advance_page(walk)
+    assert second.error is not None
+    assert second.error["error_class"] == "input"  # expired between pages
+    assert walk.done
+    assert walk.pages == 1
+    assert len(transport.calls) == 1  # page 2 never reached the transport
+    assert clock.reads == 2  # one fresh reading PER page
+
+
+# =============================================================================
+# Regression: delete is replay-gated like any other effect (defect 3)
+# =============================================================================
+def test_delete_is_in_the_replay_gated_effect_set() -> None:
+    assert "delete" in executor_mod._NON_IDEMPOTENT_EFFECTS
+    # read is the only ungated effect: it applies no effect to replay.
+    assert executor_mod._NON_IDEMPOTENT_EFFECTS == frozenset(
+        {"write", "delete", "share", "external_send", "admin", "billable"}
+    )
+
+
+def test_delete_with_an_unknown_prior_attempt_is_refused_and_emits_zero_calls() -> None:
+    # L07 refuses to call a delete idempotent: a second DELETE can land on a
+    # RECREATED resource. Excluding delete from the gate meant replay_decision
+    # never ran, so that refusal could not happen here.
+    transport = FakeTransport(_ok_response())
+    desc = _descriptor(effect="delete")
+    args = {"message_id": "m1"}
+    record = record_attempt(
+        operation_id=desc["operation_id"],
+        args_fingerprint=args_fingerprint(args),
+        idempotency_key="k1",
+        outcome=ATTEMPT_UNKNOWN,
+    )
+    outcome = execute(
+        desc,
+        _handle(),
+        transport,
+        **_kw(),
+        request_args=args,
+        request_idempotency_key="k1",
+        attempt_record=record,
+    )
+    assert outcome.error is not None
+    assert outcome.error["error_class"] == "conflict"
+    assert len(transport.calls) == 0
+
+
+def test_delete_asserted_idempotent_by_the_caller_is_still_allowed() -> None:
+    # Gating delete does not forbid it: L07's explicit idempotency assertion is
+    # what allows the replay, which is exactly what gating makes reachable.
+    transport = FakeTransport(_ok_response())
+    desc = _descriptor(effect="delete")
+    args = {"message_id": "m1"}
+    record = record_attempt(
+        operation_id=desc["operation_id"],
+        args_fingerprint=args_fingerprint(args),
+        idempotency_key="k1",
+        outcome=ATTEMPT_UNKNOWN,
+        idempotent=True,
+    )
+    outcome = execute(
+        desc,
+        _handle(),
+        transport,
+        **_kw(),
+        request_args=args,
+        request_idempotency_key="k1",
+        attempt_record=record,
+    )
+    assert outcome.ok
+    assert len(transport.calls) == 1
+
+
+# =============================================================================
+# Regression: a paging walk carries its BASE args on every page (defect 4)
+# =============================================================================
+def test_pagewalk_carries_base_args_on_every_page() -> None:
+    transport = FakeTransport(
+        [
+            _ok_response(next_cursor="c1"),
+            _ok_response(next_cursor="c2"),
+            _ok_response(next_cursor=None),
+        ]
+    )
+    base = {"folder": "Inbox", "unread_only": True}
+    walk = PageWalk(
+        descriptor=_descriptor(),
+        handle=_handle(),
+        transport=transport,
+        clock=lambda: _T0,
+        offered_mode="oauth_user",
+        permitted=declare_permitted_modes(("oauth_user",)),
+        layers=LayerCeilings(),
+        governance_scope="tools",
+        governance_item="messages.list",
+        base_args=base,
+    )
+    while not walk.done:
+        advance_page(walk)
+    assert walk.pages == 3
+    sent = [c["request_args"] for c in transport.calls]
+    assert sent == [
+        {"folder": "Inbox", "unread_only": True, "cursor": None},
+        {"folder": "Inbox", "unread_only": True, "cursor": "c1"},
+        {"folder": "Inbox", "unread_only": True, "cursor": "c2"},
+    ]
+    # Page 2+ fingerprints as the SAME query as page 1 modulo its cursor, which
+    # is what L07 attribution compares. Dropping the filters changed the query.
+    assert all(args["folder"] == "Inbox" for args in sent)
+
+
+def test_pagewalk_base_args_are_not_mutated_by_the_walk() -> None:
+    transport = FakeTransport([_ok_response(next_cursor="c1"), _ok_response(next_cursor=None)])
+    base = {"folder": "Inbox"}
+    walk = PageWalk(
+        descriptor=_descriptor(),
+        handle=_handle(),
+        transport=transport,
+        clock=lambda: _T0,
+        offered_mode="oauth_user",
+        permitted=declare_permitted_modes(("oauth_user",)),
+        layers=LayerCeilings(),
+        governance_scope="tools",
+        governance_item="messages.list",
+        base_args=base,
+    )
+    while not walk.done:
+        advance_page(walk)
+    assert base == {"folder": "Inbox"}  # no cursor leaked into the caller's dict
+
+
+# =============================================================================
+# Regression: a 412 never fabricates a precondition (defect 5)
+# =============================================================================
+def test_412_with_no_reported_precondition_reports_condition_unknown() -> None:
+    transport = FakeTransport(TransportResponse(http_status=412, preconditions=(), etag=None))
+    outcome = execute(
+        _descriptor(effect="write"), _handle(requested=("mail.send",)), transport, **_kw()
+    )
+    assert outcome.precondition is not None
+    # Empty stays empty: no If-Match invented on the provider's behalf.
+    assert outcome.precondition.preconditions == ()
+    assert outcome.precondition.condition_unknown is True
+    assert outcome.precondition.server_etag is None
+    assert "If-Match" not in outcome.precondition.error["detail"]
+    # The caller is told to read back, since nothing here says what failed.
+    assert "read the resource back" in outcome.precondition.error["detail"]
+    assert outcome.precondition.recorded_outcome == ATTEMPT_FAILED_NOT_APPLIED
+
+
+def test_412_with_a_reported_precondition_is_not_condition_unknown() -> None:
+    transport = FakeTransport(
+        TransportResponse(http_status=412, preconditions=("If-Match",), etag='W/"v9"')
+    )
+    outcome = execute(
+        _descriptor(effect="write"), _handle(requested=("mail.send",)), transport, **_kw()
+    )
+    assert outcome.precondition is not None
+    assert outcome.precondition.preconditions == ("If-Match",)
+    assert outcome.precondition.condition_unknown is False
+    assert outcome.precondition.server_etag == 'W/"v9"'
+
+
+def test_412_with_an_etag_but_no_precondition_name_is_not_unknown() -> None:
+    # An ETag IS something to re-derive against, so the condition is not unknown
+    # -- but the name is still not fabricated.
+    transport = FakeTransport(TransportResponse(http_status=412, preconditions=(), etag='W/"v9"'))
+    outcome = execute(
+        _descriptor(effect="write"), _handle(requested=("mail.send",)), transport, **_kw()
+    )
+    assert outcome.precondition is not None
+    assert outcome.precondition.preconditions == ()
+    assert outcome.precondition.condition_unknown is False
+    assert outcome.precondition.server_etag == 'W/"v9"'
+    assert "If-Match" not in outcome.precondition.error["detail"]
+
+
+# =============================================================================
+# Regression: the PRODUCTION composition is real (defect 6)
+# =============================================================================
+class StubVault:
+    """A stand-in for the vault's READ side (``SecretVault.get``).
+
+    Injected so this test needs no encrypted store on disk. It records the names
+    it was asked for, which is what proves the transport resolves the BINDING's
+    recorded ``secret_ref`` name rather than some name of its own.
+    """
+
+    def __init__(self, entries: dict[str, str]):
+        self._entries = entries
+        self.asked: list[str] = []
+
+    def get(self, name: str):
+        self.asked.append(name)
+        raw = self._entries.get(name)
+        return None if raw is None else SecretValue(raw)
+
+
+def _locator(**kwargs) -> HttpRequest:
+    """A stand-in for the VENDOR-owned request shaper."""
+
+    return HttpRequest(
+        method="GET",
+        url="https://graph.example.invalid/v1.0/me/messages",
+        headers={"Accept": "application/json"},
+    )
+
+
+def test_the_module_no_longer_claims_it_performs_no_network() -> None:
+    # The claim was false once a real transport existed, and a delivery that
+    # misdescribes itself is the defect, not the docstring wording.
+    doc = executor_mod.__doc__ or ""
+    assert "no real network" not in doc
+    assert "no network" not in doc
+    # And it points at where the network actually happens.
+    assert "production" in doc
+
+
+def test_production_transport_resolves_the_secret_through_the_vault() -> None:
+    secret_ref = binding_secret_ref("outlook")
+    vault = StubVault({secret_ref["name"]: "tok-live"})
+    sent: list[HttpRequest] = []
+
+    def _send(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
+        sent.append(request)
+        return HttpReply(status=200, headers={}, body=b"{}")
+
+    transport = build_production_transport(
+        secret_ref=secret_ref,
+        vault=vault,
+        locator=_locator,
+        http_send=_send,
+    )
+    outcome = execute(_descriptor(), _handle(), transport, **_kw())
+    assert outcome.ok
+    # The vault was asked for the BINDING's recorded entry name -- the existing
+    # CONNECTIONS_<SLUG>_BINDING_SECRET family, not a new naming scheme.
+    assert vault.asked == ["CONNECTIONS_OUTLOOK_BINDING_SECRET"]
+    # The resolved secret reached the wire as a bearer credential, and the
+    # vendor locator never had to see it.
+    assert sent[0].headers["Authorization"] == "Bearer tok-live"
+    assert "Authorization" not in _locator().headers
+
+
+def test_production_transport_uses_the_existing_secret_vault_mechanism() -> None:
+    # Not a new vault: the real SecretVault satisfies the injection protocol the
+    # composition declares, and SecretValue is the existing opaque wrapper.
+    from kiro_crew.secrets import SecretVault
+
+    assert hasattr(SecretVault, "get")
+    assert isinstance(SecretValue("x"), SecretValue)
+    assert repr(SecretValue("x")) == "SecretValue(****)"
+    ref = binding_secret_ref("outlook")
+    assert resolve_binding_secret(ref, vault=StubVault({ref["name"]: "v"})).reveal() == "v"
+
+
+def test_production_transport_missing_secret_is_a_typed_auth_failure() -> None:
+    secret_ref = binding_secret_ref("outlook")
+    vault = StubVault({})  # nothing stored
+
+    def _send(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
+        raise AssertionError("must not send without a credential")
+
+    transport = build_production_transport(
+        secret_ref=secret_ref, vault=vault, locator=_locator, http_send=_send
+    )
+    outcome = execute(_descriptor(), _handle(), transport, **_kw())
+    assert outcome.error is not None
+    assert outcome.error["error_class"] == "auth"
+    # The vault entry name is not echoed into the caller-visible detail.
+    assert secret_ref["name"] not in outcome.error["detail"]
+
+
+def test_resolve_binding_secret_refuses_a_foreign_backend() -> None:
+    ref = dict(binding_secret_ref("outlook"))
+    ref["backend"] = "somewhere-else"
+    with pytest.raises(SecretResolutionError):
+        resolve_binding_secret(ref, vault=StubVault({ref["name"]: "v"}))
+
+
+def test_production_transport_maps_a_412_to_the_preconditions_it_asserted() -> None:
+    secret_ref = binding_secret_ref("outlook")
+    vault = StubVault({secret_ref["name"]: "tok"})
+
+    def _if_match_locator(**kwargs) -> HttpRequest:
+        return HttpRequest(
+            method="PATCH",
+            url="https://graph.example.invalid/v1.0/me/messages/m1",
+            headers={"If-Match": 'W/"v1"'},
+            body=b"{}",
+        )
+
+    def _send(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
+        return HttpReply(status=412, headers={"ETag": 'W/"v2"'}, body=b"")
+
+    transport = build_production_transport(
+        secret_ref=secret_ref, vault=vault, locator=_if_match_locator, http_send=_send
+    )
+    outcome = execute(
+        _descriptor(effect="write"), _handle(requested=("mail.send",)), transport, **_kw()
+    )
+    assert outcome.precondition is not None
+    # Reported because the REQUEST sent it -- not because 412 defaults to it.
+    assert outcome.precondition.preconditions == ("If-Match",)
+    assert outcome.precondition.server_etag == 'W/"v2"'
+    assert outcome.precondition.condition_unknown is False
+
+
+def test_production_transport_412_without_an_asserted_precondition_is_unknown() -> None:
+    secret_ref = binding_secret_ref("outlook")
+    vault = StubVault({secret_ref["name"]: "tok"})
+
+    def _send(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
+        return HttpReply(status=412, headers={}, body=b"")
+
+    transport = build_production_transport(
+        secret_ref=secret_ref, vault=vault, locator=_locator, http_send=_send
+    )
+    outcome = execute(
+        _descriptor(effect="write"), _handle(requested=("mail.send",)), transport, **_kw()
+    )
+    assert outcome.precondition is not None
+    assert outcome.precondition.preconditions == ()
+    assert outcome.precondition.condition_unknown is True
+
+
+def test_production_transport_refuses_a_non_https_url_without_sending() -> None:
+    secret_ref = binding_secret_ref("outlook")
+    vault = StubVault({secret_ref["name"]: "tok"})
+
+    def _plain_http_locator(**kwargs) -> HttpRequest:
+        return HttpRequest(method="GET", url="http://graph.example.invalid/v1.0/me")
+
+    transport = build_production_transport(
+        secret_ref=secret_ref, vault=vault, locator=_plain_http_locator
+    )
+    outcome = execute(_descriptor(), _handle(), transport, **_kw())
+    # urllib_http_send refuses before opening a socket; the executor sees input.
+    assert outcome.error is not None
+    assert outcome.error["error_class"] == "input"
+
+
+def test_production_module_performs_no_network_at_import_time() -> None:
+    # A composition that dialled out on import could not be imported by a test
+    # suite at all. Pinned structurally: the module exposes only factories, and
+    # importing it (already done at the top of this file) constructed no client.
+    assert production_mod.PRODUCTION_SCHEMA_VERSION >= 1
+    assert callable(production_mod.build_production_transport)
+    assert callable(production_mod.urllib_http_send)
+    assert production_mod.neutral_decode(HttpReply(status=200)) == {
+        "status": "ok",
+        "next_cursor": None,
+    }
+
+
+def test_production_symbols_are_reachable_on_control_plane_only() -> None:
+    import kiro_crew.connections as connections
+
+    for name in (
+        "PRODUCTION_SCHEMA_VERSION",
+        "HttpReply",
+        "HttpRequest",
+        "SecretResolutionError",
+        "SecretStore",
+        "build_production_transport",
+        "resolve_binding_secret",
+        "urllib_http_send",
+    ):
+        assert hasattr(cp, name), name
+        assert name in cp.__all__, name
+        assert name not in connections.__all__, f"{name} leaked into connections.__all__"

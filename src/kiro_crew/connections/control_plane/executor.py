@@ -22,11 +22,27 @@ handle dict. Reading them off the handle would be the "validate then use the
 unvalidated value" hole L08 exists to close; a test proves that mutating the
 handle's ``service_id`` does not change where the executor routes.
 
-**Server clock, not the caller's word.** Expiry and precondition judgments never
-trust a non-finite ``now``: :func:`ensure_usable` already refuses a ``NaN`` /
-``inf`` clock (L08 turned a car over on exactly that), and this module refuses a
-non-finite ``now`` up front too, so a bad clock cannot slip an expired handle or
-a stale precondition through here.
+Resolving the trusted view is not enough on its own, though: the CALLER also
+hands in an ``offered_mode`` and a ``descriptor``, and both make claims about the
+same two axes the view already decides. So before any permit decision runs, the
+executor CROSS-CHECKS them against the view (:func:`_authorize` step 1b) and
+refuses an ``auth`` error when either disagrees. Without that check a handle
+issued for ``oauth_user`` / ``outlook`` would let a caller offer
+``service_to_service`` (permitted purely because the descriptor happens to
+declare both modes) or present a descriptor naming ``github`` -- validating one
+value and then authorizing a different one, which is the same hole one layer up.
+
+**Server clock, not the caller's word.** Time is derived from a SERVER-SIDE
+clock, not from whatever instant the caller asserts: :func:`execute` and
+:class:`PageWalk` take a ``clock`` callable (defaulting to :func:`time.time`) and
+call it FRESH on every call and on every page, so expiry is re-judged against the
+real current instant each time rather than once at the top of a walk. A finiteness
+check stays in front of every time-sensitive judgment (:func:`ensure_usable`
+refuses a ``NaN`` / ``inf`` clock and L08 turned a car over on exactly that), but
+finiteness alone never made a caller-supplied instant trustworthy -- a PAST
+timestamp is perfectly finite and would keep an expired handle alive for the
+length of a paging walk. The explicit ``now`` argument survives ONLY as a
+deterministic-test override; leave it unset and the clock decides.
 
 **HTTP 412 is preserved, not flattened.** A precondition-failed response
 (``If-Match`` / ``If-Unmodified-Since`` ETag mismatch) is NOT collapsed into a
@@ -41,8 +57,18 @@ correct shape is 412 -> preserve the structured signal -> readback + re-derive
 the precondition -> only then retry. The executor deliberately does NOT
 auto-reissue; it hands the structured signal back and stops.
 
-**Boundaries.** Pure decision + dispatch glue, no real network. The transport is
-an injected callable (an in-memory fake in tests). MS's own 412 / readback /
+When the transport reports NO failed precondition and no ETag, the executor does
+NOT fabricate one: it reports ``preconditions == ()`` and sets
+``condition_unknown`` (see :class:`PreconditionFailure`). Naming ``If-Match`` on
+a response that never mentioned it would invent readback semantics that belong to
+the vendor owner, and would tell the caller to re-derive a condition it may never
+have asserted.
+
+**Boundaries.** Decision + dispatch glue. The transport is an injected callable
+-- an in-memory fake in every unit test, and the REAL composition (vault-resolved
+secret custody plus a stdlib HTTP client) in
+:mod:`kiro_crew.connections.control_plane.production`, which is what makes this
+an executor rather than a decision table. MS's own 412 / readback /
 baseline / fresh / locator revalidation semantics live under
 ``vendors/microsoft/**`` and are that owner's -- this module only preserves the
 shared structured signal MS consumes; it changes nothing there. It also does not
@@ -54,6 +80,7 @@ intersection and the handle scope narrowing do NOT substitute for that
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Tuple
 
@@ -99,10 +126,19 @@ EXECUTOR_SCHEMA_VERSION = 1
 
 # --- effects that are non-idempotent by default (the write-replay gate runs) --
 #: Effects whose ``unknown``-outcome replay must be gated by L07. Read from the
-#: descriptor's ``effect`` -- never inferred from an operation's name. ``read``
-#: and ``delete`` are naturally idempotent and are not gated here (L07 itself
-#: still refuses to widen). Mirrors L07's own non-idempotent set.
-_NON_IDEMPOTENT_EFFECTS = frozenset({"write", "share", "external_send", "admin", "billable"})
+#: descriptor's ``effect`` -- never inferred from an operation's name.
+#:
+#: ``delete`` IS in this set. L07 deliberately refuses to treat a delete as
+#: idempotent (see ``writes._is_replay_safe_after_unknown``): a second DELETE can
+#: land on a resource that was RECREATED in the interim -- deleting someone
+#: else's new resource -- and a given API's delete may not be idempotent at all.
+#: Excluding it here would have re-opened exactly the hole L07 closed, one layer
+#: up: the gate would never run, so the explicit ``idempotent=True`` assertion
+#: L07 requires could not be consulted. ``read`` is the only effect left ungated,
+#: because it applies no effect to replay.
+_NON_IDEMPOTENT_EFFECTS = frozenset(
+    {"write", "delete", "share", "external_send", "admin", "billable"}
+)
 
 
 # --- the structured transport outcome the injected transport returns ----------
@@ -151,18 +187,26 @@ class PreconditionFailure:
     precondition against ``server_etag``, and only THEN retry. MS owns its own
     baseline / fresh / locator revalidation on top of this signal.
 
-    ``preconditions`` -- the failed precondition names. ``server_etag`` -- the
-    provider's current ETag to re-derive against (``None`` if the provider sent
-    none). ``recorded_outcome`` -- always ``failed_not_applied``. ``error`` -- the
-    typed L01 ``conflict`` :class:`OperationError` (redacted detail) for a caller
-    that only wants the flat class; the structured fields above are what makes the
-    signal discriminable.
+    ``preconditions`` -- the failed precondition names EXACTLY as the transport
+    reported them, which may legitimately be the EMPTY tuple: a provider that
+    returns a bare 412 does not say which condition failed, and naming
+    ``If-Match`` anyway would invent a readback contract the vendor owner owns.
+    ``condition_unknown`` -- True precisely when the transport named no
+    precondition AND sent no ETag, i.e. nothing here identifies what failed, so
+    the caller must read the resource back to find out rather than re-assert a
+    guess. ``server_etag`` -- the provider's current ETag to re-derive against
+    (``None`` if the provider sent none). ``recorded_outcome`` -- always
+    ``failed_not_applied``. ``error`` -- the typed L01 ``conflict``
+    :class:`OperationError` (redacted detail) for a caller that only wants the
+    flat class; the structured fields above are what makes the signal
+    discriminable.
     """
 
     preconditions: Tuple[str, ...]
     server_etag: Optional[str]
     error: OperationError
     recorded_outcome: str = ATTEMPT_FAILED_NOT_APPLIED
+    condition_unknown: bool = False
 
 
 # --- the executor's own result envelope ---------------------------------------
@@ -200,6 +244,13 @@ class ExecutionOutcome:
 #: cannot be pointed elsewhere by a mutated handle.
 Transport = Callable[..., TransportResponse]
 
+#: A SERVER-SIDE clock: called with no arguments, returns POSIX seconds. This is
+#: how the executor learns the time -- it is called fresh per :func:`execute` and
+#: per :class:`PageWalk` page, so no caller-asserted instant is carried forward
+#: across a walk and expiry is re-judged every time. Defaults to
+#: :func:`time.time`; a deterministic test injects its own.
+Clock = Callable[[], float]
+
 
 def _finite(now: float) -> bool:
     return isinstance(now, (int, float)) and math.isfinite(now)
@@ -215,14 +266,18 @@ def _classify_status(status: int, detail: str) -> Optional[ErrorClass]:
 
     if 200 <= status < 300:
         return None
-    return {
+    # Annotated so the table's values narrow to ErrorClass rather than to str;
+    # without it mypy reads the dict as dict[int, str] and rejects the return.
+    table: dict[int, ErrorClass] = {
         400: "input",
         401: "auth",
         403: "forbidden",
         404: "not_found",
         409: "conflict",
         429: "throttle",
-    }.get(status, "temporary" if status >= 500 else "input")
+    }
+    fallback: ErrorClass = "temporary" if status >= 500 else "input"
+    return table.get(status, fallback)
 
 
 def classify_error(response: TransportResponse) -> Optional[OperationError]:
@@ -263,6 +318,13 @@ def _authorize(
 ) -> Tuple[Optional[TrustedHandleView], Optional[OperationError], Optional[ReplayDecision]]:
     """Run the four judgments IN ORDER. Returns as soon as one denies.
 
+    Between step 1 (the trusted view) and step 2 (the permit) sits step 1b: the
+    caller's ``offered_mode`` and the descriptor's ``service_id`` are compared to
+    the view and a disagreement is refused. That check has to be here, not in
+    :func:`permit_operation` -- the permit only sees the descriptor and the
+    policy, never the handle -- and it has to be before step 2, so a mismatched
+    mode never reaches a decision that would happily allow it.
+
     On allow: ``(view, None, replay_or_None)``. On deny: ``(view_or_None,
     error, None)`` -- ``view`` is set once step 1 resolved it, so an audit sees
     the trusted axes even on a later deny. The transport is the caller's job and
@@ -284,6 +346,45 @@ def _authorize(
         view = ensure_usable(handle, now=now)
     except (HandleExpiredError, HandleNotIssuedError, HandleTamperedError, HandleScopeError) as exc:
         return None, exc.error, None
+
+    # (1b) The caller's own claims must AGREE with the trusted view before any
+    # permit decision is made. permit_operation judges the mode the CALLER
+    # offered against the descriptor and the policy -- it has no idea which mode
+    # this handle was actually issued for -- and the descriptor names the service
+    # the operation is for. Both are caller-supplied, so validating the handle and
+    # then authorizing a different mode / service would be the same "validate,
+    # then use the unvalidated value" hole one layer up:
+    #
+    #   * a handle issued for oauth_user + an offered service_to_service passes
+    #     permit_operation whenever the descriptor declares BOTH modes, and would
+    #     then be emitted under the handle's oauth_user credential;
+    #   * a descriptor naming github against an outlook handle would be
+    #     authorized as a github operation and routed at outlook.
+    #
+    # Refuse both, before the transport exists as a possibility.
+    if offered_mode != view.credential_mode:
+        return (
+            view,
+            operation_error(
+                "auth",
+                f"offered credential mode '{offered_mode}' does not match the mode "
+                f"this handle was issued for ('{view.credential_mode}'); the "
+                "trusted view decides which credential authenticates the call",
+            ),
+            None,
+        )
+    if descriptor["service_id"] != view.service_id:
+        return (
+            view,
+            operation_error(
+                "auth",
+                f"operation '{descriptor['operation_id']}' names service "
+                f"'{descriptor['service_id']}' but this handle was issued for "
+                f"'{view.service_id}'; a handle is never a basis to act on "
+                "another service",
+            ),
+            None,
+        )
 
     # (2) Credential-mode permit (deny-by-default, unstated == denied).
     auth_error = permit_operation(descriptor, offered_mode, permitted)
@@ -321,7 +422,8 @@ def execute(
     handle: DerivedHandle,
     transport: Transport,
     *,
-    now: float,
+    now: Optional[float] = None,
+    clock: Clock = time.time,
     offered_mode: CredentialMode,
     permitted: PermittedModes,
     layers: LayerCeilings,
@@ -333,10 +435,18 @@ def execute(
 ) -> ExecutionOutcome:
     """Authorize, then (only if authorized) emit ONE call through ``transport``.
 
-    The gate chain (handle view -> credential mode -> governance -> write replay)
-    runs FIRST. If any gate denies, this returns an :class:`ExecutionOutcome`
-    carrying the typed error and the transport is NEVER called. Routing uses the
-    TRUSTED view's ``service_id`` / ``credential_mode``, not the handle's.
+    The gate chain (handle view -> caller/view agreement -> credential mode ->
+    governance -> write replay) runs FIRST. If any gate denies, this returns an
+    :class:`ExecutionOutcome` carrying the typed error and the transport is NEVER
+    called. Routing uses the TRUSTED view's ``service_id`` / ``credential_mode``,
+    not the handle's, and the caller's own claims about those two axes must agree
+    with the view (see :func:`_authorize` step 1b).
+
+    **Time comes from ``clock``, called fresh on every invocation** -- a
+    server-side reading, not an instant the caller asserted and can hold still.
+    ``now`` overrides it and exists for deterministic tests ONLY; unset (the
+    default) is the production shape, and it is what makes a long paging walk
+    re-judge expiry per page instead of once.
 
     A ``reuse`` replay verdict hands back the recorded result without calling the
     transport. On a real emit, an HTTP 412 is returned as a structured
@@ -345,10 +455,13 @@ def execute(
     """
 
     args: Mapping[str, Any] = request_args or {}
+    # Derive the instant HERE, per call, from the clock -- unless a test pinned
+    # one. A non-finite reading (from either source) is refused by _authorize.
+    resolved_now = clock() if now is None else now
     view, error, replay = _authorize(
         descriptor,
         handle,
-        now=now,
+        now=resolved_now,
         offered_mode=offered_mode,
         permitted=permitted,
         layers=layers,
@@ -390,20 +503,45 @@ def execute(
 
 
 def _precondition_failure(response: TransportResponse) -> PreconditionFailure:
-    """Build the structured 412 signal from a transport response."""
+    """Build the structured 412 signal from a transport response.
 
-    preconditions = tuple(response.preconditions) or ("If-Match",)
-    error = operation_error(
-        "conflict",
-        "precondition failed: the asserted precondition(s) "
-        + ", ".join(preconditions)
-        + " do not hold; the write did not apply -- re-read and re-derive the "
-        "precondition before any retry",
-    )
+    Reports what the transport ACTUALLY said. When it named no failed
+    precondition, ``preconditions`` stays empty rather than defaulting to
+    ``("If-Match",)``: fabricating a name asserts a readback contract this module
+    does not own (the vendor owner does) and would point the caller at a
+    condition it may never have sent. With no name AND no ETag there is nothing
+    to re-derive against at all, so ``condition_unknown`` is set and the detail
+    says the caller must read the resource back.
+    """
+
+    preconditions = tuple(response.preconditions)
+    condition_unknown = not preconditions and response.etag is None
+    if preconditions:
+        detail = (
+            "precondition failed: the asserted precondition(s) "
+            + ", ".join(preconditions)
+            + " do not hold; the write did not apply -- re-read and re-derive the "
+            "precondition before any retry"
+        )
+    elif condition_unknown:
+        detail = (
+            "precondition failed: the provider named no failed precondition and "
+            "sent no ETag, so WHICH condition failed is not known here; the write "
+            "did not apply -- read the resource back to establish the current "
+            "state before any retry"
+        )
+    else:
+        detail = (
+            "precondition failed: the provider named no failed precondition; the "
+            "write did not apply -- re-derive against the returned ETag and "
+            "re-read before any retry"
+        )
+    error = operation_error("conflict", detail)
     return PreconditionFailure(
         preconditions=preconditions,
         server_etag=response.etag,
         error=error,
+        condition_unknown=condition_unknown,
     )
 
 
@@ -418,6 +556,21 @@ class PageWalk:
     ``None``, and refuses to loop forever on a repeated cursor -- so it neither
     drops nor duplicates a page and always terminates.
 
+    **The walk holds a ``clock``, not an instant.** It stores no frozen ``now``:
+    every page re-reads ``clock()`` and re-runs the gate chain against that fresh
+    reading, so a handle that expires between page 2 and page 3 stops the walk at
+    page 3. A cached instant would have made the whole walk -- however long -- run
+    on the expiry judgment made at page 1, and finiteness checks cannot notice
+    that, because a stale instant is a perfectly finite number. A deterministic
+    test injects its own callable (e.g. one that advances on each call).
+
+    **Every page carries the ORIGINAL request args.** ``base_args`` holds the
+    filters/selectors the walk was opened with, and each page sends
+    ``{**base_args, "cursor": cursor}``. Sending the cursor alone would silently
+    drop the filter set from page 2 onward -- a different query than page 1 --
+    and would change the request's ``args_fingerprint``, so L07's attribution
+    would no longer recognize a retry of a page as the same logical request.
+
     ``done`` is True once the last page returned no ``next_cursor`` (or a gate
     denied / a transport error stopped the walk). ``pages`` counts the pages
     successfully fetched.
@@ -426,12 +579,13 @@ class PageWalk:
     descriptor: OperationDescriptor
     handle: DerivedHandle
     transport: Transport
-    now: float
     offered_mode: CredentialMode
     permitted: PermittedModes
     layers: LayerCeilings
     governance_scope: str
     governance_item: str
+    clock: Clock = time.time
+    base_args: Mapping[str, Any] = field(default_factory=dict)
     _cursor: Optional[str] = None
     done: bool = False
     pages: int = 0
@@ -460,13 +614,17 @@ class PageWalk:
             self.descriptor,
             self.handle,
             self.transport,
-            now=self.now,
+            # No `now`: execute() reads self.clock FRESH for this page, so expiry
+            # is re-judged here rather than inherited from page 1.
+            clock=self.clock,
             offered_mode=self.offered_mode,
             permitted=self.permitted,
             layers=self.layers,
             governance_scope=self.governance_scope,
             governance_item=self.governance_item,
-            request_args={"cursor": self._cursor},
+            # The cursor is appended to the ORIGINAL args, never sent instead of
+            # them; it wins on a key collision because it is this page's cursor.
+            request_args={**dict(self.base_args), "cursor": self._cursor},
             request_idempotency_key="",
         )
 
@@ -492,6 +650,7 @@ def advance_page(walk: PageWalk) -> ExecutionOutcome:
 
 __all__ = [
     "EXECUTOR_SCHEMA_VERSION",
+    "Clock",
     "ExecutionOutcome",
     "PageWalk",
     "PreconditionFailure",
