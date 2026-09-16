@@ -1236,3 +1236,65 @@ subdirectory is this slice's to make. The name is `vendors`, not `providers`,
 deliberately: `src/kiro_crew/providers/` already exists and means LLM providers,
 so a `connections/providers/` here would be one word for two different things in
 one package tree.
+
+### Five-layer governance intersection + approval binding (W01 · L06)
+
+`control_plane/policy.py` answers one question for a connector operation: *given
+every governance layer with an opinion, is this scoped item permitted, and does
+an approval on record still apply to the exact parameters it was granted for?*
+It composes **five** layers:
+
+    platform ∩ workspace/profile ∩ session/App/job ∩ connection ∩ vendor
+
+**It sits ON TOP of `platform.governance.resolve()` and changes
+`platform/governance.py` by not one character.** `Decision.layer` there is a
+two-layer vocabulary today (`policy | profile | both | default`) and `resolve`
+composes exactly those two (an enterprise ceiling ∩ a per-surface profile) under
+Rule 2. Widening that closed set to name three more layers would edit a module
+outside this stream's ownership, so L06 does not: it *consumes the platform
+primitives read-only* — the one `SCOPE_CATALOG`, `resolve`, `GovernanceCeiling`,
+`Profile`, `Decision` — and layers the extra narrowing on top of them.
+
+- **Intersection only narrows — `resolve_layers()`.** The platform ∩ workspace
+  pair is delegated verbatim to `resolve(ceiling, profile, scope, item)`; the
+  remaining three layers are each an ordinary `GovernanceCeiling`, queried
+  through the SAME primitive with no profile (`resolve(layer_ceiling, None, …)`,
+  which returns just that one layer's answer). The effective decision is the AND
+  of all five layer permits, so the result is ⊆ every individual layer's
+  permitted set and, over the range `resolve()` itself covers, ⊆ its answer. AND
+  is monotone non-increasing: adding a layer can only shrink the permitted set,
+  never grow it, and no layer can turn another layer's deny into a permit. The
+  first layer that denies is returned, so `Decision.layer` / `reason` name the
+  deciding layer.
+- **Ceilings are inputs, never hardcoded — `LayerCeilings`.** Each layer's
+  ceiling/profile is a parameter (`platform`, `workspace`, `session`,
+  `connection`, `vendor`); a layer with nothing to say passes `None` (ungoverned
+  = unrestricted = contributes a permit, exactly `resolve`'s own `None`
+  semantics). The module hardcodes NO per-layer legal-scope-subset table — and
+  deliberately so: neither the connector-capability manifest nor this document
+  defines which scopes a "connection" or "vendor" layer may govern, so L06 does
+  not invent one. It intersects whatever the caller supplies.
+- **Deny-by-default — `decide()`.** An unknown `scope` (not a live
+  `SCOPE_CATALOG` member) is refused before any layer is consulted, and an
+  unknown layer name is outside the `LAYERS` closed set. A misspelled scope or an
+  unlisted layer gets a typed denial, not a silent open door.
+- **Approval-parameter binding — `Approval` / `approval_applies()`.** An approval
+  is granted for a specific parameter set, bound at grant time to a canonical
+  (order-independent, value-sensitive) fingerprint of those parameters. Reusing
+  it for a call whose parameters differ — an added key, a removed key, a changed
+  value — is refused: the approval on record does not permit those parameters and
+  is NOT reused. This closes the "approve once, then swap the arguments" replay.
+- **Typed refusals.** Every refusal is an L01 `OperationError` built with
+  `operation_error(...)`, which redacts its `detail` unconditionally; L06
+  hand-assembles no error string that would bypass that redaction.
+
+**No new `connection.*` / `provider.*` scope is registered.** Whether the
+connector campaign gets its own governed scope family is still an open decision
+and is not L06's to make: this module reuses the existing `SCOPE_CATALOG` rows
+and adds none.
+
+Exports for these symbols (`LAYERS`, `POLICY_SCHEMA_VERSION`, `Approval`,
+`LayerCeilings`, `LayerName`, `approval_applies`, `decide`, `resolve_layers`)
+are added ONLY to `control_plane/__init__.py`; they are NOT re-exported as
+top-level `kiro_crew.connections` aliases — a zero-consumer second spelling is a
+rename hazard, not a convenience.
