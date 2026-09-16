@@ -1432,3 +1432,62 @@ Like every other symbol on this seam, the L07 exports live on the canonical
 re-exported as top-level `kiro_crew.connections` aliases (a second spelling with
 zero consumers is a rename hazard, not a convenience).
 
+### The executor wires the four judgments together (L09)
+
+L01..L08 delivered four decision primitives; L09 (`control_plane/executor.py`)
+is the first real CALLER that runs them in the one order a dispatch must, BEFORE
+any transport call is emitted:
+
+    ensure_usable (trusted handle view)
+      → permit_operation (credential-mode permit)
+        → decide (five-layer governance intersection)
+          → replay_decision (write-replay gate)
+            → transport
+
+- **A denied gate emits ZERO calls.** Any judgment that rejects returns a typed
+  `OperationError` in an `ExecutionOutcome` and the transport is **never**
+  called — "emit first, decide after" would make all four upstream slices dead
+  code. This is pinned by a test using a call-counting in-memory fake transport
+  asserting `calls == 0` on every deny path (undeclared / unpermitted mode,
+  unknown governance scope, tampered / expired handle, non-finite clock, and an
+  `unknown`-outcome non-idempotent write).
+- **Routing trusts the VIEW, never the handle.** `service_id` and
+  `credential_mode` that reach the transport are read only off the
+  `TrustedHandleView` `ensure_usable` returns from its issuance record — never
+  off the mutable `DerivedHandle`. A test mutates the handle's `service_id` and
+  asserts the executor never routes to the forged service (the tamper is refused
+  outright, so the call is not even emitted).
+- **Server clock, not the caller's word.** A non-finite `now` (`NaN` / `±inf`)
+  is refused up front, so a bad clock cannot slip an expired handle or a stale
+  precondition through — the same fail-closed direction L08 enforces.
+- **HTTP 412 is preserved, not flattened.** A precondition-failed response is
+  returned as a structured `PreconditionFailure` carrying the failed
+  precondition names and the server's current ETag, so the CALLER can decide to
+  re-read and re-derive rather than blind-retry. It records the write's outcome
+  as L07's `failed_not_applied` (the write provably did not land — the branch
+  `replay_decision` *allows*), but "allowed to replay" is **not** "safe to
+  replay as-is": a 412 tells you only that your asserted precondition is false,
+  never the server's current state. The correct shape is 412 → preserve the
+  structured signal → readback + re-derive the precondition → only then retry.
+  The executor deliberately does NOT auto-reissue. **MS owns its own 412 /
+  readback / baseline / fresh / locator revalidation under `vendors/microsoft/`;
+  L09 changes nothing there and only preserves the shared signal MS consumes.**
+- **Three surfaces for two downstreams.** The outer interface covers `execute`
+  (dispatch), `advance_page` over a `PageWalk` (real cursor pagination — it
+  re-runs the full gate chain per page, advances on the response's
+  `next_cursor`, terminates on `None`, and refuses to loop on a repeated cursor,
+  so it neither drops nor duplicates a page), and `classify_error` (HTTP-status
+  → RUN-01 `ErrorClass`). W02 (GitHub) needs fetch / pagination / error; W05/MS
+  needs the 412 structured signal.
+- **`EXECUTOR_SCHEMA_VERSION`.** A pinnable constant (currently `1`) the two
+  downstreams encode against; a change to the request/response envelope, the
+  transport-callable contract, or the paging / error surface bumps it.
+- **Not a query-ACL substitute.** L06's five-layer intersection and the handle's
+  scope narrowing do **not** replace document- / provider-level query
+  permissions; that is a separately-owned gap and L09 makes no claim to cover it.
+
+Like every other symbol on this seam, the L09 exports live on the canonical
+`kiro_crew.connections.control_plane` subpackage only; they are **not**
+re-exported as top-level `kiro_crew.connections` aliases (a second spelling with
+zero consumers is a rename hazard, not a convenience).
+
