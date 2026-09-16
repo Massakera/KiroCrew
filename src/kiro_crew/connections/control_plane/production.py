@@ -31,7 +31,8 @@ method/URL/headers/body is the VENDOR owner's job (``vendors/microsoft/**``,
 paging, readback and precondition derivation all differ per provider. So a
 :data:`RequestLocator` is INJECTED, and the 2xx -> ``OperationResult`` decode is
 injected too; the neutral default reports no continuation cursor rather than
-guessing one provider's spelling. This module owns custody + wire mechanics and
+guessing one provider's spelling, and hands the body on as RAW BYTES rather than
+inventing a structure for it. This module owns custody + wire mechanics and
 nothing above them.
 
 **No network at import time.** Nothing here opens a socket, constructs a client,
@@ -99,7 +100,14 @@ from kiro_crew.connections.control_plane.operation import (
     CredentialMode,
     OperationDescriptor,
 )
-from kiro_crew.connections.control_plane.result import OperationResult, ResultStatus
+from kiro_crew.connections.control_plane.result import (
+    DEFAULT_MEDIA_TYPE,
+    BytesPayload,
+    OperationPayload,
+    OperationResult,
+    ResultStatus,
+    result_with_payload,
+)
 from kiro_crew.connections.control_plane.writes import ATTEMPT_UNKNOWN
 from kiro_crew.secrets import SecretValue
 
@@ -395,8 +403,16 @@ HttpSend = Callable[..., HttpReply]
 #: docstring).
 RequestLocator = Callable[..., HttpRequest]
 
-#: Maps a 2xx :class:`HttpReply` to the L01 success envelope. VENDOR-OWNED for
-#: anything cursor-shaped; :func:`neutral_decode` is the default.
+#: Maps a 2xx :class:`HttpReply` to the L01 success envelope -- INCLUDING its
+#: ``payload``, which is where the caller's data comes from. VENDOR-OWNED for
+#: anything structured: a decode that knows the provider builds a
+#: :class:`~kiro_crew.connections.control_plane.result.CollectionPayload` (items +
+#: that provider's cursor) or an
+#: :class:`~kiro_crew.connections.control_plane.result.ObjectPayload`, and should
+#: build it with
+#: :func:`~kiro_crew.connections.control_plane.result.result_with_payload` so the
+#: envelope's ``next_cursor`` cannot disagree with the collection's.
+#: :func:`neutral_decode` is the default and carries the body as raw bytes.
 ResultDecode = Callable[..., OperationResult]
 
 
@@ -428,29 +444,37 @@ _CONTENT_CURSOR_UNDETERMINED = "cursor_undetermined"
 class Decoded2xx:
     """A 2xx reading that keeps what :class:`OperationResult` has no room for.
 
-    :class:`~kiro_crew.connections.control_plane.result.OperationResult` is an
-    integrated L01 primitive and is exactly ``{status, next_cursor}`` with
-    ``status`` in ``("ok", "partial")``. Two genuinely different 2xx replies
-    therefore land on the SAME envelope -- a 204 that provably has no content, and
-    a 200 whose body is present but whose continuation this module cannot know --
-    and the second must not be reported with the first's certainty. This wrapper
-    is where the difference survives, and it is also the only reason the body is
-    not thrown away.
+    :class:`~kiro_crew.connections.control_plane.result.OperationResult` carries
+    ``status`` (in ``("ok", "partial")``), ``next_cursor`` and ``payload``. Two
+    genuinely different 2xx replies can still land on the SAME ``status`` -- a 204
+    that provably has no content, and a 200 whose body is present but whose
+    continuation this module cannot know -- and the second must not be reported
+    with the first's certainty. This wrapper is where that difference survives.
 
     ``result`` -- the L01 envelope to hand back (what the transport puts on a
-    :class:`~kiro_crew.connections.control_plane.executor.TransportResponse`).
-    ``http_status`` -- the status it was read from. ``content_kind`` -- one of the
-    four ``_CONTENT_*`` readings above. ``body`` -- the raw bytes, PRESERVED.
-    ``cursor_determined`` -- False when a vendor ``decode`` is required before any
-    claim about completeness can be made; True when the status itself settled it.
+    :class:`~kiro_crew.connections.control_plane.executor.TransportResponse`),
+    including the :data:`~kiro_crew.connections.control_plane.result.OperationPayload`
+    carrying the body. ``http_status`` -- the status it was read from.
+    ``content_kind`` -- one of the four ``_CONTENT_*`` readings above. ``body`` --
+    the raw bytes, PRESERVED. ``cursor_determined`` -- False when a vendor
+    ``decode`` is required before any claim about completeness can be made; True
+    when the status itself settled it.
 
-    NAMED GAP (a dependency on the L01 primitive, deliberately not fixed here):
-    a caller that only ever sees ``result`` still cannot tell ``no_content`` from
-    ``cursor_undetermined``, because there is no field in ``OperationResult`` that
-    expresses "content present, continuation unknown". Closing that properly means
-    adding one (a ``cursor_state`` / ``content_kind`` member) to ``result.py``,
-    which is an integrated primitive this repair may not edit. Until then the
-    honest reading is carried HERE and the envelope is downgraded to ``partial``
+    ``body`` and ``result["payload"].data`` hold the same bytes on the two
+    body-bearing rows, and that redundancy is kept on purpose: ``body`` is this
+    wrapper's own record of what came off the wire (a vendor ``decode`` replacing
+    the payload with items must not erase it), while the payload is what a
+    CONSUMER reads. They are written from the same ``reply.body`` in one place, so
+    they cannot disagree.
+
+    RESOLVED (this was a NAMED GAP): a caller that only saw ``result`` used to be
+    unable to tell ``no_content`` from ``cursor_undetermined``, because
+    ``OperationResult`` had no field expressing "content present, continuation
+    unknown" -- and, worse, no field expressing the content at all. The envelope
+    now carries a ``payload`` (``RESULT_SCHEMA_VERSION`` 2), so a ``no_content``
+    row reads ``payload is None`` and a ``cursor_undetermined`` row reads a
+    :class:`~kiro_crew.connections.control_plane.result.BytesPayload` holding the
+    body. ``status`` is still downgraded to ``partial`` on the undetermined rows
     rather than asserting a completeness nobody established.
     """
 
@@ -461,20 +485,70 @@ class Decoded2xx:
     cursor_determined: bool = True
 
 
-def _envelope(status: ResultStatus) -> OperationResult:
-    """Build an L01 result envelope with NO continuation cursor.
+def _envelope(status: ResultStatus, payload: Optional[OperationPayload] = None) -> OperationResult:
+    """Build an L01 result envelope through L01's own constructor.
 
-    The one place :func:`neutral_decode_detail` constructs an
-    :class:`~kiro_crew.connections.control_plane.result.OperationResult`, so
-    ``next_cursor=None`` is written once and the ``status`` argument is typed to
-    L01's closed :data:`ResultStatus` set -- a typo would be a type error here
-    rather than an invalid envelope handed to a downstream. ``next_cursor`` is
-    always ``None`` because a cursor is the vendor's to name, never this
-    module's; :func:`neutral_decode_detail` reports the UNCERTAINTY about paging
-    through ``status`` and ``cursor_determined`` instead of through a guess.
+    The one place :func:`neutral_decode_detail` builds an
+    :class:`~kiro_crew.connections.control_plane.result.OperationResult`, so the
+    ``status`` argument is typed to L01's closed
+    :data:`~kiro_crew.connections.control_plane.result.ResultStatus` set -- a typo
+    is a type error here rather than an invalid envelope handed downstream.
+
+    ``next_cursor`` is never passed: :func:`result_with_payload` DERIVES it from
+    the payload, and the neutral path never produces a
+    :class:`~kiro_crew.connections.control_plane.result.CollectionPayload`, so it
+    is always ``None`` here. That is the same property as before -- a cursor is the
+    vendor's to name, never this module's -- now enforced by the constructor
+    instead of by a literal. :func:`neutral_decode_detail` reports the UNCERTAINTY
+    about paging through ``status`` and ``cursor_determined``, not through a guess.
     """
 
-    return {"status": status, "next_cursor": None}
+    return result_with_payload(payload, status=status)
+
+
+def _raw_payload(reply: HttpReply) -> BytesPayload:
+    """Carry a 2xx body out VERBATIM, as bytes, with the declared media type.
+
+    The neutral half of the data channel. It does not parse, decode, sniff or
+    inspect the body -- so an ``xlsx`` reaches the caller byte-identical, and so
+    does a JSON body a vendor ``decode`` will structure later.
+
+    Carrying every body as bytes, rather than branching on whether the reply
+    "looks binary", is what makes the never-text-coerced property unconditional.
+    A branch would need a rule for deciding, and every such rule has a wrong
+    answer available: a ``Content-Type`` a provider mislabels, an absent header, an
+    Office document served as ``application/octet-stream``. Bytes are the shape no
+    reply loses information in, and the media type is REPORTED beside them so a
+    consumer (or a vendor decode) can act on what the provider claimed.
+    """
+
+    declared = _header(reply.headers, "Content-Type")
+    media_type = declared.strip() if declared and declared.strip() else DEFAULT_MEDIA_TYPE
+    return BytesPayload(
+        data=reply.body,
+        media_type=media_type,
+        filename=_content_disposition_filename(reply.headers),
+    )
+
+
+def _content_disposition_filename(headers: Mapping[str, str]) -> Optional[str]:
+    """The plain ``filename="..."`` a provider offered, or ``None``.
+
+    Only the unextended parameter is read. ``filename*`` (RFC 5987 percent-encoded
+    charset form) needs a decode this module deliberately does not do, and a
+    consumer that writes bytes to disk must treat any provider-supplied name as
+    untrusted anyway -- so an unreadable name is reported as absent rather than
+    half-decoded.
+    """
+
+    raw = _header(headers, "Content-Disposition")
+    if not raw:
+        return None
+    for part in raw.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key.strip().lower() == "filename":
+            return value.strip().strip('"') or None
+    return None
 
 
 def neutral_decode_detail(reply: HttpReply) -> Decoded2xx:
@@ -482,14 +556,14 @@ def neutral_decode_detail(reply: HttpReply) -> Decoded2xx:
 
     The status-by-status table, and why each row is what it is:
 
-    ==========================  ================= ========= ==================
-    reply                       content_kind      status    cursor_determined
-    ==========================  ================= ========= ==================
-    204 (any body)              no_content        ok        True
-    2xx, empty body             empty_complete    ok        True
-    206                         partial_content   partial   False
-    2xx, non-empty body         cursor_undeter'd  partial   False
-    ==========================  ================= ========= ==================
+    ==========================  ================= ========= ================== =============
+    reply                       content_kind      status    cursor_determined  payload
+    ==========================  ================= ========= ================== =============
+    204 (any body)              no_content        ok        True               None
+    2xx, empty body             empty_complete    ok        True               None
+    206                         partial_content   partial   False              BytesPayload
+    2xx, non-empty body         cursor_undeter'd  partial   False              BytesPayload
+    ==========================  ================= ========= ================== =============
 
     * **204** is the one row where ``next_cursor=None`` is knowledge rather than
       assumption: the provider said there is no content, so there is nothing to
@@ -500,15 +574,22 @@ def neutral_decode_detail(reply: HttpReply) -> Decoded2xx:
       word for that on the success side: ``partial``. Reporting ``ok`` said the
       opposite of what the provider said.
     * **a body with no vendor decode** is the row that used to be a silent
-      truncation. ``next_cursor`` stays ``None`` because guessing a provider's
-      cursor spelling (``@odata.nextLink`` vs ``page`` vs ``queryMore``) is the
-      vendor owner's call and inventing one here would be wrong for every other
-      provider -- but the ``status`` is ``partial``, not ``ok``, because
-      "complete" is a claim this module is not in a position to make. A caller
-      that needs paging injects a ``decode``; ``cursor_determined=False`` and the
-      preserved ``body`` are how it knows it must.
+      truncation, in two separate ways. ``next_cursor`` stays ``None`` because
+      guessing a provider's cursor spelling (``@odata.nextLink`` vs ``page`` vs
+      ``queryMore``) is the vendor owner's call and inventing one here would be
+      wrong for every other provider -- but the ``status`` is ``partial``, not
+      ``ok``, because "complete" is a claim this module is not in a position to
+      make. And the BODY is now carried, as a
+      :class:`~kiro_crew.connections.control_plane.result.BytesPayload`: dropping
+      it meant a consumer received a verdict and no data at all, which is a worse
+      truncation than a missing cursor. A caller that needs items/objects/paging
+      injects a ``decode``; ``cursor_determined=False`` is how it knows it must.
 
-    The "no vendor cursor guessing" property is intact: no row reads the body.
+    The "no vendor cursor guessing" property is intact: no row READS the body. The
+    payload carries it VERBATIM -- see :func:`_raw_payload` -- so nothing here
+    parses JSON, decodes UTF-8, or infers structure. Turning those bytes into
+    items, an object, or a cursor is the injected
+    :data:`ResultDecode`'s job, i.e. the vendor owner's.
     """
 
     status = int(reply.status)
@@ -522,7 +603,7 @@ def neutral_decode_detail(reply: HttpReply) -> Decoded2xx:
         )
     if status == 206:
         return Decoded2xx(
-            result=_envelope("partial"),
+            result=_envelope("partial", _raw_payload(reply)),
             http_status=status,
             content_kind=_CONTENT_PARTIAL,
             body=reply.body,
@@ -537,7 +618,7 @@ def neutral_decode_detail(reply: HttpReply) -> Decoded2xx:
             cursor_determined=True,
         )
     return Decoded2xx(
-        result=_envelope("partial"),
+        result=_envelope("partial", _raw_payload(reply)),
         http_status=status,
         content_kind=_CONTENT_CURSOR_UNDETERMINED,
         body=reply.body,
@@ -550,15 +631,21 @@ def neutral_decode(reply: HttpReply) -> OperationResult:
 
     Thin wrapper over :func:`neutral_decode_detail`, which carries the reasoning
     and the full table. It returns only the L01 envelope, because that is what a
-    :data:`ResultDecode` is contracted to return; a caller that needs the body or
-    the ``content_kind`` calls ``neutral_decode_detail`` directly.
+    :data:`ResultDecode` is contracted to return -- and the envelope now includes
+    the ``payload``, so a caller that only reads the envelope still receives the
+    DATA. A caller that also wants ``content_kind`` or ``cursor_determined`` calls
+    ``neutral_decode_detail`` directly.
 
     It NEVER guesses a continuation cursor -- ``next_cursor`` is always ``None``
     here, since the cursor lives at a different place in every provider's body and
     picking one would give every other provider a wrong answer. What it no longer
     does is claim that ``next_cursor=None`` means COMPLETE for a reply it never
-    read: only 204 and an empty body support that, and those are the only two rows
-    that report ``ok``.
+    read (only 204 and an empty body support that, and those are the only two rows
+    that report ``ok``), and it no longer DISCARDS the body: a body-bearing 2xx
+    comes back as a
+    :class:`~kiro_crew.connections.control_plane.result.BytesPayload` holding the
+    provider's bytes byte-for-byte, which is what makes an Office download survive
+    this path with no vendor decode at all.
     """
 
     return neutral_decode_detail(reply).result

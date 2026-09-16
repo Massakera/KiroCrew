@@ -130,7 +130,7 @@ def test_failed_not_applied_is_allowed_to_replay() -> None:
 def test_succeeded_reuses_the_recorded_result_instead_of_replaying() -> None:
     # Known to have applied -> hand back the recorded result, do not reissue.
     descriptor = _non_idempotent_descriptor()
-    recorded: OperationResult = {"status": "ok", "next_cursor": None}
+    recorded: OperationResult = {"status": "ok", "next_cursor": None, "payload": None}
     record = _record("succeeded", result=recorded)
 
     decision = _decide(descriptor, record)
@@ -316,7 +316,7 @@ def test_record_for_different_args_or_key_is_refused_not_reused() -> None:
     # must not have its recorded result reused. A `succeeded` record for other
     # args would otherwise reuse the wrong result.
     descriptor = _non_idempotent_descriptor()
-    recorded: OperationResult = {"status": "ok", "next_cursor": None}
+    recorded: OperationResult = {"status": "ok", "next_cursor": None, "payload": None}
     wrong_args = {
         "operation_id": "github.create_issue",
         "args_fingerprint": args_fingerprint({"title": "OTHER", "body": "z"}),
@@ -358,7 +358,7 @@ def test_args_attribution_cannot_be_silently_skipped() -> None:
     # be able to get allow/reuse. The gate must compare the request's args
     # unconditionally -- there is no way to call it without supplying them.
     descriptor = _non_idempotent_descriptor()  # github.create_issue
-    recorded: OperationResult = {"status": "ok", "next_cursor": None}
+    recorded: OperationResult = {"status": "ok", "next_cursor": None, "payload": None}
     # A succeeded record for a DIFFERENT argument set, same operation + key.
     other_args_record: AttemptRecord = {
         "operation_id": "github.create_issue",

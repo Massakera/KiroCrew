@@ -6,7 +6,10 @@ through: an :class:`~kiro_crew.connections.control_plane.operation.OperationDesc
 :class:`~kiro_crew.connections.control_plane.context.OperationContext` (the
 references one call is made under -- never a credential value), an
 :class:`~kiro_crew.connections.control_plane.result.OperationResult` (the
-success/partial envelope with an opaque pagination cursor), and the RUN-01
+success/partial envelope with an opaque pagination cursor AND the
+:data:`~kiro_crew.connections.control_plane.result.OperationPayload` carrying the
+data -- a collection with its cursor, a single object, or raw bytes), and the
+RUN-01
 :class:`~kiro_crew.connections.control_plane.errors.OperationError` taxonomy.
 
 W01 · L02 adds :class:`~kiro_crew.connections.control_plane.binding.Binding` --
@@ -157,10 +160,21 @@ from kiro_crew.connections.control_plane.production import (
     urllib_http_send,
 )
 from kiro_crew.connections.control_plane.result import (
+    DEFAULT_MEDIA_TYPE,
+    PAYLOAD_KIND_BYTES,
+    PAYLOAD_KIND_COLLECTION,
+    PAYLOAD_KIND_OBJECT,
+    PAYLOAD_KINDS,
     RESULT_SCHEMA_VERSION,
     RESULT_STATUSES,
+    BytesPayload,
+    CollectionPayload,
+    ObjectPayload,
+    OperationPayload,
     OperationResult,
+    PayloadKind,
     ResultStatus,
+    result_with_payload,
 )
 from kiro_crew.connections.control_plane.writes import (
     ATTEMPT_OUTCOMES,
@@ -183,6 +197,7 @@ __all__ = [
     "CREDENTIAL_MODES",
     "DEFAULT_DEADLINE_SECONDS",
     "DEFAULT_MAX_RESPONSE_BYTES",
+    "DEFAULT_MEDIA_TYPE",
     "DEFAULT_TIMEOUT_SECONDS",
     "EFFECTS",
     "ERRORS_SCHEMA_VERSION",
@@ -194,6 +209,10 @@ __all__ = [
     "MAX_ERROR_CHARS",
     "OPERATION_KINDS",
     "OPERATION_SCHEMA_VERSION",
+    "PAYLOAD_KINDS",
+    "PAYLOAD_KIND_BYTES",
+    "PAYLOAD_KIND_COLLECTION",
+    "PAYLOAD_KIND_OBJECT",
     "POLICY_SCHEMA_VERSION",
     "PRODUCTION_SCHEMA_VERSION",
     "REPLAY_VERDICTS",
@@ -209,7 +228,9 @@ __all__ = [
     "BindingIdentityMismatchError",
     "BindingSecretSelector",
     "BindingVerificationError",
+    "BytesPayload",
     "Clock",
+    "CollectionPayload",
     "CredentialMode",
     "Decoded2xx",
     "DerivedHandle",
@@ -225,12 +246,15 @@ __all__ = [
     "HttpSend",
     "LayerCeilings",
     "LayerName",
+    "ObjectPayload",
     "OperationContext",
     "OperationDescriptor",
     "OperationError",
     "OperationKind",
+    "OperationPayload",
     "OperationResult",
     "PageWalk",
+    "PayloadKind",
     "PermittedModeRegistry",
     "PermittedModes",
     "PreconditionFailure",
@@ -279,5 +303,6 @@ __all__ = [
     "replay_decision",
     "resolve_binding_secret",
     "resolve_layers",
+    "result_with_payload",
     "urllib_http_send",
 ]

@@ -130,7 +130,7 @@ def _descriptor(effect="read", modes=("oauth_user",), service="outlook") -> Oper
 
 
 def _ok_response(next_cursor=None) -> TransportResponse:
-    result: OperationResult = {"status": "ok", "next_cursor": next_cursor}
+    result: OperationResult = {"status": "ok", "next_cursor": next_cursor, "payload": None}
     return TransportResponse(http_status=200, result=result)
 
 
@@ -954,6 +954,10 @@ def test_production_module_performs_no_network_at_import_time() -> None:
     assert production_mod.neutral_decode(HttpReply(status=200)) == {
         "status": "ok",
         "next_cursor": None,
+        # An empty 2xx body genuinely returned no data, so the payload channel is
+        # empty -- not merely dropped (see the data-channel suite for the rows
+        # that DO carry bytes).
+        "payload": None,
     }
 
 

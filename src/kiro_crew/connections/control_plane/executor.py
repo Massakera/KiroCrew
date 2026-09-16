@@ -64,6 +64,17 @@ a response that never mentioned it would invent readback semantics that belong t
 the vendor owner, and would tell the caller to re-derive a condition it may never
 have asserted.
 
+**A success carries DATA, not just a verdict.** The gate chain is the point of
+this module, but a chain that authorizes perfectly and then returns nothing is
+not a dispatch. So the 2xx envelope carries a
+:data:`~kiro_crew.connections.control_plane.result.OperationPayload` -- a
+collection (items PLUS their cursor), a single object, or raw bytes -- and
+:attr:`ExecutionOutcome.payload` is where a consumer reads it. The executor does
+not INTERPRET that payload: the injected
+:data:`~kiro_crew.connections.control_plane.production.ResultDecode` produces it
+(the neutral default carries the body's raw bytes verbatim; a vendor decode turns
+them into items/object/cursor), and this module only carries it through unchanged.
+
 **Boundaries.** Decision + dispatch glue. The transport is an injected callable
 -- an in-memory fake in every unit test, and the REAL composition (vault-resolved
 secret custody plus a stdlib HTTP client) in
@@ -107,7 +118,7 @@ from kiro_crew.connections.control_plane.operation import (
     OperationDescriptor,
 )
 from kiro_crew.connections.control_plane.policy import LayerCeilings, decide
-from kiro_crew.connections.control_plane.result import OperationResult
+from kiro_crew.connections.control_plane.result import OperationPayload, OperationResult
 from kiro_crew.connections.control_plane.writes import (
     ATTEMPT_FAILED_NOT_APPLIED,
     REPLAY_REFUSE,
@@ -136,7 +147,15 @@ from kiro_crew.connections.control_plane.writes import (
 #:   custody to the identity the call was actually authorized for instead of one
 #:   fixed at composition time (see
 #:   :class:`~kiro_crew.connections.control_plane.production.BindingSecretSelector`).
-EXECUTOR_SCHEMA_VERSION = 2
+#:
+#: ``3``: the result envelope now carries DATA. :class:`OperationResult` grew a
+#: required ``payload`` (see :data:`~kiro_crew.connections.control_plane.result.RESULT_SCHEMA_VERSION`
+#: ``2``) and :class:`ExecutionOutcome` exposes it as :attr:`ExecutionOutcome.payload`.
+#: An old pin would decode this wrong in the way that matters most: it would read
+#: a success as carrying status + cursor and nothing else, which is exactly what
+#: the whole success path used to be -- so a consumer written against ``2`` drops
+#: every item, object and byte the operation returned rather than failing loudly.
+EXECUTOR_SCHEMA_VERSION = 3
 
 # --- effects that are non-idempotent by default (the write-replay gate runs) --
 #: Effects whose ``unknown``-outcome replay must be gated by L07. Read from the
@@ -180,7 +199,8 @@ class TransportResponse:
 
     ``http_status`` -- the HTTP status the provider returned (e.g. 200, 404,
     412, 429, 503). ``result`` -- the success envelope on a 2xx (with
-    ``next_cursor`` for paging), else ``None``. ``preconditions`` -- the
+    ``next_cursor`` for paging and the ``payload`` carrying the items / object /
+    bytes the ``decode`` produced), else ``None``. ``preconditions`` -- the
     precondition names that failed on a 412 (``("If-Match",)`` etc.), empty
     otherwise. ``etag`` -- the server's CURRENT ETag on a 412 (what a readback
     would re-derive against), else ``None``. ``retry_after_seconds`` -- the
@@ -259,8 +279,12 @@ class ExecutionOutcome:
 
     Exactly one of ``result`` / ``error`` / ``precondition`` is set.
 
-    ``result`` -- the success envelope (with ``next_cursor`` for paging) when the
-    call was authorized, emitted, and returned 2xx. ``error`` -- a typed
+    ``result`` -- the success envelope when the call was authorized, emitted, and
+    returned 2xx. It carries the pagination ``next_cursor`` AND the ``payload``:
+    the items / object / bytes the operation returned (see
+    :data:`~kiro_crew.connections.control_plane.result.OperationPayload`). Read
+    the payload through :attr:`payload` rather than indexing ``result``.
+    ``error`` -- a typed
     :class:`OperationError` when a gate denied (transport NOT called) or the
     transport returned a non-precondition failure. ``precondition`` -- the
     structured :class:`PreconditionFailure` on a 412. ``view`` -- the trusted
@@ -288,6 +312,29 @@ class ExecutionOutcome:
     @property
     def ok(self) -> bool:
         return self.result is not None and self.error is None and self.precondition is None
+
+    @property
+    def payload(self) -> Optional[OperationPayload]:
+        """The DATA this call returned, or ``None`` when it returned none.
+
+        The consumer-facing read of the neutral data channel: one of
+        :class:`~kiro_crew.connections.control_plane.result.CollectionPayload`,
+        :class:`~kiro_crew.connections.control_plane.result.ObjectPayload`,
+        :class:`~kiro_crew.connections.control_plane.result.BytesPayload`, or
+        ``None``. A denied gate, a transport error and a 412 all have no result at
+        all, so they read ``None`` here rather than raising -- a caller that
+        already branched on :attr:`ok` does not have to branch again.
+
+        ``.get`` rather than ``["payload"]`` on purpose: the key is REQUIRED on a
+        v2 envelope, but ``OperationResult`` is a ``TypedDict`` and nothing
+        validates a plain dict at runtime, so a producer still pinned to v1 hands
+        back a two-key mapping. Reading that as "no payload" is the honest answer;
+        raising ``KeyError`` deep in a consumer would not be.
+        """
+
+        if self.result is None:
+            return None
+        return self.result.get("payload")
 
 
 # --- the injected transport contract ------------------------------------------
@@ -516,7 +563,9 @@ def execute(
     A ``reuse`` replay verdict hands back the recorded result without calling the
     transport. On a real emit, an HTTP 412 is returned as a structured
     :class:`PreconditionFailure` (never flattened); every other non-2xx becomes a
-    typed error; a 2xx returns the success envelope.
+    typed error; a 2xx returns the success envelope, carrying the transport's
+    ``payload`` (items / object / bytes) through to
+    :attr:`ExecutionOutcome.payload` unchanged.
     """
 
     args: Mapping[str, Any] = request_args or {}

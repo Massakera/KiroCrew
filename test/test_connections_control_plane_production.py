@@ -80,9 +80,12 @@ from kiro_crew.connections.control_plane.production import (
     urllib_http_send,
 )
 from kiro_crew.connections.control_plane.result import (
+    DEFAULT_MEDIA_TYPE,
+    RESULT_SCHEMA_VERSION,
     RESULT_STATUS_OK,
     RESULT_STATUS_PARTIAL,
     RESULT_STATUSES,
+    BytesPayload,
 )
 from kiro_crew.connections.control_plane.writes import (
     ATTEMPT_FAILED_NOT_APPLIED,
@@ -800,7 +803,9 @@ def test_the_transport_binds_to_the_record_sourced_view_never_a_caller_chosen_on
 
     def _transport(**kwargs: Any) -> TransportResponse:
         seen.append(kwargs)
-        return TransportResponse(http_status=200, result={"status": "ok", "next_cursor": None})
+        return TransportResponse(
+            http_status=200, result={"status": "ok", "next_cursor": None, "payload": None}
+        )
 
     outcome = execute(_descriptor(), handle, _transport, **_kw())
     assert outcome.error is None
@@ -857,8 +862,13 @@ def test_a_204_and_a_200_with_a_body_no_longer_decode_the_same() -> None:
     no_content = neutral_decode(HttpReply(status=204, body=b""))
     with_body = neutral_decode(HttpReply(status=200, body=b'{"value":[1,2,3]}'))
     assert no_content != with_body
-    assert no_content == {"status": "ok", "next_cursor": None}
-    assert with_body == {"status": "partial", "next_cursor": None}
+    assert no_content == {"status": "ok", "next_cursor": None, "payload": None}
+    # The body-bearing reply is `partial` AND carries its bytes: the two readings
+    # differ on the payload channel as well as on the status.
+    assert with_body["status"] == "partial" and with_body["next_cursor"] is None
+    assert with_body["payload"] == BytesPayload(
+        data=b'{"value":[1,2,3]}', media_type=DEFAULT_MEDIA_TYPE
+    )
     assert neutral_decode(HttpReply(status=206, body=b"x"))["status"] == "partial"
 
 
@@ -888,7 +898,7 @@ def test_a_real_204_and_a_real_206_off_the_wire_decode_correctly(
         )
     assert reply_204.status == 204 and reply_204.body == b""
     assert neutral_decode_detail(reply_204).content_kind == "no_content"
-    assert neutral_decode(reply_204) == {"status": "ok", "next_cursor": None}
+    assert neutral_decode(reply_204) == {"status": "ok", "next_cursor": None, "payload": None}
 
     rec206 = _Recorder()
     handler206 = _handler_for(
@@ -905,6 +915,9 @@ def test_a_real_204_and_a_real_206_off_the_wire_decode_correctly(
     assert detail.result["status"] == "partial"
     assert detail.body == b'{"value":[1]}'
     assert detail.cursor_determined is False
+    # A real 206 off the wire carries its fragment's bytes to the consumer.
+    payload = detail.result["payload"]
+    assert isinstance(payload, BytesPayload) and payload.data == b'{"value":[1]}'
 
 
 def test_the_transport_surfaces_the_partial_reading_for_a_body_bearing_2xx(
@@ -1227,8 +1240,13 @@ def test_the_two_bounds_have_concrete_documented_numbers() -> None:
 
 def test_both_schema_versions_were_bumped_for_these_shape_changes() -> None:
     # TransportResponse/ExecutionOutcome grew write_outcome and the Transport
-    # contract grew trusted_view; the composition signature changed.
-    assert EXECUTOR_SCHEMA_VERSION == 2
+    # contract grew trusted_view; the composition signature changed. Then the
+    # success envelope grew a payload, which moved the executor to 3 (see
+    # RESULT_SCHEMA_VERSION 2). PRODUCTION_SCHEMA_VERSION stays at 2: the payload
+    # is a shape change in the L01 envelope this module RETURNS, not in this
+    # module's own composition signature, which is byte-identical.
+    assert EXECUTOR_SCHEMA_VERSION == 3
+    assert RESULT_SCHEMA_VERSION == 2
     assert PRODUCTION_SCHEMA_VERSION == 2
 
 

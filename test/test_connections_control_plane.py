@@ -201,7 +201,11 @@ def test_typed_dicts_have_every_declared_field() -> None:
     }
     assert set(context) == set(OperationContext.__annotations__)
 
-    result: OperationResult = {"status": "partial", "next_cursor": "opaque-cursor"}
+    result: OperationResult = {
+        "status": "partial",
+        "next_cursor": "opaque-cursor",
+        "payload": None,
+    }
     assert set(result) == set(OperationResult.__annotations__)
 
     error: OperationError = operation_error("throttle", "slow down")
