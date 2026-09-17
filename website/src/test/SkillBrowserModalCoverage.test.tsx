@@ -13,10 +13,14 @@ import type { DiscoveredSkill, DiscoverInstallResult, DiscoverSkillPreview } fro
 const { mockApi, MockApiError } = vi.hoisted(() => {
   class MockApiError extends Error {
     readonly status: number
-    constructor(status: number, message: string) {
+    /** Raw wire body, the shape the real ApiError keeps so a caller can read
+     *  the structured `code` the message unwrapping drops. */
+    readonly body: string
+    constructor(status: number, message: string, body = '') {
       super(message)
       this.name = 'ApiError'
       this.status = status
+      this.body = body
     }
   }
   return {
@@ -80,6 +84,12 @@ const anInstall = (over: Partial<DiscoverInstallResult> = {}): DiscoverInstallRe
   ...over,
 })
 
+/** A gateway refusal exactly as the wire carries it: status + `{error, code}`. */
+const aRefusal = (status: number, error: string, code: string) =>
+  new MockApiError(status, error, JSON.stringify({ error, code }))
+
+const CONNECTION_HINT = "Couldn't load the preview. Check the connection and try again."
+
 const SKILL_MD = [
   '---',
   'name: widget-wrangler',
@@ -118,6 +128,16 @@ async function search(text: string) {
     target: { value: text },
   })
   await act(async () => { await vi.advanceTimersByTimeAsync(350) })
+}
+
+/** Search, select the one result, and wait for its preview notice. */
+async function openFailedPreview(rejection: unknown) {
+  mockApi.discoverSkills.mockResolvedValue({ results: [aSkill()], providers: ['skillsh'] })
+  mockApi.previewDiscoveredSkill.mockRejectedValue(rejection)
+  renderModal()
+  await search('widget')
+  fireEvent.click(await screen.findByRole('option', { name: 'widget-wrangler' }))
+  return screen.findByTestId('skill-preview-error')
 }
 
 // The modal debounces the query behind a 300ms setTimeout. Fake timers keep
@@ -238,6 +258,9 @@ describe('SkillBrowserModal', () => {
     expect(screen.getByText('3 files')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /Source/ }))
       .toHaveAttribute('href', 'https://github.com/acme/widget-wrangler')
+    // A successful preview shows no failure notice and no retry.
+    expect(screen.queryByTestId('skill-preview-error')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('skill-preview-retry')).not.toBeInTheDocument()
   })
 
   it('falls back to the search-result tags and author when the preview omits them', async () => {
@@ -307,20 +330,23 @@ describe('SkillBrowserModal', () => {
     expect(screen.queryByTestId('meta-strip')).not.toBeInTheDocument()
   })
 
-  it('shows the gateway\'s reason when the preview fails instead of the no-preview notice', async () => {
-    // A too-large bundle, a registry 404 or a rate limit each come back as a
-    // distinct non-2xx with a display message; the pane must show THAT, not
-    // pretend the skill has no SKILL.md.
-    mockApi.discoverSkills.mockResolvedValue({ results: [aSkill()], providers: ['skillsh'] })
-    mockApi.previewDiscoveredSkill.mockRejectedValue(
-      new MockApiError(413, 'Skill bundle is 12.3 MiB, above the 10.0 MiB limit'),
+  it('a too-large bundle (413 too_large) shows the size and the limit, with no retry and no connection advice', async () => {
+    // The gateway measured the bundle; the same request refuses the same way
+    // every time, so a retry is a dead button and "check the connection" is
+    // the wrong diagnosis.
+    const alert = await openFailedPreview(
+      aRefusal(413, 'Skill bundle is 12.3 MiB, above the 10.0 MiB limit', 'too_large'),
     )
-    renderModal()
-    await search('widget')
-    fireEvent.click(await screen.findByRole('option', { name: 'widget-wrangler' }))
-    const alert = await screen.findByTestId('skill-preview-error')
     expect(alert).toHaveTextContent('Skill bundle is 12.3 MiB, above the 10.0 MiB limit')
+    expect(alert).not.toHaveTextContent(CONNECTION_HINT)
+    expect(screen.queryByTestId('skill-preview-retry')).not.toBeInTheDocument()
     expect(screen.queryByText('No preview available.')).not.toBeInTheDocument()
+  })
+
+  it('a browser-side fetch failure gets the connection words and a retry that refetches', async () => {
+    const alert = await openFailedPreview(new TypeError('Failed to fetch'))
+    expect(alert).not.toHaveTextContent('Failed to fetch')
+    expect(alert).toHaveTextContent(CONNECTION_HINT)
     // The retry re-requests the preview; a later success replaces the notice.
     mockApi.previewDiscoveredSkill.mockResolvedValue({
       name: 'widget-wrangler',
@@ -333,27 +359,54 @@ describe('SkillBrowserModal', () => {
     expect(screen.queryByTestId('skill-preview-error')).not.toBeInTheDocument()
   })
 
-  it('maps a non-gateway preview failure to plain words instead of raw browser text', async () => {
-    mockApi.discoverSkills.mockResolvedValue({ results: [aSkill()], providers: ['skillsh'] })
-    mockApi.previewDiscoveredSkill.mockRejectedValue(new TypeError('Failed to fetch'))
-    renderModal()
-    await search('widget')
-    fireEvent.click(await screen.findByRole('option', { name: 'widget-wrangler' }))
-    const alert = await screen.findByTestId('skill-preview-error')
-    expect(alert).not.toHaveTextContent('Failed to fetch')
-    expect(alert).toHaveTextContent("Couldn't load the preview.")
+  it('an unreachable registry (502 unreachable) and a timeout (504 timeout) are connectivity, not a verdict on the skill', async () => {
+    const alert = await openFailedPreview(aRefusal(502, 'Could not reach skills.sh', 'unreachable'))
+    expect(alert).toHaveTextContent(CONNECTION_HINT)
+    expect(alert).not.toHaveTextContent('Could not reach')
+    expect(screen.getByTestId('skill-preview-retry')).toBeInTheDocument()
+
+    mockApi.previewDiscoveredSkill.mockRejectedValue(aRefusal(504, 'Fetch timed out', 'timeout'))
+    fireEvent.click(screen.getByTestId('skill-preview-retry'))
+    await waitFor(() => expect(mockApi.previewDiscoveredSkill).toHaveBeenCalledTimes(2))
+    expect(await screen.findByTestId('skill-preview-error')).toHaveTextContent(CONNECTION_HINT)
+    expect(screen.getByTestId('skill-preview-retry')).toBeInTheDocument()
   })
 
-  it('shows a provider rate-limit message on the preview pane and on the install row', async () => {
+  it('a malformed registry payload (502 bad_format) keeps the gateway reason: no connection words, no retry', async () => {
+    // Same status as an unreachable registry; the structured code tells them
+    // apart, and a payload the registry serves wrong does not fix itself on a
+    // second request.
+    const alert = await openFailedPreview(
+      aRefusal(502, 'skills.sh returned an unexpected response format', 'bad_format'),
+    )
+    expect(alert).toHaveTextContent('skills.sh returned an unexpected response format')
+    expect(alert).not.toHaveTextContent(CONNECTION_HINT)
+    expect(screen.queryByTestId('skill-preview-retry')).not.toBeInTheDocument()
+  })
+
+  it('a missing skill (404 not_found) is final: the gateway reason, no retry', async () => {
+    const alert = await openFailedPreview(
+      aRefusal(404, "Skill 'acme/widget-wrangler' was not found on skills.sh", 'not_found'),
+    )
+    expect(alert).toHaveTextContent("Skill 'acme/widget-wrangler' was not found on skills.sh")
+    expect(alert).not.toHaveTextContent(CONNECTION_HINT)
+    expect(screen.queryByTestId('skill-preview-retry')).not.toBeInTheDocument()
+  })
+
+  it('shows a provider rate-limit message on the preview pane and on the install row, with a retry', async () => {
     const msg = 'skills.sh is rate-limiting requests; try again shortly'
     mockApi.discoverSkills.mockResolvedValue({ results: [aSkill()], providers: ['skillsh'] })
-    mockApi.previewDiscoveredSkill.mockRejectedValue(new MockApiError(429, msg))
-    mockApi.installDiscoveredSkill.mockRejectedValue(new MockApiError(429, msg))
+    mockApi.previewDiscoveredSkill.mockRejectedValue(aRefusal(429, msg, 'rate_limited'))
+    mockApi.installDiscoveredSkill.mockRejectedValue(aRefusal(429, msg, 'rate_limited'))
     renderModal()
     await search('widget')
     const row = await screen.findByRole('option', { name: 'widget-wrangler' })
     fireEvent.click(row)
-    expect(await screen.findByTestId('skill-preview-error')).toHaveTextContent(msg)
+    const alert = await screen.findByTestId('skill-preview-error')
+    expect(alert).toHaveTextContent(msg)
+    expect(alert).not.toHaveTextContent(CONNECTION_HINT)
+    // A rate limit clears with time, so the retry stays.
+    expect(screen.getByTestId('skill-preview-retry')).toBeInTheDocument()
     fireEvent.click(within(row).getByRole('button', { name: 'Install' }))
     // Both the row's failure line and the detail pane's copy carry the message.
     await waitFor(() => expect(screen.getAllByText(msg).length).toBeGreaterThanOrEqual(2))

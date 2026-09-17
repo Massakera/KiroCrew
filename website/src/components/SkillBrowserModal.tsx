@@ -10,6 +10,7 @@ import { useState, useCallback, useRef, useEffect, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Download, Check, ExternalLink, Loader2, RefreshCw, FileText, AlertTriangle, ArrowLeft } from 'lucide-react'
 import { api, ApiError } from '../api/client'
+import { gatewayErrorCode } from '../api/apiError'
 import Modal from './Modal'
 import { Btn } from './ui'
 import MarkdownRenderer from './MarkdownRenderer'
@@ -40,6 +41,57 @@ type InstallPhase =
   | { step: 'done'; fileCount: number; kind: string }
   | { step: 'conflict'; key: string }
   | { step: 'error'; message: string }
+
+/** What the detail pane shows for a failed preview. */
+export interface PreviewFailure {
+  /** Human text for the notice. */
+  message: string
+  /** Whether re-requesting the SAME preview can plausibly succeed. */
+  retry: boolean
+}
+
+/**
+ * Classify a failed preview by the gateway's structured `code`, then by the
+ * HTTP status — never by message keywords.
+ *
+ * Three classes, because they need three different answers:
+ *
+ * * **Connectivity** — the browser's own fetch failure (a `TypeError`, not an
+ *   `ApiError`), a registry the gateway could not reach (`unreachable`), or a
+ *   fetch that timed out (`timeout` / 504). The registry may be fine and the
+ *   skill certainly is, so: localized words about the connection, plus a retry.
+ * * **Definitive refusal about THIS skill** — the bundle is over the budget
+ *   (`too_large` / 413), the skill is missing (`not_found`, `empty_content` /
+ *   404), or the registry served something that is not a bundle
+ *   (`bad_format`). The gateway's own sentence carries the specifics (for
+ *   `too_large`, the measured size and the limit), and re-requesting the same
+ *   preview would refuse again, so no retry and no connection advice.
+ * * **Transient upstream state** — a rate limit (`rate_limited` / 429, whose
+ *   sentence already says "try again shortly") or a registry status
+ *   (`http_status`, `fetch_failed`): the gateway's sentence, and a retry.
+ *
+ * An auth-expired refusal keeps its message and drops the retry: it cannot
+ * succeed until the user re-authenticates.
+ */
+export function classifyPreviewFailure(err: unknown): PreviewFailure | null {
+  if (!err) return null
+  const connectivity: PreviewFailure = {
+    message: i18nT('components.skillBrowserModal.preview_failed_generic'),
+    retry: true,
+  }
+  if (!(err instanceof ApiError)) return connectivity
+  const code = gatewayErrorCode(err)
+  if (code === 'unreachable' || code === 'timeout' || err.status === 504) return connectivity
+  if (err.authRequired) return { message: err.message, retry: false }
+  const definitive =
+    code === 'too_large'
+    || code === 'not_found'
+    || code === 'empty_content'
+    || code === 'bad_format'
+    || err.status === 413
+    || err.status === 404
+  return { message: err.message, retry: !definitive }
+}
 
 export default function SkillBrowserModal({ open, onClose }: Props) {
   const ime = useImeGuard()
@@ -395,13 +447,9 @@ function SkillDetailPanel({
     staleTime: 60_000,
     retry: false,
   })
-  // A gateway refusal carries its own display message (size, status, reason);
-  // anything else (a dropped connection's "Failed to fetch") gets plain words.
-  const previewErrorMessage = previewError
-    ? previewError instanceof ApiError
-      ? previewError.message
-      : i18nT('components.skillBrowserModal.preview_failed_generic')
-    : ''
+  // Which words, and whether a retry can help, follow from the gateway's
+  // structured code — see classifyPreviewFailure.
+  const previewFailure = useMemo(() => classifyPreviewFailure(previewError), [previewError])
 
   // Same presentation as the installed-skill viewer (SkillDirectoryBrowser):
   // frontmatter parsed into the labeled meta strip, body rendered without
@@ -463,23 +511,26 @@ function SkillDetailPanel({
         <div className="flex items-center gap-2 text-xs text-muted" role="status">
           <Loader2 size={12} className="animate-spin" aria-hidden="true" /> {i18nT('components.skillBrowserModal.loading_preview')}
         </div>
-      ) : previewError ? (
+      ) : previewFailure ? (
         <div className="flex flex-col items-start gap-2">
           {/* The shared notice: agent hand-off with the error's context, and the
               modal closes on hand-off so the chat it navigates to is visible.
               Nothing unsaved lives in this pane, so the hand-off is safe. */}
           <ErrorNotice
-            message={previewErrorMessage}
+            message={previewFailure.message}
             variant="inline"
             askAgent
             onHandoff={onClose}
             testId="skill-preview-error"
           />
-          {/* A rate limit clears with time; give the user the retry instead of
-              making them deselect and reselect the skill. */}
-          <Btn onClick={() => { void refetchPreview() }} data-testid="skill-preview-retry">
-            <RefreshCw size={12} aria-hidden="true" /> {i18nT('components.skillBrowserModal.preview_try_again')}
-          </Btn>
+          {/* Offered only when the same request can succeed later (a dropped
+              connection, a timeout, a rate limit). A bundle over the budget or
+              a missing skill refuses the same way every time, so no retry there. */}
+          {previewFailure.retry && (
+            <Btn onClick={() => { void refetchPreview() }} data-testid="skill-preview-retry">
+              <RefreshCw size={12} aria-hidden="true" /> {i18nT('components.skillBrowserModal.preview_try_again')}
+            </Btn>
+          )}
         </div>
       ) : preview?.content ? (
         <>

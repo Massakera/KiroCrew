@@ -50,6 +50,30 @@ export const isNotFoundError = (e: unknown): boolean =>
   typeof e === 'object' && e !== null && (e as { status?: unknown }).status === 404
 
 /**
+ * The gateway's machine-readable reason for a refusal: the string `code` of a
+ * structured `{error, code}` body (`too_large`, `not_found`, `rate_limited`,
+ * `unreachable`, `timeout`, `bad_format`, ...), or `''` when the body is not
+ * that shape — a bare status, an edge proxy's own envelope, an HTML page.
+ *
+ * Duck-typed on `body` like {@link isNotFoundError}, so it reads a mocked
+ * `ApiError` too. Callers branch on the code so the SAME status can mean
+ * different things (a 502 from an unreachable registry is retryable; a 502 for
+ * a malformed bundle is not) without matching words in the message.
+ */
+export const gatewayErrorCode = (e: unknown): string => {
+  const body = typeof e === 'object' && e !== null ? (e as { body?: unknown }).body : undefined
+  if (typeof body !== 'string') return ''
+  const trimmed = body.trim()
+  if (!trimmed.startsWith('{')) return ''
+  try {
+    const code = JSON.parse(trimmed)?.code
+    return typeof code === 'string' ? code : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
  * A body whose first markup is a document type: both doctype spellings, plus a
  * bare `<html>` from a proxy that emits none. Deliberately does NOT match every
  * `<`-leading body, so an XML error envelope still reaches the caller whole.
