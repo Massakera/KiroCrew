@@ -4,7 +4,7 @@
 
 `kiro_crew/connections/vendors/slack/` is the **provider-side logic** of talking to the
 Slack Web API correctly, isolated from the dispatcher and from any credential
-handling. It holds four things:
+handling. It holds five things:
 
 1. **Per-method pagination** (`pagination.py`) — each method's scheme declared
    from its own reference, never assumed.
@@ -14,6 +14,9 @@ handling. It holds four things:
    with the conclusion on where `files_upload_v2` is not enough.
 4. **Negative fault tests** keyed on Slack's own native error strings, whose
    verified spellings are recorded as data in `errors.py`.
+5. **Error-string classification** (`error_mapping.py`) — maps each recorded
+   Slack native string onto the RUN-01 taxonomy by consuming W01's
+   control-plane `ErrorClass`, never forking a second vocabulary.
 
 Everything here is pure logic: shapes in, shapes out. No IO, no credentials, no
 socket, no dispatcher. The live inbound path (Socket Mode via
@@ -22,13 +25,13 @@ in `slack/transport.py` are **untouched** by this slice.
 
 ## What this slice deliberately does NOT own
 
-- **It is not the shared RUN-01 taxonomy.** The campaign's single source of
+- **It does not own the RUN-01 taxonomy.** The campaign's single source of
   truth for connector error classification is the W01 control-plane slice
-  (`kiro_crew.connections.control_plane`). This slice does not import it, does
-  not copy its enum, and does not create any `connections/control_plane/**`
-  file. It does not classify Slack error strings at all: the
-  error → classification mapping is delivered separately by consuming W01's
-  `ErrorClass` / `operation_error` (owner W01, tracked as `it_d610cbb5`).
+  (`kiro_crew.connections.control_plane`). This slice does not copy its enum and
+  does not create any `connections/control_plane/**` file. Its
+  `error_mapping.py` classifies Slack native error strings by **consuming** that
+  taxonomy — importing W01's `ErrorClass` / `operation_error` (`it_d610cbb5`
+  tracks that consuming relationship) — not by forking a second vocabulary.
 - **It is not a second auth / governance / retry / envelope framework.** Retry
   policy classification already lives in `slack/retry.py`; this slice only
   *describes* recovery logic (e.g. that 429 recovery must not duplicate a send)
@@ -46,19 +49,21 @@ in `slack/transport.py` are **untouched** by this slice.
   against `main`, which provides the anchor. This slice must not work around a
   missing anchor by creating one itself.
 
-## Error classification — a boundary, not a seam here
+## Error classification — a mapping that consumes W01's taxonomy
 
-This slice does **not** classify Slack error strings. It delivers the
-payload/pagination/validation/upload-stage logic and the negative fault tests
-that assert on Slack's own native error strings (e.g. `invalid_cursor`, a
-pagination concept; upload-stage error codes attributed in `upload.py`).
-`errors.py` records those verified native strings as data — evidence-built
-frozensets copied from the official method reference pages, grouped by the fault
-each string names — with **no** classification enum, return type, or `classify_*`
-function. The error → classification MAPPING is delivered separately by consuming
-W01's `kiro_crew.connections.control_plane` `ErrorClass` / `operation_error`
-(owner W01, tracked as `it_d610cbb5`), which reads these native strings. This
-slice defines no error-class enum and does not fork W01's taxonomy.
+This slice records Slack's own native error strings as data and classifies them
+into the shared RUN-01 taxonomy by consuming it. `errors.py` records the
+verified native strings (e.g. `invalid_cursor`, a pagination concept;
+upload-stage error codes attributed in `upload.py`) — evidence-built frozensets
+copied from the official method reference pages, grouped by the fault each
+string names, with **no** classification enum of its own. `error_mapping.py`
+then maps each recorded string onto a RUN-01 class by importing W01's
+`kiro_crew.connections.control_plane` `ErrorClass` / `operation_error` /
+`ERROR_CLASSES` — it CONSUMES that closed set rather than restating it, defines
+no error-class enum of its own, and does not fork W01's taxonomy. `it_d610cbb5`
+tracks this consuming relationship to the W01 control plane. An unrecognized
+string degrades to the neutral `ambiguous` class rather than a wrong specific
+one.
 
 ## `pagination.py` — three schemes, declared per method
 

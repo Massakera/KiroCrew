@@ -4,25 +4,24 @@ This package holds the *logic* of talking to the Slack Web API correctly:
 official request/response shapes, per-method pagination, the three-stage
 external upload protocol, and text/Block-Kit business validation.
 
-Boundary with error classification:
+Error classification:
 
-- This slice (S1) delivers the payload/pagination/validation/upload-stage logic
-  plus negative fault tests keyed on Slack's own native error strings, and it
-  records those verified strings as data
-  (:mod:`kiro_crew.connections.vendors.slack.errors`). It does **not** classify
-  those strings into a taxonomy.
-- The error-string → classification MAPPING is delivered separately by consuming
-  W01's ``kiro_crew.connections.control_plane`` ``ErrorClass`` / ``operation_error``
-  (owner W01, tracked as ``it_d610cbb5``), NOT here. This package does not
-  import that control plane, does not define an error-class enum, and does not
-  fork W01's taxonomy.
+- The payload/pagination/validation/upload-stage logic plus negative fault tests
+  key on Slack's own native error strings, and those verified strings are
+  recorded as data (:mod:`kiro_crew.connections.vendors.slack.errors`).
+- The error-string → classification MAPPING lives in
+  :mod:`kiro_crew.connections.vendors.slack.error_mapping`. It CONSUMES W01's
+  ``kiro_crew.connections.control_plane`` ``ErrorClass`` / ``operation_error``
+  taxonomy (``it_d610cbb5`` tracks that consuming relationship): it imports the
+  control plane's closed set, classifies each recorded Slack native string into
+  it, and neither defines its own error-class enum nor forks W01's taxonomy.
 
 What this package is deliberately NOT:
 
 - It is **not** the shared connector control plane. It does not define, copy, or
-  claim to be the campaign's RUN-01 typed-error taxonomy. RUN-01 is owned by the
-  W01 control-plane slice (``kiro_crew.connections.control_plane``); this package
-  neither imports it nor forks its enum.
+  claim to own the campaign's RUN-01 typed-error taxonomy. RUN-01 is owned by the
+  W01 control-plane slice (``kiro_crew.connections.control_plane``); the mapping
+  here imports that taxonomy and classifies into it rather than forking its enum.
 - It does **not** hold credentials, open sockets, or drive a dispatcher. Every
   function here is pure: shapes in, shapes out. The live inbound path
   (Socket Mode via ``slack.transport_dispatch`` / ``slack.events``) and the
