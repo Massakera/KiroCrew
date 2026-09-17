@@ -15,6 +15,7 @@ import { Btn } from './ui'
 import MarkdownRenderer from './MarkdownRenderer'
 import { safeHttpUrl } from '../lib/safeUrl'
 import { DiscoverySearchBar, DiscoveryStates } from './DiscoverySearchBar'
+import ErrorNotice from './ErrorNotice'
 import { SkillMetaStrip } from './SkillDirectoryBrowser'
 import { parseFrontmatter } from './SkillForm'
 import type { DiscoveredSkill } from '../types'
@@ -289,6 +290,7 @@ export default function SkillBrowserModal({ open, onClose }: Props) {
                       installed={isInstalled(selectedSkill)}
                       phase={installPhases[skillKey(selectedSkill)]}
                       onInstall={handleInstall}
+                      onClose={onClose}
                     />
                   </div>
                 </>
@@ -373,17 +375,33 @@ function SkillDetailPanel({
   installed,
   phase,
   onInstall,
+  onClose,
 }: {
   skill: DiscoveredSkill
   installed: boolean
   phase: InstallPhase | undefined
   onInstall: (skill: DiscoveredSkill, overwrite?: boolean) => void
+  /** Dismisses the modal once an error hand-off has navigated to the chat,
+   *  so the notice's "Ask the agent" does not land under this overlay. */
+  onClose: () => void
 }) {
-  const { data: preview, isLoading: previewLoading } = useQuery({
+  // A failed preview is an answer, not an empty skill: the gateway maps a
+  // too-large bundle, a registry 404, a rate limit and a bad payload to
+  // distinct statuses with a message meant for display, so surface that
+  // message instead of the "no preview available" placeholder.
+  const { data: preview, isLoading: previewLoading, error: previewError, refetch: refetchPreview } = useQuery({
     queryKey: ['skill-preview', skill.provider, skill.id],
     queryFn: () => api.previewDiscoveredSkill(skill.provider, skill.id),
     staleTime: 60_000,
+    retry: false,
   })
+  // A gateway refusal carries its own display message (size, status, reason);
+  // anything else (a dropped connection's "Failed to fetch") gets plain words.
+  const previewErrorMessage = previewError
+    ? previewError instanceof ApiError
+      ? previewError.message
+      : i18nT('components.skillBrowserModal.preview_failed_generic')
+    : ''
 
   // Same presentation as the installed-skill viewer (SkillDirectoryBrowser):
   // frontmatter parsed into the labeled meta strip, body rendered without
@@ -444,6 +462,24 @@ function SkillDetailPanel({
       {previewLoading ? (
         <div className="flex items-center gap-2 text-xs text-muted" role="status">
           <Loader2 size={12} className="animate-spin" aria-hidden="true" /> {i18nT('components.skillBrowserModal.loading_preview')}
+        </div>
+      ) : previewError ? (
+        <div className="flex flex-col items-start gap-2">
+          {/* The shared notice: agent hand-off with the error's context, and the
+              modal closes on hand-off so the chat it navigates to is visible.
+              Nothing unsaved lives in this pane, so the hand-off is safe. */}
+          <ErrorNotice
+            message={previewErrorMessage}
+            variant="inline"
+            askAgent
+            onHandoff={onClose}
+            testId="skill-preview-error"
+          />
+          {/* A rate limit clears with time; give the user the retry instead of
+              making them deselect and reselect the skill. */}
+          <Btn onClick={() => { void refetchPreview() }} data-testid="skill-preview-retry">
+            <RefreshCw size={12} aria-hidden="true" /> {i18nT('components.skillBrowserModal.preview_try_again')}
+          </Btn>
         </div>
       ) : preview?.content ? (
         <>

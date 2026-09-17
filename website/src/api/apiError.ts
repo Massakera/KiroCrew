@@ -57,6 +57,22 @@ export const isNotFoundError = (e: unknown): boolean =>
 const HTML_DOCUMENT_START = /^<(?:!doctype\s|html[\s>])/i
 
 /**
+ * The message of a gateway-authored refusal: a JSON object carrying BOTH a
+ * string `error` and a string `code`. The edge's throttle body has neither
+ * key, so it never matches; `''` when the body is not that shape.
+ */
+const structuredGatewayError = (trimmed: string): string => {
+  if (!trimmed.startsWith('{')) return ''
+  try {
+    const parsed = JSON.parse(trimmed)
+    const msg = parsed?.error
+    const code = parsed?.code
+    if (typeof msg === 'string' && msg.trim() && typeof code === 'string' && code) return msg
+  } catch { /* not JSON */ }
+  return ''
+}
+
+/**
  * Map raw edge/proxy error bodies to a human-readable message. A dashboard
  * served through Builder Tunnels sits behind API Gateway, whose throttle
  * response is the opaque `{"message":"Rate exceeded","throttlingReasons":null}`
@@ -69,13 +85,19 @@ const HTML_DOCUMENT_START = /^<(?:!doctype\s|html[\s>])/i
  * one place. The raw body remains on `ApiError.body` for diagnostics.
  */
 export const friendlyErrText = (status: number, body: string): string => {
+  const trimmed = body.trim()
   if (status === 429) {
+    // The gateway's OWN 429 is a structured `{error, code}` refusal — e.g. a
+    // skill provider that is rate-limiting us — and its message is the one the
+    // user needs. Only a bodyless or foreign 429 (the tunnel edge's opaque
+    // `{"message":"Rate exceeded"}`) gets the tunnel hint.
+    const structured = structuredGatewayError(trimmed)
+    if (structured) return structured
     return i18nT('api.client.rate_limited_by_the_tunnel_edge_http_429_too_man')
   }
   // Backends return errors as {"error": "…"} (or detail/message). Unwrap the
   // field so the UI shows the human message with its real newlines, not the
   // raw JSON envelope with escaped \n and \".
-  const trimmed = body.trim()
   if (trimmed.startsWith('{')) {
     try {
       const parsed = JSON.parse(trimmed)

@@ -307,6 +307,58 @@ describe('SkillBrowserModal', () => {
     expect(screen.queryByTestId('meta-strip')).not.toBeInTheDocument()
   })
 
+  it('shows the gateway\'s reason when the preview fails instead of the no-preview notice', async () => {
+    // A too-large bundle, a registry 404 or a rate limit each come back as a
+    // distinct non-2xx with a display message; the pane must show THAT, not
+    // pretend the skill has no SKILL.md.
+    mockApi.discoverSkills.mockResolvedValue({ results: [aSkill()], providers: ['skillsh'] })
+    mockApi.previewDiscoveredSkill.mockRejectedValue(
+      new MockApiError(413, 'Skill bundle is 12.3 MiB, above the 10.0 MiB limit'),
+    )
+    renderModal()
+    await search('widget')
+    fireEvent.click(await screen.findByRole('option', { name: 'widget-wrangler' }))
+    const alert = await screen.findByTestId('skill-preview-error')
+    expect(alert).toHaveTextContent('Skill bundle is 12.3 MiB, above the 10.0 MiB limit')
+    expect(screen.queryByText('No preview available.')).not.toBeInTheDocument()
+    // The retry re-requests the preview; a later success replaces the notice.
+    mockApi.previewDiscoveredSkill.mockResolvedValue({
+      name: 'widget-wrangler',
+      description: 'now it loads',
+      content: '# Widget Wrangler\n\nbody',
+    } satisfies DiscoverSkillPreview)
+    fireEvent.click(screen.getByTestId('skill-preview-retry'))
+    await waitFor(() => expect(mockApi.previewDiscoveredSkill).toHaveBeenCalledTimes(2))
+    expect(await screen.findByTestId('md')).toBeInTheDocument()
+    expect(screen.queryByTestId('skill-preview-error')).not.toBeInTheDocument()
+  })
+
+  it('maps a non-gateway preview failure to plain words instead of raw browser text', async () => {
+    mockApi.discoverSkills.mockResolvedValue({ results: [aSkill()], providers: ['skillsh'] })
+    mockApi.previewDiscoveredSkill.mockRejectedValue(new TypeError('Failed to fetch'))
+    renderModal()
+    await search('widget')
+    fireEvent.click(await screen.findByRole('option', { name: 'widget-wrangler' }))
+    const alert = await screen.findByTestId('skill-preview-error')
+    expect(alert).not.toHaveTextContent('Failed to fetch')
+    expect(alert).toHaveTextContent("Couldn't load the preview.")
+  })
+
+  it('shows a provider rate-limit message on the preview pane and on the install row', async () => {
+    const msg = 'skills.sh is rate-limiting requests; try again shortly'
+    mockApi.discoverSkills.mockResolvedValue({ results: [aSkill()], providers: ['skillsh'] })
+    mockApi.previewDiscoveredSkill.mockRejectedValue(new MockApiError(429, msg))
+    mockApi.installDiscoveredSkill.mockRejectedValue(new MockApiError(429, msg))
+    renderModal()
+    await search('widget')
+    const row = await screen.findByRole('option', { name: 'widget-wrangler' })
+    fireEvent.click(row)
+    expect(await screen.findByTestId('skill-preview-error')).toHaveTextContent(msg)
+    fireEvent.click(within(row).getByRole('button', { name: 'Install' }))
+    // Both the row's failure line and the detail pane's copy carry the message.
+    await waitFor(() => expect(screen.getAllByText(msg).length).toBeGreaterThanOrEqual(2))
+  })
+
   it('lists the bundle manifest when the skill ships more than one file', async () => {
     mockApi.discoverSkills.mockResolvedValue({ results: [aSkill()], providers: ['skillsh'] })
     mockApi.previewDiscoveredSkill.mockResolvedValue({
