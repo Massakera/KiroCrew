@@ -51,27 +51,33 @@ export interface PreviewFailure {
 }
 
 /**
- * Classify a failed preview by the gateway's structured `code`, then by the
- * HTTP status — never by message keywords.
+ * Classify a failed preview. Precedence: an expired session, then the
+ * gateway's structured `code`, then the HTTP status — and only when the body
+ * carries no recognized code. Never message keywords.
  *
  * Three classes, because they need three different answers:
  *
  * * **Connectivity** — the browser's own fetch failure (a `TypeError`, not an
  *   `ApiError`), a registry the gateway could not reach (`unreachable`), or a
- *   fetch that timed out (`timeout` / 504). The registry may be fine and the
- *   skill certainly is, so: localized words about the connection, plus a retry.
+ *   fetch that timed out (`timeout`, or a bare 504). The registry may be fine
+ *   and the skill certainly is, so: localized words about the connection, plus
+ *   a retry.
  * * **Definitive refusal about THIS skill** — the bundle is over the budget
- *   (`too_large` / 413), the skill is missing (`not_found`, `empty_content` /
- *   404), or the registry served something that is not a bundle
- *   (`bad_format`). The gateway's own sentence carries the specifics (for
- *   `too_large`, the measured size and the limit), and re-requesting the same
- *   preview would refuse again, so no retry and no connection advice.
- * * **Transient upstream state** — a rate limit (`rate_limited` / 429, whose
- *   sentence already says "try again shortly") or a registry status
- *   (`http_status`, `fetch_failed`): the gateway's sentence, and a retry.
+ *   (`too_large`, or a bare 413), the skill is missing (`not_found`,
+ *   `empty_content`, or a bare 404), or the registry served something that is
+ *   not a bundle (`bad_format`). The gateway's own sentence carries the
+ *   specifics (for `too_large`, the measured size and the limit), and
+ *   re-requesting the same preview would refuse again, so no retry and no
+ *   connection advice.
+ * * **Transient upstream state** — a rate limit (`rate_limited`, whose
+ *   sentence already says "try again shortly"), a registry status
+ *   (`http_status`), or an unclassified provider failure (`fetch_failed`): the
+ *   gateway's sentence, and a retry.
  *
- * An auth-expired refusal keeps its message and drops the retry: it cannot
- * succeed until the user re-authenticates.
+ * The code wins over the status so that a proxy rewriting the status (a 504
+ * wrapped around a `too_large` body) cannot turn a definitive refusal into
+ * connection advice with a dead retry. An auth-expired refusal wins over both:
+ * it cannot succeed until the user re-authenticates.
  */
 export function classifyPreviewFailure(err: unknown): PreviewFailure | null {
   if (!err) return null
@@ -80,17 +86,28 @@ export function classifyPreviewFailure(err: unknown): PreviewFailure | null {
     retry: true,
   }
   if (!(err instanceof ApiError)) return connectivity
-  const code = gatewayErrorCode(err)
-  if (code === 'unreachable' || code === 'timeout' || err.status === 504) return connectivity
   if (err.authRequired) return { message: err.message, retry: false }
-  const definitive =
-    code === 'too_large'
-    || code === 'not_found'
-    || code === 'empty_content'
-    || code === 'bad_format'
-    || err.status === 413
-    || err.status === 404
-  return { message: err.message, retry: !definitive }
+  switch (gatewayErrorCode(err)) {
+    case 'unreachable':
+    case 'timeout':
+      return connectivity
+    case 'too_large':
+    case 'not_found':
+    case 'empty_content':
+    case 'bad_format':
+      return { message: err.message, retry: false }
+    case 'rate_limited':
+    case 'http_status':
+    case 'fetch_failed':
+      return { message: err.message, retry: true }
+    default:
+      break
+  }
+  // No recognized code — a bare status, an edge proxy's own envelope, an HTML
+  // error page — so the status is the only signal left.
+  if (err.status === 504) return connectivity
+  if (err.status === 413 || err.status === 404) return { message: err.message, retry: false }
+  return { message: err.message, retry: true }
 }
 
 export default function SkillBrowserModal({ open, onClose }: Props) {
@@ -441,7 +458,13 @@ function SkillDetailPanel({
   // too-large bundle, a registry 404, a rate limit and a bad payload to
   // distinct statuses with a message meant for display, so surface that
   // message instead of the "no preview available" placeholder.
-  const { data: preview, isLoading: previewLoading, error: previewError, refetch: refetchPreview } = useQuery({
+  const {
+    data: preview,
+    isLoading: previewLoading,
+    isFetching: previewFetching,
+    error: previewError,
+    refetch: refetchPreview,
+  } = useQuery({
     queryKey: ['skill-preview', skill.provider, skill.id],
     queryFn: () => api.previewDiscoveredSkill(skill.provider, skill.id),
     staleTime: 60_000,
@@ -525,9 +548,15 @@ function SkillDetailPanel({
           />
           {/* Offered only when the same request can succeed later (a dropped
               connection, a timeout, a rate limit). A bundle over the budget or
-              a missing skill refuses the same way every time, so no retry there. */}
+              a missing skill refuses the same way every time, so no retry there.
+              Disabled while a refetch is in flight: the notice stays up until
+              the answer lands, so a second click would only queue a duplicate. */}
           {previewFailure.retry && (
-            <Btn onClick={() => { void refetchPreview() }} data-testid="skill-preview-retry">
+            <Btn
+              onClick={() => { void refetchPreview() }}
+              disabled={previewFetching}
+              data-testid="skill-preview-retry"
+            >
               <RefreshCw size={12} aria-hidden="true" /> {i18nT('components.skillBrowserModal.preview_try_again')}
             </Btn>
           )}

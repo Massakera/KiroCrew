@@ -51,14 +51,18 @@ export const isNotFoundError = (e: unknown): boolean =>
 
 /**
  * The gateway's machine-readable reason for a refusal: the string `code` of a
- * structured `{error, code}` body (`too_large`, `not_found`, `rate_limited`,
- * `unreachable`, `timeout`, `bad_format`, ...), or `''` when the body is not
- * that shape — a bare status, an edge proxy's own envelope, an HTML page.
+ * `{"error": "...", "code": "..."}` JSON body (`too_large`, `not_found`,
+ * `rate_limited`, `unreachable`, `timeout`, `bad_format`, ...), or `''` when
+ * the body is not that shape — an empty body, an edge proxy's own envelope, an
+ * HTML error page, or a `code` that is not a string.
  *
- * Duck-typed on `body` like {@link isNotFoundError}, so it reads a mocked
- * `ApiError` too. Callers branch on the code so the SAME status can mean
- * different things (a 502 from an unreachable registry is retryable; a 502 for
- * a malformed bundle is not) without matching words in the message.
+ * Reads `body`, the response text `toApiError` stores verbatim on the
+ * `ApiError` (`friendlyErrText` unwraps only the human `error` sentence into
+ * `message`, so the code survives nowhere else). Duck-typed on `body` like
+ * {@link isNotFoundError}, so a mocked `ApiError`-shaped rejection counts too.
+ * Callers branch on the code so the SAME status can mean different things (a
+ * 502 from an unreachable registry is retryable; a 502 for a malformed bundle
+ * is not) without matching words in the message.
  */
 export const gatewayErrorCode = (e: unknown): string => {
   const body = typeof e === 'object' && e !== null ? (e as { body?: unknown }).body : undefined
