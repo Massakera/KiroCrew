@@ -634,6 +634,29 @@ async def _monitor_update(
             "monitor_update cannot apply structured fields to a legacy loop: "
             + ", ".join(structured_only)
         )
+    # PERPETUAL MODE (owner-armed member loop): the owner chose "no cycle or
+    # time cap" on the Crew Members page, and that choice is the owner's. The
+    # member may retune its own cadence from inside a wake (``interval_secs``
+    # -> ``idle_secs``, ``message``, ``banner``), but a cap it sets on itself
+    # is a scheduled stop the owner never asked for, so the two bound fields
+    # are refused here. The owner's switch is the only thing that ends it.
+    if "max_cycles" in patch or "max_runtime_secs" in patch:
+        owner_armed = await _is_owner_armed_member_loop(state, loop)
+        if owner_armed is None:
+            # FAIL CLOSED: the record that says whose loop this is could not be
+            # read, and the two fields are the ones an owner-armed loop
+            # withholds from the member.
+            raise _DirectiveDenied(
+                "monitor_update: could not read who armed this loop (the trust record is "
+                "unreadable), so max_cycles and max_runtime_secs are refused on this member "
+                "session until it can be. Adjust interval_secs, message or banner only."
+            )
+        if owner_armed:
+            raise _DirectiveDenied(
+                "monitor_update: this loop is the owner's Perpetual mode for this member; "
+                "max_cycles and max_runtime_secs are the owner's to set (the Crew Members "
+                "page switch turns it off). Adjust interval_secs, message or banner only."
+            )
     cycle_count = int(getattr(loop, "cycle_count", 0) or 0)
     current_cap = int(getattr(loop, "max_cycles", 0) or 0)
     new_cap = patch.get("max_cycles", current_cap)
@@ -930,6 +953,87 @@ def _structured_stop_reason(args: dict[str, Any]) -> str:
     )
 
 
+async def _is_owner_armed_member_loop(state: Any, loop: Any, *, slot: Any = None) -> bool | None:
+    """Whether *loop* is the owner's Perpetual mode loop on a MEMBER slot.
+
+    Three answers, because the callers act on the difference. ``False`` is a
+    CONFIRMED "not the owner's": a non-member slot, or a member slot whose
+    trust entry names another party or nobody. ``True`` is the owner's
+    ``armed_by`` entry naming this loop on its own slot -- the same evidence
+    the fire-time guard admits the wake on. ``None`` is "cannot determine":
+    the slot is member-mode but the keystone-gated record exists and could
+    not be read. On a member slot the callers treat ``None`` as ``True``
+    (refuse the cap, keep the record): an unreadable record must never widen
+    what the member may do to a loop the owner may have armed. A non-member
+    slot never reaches the read, so it is unaffected. The slot is resolved
+    from *slot* when the caller holds it, from *state* otherwise. File IO is
+    offloaded.
+    """
+    from kiro_crew.autonudge_selfarm import ARMED_BY_OWNER, read_arm_party_strict
+
+    slot_key = str(getattr(loop, "slot_key", "") or "")
+    if not slot_key:
+        return False
+    if slot is None and state is not None:
+        slot = (getattr(state, "_slots", None) or {}).get(slot_key)
+    if slot is None or str(getattr(slot, "mode", "")) != "member":
+        return False
+    try:
+        party = await asyncio.to_thread(read_arm_party_strict, loop.id, slot_key)
+    except Exception:  # noqa: BLE001 - the callers fail closed on an unknown party
+        logger.warning("owner-arm record unreadable for loop %s", loop.id, exc_info=True)
+        return None
+    return party == ARMED_BY_OWNER
+
+
+async def _stop_owner_armed_member_loop(svc: Any, loop_id: str, reason: str) -> str:
+    """The owner's Perpetual mode: a member that stops itself is a rare,
+    reportable event, and the Crew Members drawer is where the owner reads
+    why. Deactivate with the directive's own code AND the member's own words
+    (redacted, capped -- the same ``reason`` a structured stop records) so the
+    record stays -- the owner's switch shows OFF with "stopped by the member"
+    plus that text, and can turn it back on (the resume path lifts nothing it
+    did not already hold). Removing it, as an ordinary legacy stop does, would
+    collapse the stop into "nothing scheduled", which is exactly the silent
+    death the drawer block exists to make visible. The caller takes this path
+    for an UNREADABLE record too -- keeping a record is the safe side.
+
+    The record stays; the AUTHORIZATION does not. An owner-arm entry is the
+    whole of the fire-time admission and the loop store is agent-writable, so
+    a paused loop that kept its entry could be revived by a forged
+    ``active: true``. STRICT, and a failure is SURFACED, not swallowed: the
+    loop is stopped either way, but the tool's answer says the authorization
+    is still standing (the owner's OFF on the detail page revokes it again;
+    the owner's ON re-records it before resuming), and the error log carries
+    the cause. Joined on cancellation like every trust write.
+    """
+    from kiro_crew.autonudge_selfarm import await_thread_to_completion, revoke_arm
+
+    await svc.update(
+        loop_id,
+        active=False,
+        stopped_reason=AUTONUDGE_STOP_REASON,
+        stopped_detail=reason,
+    )
+    stopped = f"Auto-nudge loop {loop_id} stopped on this session" + (
+        f" (reason: {reason})" if reason else ""
+    )
+    try:
+        await await_thread_to_completion(revoke_arm, loop_id)
+    except OSError:
+        logger.error(
+            "owner-arm record could not be revoked on the member's own stop of loop %s",
+            loop_id,
+            exc_info=True,
+        )
+        return (
+            stopped + ". No further nudges will fire. Its Perpetual mode authorization could "
+            "not be revoked (the trust record refused the write); the owner's switch "
+            "on the detail page revokes it when turned off."
+        )
+    return stopped + ". No further nudges will fire."
+
+
 async def _stop_resolved_loop(
     slot: Any, svc: Any, binding: str, loop: Any, args: dict[str, Any]
 ) -> str:
@@ -983,6 +1087,23 @@ async def _stop_resolved_loop(
     # reads.
     if is_owned_research_slot(binding, str(getattr(slot, "_app", "") or "")):
         await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
+    elif str(getattr(slot, "mode", "")) == "member":
+        # A MEMBER slot's stop is serialized with the owner's switch on the same
+        # per-slot lock (``handlers.members._perpetual_lock``): the owner's
+        # takeover writes its entry and then resumes the loop, and a stop
+        # landing between those two steps would revoke the entry under a loop
+        # the takeover then reports as ON -- every wake refused, nothing to
+        # say why. Under the lock the two run whole, in either order, and the
+        # party is read INSIDE it so a takeover that just finished is seen.
+        from kiro_crew.dashboard.handlers.members import _perpetual_lock
+
+        async with _perpetual_lock(str(getattr(loop, "slot_key", "") or "")):
+            current = svc.get_by_id(loop_id) if callable(getattr(svc, "get_by_id", None)) else loop
+            if current is None:
+                return _no_loop_message(svc, binding)
+            if await _is_owner_armed_member_loop(None, current, slot=slot) is not False:
+                return await _stop_owner_armed_member_loop(svc, loop_id, reason)
+            await svc.remove(loop_id)
     else:
         await svc.remove(loop_id)
     return (

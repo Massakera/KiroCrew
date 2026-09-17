@@ -324,6 +324,7 @@ const PATROL_STOPPED_REASON: Record<string, string> = {
   runtime_budget: 'pages.membersPage.patrol_stopped_runtime_budget',
   approval_stalled: 'pages.membersPage.patrol_stopped_approval_stalled',
   interrupted: 'pages.membersPage.patrol_stopped_interrupted',
+  autonudge_stop: 'pages.membersPage.patrol_stopped_autonudge_stop',
 }
 /** How often the "next wake in …" countdown in the drawer re-reads the clock.
  *  Coarser than the popover's per-second tick on purpose: the drawer line is
@@ -1491,8 +1492,17 @@ export default function MembersPage() {
       loops,
     }
   }, [patrolQuery.data, patrolQuery.isError])
+  /** The loop record for a member's slot, but only when the roster counts it
+   *  as the switch's loop: `GET /api/autonudge` lists a STRUCTURED MONITOR
+   *  (`monitor_watch`) on the same slot as a reduced, active row, and that is
+   *  a watch task, not Perpetual mode -- the roster's `perpetual` reads `none`
+   *  for it (`perpetual_state_of` applies `is_structured_monitor_loop`), so
+   *  the badge, the status filter and the Work log block all follow that
+   *  reading rather than the bare registry row. A roster without the field
+   *  (an older backend) falls back to the registry alone. */
   const patrolLoopOf = useCallback(
     (m: MemberRosterRow) => {
+      if (m.perpetual === 'none') return undefined
       const key = slotKeyOf(m)
       return key ? patrol.loops[key] : undefined
     },
@@ -1511,7 +1521,8 @@ export default function MembersPage() {
     },
     [patrolLoopOf],
   )
-  const activePatrol = activeMemberKey ? patrol.loops[activeMemberKey] : undefined
+  const activePatrol =
+    activeMemberKey && active?.perpetual !== 'none' ? patrol.loops[activeMemberKey] : undefined
   // The armed/stopped verdict and the stop reason now come from the pushed
   // `wake` projection, so a stop that lands re-renders the block without a
   // poll — that is why patrolQuery no longer carries a refetchInterval. The
@@ -1572,7 +1583,11 @@ export default function MembersPage() {
   // a stop (and its reason) survives the registry forgetting the loop. That
   // is the case that used to read "nothing scheduled" after a restart killed
   // a patrol mid-cycle; now the loader's synthesised stop is what renders.
-  const patrolState: 'active' | 'stopped' | 'none' = activePatrol?.active
+  // Both sources yield to the roster's `perpetual` when it says `none`: a
+  // structured monitor on the slot is neither armed nor stopped Perpetual mode.
+  const patrolState: 'active' | 'stopped' | 'none' = active?.perpetual === 'none'
+    ? 'none'
+    : activePatrol?.active
     ? 'active'
     : activeWake?.patrol === 'stopped'
       ? 'stopped'
@@ -2584,6 +2599,15 @@ export default function MembersPage() {
                       {PATROL_STOPPED_REASON[patrolStoppedReason]
                         ? t(PATROL_STOPPED_REASON[patrolStoppedReason])
                         : patrolStoppedReason}
+                    </span>
+                  )}
+                  {/* The crewmate's own words for a stop it chose (redacted and
+                      capped on the server), under the coded reason. Absent for
+                      every other stop. The switch that turns it back on is on
+                      the detail page, with the schedules. */}
+                  {activePatrol?.stopped_detail && (
+                    <span className="block mt-0.5 italic" data-testid="member-patrol-detail">
+                      {activePatrol.stopped_detail}
                     </span>
                   )}
                   {/* No rearm control here, deliberately. The state reads as a dead end

@@ -3188,10 +3188,15 @@ relaxes a session boundary, the persisted bit is a HINT, not authorization:
 `_load()` normalises a non-boolean value (the string `"false"` is truthy) to
 `False` with a warning, the fire-time guard compares `is True`, and it ALSO
 requires the keystone-gated trust record — `autonudge-self-armed.json` inside
-the data home's `trust` directory, written by `autonudge_selfarm.py`; that
-directory is on the sensitive-path floor as a whole, so
-agent file tools can neither read nor write it) to name this loop id on this
-slot. The authorizer mints the loop id itself, writes that record BEFORE
+the data home's `autonudge-trust/` directory, written by `autonudge_selfarm.py`;
+a gateway-only leaf of its own, on `security._CREW_SECRET_LEAVES` (agent file
+tools can neither read nor write it) AND bind-masked by
+`sandbox._CREW_HIDDEN_LEAVES` (precreated, alias-refused), so a sandboxed
+command that composes the path at runtime cannot write it either — deliberately
+NOT under `trust/`, which stays sandbox read-write for the SEL appends; a record
+left at that older layout is DISCARDED, not migrated, on the gateway's first
+access — its entries may be the sandbox's — so loops armed before the upgrade
+are refused until armed again) to name this loop id on this slot. The authorizer mints the loop id itself, writes that record BEFORE
 `svc.add` (handing the id to the service), and FAILS CLOSED if it cannot
 (denies 503 "self-arm record unavailable" with the store untouched — so a
 stopped loop the arm would have displaced is never removed for nothing),
@@ -3233,6 +3238,128 @@ record does NOT do is authenticate the loop's PAYLOAD: the store is
 agent-writable for every loop, so any loop's `message` can be rewritten
 out-of-band — a pre-existing property of the store, tracked as its own design
 question (#8980), not a property of the self-arm exception.
+**Owner-arm (Perpetual mode), the second admitted party — MEMBER slots only.**
+The Perpetual mode switch on a member's detail page (the crew editor's
+Schedules pane) arms the member's own thread from OUTSIDE its turn, which the self-arm exception does not cover, so
+`authorize_and_add_nudge` takes `owner_arm=True` from exactly one caller: the
+owner-gated `POST /api/members/{slug}/perpetual` (`handlers/members.py`; app
+tokens 404, non-owner subjects refused by `require_owner_dashboard_request`
+BEFORE any input is read; the slot key is derived from the slug's `dm.json`
+binding, never taken from the body, and must name a live `mode="member"`
+slot). Admission is audited as its own `owner_armed` outcome, the arm never
+sets `self_armed` (and where the owner takes over a stopped SELF-armed loop
+the owner record makes that loop's stale `self_armed` bit inert: the self
+reader no longer vouches for it), and the trust record entry is written by
+`record_owner_arm` with `armed_by: "owner"` — `is_recorded_self_arm` and
+`is_recorded_owner_arm` are disjoint readers of the same file (an entry
+without `armed_by` reads as self, the only writer that existed before the
+field), so a forged `self_armed` bit cannot ride an owner entry and an owner
+entry cannot satisfy the self-arm check. The fire-time guard
+(`_dashboard_mode_admits`) admits a member wake on the owner record alone —
+there is no store bit for it to agree with, and the record is the trusted
+half — and never admits it on a crew slot. Same fail-closed write ordering,
+same revocation on removal. Semantics: ON with no loop arms
+`max_cycles=0`/`max_runtime_secs=0` (unlimited — the owner's deliberate
+choice; every finite loop armed elsewhere keeps its caps), default
+`idle_secs` 3600, a fixed standing instruction and the banner `Perpetual
+mode`. Every mutation of the switch runs as ONE SUPERVISED TASK the request
+only awaits (`asyncio.shield`): a cancelled request never interrupts the
+steps, the task acquires and releases the per-slot lock itself (held until
+any rollback has finished; the lock map is refcounted and an idle slot's
+entry dropped), and it re-runs the ownership resolution UNDER the lock,
+refusing 409 `member_slot_conflict` if the binding or live slot moved while
+it waited. That lock also serializes the member's own `autonudge_stop` /
+`monitor_stop` on a member slot (`_stop_resolved_loop` takes it and re-reads
+the party inside it), so a stop cannot land between the takeover's entry
+write and its resume and leave a loop reported ON with its entry revoked;
+`monitor_update` and the fire path go through the nudge service's locks, so
+the takeover's rollback still targets exactly the loop id and token it
+captured. ON on a STOPPED
+legacy loop is an owner TAKEOVER (`_takeover_stopped_loop`): the entry's
+current party is read with the STRICT reader (`read_arm_party_strict` —
+unreadable file or a present-but-malformed entry RAISES, so an indeterminate
+record refuses the takeover; only "no file" / "no entry" answer none), the
+entry is rewritten to `owner` stamped with this takeover's `txn` token (one
+entry per loop, one party per entry; skipped when it already says owner),
+then THAT loop is resumed through
+`authorize_and_update_nudge(active=True, max_cycles=0, max_runtime_secs=0)`,
+keeping its cycle accounting; the decision reads the RETURNED loop (the
+service rolls its fields back on a failed persist), and a refused, raised or
+not-actually-active result restores the prior party only while the entry
+still carries THIS takeover's token — a later takeover's entry is never
+undone by an earlier one's cleanup; the compare and the rewrite are ONE
+locked read-modify-write in the trust module (`restore_arm_party_if_token`,
+siblings preserved verbatim), awaited inside the slot lock so the lock is
+released only after the restore ran. A cancellation of the task itself
+(shutdown) leaves the entry as written: the outcome is unknown and an owner
+entry over a stopped loop is resumable only by the owner. Every supervised
+task's outcome is read by a done-callback (error line = exception type + slot
+key, never the message; the chain at debug), and the PER-APP task set is
+hooked into the app's own lifecycle (`register_perpetual_lifecycle`:
+`on_shutdown` stops admitting with 503 `shutting_down`, `on_cleanup` waits a
+bounded grace then cancels and joins its own app's tasks). Every blocking
+trust write (the owner record, in the takeover and in the authorizer's
+no-loop arm alike, and the restore) goes through
+`autonudge_selfarm.await_thread_to_completion` — on cancellation the thread
+is awaited again, shielded and in a loop, so a second cancel does not
+abandon it either; only when the thread future is done does the cancel
+propagate — so joining the task joins its threads and the slot lock is
+released only after the write finished. The drain's join is bounded: a
+task still running when its second wait expires is given up on and logged,
+and that task's thread then finishes on its own.
+Phase two of the drain is a bounded, best-effort wait: the nudge service's
+own add/update persists are shielded internal tasks it retains in
+`_inflight_adds`; the drain waits on that set for the same bound without
+cancelling (they are the service's) and logs at info how many were still
+writing when it gave up. Nothing takes them over afterwards —
+`AutoNudgeService.stop()` cancels timers and does not join in-flight
+persists — so a write still running then finishes on its own or not at all.
+The writers
+(`_record_arm`, `forget_self_arm`) read the file strictly and verbatim too,
+so a corrupt file refuses the write instead of being replaced by a
+one-entry map that would strand every sibling loop. ON on an active loop
+changes nothing; OFF is
+`active=False` (reason `manual`, record kept, pending wake cleared, running
+turn untouched) FOLLOWED by a strict revoke of the loop's trust entry
+(`revoke_arm`; a revoke the record refuses is answered 503 with the loop
+already paused, never swallowed) -- the owner entry is the whole of an
+owner arm's fire-time admission and the loop store is agent-writable, so a
+paused record that kept it could be revived by a forged `active: true`; the
+next ON re-records it through the takeover path. The member's own
+`autonudge_stop` on an owner-armed loop revokes the entry the same way
+(best effort, the record kept for its words), and a CANCELLED initial arm
+forgets the entry it wrote before the add committed (joined), so no entry
+stands over a loop that is paused or never existed; a structured monitor is refused 409, never converted. Inside
+its wakes the member keeps `monitor_update` for `interval_secs`/`message`/
+`banner`, but on an owner-armed member loop `max_cycles` and
+`max_runtime_secs` are refused (a self-set cap is a scheduled stop the owner
+never asked for), the owner's `manual` OFF stays unrevivable by the member
+(`monitor_update` will not resume a manual pause; `monitor_start` cannot
+displace a retained row), and the member's own `autonudge_stop` on such a
+loop DEACTIVATES with reason `autonudge_stop` instead of removing the record
+— the member's own words ride along in `NudgeLoop.stopped_detail`, the one
+free-text field a stop carries, redacted and capped at
+`MAX_MONITOR_STOP_REASON_CHARS` by `normalize_stopped_detail` at every
+boundary (the `update` write, `_load` of the agent-writable store, and the
+REST `_serialize` output; withheld on the reduced structured row like
+`banner`) — so the detail page and the Crew Members drawer read "stopped by
+the member itself" plus that text, and the owner's switch on the detail page
+can turn it back on. The roster payload (`GET /api/members`) carries each
+member's `perpetual` reading (`on` / `off` / `none`, `perpetual_state_of`: an
+O(1) registry read per slot; a structured monitor and a never-opened thread
+both read `none`) so the roster and the team view can show a paused member
+without a second request. `on` means "a loop on this crewmate's own thread is
+active", NOT "uncapped": a finite loop the crewmate armed itself reads `on`
+while still scheduled to stop at its cap, and ON pressed over it changes
+nothing (the switch never rewrites a live loop the member is driving — a
+takeover is only offered over a STOPPED one, where the member has nothing in
+flight to lose). The detail page's ON readout carries the loop's own wake
+count against its cap (`patrol_cycles_of`), which is where the coming stop
+shows; when that loop stops, the reading turns `off` with the cap reason and
+the owner's ON then lifts the caps. On a member slot the
+applier's owner-arm read is tri-state and FAILS CLOSED: an unreadable or
+malformed record refuses the cap change and takes the retain-record stop
+path; non-member slots never reach the read.
 **Which turns count as "the session's own":** the directive consumer supplies
 `initiator_slot_key` for exactly two producers, each named explicitly — a turn
 a HUMAN started in this session (`producer_is_user_facing`, the same

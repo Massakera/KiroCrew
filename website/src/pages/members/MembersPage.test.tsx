@@ -732,7 +732,7 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
     expect(within(workLog).getByTestId('member-stats')).toBeInTheDocument()
     expect(within(workLog).getByTestId('member-summary-status')).toBeInTheDocument()
     expect(within(workLog).getByText('Sessions it\'s driving')).toBeInTheDocument()
-    expect(within(workLog).getByText('Auto patrol')).toBeInTheDocument()
+    expect(within(workLog).getByText('Perpetual mode')).toBeInTheDocument()
     expect(within(workLog).getByText('Recent activity')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('side-panel-leading-tab-crew-dashboard'))
     const dashboard = await screen.findByTestId('member-dashboard')
@@ -1935,7 +1935,7 @@ describe('MembersPage Work log — driving sessions', () => {
   })
 })
 
-describe('MembersPage auto patrol (monitor loop status)', () => {
+describe('MembersPage Perpetual mode (monitor loop status)', () => {
   // The auto-nudge loop bound to a member's own DM slot is what wakes a
   // standing member without anyone asking. The block reads the whole
   // registry (`GET /api/autonudge`) and filters on the member's slot key —
@@ -1972,11 +1972,11 @@ describe('MembersPage auto patrol (monitor loop status)', () => {
     ;(api.autonudgeList as ReturnType<typeof vi.fn>).mockResolvedValue({ enabled: true, loops: [] })
   })
 
-  it('an active loop renders as patrolling, with interval, cycles, last and next wake, and the banner-or-instruction line', async () => {
+  it('an active loop renders as ON, with interval, cycles, last and next wake, and the banner-or-instruction line', async () => {
     await openDrawerWith({ loops: [loop()] })
     const block = screen.getByTestId('member-patrol')
     expect(block).toHaveAttribute('data-state', 'active')
-    expect(screen.getByTestId('member-patrol-status')).toHaveTextContent(/patrolling/i)
+    expect(screen.getByTestId('member-patrol-status')).toHaveTextContent(/on\. waking on its own/i)
     // Finite cap: self-describing in the drawer ("3 of 24"); the compact
     // "3/24" stays on the roster badge, where it has the tooltip's sentence.
     expect(screen.getByTestId('member-patrol-cycles')).toHaveTextContent('3 of 24')
@@ -1993,6 +1993,23 @@ describe('MembersPage auto patrol (monitor loop status)', () => {
     expect(instruction).not.toHaveTextContent('Second line')
   })
 
+  it('a structured monitor on the slot is not Perpetual mode: the roster says none and the block, badge and filter follow', async () => {
+    // `GET /api/autonudge` lists a monitor_watch as a reduced ACTIVE row on the
+    // member's own slot; the roster's `perpetual` reads `none` for it, and
+    // that reading wins over the bare registry row everywhere on this page.
+    ;(api.autonudgeList as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enabled: true,
+      loops: [loop({ message: undefined, banner: undefined, cycle_count: undefined })],
+    })
+    await renderPage([row({ bound: true, slot_key: 'member-oncall', perpetual: 'none' })])
+    expect(screen.queryByTestId('member-patrol-dot')).toBeNull()
+    fireEvent.click(await rosterRow('oncall'))
+    await openWorkLog()
+    await waitFor(() => expect(screen.queryByTestId('member-patrol-loading')).toBeNull())
+    expect(screen.getByTestId('member-patrol')).toHaveAttribute('data-state', 'none')
+    expect(screen.getByTestId('member-patrol-status')).toHaveTextContent(/never been turned on/i)
+  })
+
   it('an unlimited cap says so instead of rendering a denominator of zero', async () => {
     await openDrawerWith({ loops: [loop({ max_cycles: 0, cycle_count: 61 })] })
     const cycles = screen.getByTestId('member-patrol-cycles')
@@ -2006,10 +2023,10 @@ describe('MembersPage auto patrol (monitor loop status)', () => {
     expect(screen.getByTestId('member-patrol-instruction')).toHaveTextContent('watching PR #123')
   })
 
-  it('no loop on the member slot renders "no patrol scheduled" — and a loop on ANOTHER slot does not leak in', async () => {
+  it('no loop on the member slot renders "nothing wakes this crewmate" — and a loop on ANOTHER slot does not leak in', async () => {
     await openDrawerWith({ loops: [loop({ slot_key: 'member-research' }), loop({ slot_key: 'chat-1-abc' })] })
     expect(screen.getByTestId('member-patrol')).toHaveAttribute('data-state', 'none')
-    expect(screen.getByTestId('member-patrol-status')).toHaveTextContent(/no patrol scheduled/i)
+    expect(screen.getByTestId('member-patrol-status')).toHaveTextContent(/never been turned on/i)
   })
 
   it('a stop the loop registry has already forgotten still renders from the wake projection', async () => {
@@ -2027,19 +2044,28 @@ describe('MembersPage auto patrol (monitor loop status)', () => {
       )
     })
     await waitFor(() => expect(screen.getByTestId('member-patrol')).toHaveAttribute('data-state', 'stopped'))
-    expect(screen.getByTestId('member-patrol-status')).toHaveTextContent(/patrol stopped/i)
+    expect(screen.getByTestId('member-patrol-status')).toHaveTextContent(/^off\./i)
     expect(screen.getByTestId('member-patrol-reason')).toHaveTextContent(/interrupted/i)
   })
 
-  it('a stopped loop keeps its reason visible instead of collapsing into "no patrol scheduled"', async () => {
+  it('a stopped loop keeps its reason visible instead of collapsing into "nothing wakes this crewmate"', async () => {
     // This is the failure the block exists for: a loop that hit its cycle
     // cap stops silently, and a page that reads that as "nothing scheduled"
     // hides the one fact that would have told someone the member is dead.
     await openDrawerWith({ loops: [loop({ active: false, stopped_reason: 'cycle_cap' })] })
     expect(screen.getByTestId('member-patrol')).toHaveAttribute('data-state', 'stopped')
-    expect(screen.getByTestId('member-patrol-status')).toHaveTextContent(/patrol stopped/i)
+    expect(screen.getByTestId('member-patrol-status')).toHaveTextContent(/^off\./i)
     expect(screen.getByTestId('member-patrol-reason')).toHaveTextContent(/wake limit/i)
-    expect(screen.queryByText(/no patrol scheduled/i)).toBeNull()
+    expect(screen.queryByText(/never been turned on/i)).toBeNull()
+  })
+
+  it('a loop the crewmate stopped itself shows that reason and its own words under it', async () => {
+    await openDrawerWith({
+      loops: [loop({ active: false, stopped_reason: 'autonudge_stop', stopped_detail: 'standing duty is over' })],
+    })
+    expect(screen.getByTestId('member-patrol')).toHaveAttribute('data-state', 'stopped')
+    expect(screen.getByTestId('member-patrol-reason')).toHaveTextContent(/stopped by the crewmate itself/i)
+    expect(screen.getByTestId('member-patrol-detail')).toHaveTextContent('standing duty is over')
   })
 
   it('a failed registry read renders the error state, never the affirmative empty state', async () => {
@@ -2051,7 +2077,7 @@ describe('MembersPage auto patrol (monitor loop status)', () => {
     // hand-rolled alert box.
     const notice = await screen.findByTestId('member-patrol-error')
     expect(notice).toHaveAttribute('role', 'alert')
-    expect(notice).toHaveTextContent(/patrol status/i)
+    expect(notice).toHaveTextContent(/perpetual mode/i)
     expect(screen.queryByTestId('member-patrol')).toBeNull()
     // The roster says so too: every badge is blank for an unknown reason,
     // which must not read as "no member has a patrol".
@@ -2062,7 +2088,7 @@ describe('MembersPage auto patrol (monitor loop status)', () => {
     ;(api.autonudgeList as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'))
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     await rosterRow('oncall')
-    expect(await screen.findByTestId('member-roster-patrol-error')).toHaveTextContent(/patrol status/i)
+    expect(await screen.findByTestId('member-roster-patrol-error')).toHaveTextContent(/perpetual mode/i)
     expect(screen.queryByTestId('member-patrol-dot')).toBeNull()
   })
 

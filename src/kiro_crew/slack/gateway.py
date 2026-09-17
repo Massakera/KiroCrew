@@ -7570,17 +7570,34 @@ class GatewayOrchestrator:
         the persisted ``self_armed`` must be the boolean True (``is True`` -- a
         forged string is truthy; ``_load`` normalises too) AND the
         keystone-gated trust record the authorizer wrote at arm time
-        (``autonudge_selfarm``, unreachable by agent file tools) must name this
-        loop on this slot. A forged boolean in the store has no trust entry and
-        refuses. The record read is file IO, so it is offloaded.
+        (``autonudge_selfarm``: its own ``autonudge-trust/`` leaf, fenced from
+        agent file tools AND bind-masked from a sandboxed shell -- not the
+        sandbox-writable ``trust/``) must name this loop on this slot. A forged
+        boolean in the store has no trust entry and refuses. The record read is
+        file IO, so it is offloaded.
         """
-        if str(getattr(slot, "mode", "")) not in {"crew", "member"}:
+        mode = str(getattr(slot, "mode", ""))
+        if mode not in {"crew", "member"}:
             return True
-        if getattr(loop, "self_armed", False) is not True:
-            return False
-        return bool(
+        if getattr(loop, "self_armed", False) is True and bool(
             await asyncio.to_thread(autonudge_selfarm.is_recorded_self_arm, loop.id, loop.slot_key)
-        )
+        ):
+            return True
+        # The second admitted party, MEMBER slots only: the dashboard owner's
+        # Perpetual mode switch. It has no store bit to agree with -- the
+        # record, which only the owner-gated member route writes and which
+        # no sandboxed process can reach (the leaf is masked, and the mask
+        # covers a path composed at runtime as much as a literal one), is the
+        # whole authorization -- and a self-arm entry never
+        # satisfies it (``armed_by`` is disjoint), so a forged ``self_armed``
+        # bit cannot ride an owner entry and vice versa.
+        if mode == "member":
+            return bool(
+                await asyncio.to_thread(
+                    autonudge_selfarm.is_recorded_owner_arm, loop.id, loop.slot_key
+                )
+            )
+        return False
 
     @staticmethod
     async def _audit_fire_refused(loop: NudgeLoop, slot: Any) -> None:
