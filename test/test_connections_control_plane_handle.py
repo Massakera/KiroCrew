@@ -29,10 +29,12 @@ from kiro_crew.connections.control_plane import (
     create_binding,
     derive_handle,
     ensure_usable,
+)
+from kiro_crew.connections.control_plane import handle as handle_mod
+from kiro_crew.connections.control_plane import (
     is_expired,
     next_generation,
 )
-from kiro_crew.connections.control_plane import handle as handle_mod
 from kiro_crew.connections.control_plane.errors import ERROR_INPUT, ERROR_SCOPE
 from kiro_crew.connections.control_plane.handle import _binding_fingerprint
 
@@ -180,6 +182,115 @@ def test_a_caller_changed_generation_is_refused() -> None:
     assert excinfo.value.error["error_class"] == "auth"
 
 
+# --- Fault: malformed shape (F3) -------------------------------------------
+# A handle's fields are UNTRUSTED, so a missing/corrupt field is the SAME class
+# of input as a widened scope and must be a TYPED refusal -- not an uncaught
+# KeyError/TypeError that carries no error_class, skips the audit, and jumps the
+# decision chain onto the caller. Each test below first proves the OLD behavior
+# would crash (the raw exception the bare read raised) and asserts the fix turns
+# it into HandleTamperedError.
+
+
+def test_a_handle_missing_scopes_is_refused_not_crashed() -> None:
+    # Was: `set(handle["scopes"])` raised an uncaught KeyError: 'scopes'.
+    handle = _make_handle(now=_T0, ttl_seconds=300.0)
+    del handle["scopes"]
+    with pytest.raises(HandleTamperedError) as excinfo:
+        ensure_usable(handle, now=_T0 + 1.0)
+    assert excinfo.value.error["error_class"] == "auth"
+    assert "scopes" in excinfo.value.error["detail"]
+
+
+def test_a_handle_with_a_non_iterable_scopes_is_refused_not_crashed() -> None:
+    # Was: `set(12345)` raised an uncaught TypeError: 'int' object is not iterable.
+    handle = _make_handle(now=_T0, ttl_seconds=300.0)
+    handle["scopes"] = 12345  # type: ignore[typeddict-item]
+    with pytest.raises(HandleTamperedError) as excinfo:
+        ensure_usable(handle, now=_T0 + 1.0)
+    assert excinfo.value.error["error_class"] == "auth"
+
+
+def test_a_handle_with_unhashable_scope_elements_is_refused_not_crashed() -> None:
+    # Was: `set([["mail.read"]])` raised an uncaught TypeError: unhashable type.
+    handle = _make_handle(now=_T0, ttl_seconds=300.0)
+    handle["scopes"] = [["mail.read"]]  # type: ignore[list-item]
+    with pytest.raises(HandleTamperedError) as excinfo:
+        ensure_usable(handle, now=_T0 + 1.0)
+    assert excinfo.value.error["error_class"] == "auth"
+
+
+def test_a_handle_missing_expiry_is_refused_not_crashed() -> None:
+    # Was: `handle["not_after"] > record.not_after` raised KeyError: 'not_after'.
+    handle = _make_handle(now=_T0, ttl_seconds=300.0)
+    del handle["not_after"]
+    with pytest.raises(HandleTamperedError) as excinfo:
+        ensure_usable(handle, now=_T0 + 1.0)
+    assert excinfo.value.error["error_class"] == "auth"
+    assert "not_after" in excinfo.value.error["detail"]
+
+
+def test_a_handle_with_a_non_numeric_expiry_is_refused_not_crashed() -> None:
+    # Was: `"soon" > record.not_after` raised TypeError: '>' not supported
+    # between instances of 'str' and 'float'.
+    handle = _make_handle(now=_T0, ttl_seconds=300.0)
+    handle["not_after"] = "soon"  # type: ignore[typeddict-item]
+    with pytest.raises(HandleTamperedError) as excinfo:
+        ensure_usable(handle, now=_T0 + 1.0)
+    assert excinfo.value.error["error_class"] == "auth"
+
+
+def test_a_handle_missing_handle_id_is_refused_not_crashed() -> None:
+    # The shape gate runs BEFORE the registry lookup, so even a missing
+    # handle_id (which _record_for would KeyError on) is a typed refusal.
+    handle = _make_handle(now=_T0, ttl_seconds=300.0)
+    del handle["handle_id"]
+    with pytest.raises(HandleTamperedError) as excinfo:
+        ensure_usable(handle, now=_T0 + 1.0)
+    assert excinfo.value.error["error_class"] == "auth"
+    assert "handle_id" in excinfo.value.error["detail"]
+
+
+def test_a_non_mapping_handle_is_refused_not_crashed() -> None:
+    # A caller can pass something that is not a dict at all; refuse it typed.
+    with pytest.raises(HandleTamperedError) as excinfo:
+        ensure_usable(None, now=_T0 + 1.0)  # type: ignore[arg-type]
+    assert excinfo.value.error["error_class"] == "auth"
+
+
+def test_the_shape_gate_names_only_the_field_never_its_value() -> None:
+    # The refusal detail must not echo the offending value (it goes through L01
+    # redaction regardless, but it should name only the field).
+    handle = _make_handle(now=_T0, ttl_seconds=300.0)
+    handle["binding_fingerprint"] = 12345  # type: ignore[typeddict-item]
+    with pytest.raises(HandleTamperedError) as excinfo:
+        ensure_usable(handle, now=_T0 + 1.0)
+    detail = excinfo.value.error["detail"]
+    assert "binding_fingerprint" in detail
+    assert "12345" not in detail
+
+
+# --- Fault: is_expired shares the same crash surface, but fails CLOSED ------
+# is_expired is a boolean PREDICATE (its contract: the typed refusal belongs to
+# ensure_usable). The registry lookup it shares with ensure_usable ends in a
+# bare handle["handle_id"], so a malformed handle would crash it the same way.
+# A malformed handle is a WEAKER case than "unknown", so under the same
+# fail-closed contract it must answer True (expired) -- never raise.
+
+
+def test_is_expired_on_a_handle_missing_handle_id_is_true_not_crashed() -> None:
+    # Was: _record_for's `_ISSUED.get(handle["handle_id"])` raised KeyError.
+    handle = _make_handle(now=_T0, ttl_seconds=300.0)
+    del handle["handle_id"]
+    assert is_expired(handle, now=_T0 + 1.0) is True
+
+
+def test_is_expired_on_a_handle_with_unhashable_handle_id_is_true_not_crashed() -> None:
+    # Was: `_ISSUED.get([])` raised TypeError: unhashable type: 'list'.
+    handle = _make_handle(now=_T0, ttl_seconds=300.0)
+    handle["handle_id"] = []  # type: ignore[typeddict-item]
+    assert is_expired(handle, now=_T0 + 1.0) is True
+
+
 # --- Fault: TTL finiteness -------------------------------------------------
 
 
@@ -297,7 +408,7 @@ def test_a_usable_handle_returns_a_trusted_view() -> None:
 def test_a_handle_from_before_restart_is_refused() -> None:
     # The issuance registry is process-local and in-memory; a restart starts it
     # empty. Simulate a restart by clearing the registry AFTER minting: the
-    # handle's id no longer resolves, so ensure_usable fails closed with a typed
+    # handle's id does not resolve, so ensure_usable fails closed with a typed
     # auth refusal (NOT silently accepted, NOT treated as valid).
     handle = _make_handle(now=_T0, ttl_seconds=10_000.0)
     ensure_usable(handle, now=_T0 + 1.0)  # usable before the "restart"

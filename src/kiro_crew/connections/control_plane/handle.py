@@ -116,7 +116,7 @@ import hmac
 import math
 import secrets
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, Tuple, TypedDict
+from typing import Any, Dict, FrozenSet, Tuple, TypedDict
 
 from kiro_crew.connections.control_plane.binding import Binding
 from kiro_crew.connections.control_plane.errors import (
@@ -431,16 +431,140 @@ def _record_for(handle: DerivedHandle) -> _IssuanceRecord | None:
     return _ISSUED.get(handle["handle_id"])
 
 
+#: The complete set of keys a well-formed handle carries, with the concrete
+#: check each must pass to be USABLE by :func:`ensure_usable` -- not merely
+#: present, but of a type the enforcement can operate on (a ``handle_id`` that
+#: can key the registry, a ``scopes`` that ``set()`` accepts, a ``not_after``
+#: that ``>=`` compares). Kept in lock-step with :class:`DerivedHandle`'s fields.
+def _is_str(value: Any) -> bool:
+    return isinstance(value, str)
+
+
+def _is_int(value: Any) -> bool:
+    # bool is an int subclass; a boolean generation/int is malformed, so exclude it.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_finite_number(value: Any) -> bool:
+    # A usable timestamp: a real number (not bool) that ``>``/``>=`` can order
+    # against a float. NaN/inf are "numbers" but would break the comparison
+    # semantics the expiry check relies on, so they are malformed here too.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def _is_scope_sequence(value: Any) -> bool:
+    # ``set(value)`` must succeed and yield a scope set: an iterable (but not a
+    # bare str, which would iterate into characters) of hashable strings. A
+    # missing/non-iterable value or non-string element is what crashes the bare
+    # ``set(handle["scopes"])`` today.
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        return False
+    return all(isinstance(scope, str) for scope in value)
+
+
+#: Each required key mapped to its usability predicate, in the field order of
+#: :class:`DerivedHandle`. A single source of truth for the shape gate.
+_HANDLE_FIELD_CHECKS: Tuple[Tuple[str, Any], ...] = (
+    ("handle_id", _is_str),
+    ("service_id", _is_str),
+    ("credential_mode", _is_str),
+    ("scopes", _is_scope_sequence),
+    ("generation", _is_int),
+    ("binding_fingerprint", _is_str),
+    ("issued_at", _is_finite_number),
+    ("not_after", _is_finite_number),
+)
+
+
+def _validate_handle_shape(handle: Any) -> None:
+    """Refuse a malformed handle with a typed :class:`HandleTamperedError`.
+
+    The premise of this module is that a handle's fields are UNTRUSTED. A
+    missing or wrong-typed field is the same class of untrusted input as a
+    widened scope: a caller who deleted ``scopes`` or set ``not_after`` to a
+    string has handed :func:`ensure_usable` something it cannot judge. Left
+    unchecked, the first read of such a field raises a bare ``KeyError`` /
+    ``TypeError`` that carries no ``error_class``, cannot be routed by an
+    upstream on ``error_class``, is not audited, and jumps the whole
+    decision chain to land on the caller.
+
+    So the FIRST thing :func:`ensure_usable` does is validate the COMPLETE
+    shape: that ``handle`` is a mapping, that every required key is present, and
+    that each value is of a type the enforcement can actually operate on (a
+    ``handle_id`` that can key the registry, a ``scopes`` that ``set()``
+    accepts, a ``not_after`` that ``>=`` can order). Any failure raises
+    :class:`HandleTamperedError` (typed ``auth``) instead of crashing. The
+    ``detail`` names only the offending FIELD, never its value -- and it goes
+    through L01's unconditional redaction regardless.
+    """
+
+    if not isinstance(handle, dict):
+        error = operation_error(
+            "auth",
+            "handle is malformed: expected a mapping of handle fields",
+        )
+        raise HandleTamperedError(error)
+
+    for field, check in _HANDLE_FIELD_CHECKS:
+        if field not in handle:
+            error = operation_error(
+                "auth",
+                f"handle is malformed: missing required field {field!r}",
+            )
+            raise HandleTamperedError(error)
+        if not check(handle[field]):
+            error = operation_error(
+                "auth",
+                f"handle is malformed: field {field!r} has an unusable type",
+            )
+            raise HandleTamperedError(error)
+
+
+def _handle_id_is_lookupable(handle: Any) -> bool:
+    """True iff ``handle`` can be looked up in the registry without crashing.
+
+    :func:`_record_for` ends in a BARE ``_ISSUED.get(handle["handle_id"])``: a
+    missing ``handle_id`` raises ``KeyError`` and an unhashable one (a caller
+    passed a ``list``) raises ``TypeError``. Both are the SAME untrusted-input
+    class F3 fixed in :func:`ensure_usable`, reaching the registry through the
+    second call site -- :func:`is_expired`. Since ``is_expired`` is a boolean
+    PREDICATE (its own contract says the typed refusal belongs to
+    :func:`ensure_usable`, and a raising predicate would break any caller polling
+    it), it cannot raise here; it uses this to fail closed instead. A handle
+    that is not even a mapping, or whose ``handle_id`` is absent or unhashable,
+    is not lookupable.
+    """
+
+    if not isinstance(handle, dict) or "handle_id" not in handle:
+        return False
+    try:
+        hash(handle["handle_id"])
+    except TypeError:
+        return False
+    return True
+
+
 def is_expired(handle: DerivedHandle, *, now: float) -> bool:
     """True iff ``handle`` is at/past its expiry, decided from the TRUSTED record.
 
     Reads the RECORD's ``not_after`` (inclusive: ``now >= not_after``), never the
     handle's own copy. A handle with no issuance record is treated as expired
     (True) -- fail closed -- so a caller polling ``is_expired`` cannot get a
-    "still live" answer for an unknown or post-restart handle. For the typed
-    refusal (and the tamper check), call :func:`ensure_usable`.
+    "still live" answer for an unknown or post-restart handle. A MALFORMED handle
+    (not a mapping, or a missing / unhashable ``handle_id`` that the registry
+    lookup cannot even key on) is a WEAKER case than "unknown", so under the same
+    fail-closed contract it is treated as expired (True) too -- rather than
+    letting the bare ``_record_for`` lookup crash with ``KeyError`` / ``TypeError``.
+    This is a boolean PREDICATE: it never raises. For the typed refusal (and the
+    tamper / full-shape check), call :func:`ensure_usable`.
     """
 
+    # Fail closed on a handle the registry cannot even look up (missing /
+    # unhashable handle_id, or not a mapping): treat as expired, never crash.
+    if not _handle_id_is_lookupable(handle):
+        return True
     record = _record_for(handle)
     if record is None:
         return True
@@ -453,17 +577,26 @@ def ensure_usable(handle: DerivedHandle, *, now: float) -> TrustedHandleView:
     The single enforcement point, and it trusts ONLY the issuance record, never
     the handle's self-reported fields. In order:
 
-    0. **Finite clock.** ``now`` MUST be finite. A ``NaN`` ``now`` makes every
+    0. **Well-formed shape.** Because the handle's fields are UNTRUSTED, the very
+       first step validates the COMPLETE shape -- ``handle`` is a mapping, every
+       required key is present, and each value is of a type the enforcement can
+       operate on (a ``handle_id`` that keys the registry, a ``scopes`` that
+       ``set()`` accepts, a ``not_after`` that ``>=`` orders). A missing or
+       wrong-typed field is the SAME class of untrusted input as a widened scope,
+       so it is a typed refusal (:class:`HandleTamperedError`, ``auth``), not a
+       bare ``KeyError`` / ``TypeError`` that would carry no ``error_class``,
+       skip the audit, and jump the decision chain onto the caller.
+    1. **Finite clock.** ``now`` MUST be finite. A ``NaN`` ``now`` makes every
        ``now >= not_after`` comparison False, which would let an EXPIRED handle
        through -- the expiry check silently disabled by the caller's clock. So a
        non-finite ``now`` is refused up front (:class:`HandleExpiredError`, typed
        ``input``); the enforcement never trusts the clock it was handed without
        checking it.
-    1. **Issued here?** Look the handle up by ``handle_id`` in the process-local
+    2. **Issued here?** Look the handle up by ``handle_id`` in the process-local
        registry. If absent -> :class:`HandleNotIssuedError` (typed ``auth``):
        the fail-closed refusal for an unknown, forged, cross-process, or
        post-restart handle.
-    2. **Untampered?** The presented handle must agree with the record on every
+    3. **Untampered?** The presented handle must agree with the record on every
        axis a caller could otherwise abuse: ``scopes`` must be a subset of the
        record's; ``not_after`` must not be later; ``generation``,
        ``binding_fingerprint``, ``service_id`` and ``credential_mode`` must
@@ -471,7 +604,7 @@ def ensure_usable(handle: DerivedHandle, *, now: float) -> TrustedHandleView:
        ``auth``). A caller who widened the scope, pushed the expiry, flipped the
        target service, or swapped the credential mode on the dict is refused
        here, not obeyed.
-    3. **Not expired?** Compare the (now-known-finite) ``now`` against the
+    4. **Not expired?** Compare the (now-known-finite) ``now`` against the
        RECORD's ``not_after`` (inclusive). If expired ->
        :class:`HandleExpiredError` (typed ``input``).
 
@@ -483,7 +616,13 @@ def ensure_usable(handle: DerivedHandle, *, now: float) -> TrustedHandleView:
     the caller can edit.
     """
 
-    # (0) The clock itself must be finite; a NaN now would silently pass the
+    # (0) The handle's fields are untrusted, so validate the COMPLETE shape
+    # before reading ANY of them. A missing/wrong-typed field is refused as
+    # tampered (typed) rather than crashing the first ``handle[...]`` read with
+    # an uncaught KeyError/TypeError that would bypass the whole decision chain.
+    _validate_handle_shape(handle)
+
+    # (1) The clock itself must be finite; a NaN now would silently pass the
     # expiry comparison (NaN >= x is False) and let an expired handle through.
     if not math.isfinite(now):
         error = operation_error(

@@ -52,6 +52,13 @@ import them from ``kiro_crew.connections.control_plane`` (or its submodules),
 never as ``kiro_crew.connections.<name>`` aliases.
 """
 
+from kiro_crew.connections.control_plane.acl_binding_resolver import (
+    AccessGrant,
+    AccountToDeployment,
+    ControlPlaneBindingResolver,
+    StoreBackedAccountToDeployment,
+    map_provider_to_service_id,
+)
 from kiro_crew.connections.control_plane.auth_modes import (
     AUTH_MODES_SCHEMA_VERSION,
     PermittedModeRegistry,
@@ -71,9 +78,11 @@ from kiro_crew.connections.control_plane.binding import (
     SecretRef,
     SubjectTenantVerifier,
     VerifiedIdentity,
+    binding_scoped_secret_ref,
     binding_secret_ref,
     create_binding,
     next_generation,
+    resolve_binding_for_principal,
 )
 from kiro_crew.connections.control_plane.context import (
     CONTEXT_SCHEMA_VERSION,
@@ -160,6 +169,7 @@ from kiro_crew.connections.control_plane.production import (
     HttpReply,
     HttpRequest,
     HttpSend,
+    MalformedResponseBodyError,
     RedirectHop,
     RedirectRefusedError,
     RequestLocator,
@@ -271,6 +281,7 @@ __all__ = [
     "HttpSend",
     "LayerCeilings",
     "LayerName",
+    "MalformedResponseBodyError",
     "ObjectPayload",
     "OperationContext",
     "OperationDescriptor",
@@ -309,6 +320,13 @@ __all__ = [
     "approval_applies",
     "args_fingerprint",
     "binding_secret_ref",
+    "binding_scoped_secret_ref",
+    "resolve_binding_for_principal",
+    "AccessGrant",
+    "AccountToDeployment",
+    "ControlPlaneBindingResolver",
+    "StoreBackedAccountToDeployment",
+    "map_provider_to_service_id",
     "build_production_transport",
     "classify_error",
     "create_binding",

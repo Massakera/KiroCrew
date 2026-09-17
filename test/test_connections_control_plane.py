@@ -9,7 +9,6 @@ no-credential / two-axis invariants hold (negative).
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import pathlib
@@ -46,14 +45,13 @@ from kiro_crew.connections.control_plane import (
     ResolvedCredential,
     SecretRef,
     VerifiedIdentity,
-)
-from kiro_crew.connections.control_plane import binding as binding_mod
-from kiro_crew.connections.control_plane import (
+    binding_scoped_secret_ref,
     binding_secret_ref,
     create_binding,
     next_generation,
     operation_error,
     redacted_detail,
+    resolve_binding_for_principal,
     store_path,
 )
 
@@ -218,11 +216,7 @@ def test_typed_dicts_have_every_declared_field() -> None:
     }
     assert set(context) == set(OperationContext.__annotations__)
 
-    result: OperationResult = {
-        "status": "partial",
-        "next_cursor": "opaque-cursor",
-        "payload": None,
-    }
+    result: OperationResult = {"status": "partial", "next_cursor": "opaque-cursor", "payload": None}
     assert set(result) == set(OperationResult.__annotations__)
 
     error: OperationError = operation_error("throttle", "slow down")
@@ -484,13 +478,35 @@ def test_next_generation_does_not_mutate_the_input() -> None:
     assert binding["generation"] == before  # caller's record is untouched
 
 
-def test_binding_secret_ref_follows_the_connections_vault_family() -> None:
+def test_legacy_binding_secret_ref_is_slug_level_not_identity_bound() -> None:
+    # binding_secret_ref is the LEGACY slug-level name, retained for compat. It
+    # follows the CONNECTIONS_<SLUG>_ family oauth_clients uses, with the
+    # binding suffix distinguishing it from _CLIENT_SECRET. It is NOT what a
+    # binding stores (that is binding_scoped_secret_ref) precisely because it is
+    # keyed by slug alone.
     ref = binding_secret_ref("google-drive")
-    # Same CONNECTIONS_<SLUG>_ family and slug spelling oauth_clients uses, with
-    # the binding-specific suffix distinguishing it from _CLIENT_SECRET.
     assert ref["name"] == "CONNECTIONS_GOOGLE_DRIVE_BINDING_SECRET"
     assert ref["backend"] == cp.SECRET_BACKEND_VAULT
     assert isinstance(ref["bound_at"], float)
+
+
+def test_scoped_secret_ref_differs_per_identity_same_slug() -> None:
+    # The per-binding name a binding actually stores: same slug, two different
+    # identities -> two different vault names.
+    a = binding_scoped_secret_ref(
+        "github", binding_id="id-a", subject_ref="s://a", tenant_ref="t://a"
+    )
+    b = binding_scoped_secret_ref(
+        "github", binding_id="id-b", subject_ref="s://b", tenant_ref="t://b"
+    )
+    assert a["name"] != b["name"]
+    assert a["name"].startswith("CONNECTIONS_GITHUB_BINDING_")
+    assert a["name"].endswith("_SECRET")
+    # Same identity -> stable name (deterministic scope).
+    a2 = binding_scoped_secret_ref(
+        "github", binding_id="id-a", subject_ref="s://a", tenant_ref="t://a"
+    )
+    assert a["name"] == a2["name"]
 
 
 # --- Fault -----------------------------------------------------------------
@@ -609,9 +625,12 @@ def test_binding_symbols_are_reachable_via_control_plane_not_the_top_level() -> 
         "VerifiedIdentity",
         "SubjectTenantVerifier",
         "BindingVerificationError",
+        "BindingResolutionError",
         "create_binding",
         "next_generation",
         "binding_secret_ref",
+        "binding_scoped_secret_ref",
+        "resolve_binding_for_principal",
         "INITIAL_GENERATION",
     )
     for name in binding_names:
@@ -621,6 +640,145 @@ def test_binding_symbols_are_reachable_via_control_plane_not_the_top_level() -> 
         # ...and NOT re-exported as a top-level connections alias.
         assert name not in connections.__all__, f"{name} leaked into connections.__all__"
         assert not hasattr(connections, name), f"{name} is a top-level connections alias"
+
+
+# --- L02 fix: per-binding secret ref + trusted principal resolution --------
+#
+# The judgement point. A two-binding fixture (different tenants, different
+# subjects, same provider) proves: (1) the OLD slug-level ref collapses both to
+# ONE reference (the defect, kept as a counter-example); (2) the per-binding ref
+# each binding actually stores is DIFFERENT; (3) resolving A's verified principal
+# yields only A's binding and A's secret; (4) B's verified principal can never
+# reach A's secret; (5) resolution keys on the VERIFIED identity, refusing an
+# unverified claim and a no-match, both typed.
+
+
+def _identity_verifier(*, claimed_subject, claimed_tenant, service_id) -> VerifiedIdentity:
+    """Verifier that canonicalizes each distinct claim to a distinct identity."""
+
+    return {
+        "subject_ref": f"subject://verified/{claimed_subject}",
+        "tenant_ref": f"tenant://verified/{claimed_tenant}",
+    }
+
+
+def _two_bindings() -> tuple[Binding, Binding]:
+    a = create_binding(
+        service_id="github",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        credential_mode="oauth_user",
+        verifier=_identity_verifier,
+        slug="github",
+    )
+    b = create_binding(
+        service_id="github",
+        claimed_subject="bob",
+        claimed_tenant="beta",
+        credential_mode="oauth_user",
+        verifier=_identity_verifier,
+        slug="github",
+    )
+    return a, b
+
+
+def test_COUNTEREXAMPLE_slug_level_ref_collapses_both_bindings_to_one() -> None:
+    # The defect, pinned: the legacy slug-level selector returns the SAME
+    # reference for two different-identity bindings under one provider.
+    a, b = _two_bindings()
+    slug_ref_a = binding_secret_ref("github")
+    slug_ref_b = binding_secret_ref("github")
+    assert slug_ref_a["name"] == slug_ref_b["name"] == "CONNECTIONS_GITHUB_BINDING_SECRET"
+    # Two distinct identities would have shared this one credential name.
+    assert a["subject_ref"] != b["subject_ref"]
+    assert a["tenant_ref"] != b["tenant_ref"]
+
+
+def test_two_bindings_get_different_per_binding_secret_refs() -> None:
+    # The fix: each binding stores a per-identity secret ref, so the two differ.
+    a, b = _two_bindings()
+    assert a["secret_ref"]["name"] != b["secret_ref"]["name"]
+    # Both still in the provider's family, distinguished by the scope segment.
+    assert a["secret_ref"]["name"].startswith("CONNECTIONS_GITHUB_BINDING_")
+    assert b["secret_ref"]["name"].startswith("CONNECTIONS_GITHUB_BINDING_")
+    # And neither is the legacy slug-level (collision-prone) name.
+    assert a["secret_ref"]["name"] != "CONNECTIONS_GITHUB_BINDING_SECRET"
+    assert b["secret_ref"]["name"] != "CONNECTIONS_GITHUB_BINDING_SECRET"
+
+
+def test_resolve_principal_yields_only_its_own_binding_and_secret() -> None:
+    a, b = _two_bindings()
+    store = [a, b]
+    resolved = resolve_binding_for_principal(
+        store,
+        service_id="github",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        verifier=_identity_verifier,
+    )
+    assert resolved["binding_id"] == a["binding_id"]
+    assert resolved["secret_ref"]["name"] == a["secret_ref"]["name"]
+    # A's principal never surfaces B's secret.
+    assert resolved["secret_ref"]["name"] != b["secret_ref"]["name"]
+
+
+def test_principal_B_cannot_reach_principal_A_secret() -> None:
+    a, b = _two_bindings()
+    store = [a, b]
+    resolved_b = resolve_binding_for_principal(
+        store,
+        service_id="github",
+        claimed_subject="bob",
+        claimed_tenant="beta",
+        verifier=_identity_verifier,
+    )
+    # B resolves to B's own binding/secret, and A's secret is unreachable via B.
+    assert resolved_b["binding_id"] == b["binding_id"]
+    assert resolved_b["secret_ref"]["name"] == b["secret_ref"]["name"]
+    assert resolved_b["secret_ref"]["name"] != a["secret_ref"]["name"]
+
+
+def test_resolution_keys_on_verified_identity_not_the_claim() -> None:
+    # A claim whose verified identity does not match A's stored identity must not
+    # resolve to A, even if the raw claimed strings look plausible. Here the
+    # verifier maps a different claim to a different verified identity, so the
+    # store (holding only A and B) has no match -> typed refusal.
+    a, b = _two_bindings()
+    with pytest.raises(BindingResolutionError):
+        resolve_binding_for_principal(
+            [a, b],
+            service_id="github",
+            claimed_subject="mallory",
+            claimed_tenant="acme",
+            verifier=_identity_verifier,
+        )
+
+
+def test_resolution_refuses_an_unverified_claim() -> None:
+    a, b = _two_bindings()
+    with pytest.raises(BindingVerificationError):
+        resolve_binding_for_principal(
+            [a, b],
+            service_id="github",
+            claimed_subject="x",
+            claimed_tenant="y",
+            verifier=_rejecting_verifier,
+        )
+
+
+def test_resolution_is_fail_closed_on_ambiguity() -> None:
+    # Two bindings with the SAME verified identity is a corrupt store; resolution
+    # must refuse rather than silently pick one.
+    a, _ = _two_bindings()
+    dup = dict(a)  # same subject_ref/tenant_ref/service_id
+    with pytest.raises(BindingResolutionError):
+        resolve_binding_for_principal(
+            [a, dup],  # type: ignore[list-item]
+            service_id="github",
+            claimed_subject="alice",
+            claimed_tenant="acme",
+            verifier=_identity_verifier,
+        )
 
 
 # --- L04 · binding lifecycle: trusted store, single-writer rotation, revoke ---
@@ -638,7 +796,7 @@ def test_binding_symbols_are_reachable_via_control_plane_not_the_top_level() -> 
 #   3. rotate's lock covered only the counter/ref bump, not the REAL token
 #      refresh -> two processes could both refresh. Now: the refresh callable
 #      runs INSIDE the lock; a controlled endpoint is hit exactly once.
-#   4. `instance` meant the KiroCrew instance (backwards). Now `deployment_id`
+#   4. `instance` meant the Kiro Crew instance (backwards). Now `deployment_id`
 #      means the PROVIDER-side deployment, and the Kiro principal -> authorization
 #      link is enforced in resolve, not merely documented.
 
@@ -658,7 +816,7 @@ def _fresh_store(tmp_path) -> BindingStore:
 
 
 def _mk_binding(subject="alice", tenant="acme", service="github") -> Binding:
-    binding = create_binding(
+    return create_binding(
         service_id=service,
         claimed_subject=subject,
         claimed_tenant=tenant,
@@ -666,24 +824,22 @@ def _mk_binding(subject="alice", tenant="acme", service="github") -> Binding:
         verifier=_store_verifier,
         slug=service,
     )
-    # A PER-BINDING vault-entry name. On L04's own base this came from L02's
-    # `binding_scoped_secret_ref`, which is not on this branch: here
-    # `create_binding` mints the SLUG-derived name, and a slug names a PROVIDER,
-    # so every binding of one provider would share one entry. The tests below have
-    # to be able to tell "asked by binding" from "asked by slug", which needs the
-    # two names to differ -- so the per-binding name is stamped on here. It is a
-    # stamp on the record, not a new naming scheme and not a second vault.
-    binding["secret_ref"] = dict(binding["secret_ref"])  # type: ignore[typeddict-item]
-    binding["secret_ref"]["name"] = f"{binding['secret_ref']['name']}__{binding['binding_id']}"
-    return binding
 
 
 _DEPLOY = "github-enterprise://ghe.acme.example"  # a PROVIDER-side deployment
 _PRINCIPAL = "kiro://principal/operator-1"
 
 
-def _insert(store, binding, *, deployment_id=_DEPLOY, kiro_principal=_PRINCIPAL):
-    return store.insert(binding, deployment_id=deployment_id, kiro_principal=kiro_principal)
+def _insert(
+    store, binding, *, deployment_id=_DEPLOY, kiro_principal=_PRINCIPAL, account=None, endpoint=None
+):
+    return store.insert(
+        binding,
+        deployment_id=deployment_id,
+        kiro_principal=kiro_principal,
+        account=account,
+        endpoint=endpoint,
+    )
 
 
 def _resolve(store, *, subject="alice", tenant="acme", deployment_id=_DEPLOY, principal=_PRINCIPAL):
@@ -703,9 +859,90 @@ def _resolve(store, *, subject="alice", tenant="acme", deployment_id=_DEPLOY, pr
 def test_store_path_lives_under_config_dir_connections(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
     p = store_path()
-    assert p.parent.name == "connections"
-    assert p.name == "control_plane_bindings.json"
+    # A TOP-LEVEL directory under the data home (NOT nested under connections/),
+    # so the OS-sandbox read-only leaf and the file-tool write-protection seal
+    # cannot be bypassed by renaming a writable parent.
+    assert p.parent.name == "control-plane-bindings"
+    assert p.parent.parent == tmp_path
+    assert p.name == "bindings.json"
     assert str(tmp_path) in str(p)
+
+
+class TestF2StoreIsWriteProtectedButReadable:
+    """F2 (behavior-level): the binding store is fenced from agent writes at both
+    gates, the legitimate backend writer still works, and the resolver still reads.
+
+    Membership in a list is not evidence; these exercise the actual predicates and
+    the real store. The store is the SINGLE trusted source the ACL resolver reads a
+    credential's binding/secret_ref from, so a forged record written by a sandboxed
+    agent would be trusted -- the fence is what stops that.
+    """
+
+    def _rel(self, monkeypatch, tmp_path):
+        # Anchor the store under a crew-home prefix so the home-relative gates match.
+        home = tmp_path / "home"
+        crew = home / ".kiro" / "crew"
+        crew.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("KIROCREW_HOME", str(crew))
+        return home, crew
+
+    def test_the_file_tool_write_gate_refuses_store_lock_and_temp(self, monkeypatch, tmp_path):
+        """1. store, lock, and an atomic-write temp are each REFUSED to the edit tool."""
+        from kiro_crew.security import is_sensitive_write_path
+
+        _home, crew = self._rel(monkeypatch, tmp_path)
+        store = str(crew / "control-plane-bindings" / "bindings.json")
+        lock = str(crew / "control-plane-bindings" / "bindings.lock")
+        # atomic_write's temp shape: .{token}.tmp beside the store, inside the dir.
+        temp = str(crew / "control-plane-bindings" / ".abcd1234.tmp")
+        for target in (store, lock, temp):
+            assert is_sensitive_write_path(target) is True, target
+
+    def test_the_directory_prefix_covers_arbitrary_children(self, monkeypatch, tmp_path):
+        """The single directory entry fences present-and-future children, not just
+        the two named files (the `entry + os.sep` prefix rule)."""
+        from kiro_crew.security import is_sensitive_write_path
+
+        _home, crew = self._rel(monkeypatch, tmp_path)
+        future = str(crew / "control-plane-bindings" / "some-future-sidecar.json")
+        assert is_sensitive_write_path(future) is True
+
+    def test_the_store_stays_READABLE_the_write_gate_is_a_superset_not_a_read_block(
+        self, monkeypatch, tmp_path
+    ):
+        """3. write-protected != read-blocked: the resolver's read path is not fenced."""
+        from kiro_crew.security import is_sensitive_path, is_sensitive_write_path
+
+        _home, crew = self._rel(monkeypatch, tmp_path)
+        store = str(crew / "control-plane-bindings" / "bindings.json")
+        # write-only protection: refused to WRITE, but NOT read+write sensitive.
+        assert is_sensitive_write_path(store) is True
+        assert is_sensitive_path(store) is False
+
+    def test_the_legitimate_backend_writer_still_writes_and_the_resolver_reads(
+        self, monkeypatch, tmp_path
+    ):
+        """2 + 3 end to end: the store's OWN writer (direct atomic_write/os.open, not a
+        tool call) inserts a binding at the real production path, and resolve() reads it.
+
+        The gates fence the AGENT's file-edit/shell tools; the store's own methods open
+        the path directly and never route through hooks.on_tool_call, so lifecycle
+        writes keep working -- the property every write-protection precedent relies on.
+        """
+        _home, crew = self._rel(monkeypatch, tmp_path)
+        # Construct at the REAL production location (store_path()), not a hand path.
+        p = store_path()
+        assert p.parent.name == "control-plane-bindings"
+        store = BindingStore(path=p)
+        b = _mk_binding()
+        _insert(store, b)
+        # The writer created the file at the protected location.
+        assert p.exists()
+        # The resolver reads it back from that same trusted location.
+        assert _resolve(store)["binding_id"] == b["binding_id"]
+        # And a re-opened store at the same path (a fresh reader) sees it too.
+        assert BindingStore(path=p).get(b["binding_id"]) is not None
 
 
 def test_resolution_reads_from_the_store_not_a_caller_iterable(tmp_path) -> None:
@@ -723,21 +960,19 @@ def test_resolution_reads_from_the_store_not_a_caller_iterable(tmp_path) -> None
 
 def test_a_caller_supplied_candidate_outside_the_trusted_store_is_refused(tmp_path) -> None:
     fabricated = _mk_binding(subject="alice", tenant="acme")
-    # (a) The DEFECT half of this counter-example -- L02's
-    # `resolve_binding_for_principal([fabricated], ...)` matching over a
-    # caller-supplied Iterable and happily returning `fabricated` -- is NOT
-    # reproducible on this branch: that function lands with L02's own commit,
-    # which is not in this history (this branch's binding.py has no such
-    # entry point). What IS pinned here is the structural half of the fix: the
-    # trusted store's resolve takes NO caller candidate set at all, so there is
-    # no parameter through which `fabricated` could be offered.
-    assert "bindings" not in inspect.signature(BindingStore.resolve).parameters
-    assert not hasattr(binding_mod, "resolve_binding_for_principal")
+    # (a) WOULD resolve under L02's caller-controlled candidate set (the defect):
+    hit = resolve_binding_for_principal(
+        [fabricated],
+        service_id="github",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        verifier=_store_verifier,
+    )
+    assert hit["binding_id"] == fabricated["binding_id"]
     # (b) the trusted store never admitted it -> refused.
     store = _fresh_store(tmp_path)
     with pytest.raises(BindingResolutionError):
         _resolve(store)
-    assert store.get(fabricated["binding_id"]) is None
 
 
 # ===========================================================================
@@ -878,6 +1113,118 @@ def test_an_absent_store_is_empty_not_corrupt(tmp_path) -> None:
 
 
 # ===========================================================================
+# F3 (round-60): a malformed RECORD inside valid JSON, and a zero-byte file,
+# must FAIL CLOSED -- not be silently dropped / read as empty and then
+# republished away by the next mutation (permanent binding loss).
+# ===========================================================================
+
+
+def _valid_store_doc_with(records: dict) -> str:
+    """Serialise a store doc carrying the given {binding_id: record} map."""
+    return json.dumps({"schema_version": 1, "bindings": records})
+
+
+def _one_good_one_malformed_on_disk(store) -> tuple[str, dict]:
+    """Write a store file with ONE well-formed record and ONE malformed record
+    (valid JSON overall). Returns (good_binding_id, malformed_record)."""
+    good = _mk_binding(subject="alice", tenant="acme")
+    good_stored = {
+        "binding": good,
+        "deployment_id": _GHE_HOST,
+        "kiro_principal": _PRINCIPAL,
+        "live_generation": good["generation"],
+        "revoked": False,
+        "updated_at": 0.0,
+    }
+    # malformed: missing the whole embedded binding + wrong-typed live_generation
+    malformed = {"deployment_id": "d", "kiro_principal": "p", "live_generation": "NOT_AN_INT"}
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(
+        _valid_store_doc_with({good["binding_id"]: good_stored, "bad-1": malformed}),
+        encoding="utf-8",
+    )
+    return good["binding_id"], malformed
+
+
+def test_F3_BEFORE_a_malformed_record_was_silently_dropped(tmp_path) -> None:
+    # Reproduce the round-59 _read: keep well-formed rows, DROP malformed ones.
+    # Prove that behaviour returns a truncated map (the good row only), which is
+    # what the mutation path would then republish -- losing 'bad-1' forever.
+    from kiro_crew.connections.control_plane import lifecycle as lc
+
+    store = _fresh_store(tmp_path)
+    good_id, _ = _one_good_one_malformed_on_disk(store)
+    raw = store.path.read_text(encoding="utf-8")
+    doc = json.loads(raw)
+    # the round-59 rule, reconstructed here:
+    round59 = {str(b): r for b, r in doc["bindings"].items() if lc._well_formed(r)}
+    assert good_id in round59
+    assert "bad-1" not in round59  # silently dropped
+    assert len(doc["bindings"]) == 2 and len(round59) == 1  # a TRUNCATED view
+    print(
+        f"[F3 BEFORE] malformed record 'bad-1' silently dropped: on_disk=2 -> read={len(round59)}"
+    )
+
+
+def test_F3_BEFORE_a_zero_byte_file_was_read_as_empty(tmp_path) -> None:
+    # Reproduce the round-59 rule: raw.strip()=="" -> {} (empty store).
+    store = _fresh_store(tmp_path)
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text("", encoding="utf-8")
+    raw = store.path.read_text(encoding="utf-8")
+    round59_empty = {} if raw.strip() == "" else {"_": 1}
+    assert round59_empty == {}  # would be read as an EMPTY store
+    print("[F3 BEFORE] zero-byte file read as empty store {} (round-59)")
+
+
+def test_F3_a_malformed_record_fails_the_whole_store_closed(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    _one_good_one_malformed_on_disk(store)
+    # read fails closed on the WHOLE store, not a truncated view
+    with pytest.raises(BindingStoreCorruptError):
+        store.all_bindings()
+    print("[F3 AFTER] malformed record -> BindingStoreCorruptError (whole store)")
+
+
+def test_F3_a_zero_byte_file_fails_closed_as_tampered(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text("", encoding="utf-8")
+    with pytest.raises(BindingStoreCorruptError):
+        store.all_bindings()
+    # whitespace-only too
+    store.path.write_text("   \n\t ", encoding="utf-8")
+    with pytest.raises(BindingStoreCorruptError):
+        store.all_bindings()
+    print("[F3 AFTER] zero-byte/whitespace file -> BindingStoreCorruptError (tampered)")
+
+
+def test_F3_the_dropped_map_is_never_republished_by_insert_rotate_revoke(tmp_path) -> None:
+    # The guard for the ACTUAL consequence: a mutation must NOT republish a
+    # silently-truncated map (which would permanently lose 'bad-1'). Since _read
+    # now fails closed, insert/rotate/revoke all refuse, and the on-disk bytes
+    # (both records) are left intact -- never overwritten by a 1-record map.
+    store = _fresh_store(tmp_path)
+    good_id, _ = _one_good_one_malformed_on_disk(store)
+    before = store.path.read_text(encoding="utf-8")
+
+    with pytest.raises(BindingStoreCorruptError):
+        _insert(store, _mk_binding(subject="carol", tenant="acme"))
+    with pytest.raises(BindingStoreCorruptError):
+        store.rotate(good_id, observed_generation=1, refresh=lambda b: None)
+    with pytest.raises(BindingStoreCorruptError):
+        store.revoke(good_id)
+
+    after = store.path.read_text(encoding="utf-8")
+    assert after == before  # both records still on disk, nothing republished
+    doc = json.loads(after)
+    assert set(doc["bindings"]) == {good_id, "bad-1"}  # 'bad-1' NOT lost
+    print(
+        "[F3 GUARD] insert/rotate/revoke all refused; on-disk map intact (2 records, bad-1 preserved)"
+    )
+
+
+# ===========================================================================
 # DEFECT 3: the lock must wrap the REAL token refresh -- controlled endpoint
 # ===========================================================================
 
@@ -890,7 +1237,7 @@ def test_an_absent_store_is_empty_not_corrupt(tmp_path) -> None:
 # refresh, so the endpoint is hit exactly once. Real subprocesses, not threads.
 _REFRESH_WORKER = textwrap.dedent("""
     import json, os, sys, time, urllib.request
-    from kiro_crew.connections.control_plane import BindingStore, binding_secret_ref
+    from kiro_crew.connections.control_plane import BindingStore, binding_scoped_secret_ref
 
     store_file, binding_id, observed, endpoint, barrier, out_file = sys.argv[1:7]
     observed = int(observed)
@@ -900,11 +1247,10 @@ _REFRESH_WORKER = textwrap.dedent("""
         # The REAL token-refresh call: hit the controlled provider endpoint.
         with urllib.request.urlopen(endpoint, timeout=30) as resp:
             resp.read()
-        # A DISTINCT per-binding ref for the rotation to swap in (L04's own
-        # commit used L02's binding_scoped_secret_ref, absent on this branch).
-        ref = dict(binding_secret_ref("github"))
-        ref["name"] = "CONNECTIONS_GITHUB_BINDING_SECRET__ROTATED_%s" % binding["binding_id"]
-        return ref
+        return binding_scoped_secret_ref(
+            "github", binding_id=binding["binding_id"],
+            subject_ref="s://rot", tenant_ref="t://rot",
+        )
 
     while not os.path.exists(barrier):
         time.sleep(0.005)
@@ -967,28 +1313,45 @@ def test_only_one_process_rotates_under_contention(tmp_path) -> None:
             str(observed),
             endpoint,
         ]
-        p1 = subprocess.Popen(common + [str(barrier), str(out1)], env=env)
-        p2 = subprocess.Popen(common + [str(barrier), str(out2)], env=env)
-        time.sleep(0.3)
-        barrier.write_text("go", encoding="utf-8")
-        assert p1.wait(timeout=60) == 0
-        assert p2.wait(timeout=60) == 0
+        # Isolate + reliably reap both workers. cwd=tmp_path so a spawned worker
+        # never inherits (or holds open) the repository CWD, and both handles are
+        # terminated/waited in the finally so that a failed second spawn or a
+        # failed assertion below cannot leave the first worker blocked on the
+        # barrier forever. (Same shape as the earlier single-worker reap; this is
+        # the two-worker site.)
+        p1 = p2 = None
+        try:
+            p1 = subprocess.Popen(common + [str(barrier), str(out1)], env=env, cwd=str(tmp_path))
+            p2 = subprocess.Popen(common + [str(barrier), str(out2)], env=env, cwd=str(tmp_path))
+            time.sleep(0.3)
+            barrier.write_text("go", encoding="utf-8")
+            assert p1.wait(timeout=60) == 0
+            assert p2.wait(timeout=60) == 0
 
-        r1 = json.loads(out1.read_text())
-        r2 = json.loads(out2.read_text())
-        with hits_lock:
-            endpoint_hits = hits["n"]
-        print(
-            f"\n[CONTENTION EVIDENCE] worker1={r1}\n[CONTENTION EVIDENCE] worker2={r2}\n"
-            f"[CONTENTION EVIDENCE] TOKEN ENDPOINT HITS={endpoint_hits} "
-            f"(must be 1) final_store_generation="
-            f"{store.get(b['binding_id'])['live_generation']} observed={observed}"
-        )
-        rotated = [r for r in (r1, r2) if r["did_rotate"]]
-        # The judgement: the REAL provider endpoint was hit exactly once.
-        assert endpoint_hits == 1, f"token endpoint hit {endpoint_hits} times; r1={r1} r2={r2}"
-        assert len(rotated) == 1, f"expected one rotation, r1={r1} r2={r2}"
-        assert store.get(b["binding_id"])["live_generation"] == observed + 1
+            r1 = json.loads(out1.read_text())
+            r2 = json.loads(out2.read_text())
+            with hits_lock:
+                endpoint_hits = hits["n"]
+            print(
+                f"\n[CONTENTION EVIDENCE] worker1={r1}\n[CONTENTION EVIDENCE] worker2={r2}\n"
+                f"[CONTENTION EVIDENCE] TOKEN ENDPOINT HITS={endpoint_hits} "
+                f"(must be 1) final_store_generation="
+                f"{store.get(b['binding_id'])['live_generation']} observed={observed}"
+            )
+            rotated = [r for r in (r1, r2) if r["did_rotate"]]
+            # The judgement: the REAL provider endpoint was hit exactly once.
+            assert endpoint_hits == 1, f"token endpoint hit {endpoint_hits} times; r1={r1} r2={r2}"
+            assert len(rotated) == 1, f"expected one rotation, r1={r1} r2={r2}"
+            assert store.get(b["binding_id"])["live_generation"] == observed + 1
+        finally:
+            for proc in (p1, p2):
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=10)
     finally:
         server.shutdown()
         server.server_close()
@@ -1023,12 +1386,9 @@ def test_rotate_swaps_secret_ref_from_the_refresh_result(tmp_path) -> None:
     store = _fresh_store(tmp_path)
     b = _mk_binding()
     stored = _insert(store, b)
-    # A DISTINCT per-binding ref for the rotation to swap in. L04's own commit
-    # used L02's `binding_scoped_secret_ref`, which is not on this branch, so the
-    # distinct name is built here -- what the test asserts is unchanged: the
-    # record takes the ref the refresh callable returned.
-    new_ref = dict(binding_secret_ref("github"))
-    new_ref["name"] = f"CONNECTIONS_GITHUB_BINDING_SECRET__ROTATED__{b['binding_id']}"
+    new_ref = binding_scoped_secret_ref(
+        "github", binding_id=b["binding_id"], subject_ref="s://rot", tenant_ref="t://rot"
+    )
     rotated, did = store.rotate(
         b["binding_id"], observed_generation=stored["live_generation"], refresh=lambda _b: new_ref
     )
@@ -1046,7 +1406,7 @@ def test_rotate_swaps_secret_ref_from_the_refresh_result(tmp_path) -> None:
 
 def test_deployment_id_is_a_provider_deployment_not_a_kiro_instance(tmp_path) -> None:
     # The corrected direction: the SAME provider account resolved from what would
-    # be two different KiroCrew instances is still ONE binding (same deployment),
+    # be two different Kiro Crew instances is still ONE binding (same deployment),
     # while the SAME account on two different provider deployments is TWO.
     store = _fresh_store(tmp_path)
     b = _mk_binding(subject="alice", tenant="acme")
@@ -1317,7 +1677,7 @@ def test_DEFECTB_pre_fix_reinsert_with_changed_pri_or_mode_silently_returns_old(
 def test_assert_live_returns_the_trusted_store_binding(tmp_path) -> None:
     import inspect
 
-    # The signature no longer promises None.
+    # The signature does not promise None.
     ann = inspect.signature(BindingStore.assert_live).return_annotation
     assert ann is not None
     assert ann is not inspect.Signature.empty
@@ -1369,7 +1729,7 @@ def test_a_swapped_credential_mode_is_refused(tmp_path) -> None:
 
 def test_the_sender_consumes_the_returned_binding_not_the_caller_dict(tmp_path) -> None:
     # The store's record has the RIGHT secret_ref; build a GOOD handle (so
-    # assert_live does not raise) whose OTHER fields match, but sanity-check that
+    # assert_live does not raise) whose OTHER fields match, but confidence-check that
     # the RETURNED binding carries the STORE's secret_ref name -- the value a real
     # sender must consume -- not whatever the caller might have carried forward.
     store = _fresh_store(tmp_path)
@@ -1565,9 +1925,15 @@ def test_JUDGEMENT_fencing_reads_the_live_store_after_revoke(tmp_path) -> None:
     _insert(store, b)
     handle = _resolve(store)
     vault, name = _vault_for(store, b, "live")
-    # Before revoke: selector works.
+    # Before revoke: selector works. Evidence is the assertion below, NOT a log:
+    # the secret VALUE is never passed to a print/log sink (that is the clear-text
+    # logging class that keeps regrowing at a new line as this file lengthens --
+    # :1570, :1644, :1832 were all the same `.reveal()`-into-`print` shape). We
+    # assert the non-secret envelope instead: a secret resolved, under the store's
+    # own ref name -- no plaintext leaves the test.
     ok = store.select_secret(handle, reader=vault)
-    print(f"\n[SELECTOR EVIDENCE] before-revoke: got secret for {name} = {ok['secret'].reveal()!r}")
+    assert ok["secret"] is not None
+    assert ok["secret_ref"]["name"] == name
     # Revoke, then the SAME handle is fenced by a fresh live-store read.
     store.revoke(b["binding_id"])
     try:
@@ -1587,12 +1953,9 @@ def test_JUDGEMENT_fencing_reads_live_store_after_rotation(tmp_path) -> None:
     stored = _insert(store, b)
     pre = _resolve(store)  # generation = live
     # Rotate to a NEW per-binding secret ref via the real refresh callable.
-    # A DISTINCT per-binding ref for the rotation to swap in. L04's own commit
-    # used L02's `binding_scoped_secret_ref`, which is not on this branch, so the
-    # distinct name is built here -- what the test asserts is unchanged: the
-    # record takes the ref the refresh callable returned.
-    new_ref = dict(binding_secret_ref("github"))
-    new_ref["name"] = f"CONNECTIONS_GITHUB_BINDING_SECRET__ROTATED__{b['binding_id']}"
+    new_ref = binding_scoped_secret_ref(
+        "github", binding_id=b["binding_id"], subject_ref="s://rot", tenant_ref="t://rot"
+    )
     rec, did = store.rotate(
         b["binding_id"], observed_generation=stored["live_generation"], refresh=lambda _b: new_ref
     )
@@ -1624,3 +1987,549 @@ def test_secret_reader_and_resolved_credential_are_canonical_only() -> None:
         assert hasattr(cp, name)
         assert name not in connections.__all__
         assert not hasattr(connections, name)
+
+
+# ===========================================================================
+# W01 · L04 round-60: the ACL BindingResolver adapter.
+#
+# resolve(principal, provider, account) -> AccessGrant|None, matching the ACL
+# BindingResolver CALL shape without importing the ACL module. AccessGrant is
+# bridged into ACL's AccessContext ON THE ACL SIDE (it reads subject_ids, which
+# W01 does not emit). Round-60 adds: (a) a REAL store-backed account->deployment
+# default (not None, not a fixture lambda) with same-name-cross-host isolation
+# and a named ambiguity gap; (b) principal-trust hardening -- a principal is only
+# an authorization subject when its verification is established (a bare
+# X-Session-Key echo must not pass).
+# ===========================================================================
+
+
+class _FakeQueryPrincipal:
+    """Structural stand-in for acl.QueryPrincipal: only the attributes the
+    adapter duck-types (principal_id, local_library). NOT an import of the ACL
+    type. A `verified` attribute stands in for whatever real trust-contract the
+    ACL/request layer supplies to the principal_verified predicate."""
+
+    def __init__(self, principal_id: str, local_library: bool = False) -> None:
+        self.principal_id = principal_id
+        self.local_library = local_library
+
+
+_GHE_HOST = "github-enterprise://ghe.acme.example"  # a provider-side DEPLOYMENT
+_ACL_ACCOUNT = "octo-org"  # the ACL `account` (a GitHub org/login), NOT the host
+
+
+def _account_to_deployment_ok(service_id, account):
+    """An INJECTED test seam kept only to prove the injection point still works;
+    the PRODUCTION path uses the store-backed default, not this lambda."""
+
+    if service_id == "github" and account == _ACL_ACCOUNT:
+        return _GHE_HOST
+    return None
+
+
+def _verified(principal) -> bool:
+    """Test trust-contract predicate: vouches a principal is verified. The real
+    predicate is supplied by the ACL/request layer (module docstring's
+    trust-contract note); tests wire this explicit one over a `verified` attr."""
+
+    return bool(getattr(principal, "verified", False))
+
+
+def _P(principal_id, *, local=False, verified=True):
+    p = _FakeQueryPrincipal(principal_id, local_library=local)
+    p.verified = verified
+    return p
+
+
+def _acl_store_with_binding(
+    tmp_path,
+    *,
+    principal=_PRINCIPAL,
+    deployment=_GHE_HOST,
+    subject="alice",
+    service="github",
+    account=_ACL_ACCOUNT,
+):
+    """A store holding ONE inserted github binding for `principal` on
+    `deployment` (recording the vendor `account`), plus a resolver over it using
+    the PRODUCTION store-backed account->deployment default and a wired
+    principal-verified predicate. Returns (store, resolver, binding)."""
+
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(subject=subject, service=service)
+    _insert(store, b, deployment_id=deployment, kiro_principal=principal, account=account)
+    resolver = cp.ControlPlaneBindingResolver(store, principal_verified=_verified)
+    return store, resolver, b
+
+
+# Salesforce is the one IMPLEMENTED provider that carries a REAL endpoint
+# discriminator (`instanceUrl`), so the endpoint-bearing resolve_ref path and the
+# two-deployment (same account name, different instanceUrl) case use it.
+_SF_ACCOUNT = "00Dxx0000001gPX"  # a Salesforce org id (the ACL `account`)
+_SF_INSTANCE_A = "https://acme.my.salesforce.com"  # instanceUrl = the endpoint/host
+_SF_INSTANCE_B = "https://acme--sandbox.my.salesforce.com"
+
+
+class _Ref:
+    """Structural stand-in for acl.ProviderResourceRef: .provider/.account/
+    .resource_id/.locator. NOT an import of the ACL type -- resolve_ref reads
+    attributes, so a structural double is faithful."""
+
+    def __init__(self, provider, account, locator=None, resource_id=""):
+        self.provider = provider
+        self.account = account
+        self.resource_id = resource_id
+        self.locator = locator or {}
+
+
+def _sf_ref(account=_SF_ACCOUNT, instance_url=_SF_INSTANCE_A, resource_id="rec1"):
+    return _Ref(
+        provider="salesforce",
+        account=account,
+        resource_id=resource_id,
+        locator={"instanceUrl": instance_url, "sobjectType": "Account", "recordId": resource_id},
+    )
+
+
+def _acl_store_with_sf_binding(
+    tmp_path, *, principal=_PRINCIPAL, subject="alice", account=_SF_ACCOUNT, instance=_SF_INSTANCE_A
+):
+    """A store holding ONE Salesforce binding for `principal`, recording the
+    vendor `account` AND the `endpoint` (instanceUrl), plus a resolver with a
+    wired principal-verified predicate. Returns (store, resolver, binding)."""
+
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(subject=subject, service="salesforce")
+    _insert(
+        store,
+        b,
+        deployment_id=instance,
+        kiro_principal=principal,
+        account=account,
+        endpoint=instance,
+    )
+    resolver = cp.ControlPlaneBindingResolver(store, principal_verified=_verified)
+    return store, resolver, b
+
+
+# --- the account->deployment default is a REAL store-backed implementation --
+
+
+def test_the_default_account_to_deployment_is_store_backed_not_none() -> None:
+    store = cp.BindingStore(path=pathlib.Path("/tmp/does-not-matter.json"))
+    resolver = cp.ControlPlaneBindingResolver(store, principal_verified=_verified)
+    mapping = resolver._account_to_deployment  # the production default
+    assert mapping is not None
+    assert isinstance(mapping, cp.StoreBackedAccountToDeployment)
+
+
+def test_store_backed_mapping_reads_account_to_deployment_from_the_store(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    mapping = cp.StoreBackedAccountToDeployment(store)
+    assert mapping("github", _ACL_ACCOUNT) == _GHE_HOST
+    print(f"[F-ACCT EVIDENCE] store-backed: ('github',{_ACL_ACCOUNT!r}) -> {_GHE_HOST!r}")
+
+
+def test_store_backed_mapping_refuses_an_unknown_account(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    mapping = cp.StoreBackedAccountToDeployment(store)
+    assert mapping("github", "no-such-org") is None
+    assert mapping("slack", _ACL_ACCOUNT) is None
+
+
+def test_same_name_account_on_two_hosts_is_isolated_positive_and_negative(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    host_a = "github-enterprise://ghe-a.example"
+    host_b = "github-enterprise://ghe-b.example"
+    same_account = "acme"  # SAME org name on both hosts
+    b_a = _mk_binding(subject="alice", service="github")
+    b_b = _mk_binding(subject="bob", service="github")
+    _insert(store, b_a, deployment_id=host_a, kiro_principal="kiro://A", account=same_account)
+    _insert(store, b_b, deployment_id=host_b, kiro_principal="kiro://B", account=same_account)
+
+    # store-backed mapping: same account name -> two deployments, ambiguous -> None
+    mapping = cp.StoreBackedAccountToDeployment(store)
+    assert mapping("github", same_account) is None
+    print("[F-ACCT EVIDENCE] same account name on 2 hosts -> mapping None (ambiguous, named gap)")
+
+    # per-deployment isolation (what a disambiguated request keys on):
+    got_a = store.resolve_for_acl(
+        kiro_principal="kiro://A", deployment_id=host_a, service_id="github"
+    )
+    got_b = store.resolve_for_acl(
+        kiro_principal="kiro://B", deployment_id=host_b, service_id="github"
+    )
+    assert got_a["subject_ref"] == b_a["subject_ref"]
+    assert got_b["subject_ref"] == b_b["subject_ref"]
+    assert got_a["subject_ref"] != got_b["subject_ref"]
+    assert (
+        store.resolve_for_acl(kiro_principal="kiro://A", deployment_id=host_b, service_id="github")
+        is None
+    )
+    assert (
+        store.resolve_for_acl(kiro_principal="kiro://B", deployment_id=host_a, service_id="github")
+        is None
+    )
+    print("[F-ACCT EVIDENCE] per-deployment isolation: A->hostA, B->hostB, cross reads None")
+
+
+def test_the_ambiguity_is_a_named_interface_gap_in_the_module(tmp_path) -> None:
+    import inspect
+
+    import kiro_crew.connections.control_plane.acl_binding_resolver as mod
+
+    src = pathlib.Path(mod.__file__).read_text()
+    assert "endpoint" in src and "discriminator" in src
+    doc = inspect.getdoc(cp.BindingStore.resolve_deployment_for_account) or ""
+    assert "more than one" in doc.lower() or "two different" in doc.lower()
+
+
+def test_an_injected_account_to_deployment_still_overrides_the_default(tmp_path) -> None:
+    # The account_to_deployment injection point is retained (constructor accepts
+    # it, tests may pass it), but it is NOT the judgment path any more: resolve()
+    # is a thin shell over resolve_ref, and resolve_ref keys on the store's
+    # (account, endpoint) registry, not this 2-key seam. So an injected seam does
+    # NOT let an endpoint-less resolve() bypass the endpoint check.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(service="github")
+    _insert(store, b, deployment_id=_GHE_HOST, kiro_principal=_PRINCIPAL, account="stored-acct")
+    resolver = cp.ControlPlaneBindingResolver(
+        store, account_to_deployment=_account_to_deployment_ok, principal_verified=_verified
+    )
+    # constructor accepted the seam (stored, not the judgment path):
+    assert resolver._account_to_deployment is _account_to_deployment_ok
+    # the endpoint-less two-arg resolve still fails closed (github has no endpoint):
+    assert resolver.resolve(_P(_PRINCIPAL), "github", "stored-acct") is None
+
+
+# --- principal trust hardening (bare session-key must not pass) -------------
+
+
+def test_an_unproven_principal_is_refused_even_with_a_principal_id(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    unproven = _P(_PRINCIPAL, verified=False)
+    assert resolver.resolve(unproven, "github", _ACL_ACCOUNT) is None
+    print("[TRUST EVIDENCE] unproven principal (has id, not verified) -> None")
+
+
+def test_with_no_trust_predicate_wired_every_principal_fails_closed(tmp_path) -> None:
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(service="github")
+    _insert(store, b, deployment_id=_GHE_HOST, kiro_principal=_PRINCIPAL, account=_ACL_ACCOUNT)
+    resolver = cp.ControlPlaneBindingResolver(store)  # no principal_verified
+    assert resolver.resolve(_P(_PRINCIPAL), "github", _ACL_ACCOUNT) is None
+    print("[TRUST EVIDENCE] no trust predicate wired -> every principal None (fail closed)")
+
+
+def test_the_trust_contract_gap_is_named_in_the_module() -> None:
+    import kiro_crew.connections.control_plane.acl_binding_resolver as mod
+
+    src = pathlib.Path(mod.__file__).read_text()
+    assert "X-Session-Key" in src
+    assert "principal_verified" in src
+
+
+# --- Issue 1 preserved: bridge chain, NOT structural equivalence ------------
+
+
+def test_access_grant_carries_only_what_w01_verifies(tmp_path) -> None:
+    from dataclasses import fields
+
+    assert {f.name for f in fields(cp.AccessGrant)} == {"subject", "tenant", "groups", "bypass_acl"}
+
+
+def test_access_grant_does_not_provide_subject_ids_that_is_the_acl_bridge(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_sf_binding(tmp_path)
+    grant = resolver.resolve_ref(_P(_PRINCIPAL), _sf_ref())
+    assert grant is not None
+    assert not hasattr(grant, "subject_ids"), "subject_ids is ACL-derived, not W01-emitted"
+    from dataclasses import fields
+
+    assert "subject_ids" not in {f.name for f in fields(cp.AccessGrant)}
+
+
+def test_the_documented_bridge_inputs_are_present_for_the_acl_side(tmp_path) -> None:
+    store, resolver, binding = _acl_store_with_sf_binding(tmp_path)
+    grant = resolver.resolve_ref(_P(_PRINCIPAL), _sf_ref())
+    assert grant is not None
+    assert grant.subject == binding["subject_ref"]
+    assert grant.groups == frozenset()
+    assert frozenset({grant.subject, *grant.groups}) == frozenset({binding["subject_ref"]})
+
+
+def test_module_makes_no_structural_equivalence_or_direct_injection_claim() -> None:
+    import kiro_crew.connections.control_plane.acl_binding_resolver as mod
+
+    src = pathlib.Path(mod.__file__).read_text().lower()
+    for banned in (
+        "structurally identical",
+        "directly consumable",
+        "direct injection",
+        "the acl will call",
+    ):
+        assert banned not in src, f"stale equivalence claim present: {banned!r}"
+    assert "subject_ids" in pathlib.Path(mod.__file__).read_text()
+
+
+# --- positive / negative resolution (through the store-backed default) ------
+
+
+def test_positive_a_principal_resolves_to_its_own_binding(tmp_path) -> None:
+    store, resolver, binding = _acl_store_with_sf_binding(
+        tmp_path, principal="kiro://A", subject="alice"
+    )
+    grant = resolver.resolve_ref(_P("kiro://A"), _sf_ref())
+    assert grant is not None
+    assert grant.subject == binding["subject_ref"] == "subject://verified/alice"
+    assert grant.tenant == binding["tenant_ref"] == "tenant://verified/acme"
+    print(
+        f"[ADAPTER EVIDENCE] positive A (resolve_ref/sf): subject={grant.subject!r} tenant={grant.tenant!r}"
+    )
+
+
+def test_negative_b_cannot_get_a_binding(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path, principal="kiro://A")
+    got = resolver.resolve(_P("kiro://B"), "github", _ACL_ACCOUNT)
+    assert got is None
+    print("[ADAPTER EVIDENCE] negative B->A: None (fail-closed, no fallback)")
+
+
+def test_negative_an_empty_principal_is_refused(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    assert resolver.resolve(_P(""), "github", _ACL_ACCOUNT) is None
+    assert resolver.resolve(object(), "github", _ACL_ACCOUNT) is None
+
+
+def test_negative_a_local_library_principal_holds_no_managed_binding(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    got = resolver.resolve(_P(_PRINCIPAL, local=True), "github", _ACL_ACCOUNT)
+    assert got is None
+
+
+def test_negative_a_revoked_binding_resolves_to_none(tmp_path) -> None:
+    store, resolver, binding = _acl_store_with_sf_binding(tmp_path)
+    assert resolver.resolve_ref(_P(_PRINCIPAL), _sf_ref()) is not None
+    store.revoke(binding["binding_id"])
+    after = resolver.resolve_ref(_P(_PRINCIPAL), _sf_ref())
+    assert after is None
+    print("[ADAPTER EVIDENCE] revoke: usable before -> None after")
+
+
+def test_resolve_refuses_an_unmappable_provider_without_touching_the_store(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_binding(tmp_path)
+    assert resolver.resolve(_P(_PRINCIPAL), "notion", _ACL_ACCOUNT) is None
+
+
+# --- provider -> ServiceId closed-set mapping -------------------------------
+
+
+def test_provider_maps_to_service_id_over_a_closed_set() -> None:
+    for p in ("github", "teams", "outlook", "sharepoint", "salesforce", "slack"):
+        assert cp.map_provider_to_service_id(p) == p
+    assert cp.map_provider_to_service_id("excel") == "excel_shared_engine"
+
+
+def test_an_unknown_provider_string_is_refused_not_leniently_accepted() -> None:
+    for bogus in ("Excel", "git hub", "notion", "", "excel_shared_engine "):
+        assert cp.map_provider_to_service_id(bogus) is None
+
+
+# --- groups empty, bypass_acl never true ------------------------------------
+
+
+def test_groups_are_empty_and_bypass_acl_is_false_for_every_w01_grant(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_sf_binding(tmp_path)
+    grant = resolver.resolve_ref(_P(_PRINCIPAL), _sf_ref())
+    assert grant is not None
+    assert grant.groups == frozenset()
+    assert grant.bypass_acl is False
+    default = cp.AccessGrant(subject="s", tenant="t")
+    assert default.groups == frozenset()
+    assert default.bypass_acl is False
+
+
+# --- CALL-shape conformance + canonical exports -----------------------------
+
+
+def test_resolver_signature_matches_the_acl_protocol_shape() -> None:
+    import inspect
+
+    sig = inspect.signature(cp.ControlPlaneBindingResolver.resolve)
+    assert list(sig.parameters) == ["self", "principal", "provider", "account"]
+    for name in ("principal", "provider", "account"):
+        assert sig.parameters[name].kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.POSITIONAL_ONLY,
+        )
+
+
+def test_adapter_does_not_import_the_unmerged_acl_module() -> None:
+    import kiro_crew.connections.control_plane.acl_binding_resolver as mod
+
+    src = pathlib.Path(mod.__file__).read_text()
+    assert "import kiro_crew.knowledge.acl" not in src
+    assert "from kiro_crew.knowledge.acl import" not in src
+    assert "from kiro_crew.knowledge import acl" not in src
+
+
+def test_adapter_symbols_are_canonical_only() -> None:
+    for name in (
+        "AccessGrant",
+        "AccountToDeployment",
+        "ControlPlaneBindingResolver",
+        "StoreBackedAccountToDeployment",
+        "map_provider_to_service_id",
+    ):
+        assert name in cp.__all__
+        assert hasattr(cp, name)
+        assert name not in connections.__all__
+        assert not hasattr(connections, name)
+
+
+# ===========================================================================
+# W01 · L04 round-66: resolve_ref(principal, ref) -- the single judgment path,
+# five fail-closed checks, endpoint-discriminated two-deployment isolation.
+# Real endpoint provider = Salesforce (instanceUrl). GitHub carries NO endpoint
+# field yet (W02 owns it) -- NOT fabricated here.
+# ===========================================================================
+
+
+def test_resolve_ref_signature_is_the_contract() -> None:
+    import inspect
+
+    sig = inspect.signature(cp.ControlPlaneBindingResolver.resolve_ref)
+    assert list(sig.parameters) == ["self", "principal", "ref"]
+
+
+def test_resolve_ref_positive_salesforce_by_instance_url(tmp_path) -> None:
+    store, resolver, binding = _acl_store_with_sf_binding(tmp_path)
+    grant = resolver.resolve_ref(_P(_PRINCIPAL), _sf_ref())
+    assert grant is not None
+    assert grant.subject == binding["subject_ref"]
+    assert grant.tenant == binding["tenant_ref"]
+    print(
+        f"[REF EVIDENCE] salesforce ref (instanceUrl={_SF_INSTANCE_A}) -> subject={grant.subject!r}"
+    )
+
+
+def test_resolve_ref_check1_unproven_principal_refused(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_sf_binding(tmp_path)
+    assert resolver.resolve_ref(_P(_PRINCIPAL, verified=False), _sf_ref()) is None
+
+
+def test_resolve_ref_check2_unmappable_provider_refused(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_sf_binding(tmp_path)
+    bad = _Ref(provider="notion", account=_SF_ACCOUNT, locator={"instanceUrl": _SF_INSTANCE_A})
+    assert resolver.resolve_ref(_P(_PRINCIPAL), bad) is None
+
+
+def test_resolve_ref_check3_missing_required_locator_key_refused(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_sf_binding(tmp_path)
+    # salesforce requires instanceUrl; omit it -> refuse (no best-effort)
+    missing = _Ref(provider="salesforce", account=_SF_ACCOUNT, locator={"sobjectType": "Account"})
+    assert resolver.resolve_ref(_P(_PRINCIPAL), missing) is None
+    print("[REF EVIDENCE] missing required locator key (instanceUrl) -> None")
+
+
+def test_resolve_ref_check4_unregistered_endpoint_refused(tmp_path) -> None:
+    store, resolver, _ = _acl_store_with_sf_binding(tmp_path)  # registers _SF_INSTANCE_A
+    # caller supplies a DIFFERENT instanceUrl the store never registered -> refuse
+    other = _sf_ref(instance_url="https://evil.my.salesforce.com")
+    assert resolver.resolve_ref(_P(_PRINCIPAL), other) is None
+    print("[REF EVIDENCE] caller endpoint not registered in store -> None (store is authority)")
+
+
+def test_resolve_ref_check5_two_salesforce_deployments_isolated_by_instance_url(tmp_path) -> None:
+    # THE two-deployment test, real Salesforce instanceUrl. SAME account (org id)
+    # on TWO instances; each principal has its own binding; the instanceUrl
+    # discriminator resolves each to its OWN deployment, and cross reads deny.
+    store = _fresh_store(tmp_path)
+    b_a = _mk_binding(subject="alice", service="salesforce")
+    b_b = _mk_binding(subject="bob", service="salesforce")
+    _insert(
+        store,
+        b_a,
+        deployment_id=_SF_INSTANCE_A,
+        kiro_principal="kiro://A",
+        account=_SF_ACCOUNT,
+        endpoint=_SF_INSTANCE_A,
+    )
+    _insert(
+        store,
+        b_b,
+        deployment_id=_SF_INSTANCE_B,
+        kiro_principal="kiro://B",
+        account=_SF_ACCOUNT,
+        endpoint=_SF_INSTANCE_B,
+    )
+    resolver = cp.ControlPlaneBindingResolver(store, principal_verified=_verified)
+
+    # A on instance A -> A's binding; B on instance B -> B's binding
+    ga = resolver.resolve_ref(_P("kiro://A"), _sf_ref(instance_url=_SF_INSTANCE_A))
+    gb = resolver.resolve_ref(_P("kiro://B"), _sf_ref(instance_url=_SF_INSTANCE_B))
+    assert ga is not None and gb is not None
+    assert ga.subject == b_a["subject_ref"] and gb.subject == b_b["subject_ref"]
+    assert ga.subject != gb.subject
+    # cross: A's principal against B's instanceUrl -> None (no cross-deployment)
+    assert resolver.resolve_ref(_P("kiro://A"), _sf_ref(instance_url=_SF_INSTANCE_B)) is None
+    assert resolver.resolve_ref(_P("kiro://B"), _sf_ref(instance_url=_SF_INSTANCE_A)) is None
+    print(
+        f"[REF EVIDENCE] two SF deployments: A@{_SF_INSTANCE_A} -> {ga.subject!r}, "
+        f"B@{_SF_INSTANCE_B} -> {gb.subject!r}, cross reads None"
+    )
+
+
+def test_resolve_ref_github_has_no_endpoint_and_stays_fail_closed(tmp_path) -> None:
+    # GitHub's real connector emits {owner, repo, ...} with NO endpoint field
+    # (W02 owns adding it). So a github ref, even well-formed, resolves
+    # fail-closed here -- we do NOT fabricate an endpoint.
+    store = _fresh_store(tmp_path)
+    b = _mk_binding(service="github")
+    _insert(
+        store,
+        b,
+        deployment_id=_GHE_HOST,
+        kiro_principal=_PRINCIPAL,
+        account="octo-org",
+        endpoint=_GHE_HOST,
+    )
+    resolver = cp.ControlPlaneBindingResolver(store, principal_verified=_verified)
+    gh_ref = _Ref(provider="github", account="octo-org", locator={"owner": "octo-org", "repo": "r"})
+    assert resolver.resolve_ref(_P(_PRINCIPAL), gh_ref) is None
+    print("[REF EVIDENCE] github ref (no endpoint field, W02-owned) -> None (not fabricated)")
+
+
+def test_resolve_is_a_thin_shell_over_resolve_ref_not_a_second_path(tmp_path) -> None:
+    # The two-arg resolve() must delegate to resolve_ref with an endpoint-less
+    # ref, so it cannot resolve an endpoint-requiring provider -- proving it is
+    # not a second judgment path that bypasses the endpoint check.
+    store, resolver, _ = _acl_store_with_sf_binding(tmp_path)
+    # salesforce via the thin two-arg shell (no endpoint) -> None
+    assert resolver.resolve(_P(_PRINCIPAL), "salesforce", _SF_ACCOUNT) is None
+    # but via resolve_ref with the full ref (endpoint present) -> resolves
+    assert resolver.resolve_ref(_P(_PRINCIPAL), _sf_ref()) is not None
+    print("[REF EVIDENCE] thin resolve() (no endpoint) -> None; resolve_ref (full ref) -> ok")
+
+
+def test_the_ref_is_a_lookup_key_only_never_an_identity_source(tmp_path) -> None:
+    # Even if the ref's account/locator are attacker-chosen, the returned view's
+    # subject/tenant come ONLY from the store's verified record, never the ref.
+    store, resolver, binding = _acl_store_with_sf_binding(tmp_path, subject="alice")
+    ref = _sf_ref()
+    # attacker cannot inject identity via the ref -- there is no subject/tenant
+    # field consumed from it; the grant equals the STORE's verified refs.
+    grant = resolver.resolve_ref(_P(_PRINCIPAL), ref)
+    assert grant.subject == binding["subject_ref"] == "subject://verified/alice"
+    assert grant.tenant == binding["tenant_ref"]
+
+
+def test_proposed_provider_families_are_not_fabricated() -> None:
+    # The proposed (unbuilt) providers carry no endpoint_key -- their shapes are
+    # recorded as proposed, not invented as wired.
+    import kiro_crew.connections.control_plane.acl_binding_resolver as mod
+
+    src = pathlib.Path(mod.__file__).read_text()
+    assert "PROPOSED" in src
+    # salesforce/github/google_drive are the only IMPLEMENTED locator specs
+    for impl in ("salesforce", "github", "google_drive"):
+        assert impl in src

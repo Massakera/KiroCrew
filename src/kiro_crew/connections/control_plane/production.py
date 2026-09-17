@@ -69,7 +69,9 @@ two other things an unbounded ``urlopen`` will happily do to you.
 
 from __future__ import annotations
 
+import base64
 import hmac
+import http.client
 import json
 import time
 import urllib.error
@@ -99,7 +101,10 @@ from kiro_crew.connections.control_plane.executor import (
     TransportResponse,
     is_non_idempotent_effect,
 )
-from kiro_crew.connections.control_plane.handle import TrustedHandleView
+from kiro_crew.connections.control_plane.handle import (
+    TrustedHandleView,
+    _binding_fingerprint,
+)
 from kiro_crew.connections.control_plane.lifecycle import (
     BindingResolutionError,
     BindingRevokedError,
@@ -124,7 +129,7 @@ from kiro_crew.secrets import SecretValue
 #: Bumped when this module's composition shape changes, mirroring the schema
 #: version every sibling control-plane module carries.
 #:
-#: ``2``: :func:`build_production_transport` no longer takes a fixed
+#: ``2``: :func:`build_production_transport` does not take a fixed
 #: ``secret_ref``. It takes a per-call binding-identity selector, and the secret
 #: is selected per call FROM the trusted binding identity the executor passes -- a
 #: composition-signature change, so the number moves. :func:`urllib_http_send`
@@ -278,12 +283,22 @@ _CREDENTIAL_RESPONSE_HEADERS: FrozenSet[str] = frozenset(
 )
 
 #: Statuses that report a failure IN TRANSIT rather than an answer from the
-#: application: no end-to-end verdict was reached, so for a non-idempotent write
-#: whether the effect landed is UNKNOWN in exactly the way a socket timeout is.
-#: A gateway that times out upstream (504) may well have delivered the request.
-#: 500 is deliberately NOT here -- see the NAMED GAP in
-#: :func:`build_production_transport`.
-_AMBIGUOUS_TRANSIT_STATUSES: FrozenSet[int] = frozenset({502, 503, 504})
+#: application: no end-to-end commit verdict was reached, so for a non-idempotent
+#: write whether the effect landed is UNKNOWN in exactly the way a socket timeout
+#: is. A gateway that times out upstream (504) may well have delivered the
+#: request; a 500 the origin raised carries no evidence of whether it fired
+#: before or after it committed. 500 is INCLUDED here on purpose: the executor's
+#: own contract (``ConnectorCall.write_outcome``) states that dropping the 5xx
+#: ``unknown`` "would leave the caller inferring 'not applied' from a 5xx, which
+#: is the precise inference L07 exists to refuse", so the DEFAULT for a 500 with
+#: no proof of non-application must be ``unknown``, not ``None``. The asymmetry
+#: this rests on is the one this module already states below: a wrong ``unknown``
+#: costs one refused replay the caller can override, a wrong not-applied costs a
+#: duplicated write. A vendor owner that KNOWS its API commits-first still
+#: NARROWS this by setting ``write_outcome`` itself (see the NAMED GAP in
+#: :func:`build_production_transport`); that path is unchanged and does not
+#: conflict with the safe default.
+_AMBIGUOUS_TRANSIT_STATUSES: FrozenSet[int] = frozenset({500, 502, 503, 504})
 
 #: The request headers that ASSERT a precondition. On a 412 the provider often
 #: does not say which one failed, so the transport reports the ones this request
@@ -375,16 +390,50 @@ class TransportDeadlineExceededError(Exception):
     """
 
 
+class MalformedResponseBodyError(Exception):
+    """Raised when a NON-EMPTY reply body cannot be read as a JSON object.
+
+    A present-but-unparseable 2xx body (mid-transfer truncation, an HTML error
+    page served with 200, a gzip fault, or a JSON array/scalar where an object
+    was contracted) must NOT collapse to ``{}``: an empty mapping is
+    indistinguishable from a genuinely empty body, so a caller reads a reported
+    success carrying no data and has no signal to retry -- silent data loss on
+    the success path. Refusing with a typed error gives the caller that signal.
+    An EMPTY body is not this error; it is a real empty result and still yields
+    ``{}``.
+    """
+
+
+def _frozen_binding(binding: Mapping[str, Any]) -> Binding:
+    """A read-only, independently-owned snapshot of ``binding``.
+
+    Copies every field into a fresh mapping (so no reference the caller kept can
+    reach it) and wraps both the top level AND the nested ``secret_ref`` in
+    :class:`~types.MappingProxyType`, so neither the binding's identity fields nor
+    its secret reference can be mutated after the snapshot is taken. This is the
+    carrier :class:`BindingCustodyGate` holds and hands out once its fingerprint
+    check has passed, which is what makes "validate then someone mutates the dict"
+    unrepresentable rather than merely re-checked. ``assert_live`` only subscripts
+    the binding, so a read-only mapping satisfies every consumer downstream.
+    """
+
+    snapshot: dict[str, Any] = dict(binding)
+    secret_ref = snapshot.get("secret_ref")
+    if isinstance(secret_ref, Mapping):
+        snapshot["secret_ref"] = MappingProxyType(dict(secret_ref))
+    return MappingProxyType(snapshot)  # type: ignore[return-value]
+
+
 @dataclass(frozen=True)
 class BindingCustodyGate:
     """Answers WHICH binding a call may resolve a credential for. No secret, no ref.
 
-    This exists because the composition used to take a fixed ``secret_ref`` and
-    the transport closure resolved that same one on every call, whatever identity
+    This exists because a composition that took a fixed ``secret_ref`` would let
+    the transport closure resolve that same one on every call, whatever identity
     the call was actually authorized for. ``service_id`` and ``credential_mode``
-    -- the two axes the executor passed -- do NOT identify a binding: two
+    -- the two axes the executor passes -- do NOT identify a binding: two
     bindings for two different accounts in two different tenants can agree on
-    both, so a transport that only saw those had no way to tell whose credential
+    both, so a transport that only saw those would have no way to tell whose credential
     it was reaching for, and would reach for the one it was built with. A
     transport composed for tenant A could therefore serve a call routed for
     tenant B under A's credential. That is the same "validate one thing, then use
@@ -398,11 +447,11 @@ class BindingCustodyGate:
     NOTHING is resolved: neither the store nor the vault is asked, so there is no
     window in which the wrong binding's plaintext exists.
 
-    **It does NOT select a secret, and it derives no vault name.** It used to
-    return a :class:`SecretRef` built by
+    **It does NOT select a secret, and it derives no vault name.** Returning a
+    :class:`SecretRef` built by
     :func:`~kiro_crew.connections.control_plane.binding.binding_secret_ref` from a
-    provider ``slug`` -- which collapsed every binding of one provider onto ONE
-    vault entry, so per-binding custody was only ever apparent. That derivation is
+    provider ``slug`` would collapse every binding of one provider onto ONE
+    vault entry, so per-binding custody would be only ever apparent. That derivation is
     gone: the gate hands back a binding, and L04's
     :meth:`~kiro_crew.connections.control_plane.lifecycle.BindingStore.select_secret`
     is what resolves a credential, taking the ``secret_ref`` from the LIVE STORE's
@@ -427,6 +476,46 @@ class BindingCustodyGate:
 
     binding: Binding
     binding_fingerprint: str
+
+    def __post_init__(self) -> None:
+        """Bind the two fields to each other: the fingerprint MUST be this binding's.
+
+        ``binding`` and ``binding_fingerprint`` arrive as two independent values.
+        Without checking that the fingerprint is the one-way digest of THIS
+        binding's id, a gate could be composed with binding B but A's fingerprint:
+        a call carrying A's trusted view would then match the fingerprint, pass
+        every axis when A and B share ``service_id`` / ``credential_mode``, and get
+        B's credential selected and sent -- cross-binding credential exposure. So a
+        gate whose fingerprint is not derived from its own binding's id is refused
+        at construction; the two can never be paired mismatched. (The eighth
+        recurrence of the trusted-source discipline: two values that must pin each
+        other are worthless unless compared.)
+        """
+
+        expected = _binding_fingerprint(self.binding["binding_id"])
+        if not hmac.compare_digest(self.binding_fingerprint or "", expected):
+            raise BindingIdentityMismatchError(
+                "this gate's binding_fingerprint is not the fingerprint of its own "
+                "binding's id; the two must pin each other, refusing to compose a "
+                "gate that could fence one binding while carrying another's credential"
+            )
+        # FREEZE the authorization carrier AT THE MOMENT OF VALIDATION. The root
+        # cause this class keeps recurring through (ninth time: record ownership ->
+        # returned view -> executor arg -> secret resolution -> candidate set ->
+        # assert_live return -> fingerprint cross-check -> and here) is that the
+        # authorization value has always travelled as a MUTABLE dict, while each
+        # consumer separately decided whether to re-read it. A gate that validated
+        # ``self.binding`` and then held the same mutable dict lets any holder of
+        # the original reference mutate the id / credential_mode / secret_ref AFTER
+        # the checks above have passed -- so a gate composed for binding A, its dict
+        # then swapped to B, would fence and send B's credential under A's proof.
+        # Adding one more field comparison would only move the seam. The fix is to
+        # remove the mutable carrier itself: from this point the gate holds a
+        # read-only snapshot (deep, so the nested ``secret_ref`` cannot be swapped
+        # either), and :meth:`trusted_binding_for` hands out read-only mappings, so
+        # NO consumer downstream has a mutable dict left to re-read. Mutating what
+        # the caller passed in does not reach anything the gate uses.
+        object.__setattr__(self, "binding", _frozen_binding(self.binding))
 
     @property
     def service_id(self) -> str:
@@ -485,8 +574,15 @@ class BindingCustodyGate:
                 f"this call authenticates as '{trusted_view.credential_mode}' but "
                 f"this transport holds custody for '{self.credential_mode}'"
             )
-        presented: Binding = dict(self.binding)  # type: ignore[assignment]
-        presented["generation"] = trusted_view.generation
+        # The carrier stays read-only end to end: build the presented binding as a
+        # deep-frozen snapshot of the (already frozen) composed binding with only
+        # the VIEW's generation substituted, so what leaves this method is a
+        # read-only mapping the caller cannot mutate before or after select_secret
+        # consumes it. Mutating what the caller passed in does not reach anything
+        # the gate uses -- there is no mutable dict handed downstream.
+        presented: Binding = _frozen_binding(
+            {**self.binding, "generation": trusted_view.generation}  # type: ignore[misc]
+        )
         return presented
 
 
@@ -553,14 +649,46 @@ def _header(headers: Mapping[str, str], name: str) -> Optional[str]:
     return None
 
 
-def response_metadata(headers: Mapping[str, str]) -> ResponseMetadata:
+def _credential_echo_forms(sent_credential: Optional[str]) -> Tuple[str, ...]:
+    """Forms of the outbound credential to screen a response header value for.
+
+    A provider that reflects the bearer into an allowlisted header does not have
+    to reflect it RAW: a value could carry a base64 (standard or url-safe) or
+    percent-encoded copy and still hand the token back through ``.metadata``. This
+    returns the raw credential plus those encoded forms so
+    :func:`response_metadata` drops a value containing ANY of them. Only non-empty,
+    distinct forms are returned; an empty credential yields no forms (nothing to
+    screen). This is a defensive superset of the raw-echo check -- the raw form is
+    the realistic buggy-provider case, the encoded forms close the FLAGged
+    edge-case escape without waving anything through.
+    """
+
+    if not sent_credential:
+        return ()
+    raw = sent_credential
+    forms = {raw}
+    raw_bytes = raw.encode("utf-8", "surrogatepass")
+    # base64 (standard + url-safe), with and without padding stripped, since a
+    # reflected token may drop '=' padding.
+    for enc in (base64.b64encode(raw_bytes), base64.urlsafe_b64encode(raw_bytes)):
+        s = enc.decode("ascii")
+        forms.add(s)
+        forms.add(s.rstrip("="))
+    # percent-encoding (a URL-embedded reflection).
+    forms.add(urllib.parse.quote(raw, safe=""))
+    return tuple(f for f in forms if f)
+
+
+def response_metadata(
+    headers: Mapping[str, str], *, sent_credential: Optional[str] = None
+) -> ResponseMetadata:
     """Project ``headers`` onto :data:`RESPONSE_METADATA_ALLOWLIST`.
 
     The ONE place a response header becomes something a caller can read. It walks
     the headers the provider sent, keeps a name only if its lowercase form is on
     the allowlist, and returns a READ-ONLY mapping keyed by that lowercase form.
 
-    Three properties, each load-bearing:
+    Four properties, each load-bearing:
 
     * **allowlist, not denylist.** A name that is not listed is dropped, so a
       provider's new session-cookie spelling is absent the day it appears rather
@@ -568,6 +696,17 @@ def response_metadata(headers: Mapping[str, str]) -> ResponseMetadata:
       :data:`_CREDENTIAL_RESPONSE_HEADERS` -- it does not need to, and a
       belt-and-braces second filter would invite the next reader to believe the
       denylist is what protects them and relax the allowlist;
+    * **the allowlist gates the NAME; a VALUE that echoes the outbound credential
+      is still dropped.** An allowlist decides which header names a caller may
+      read, but it cannot vouch for what a provider put in the value: a provider
+      that reflects the request's ``Authorization`` (or the bearer itself) into an
+      allowlisted header would hand the token back through
+      :attr:`~kiro_crew.connections.control_plane.executor.TransportResponse.metadata`.
+      So when the outbound ``sent_credential`` is known, any kept value that
+      CONTAINS it -- raw OR in a base64 / percent-encoded form (see
+      :func:`_credential_echo_forms`) -- is dropped rather than surfaced, the same
+      discipline as stripping credential headers across a cross-origin redirect,
+      applied to the value the allowlist would otherwise wave through;
     * **lowercase keys.** HTTP header names are case-insensitive, so a caller must
       not have to try ``Retry-After`` and then ``retry-after``;
     * **read-only.** A caller cannot mutate one call's metadata into something
@@ -580,15 +719,23 @@ def response_metadata(headers: Mapping[str, str]) -> ResponseMetadata:
     """
 
     kept: dict[str, str] = {}
+    echo_forms = _credential_echo_forms(sent_credential)
     for name, value in headers.items():
         key = name.strip().lower()
-        if key in RESPONSE_METADATA_ALLOWLIST and key not in kept:
-            kept[key] = value
+        if key not in RESPONSE_METADATA_ALLOWLIST or key in kept:
+            continue
+        # The allowlist admitted the NAME; refuse the VALUE if it echoes the
+        # outbound credential in ANY form. A bearer reflected into an allowlisted
+        # header -- raw, or base64/url-encoded -- would otherwise reach the caller
+        # through .metadata.
+        if echo_forms and any(form in value for form in echo_forms):
+            continue
+        kept[key] = value
     return MappingProxyType(kept)
 
 
 #: What a 2xx reply says about its own content, independently of any vendor's
-#: paging spelling. This is the axis :func:`neutral_decode` used to collapse.
+#: paging spelling. This is the axis a naive ``neutral_decode`` would collapse.
 #: ``no_content`` -- 204: the provider stated there is nothing, so ``ok`` +
 #: ``next_cursor=None`` is a FACT. ``empty_complete`` -- a 2xx with an empty body
 #: (a 201/202 acknowledgement): nothing was returned, so there is nothing left to
@@ -628,8 +775,8 @@ class Decoded2xx:
     CONSUMER reads. They are written from the same ``reply.body`` in one place, so
     they cannot disagree.
 
-    RESOLVED (this was a NAMED GAP): a caller that only saw ``result`` used to be
-    unable to tell ``no_content`` from ``cursor_undetermined``, because
+    RESOLVED (this was a NAMED GAP): a caller that only saw ``result`` could not
+    tell ``no_content`` from ``cursor_undetermined``, because
     ``OperationResult`` had no field expressing "content present, continuation
     unknown" -- and, worse, no field expressing the content at all. The envelope
     now carries a ``payload`` (``RESULT_SCHEMA_VERSION`` 2), so a ``no_content``
@@ -735,7 +882,7 @@ def neutral_decode_detail(reply: HttpReply) -> Decoded2xx:
     * **206** means the provider itself declared this a fragment, and L01 has the
       word for that on the success side: ``partial``. Reporting ``ok`` said the
       opposite of what the provider said.
-    * **a body with no vendor decode** is the row that used to be a silent
+    * **a body with no vendor decode** is the row most at risk of a silent
       truncation, in two separate ways. ``next_cursor`` stays ``None`` because
       guessing a provider's cursor spelling (``@odata.nextLink`` vs ``page`` vs
       ``queryMore``) is the vendor owner's call and inventing one here would be
@@ -800,10 +947,10 @@ def neutral_decode(reply: HttpReply) -> OperationResult:
 
     It NEVER guesses a continuation cursor -- ``next_cursor`` is always ``None``
     here, since the cursor lives at a different place in every provider's body and
-    picking one would give every other provider a wrong answer. What it no longer
-    does is claim that ``next_cursor=None`` means COMPLETE for a reply it never
+    picking one would give every other provider a wrong answer. What it does NOT
+    do is claim that ``next_cursor=None`` means COMPLETE for a reply it never
     read (only 204 and an empty body support that, and those are the only two rows
-    that report ``ok``), and it no longer DISCARDS the body: a body-bearing 2xx
+    that report ``ok``), and it does NOT DISCARD the body: a body-bearing 2xx
     comes back as a
     :class:`~kiro_crew.connections.control_plane.result.BytesPayload` holding the
     provider's bytes byte-for-byte, which is what makes an Office download survive
@@ -835,7 +982,7 @@ def resolve_binding_secret(secret_ref: SecretRef, *, vault: SecretStore) -> Secr
     :meth:`~kiro_crew.connections.control_plane.lifecycle.BindingStore.select_secret`,
     which FENCES against the live store first and takes the reference from the
     store's own record. This helper takes whatever ref it is handed and fences
-    nothing, so it must not be used to serve a call -- it is the plain
+    nothing, so it must not serve a call -- it is the plain
     ref -> value custody read, kept public because a ref-holding caller outside a
     dispatch (a diagnostic, a vault-presence check) legitimately needs it.
     """
@@ -967,7 +1114,18 @@ class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
                 "send follows no redirects (no egress allowlist was injected), so "
                 "a credentialed request cannot be pointed elsewhere"
             )
-        target = _origin_of(newurl)
+        try:
+            target = _origin_of(newurl)
+        except ValueError as exc:
+            # A malformed redirect target (e.g. a non-numeric port
+            # ``https://host:invalid/``) makes ``urlsplit(...).port`` raise. That is
+            # a redirect this send cannot even parse, let alone vouch for, so refuse
+            # it as a redirect rather than letting the parse error escape the
+            # transport uncaught.
+            raise RedirectRefusedError(
+                f"refusing the HTTP {code} redirect to {newurl!r}: its target could "
+                f"not be parsed as a URL ({exc})"
+            ) from exc
         if target[0] != "https":
             raise RedirectRefusedError(
                 f"refusing the HTTP {code} redirect to {newurl!r}: it would leave "
@@ -1092,10 +1250,20 @@ def urllib_http_send(
 
     if not request.url.lower().startswith("https://"):
         raise SecretResolutionError("refusing to send a credentialed request over a non-https URL")
+    try:
+        request_origin = _origin_of(request.url)
+    except ValueError as exc:
+        # A malformed request URL (e.g. a non-numeric port ``https://host:x/``)
+        # makes ``urlsplit(...).port`` raise. Refuse before a socket exists rather
+        # than letting the parse error escape untyped -- the same typed pre-send
+        # refusal as the non-https guard above.
+        raise SecretResolutionError(
+            f"refusing to send: the request URL could not be parsed ({exc})"
+        ) from exc
     deadline_at = monotonic() + deadline_seconds
     opener = urllib.request.build_opener(
         _GuardedRedirectHandler(
-            origin=_origin_of(request.url),
+            origin=request_origin,
             allowed_hosts=allowed_redirect_hosts,
             hop_log=hop_log,
         )
@@ -1209,7 +1377,7 @@ def build_production_transport(
     two accounts in two tenants resolved the same credential, so per-binding
     custody was apparent rather than real. That derivation is REMOVED from this
     path and there is no fallback branch that reintroduces it -- ``slug`` is not a
-    parameter of this composition, and this module no longer imports
+    parameter of this composition, and this module does not import
     ``binding_secret_ref`` at all. A fence refusal and a resolution failure both
     return a typed refusal and emit ZERO calls.
 
@@ -1280,11 +1448,21 @@ def build_production_transport(
       exists and is single-writer, but this transport never CALLS it: it does not
       react to a 401 by refreshing. What it does honour is the outcome -- once
       something else rotates or revokes, the next call through here is fenced.
-    * **HTTP 500.** Left OUT of :data:`_AMBIGUOUS_TRANSIT_STATUSES` on purpose:
-      whether a given provider's 500 is raised before or after it commits is
-      provider knowledge, so a vendor owner that knows its API commits first must
-      set ``write_outcome`` itself. Treating every 500 as ``unknown`` here would
-      make almost every write unreplayable on a provider that 500s pre-commit.
+    * **HTTP 500 defaults to ``unknown``, and a vendor owner may NARROW it.**
+      500 is IN :data:`_AMBIGUOUS_TRANSIT_STATUSES`: a 500 on a non-idempotent
+      write carries no evidence of whether the origin raised it before or after
+      committing, and this module's own contract refuses to let a caller infer
+      "not applied" from a 5xx. So with no proof of non-application the outcome is
+      ``unknown`` and L07 refuses a blind replay (the caller can still override by
+      asserting idempotence). "Unknown" IS the state of not knowing whether the
+      effect landed, so it is the correct default -- the burden of proof runs the
+      other way: a safe default does not wait for a vendor to prove commits-first,
+      and the safety asymmetry stated above (a wrong ``unknown`` costs one
+      overridable refused replay; a wrong not-applied costs a duplicated write)
+      outweighs the convenience of keeping more writes replayable. A vendor owner
+      that genuinely KNOWS its API commits-first still narrows this the sanctioned
+      way, by setting ``write_outcome`` itself; that path is unchanged and does
+      not conflict with the safe default.
     """
 
     def _transport(
@@ -1334,7 +1512,7 @@ def build_production_transport(
             # generation/identity/mode/secret_ref is not the live one. Determinate:
             # nothing was sent, and no secret was read. The exception's text names
             # a binding id, which the caller does not need in order to know it is
-            # no longer authorized.
+            # not authorized.
             return TransportResponse(
                 http_status=401,
                 detail=(
@@ -1381,7 +1559,8 @@ def build_production_transport(
         # The ONE place the plaintext exists, on a local that dies with the call.
         # All three L01 credential modes present as a bearer credential here; a
         # provider needing another header shape is a vendor-owned locator concern.
-        headers["Authorization"] = f"Bearer {secret.reveal()}"
+        sent_credential = secret.reveal()
+        headers["Authorization"] = f"Bearer {sent_credential}"
 
         try:
             reply = http_send(
@@ -1400,10 +1579,26 @@ def build_production_transport(
                 http_status=400,
                 detail=f"operation {operation_id} was not dispatched over https",
             )
-        except (urllib.error.URLError, TimeoutError, TransportDeadlineExceededError):
-            # Ambiguous by construction: urllib cannot tell us whether the request
-            # bytes reached the server. See the docstring on why this is `unknown`
-            # for a non-idempotent write rather than a determinate not-applied.
+        except (
+            urllib.error.URLError,
+            ConnectionError,
+            http.client.HTTPException,
+            TimeoutError,
+            TransportDeadlineExceededError,
+        ):
+            # Ambiguous by construction: the transport cannot tell whether the
+            # request bytes reached the server. See the docstring on why this is
+            # `unknown` for a non-idempotent write rather than a determinate
+            # not-applied. The tuple names each ambiguity family explicitly rather
+            # than catching Exception (which would misclassify a programming error
+            # as network ambiguity): `urllib.error.URLError` is what the default
+            # opener wraps a connect/read failure in, but a raw
+            # `http.client.RemoteDisconnected` -- a server-committed-then-dropped
+            # reply -- is a `ConnectionResetError` (-> `ConnectionError`) AND an
+            # `http.client.BadStatusLine` (-> `HTTPException`), and is NOT a
+            # `URLError`, so it escaped this branch until both bases were named.
+            # `ConnectionError` also covers ConnectionAborted / BrokenPipe;
+            # `http.client.HTTPException` also covers IncompleteRead / BadStatusLine.
             return TransportResponse(
                 http_status=503,
                 detail=f"could not reach {service_id} for operation {operation_id}",
@@ -1435,7 +1630,9 @@ def build_production_transport(
         # The provider answered, so there is response metadata to project. ONE
         # call, reused by all three reply branches below, so a branch cannot be
         # added later that forgets it -- or that reaches for reply.headers raw.
-        metadata = response_metadata(reply.headers)
+        # `sent_credential` is passed so an allowlisted header whose VALUE echoes
+        # the outbound bearer is dropped, not handed to the caller.
+        metadata = response_metadata(reply.headers, sent_credential=sent_credential)
 
         if 200 <= reply.status < 300:
             return TransportResponse(
@@ -1461,19 +1658,35 @@ def build_production_transport(
 
 
 def decode_json_body(reply: HttpReply) -> Mapping[str, Any]:
-    """Parse a JSON reply body, or ``{}`` when it is empty or not JSON.
+    """Parse a JSON reply body into an object, refusing a malformed non-empty body.
 
     A helper for a vendor-owned ``decode``: it does the byte/JSON mechanics (this
     module's business) without deciding where a cursor lives (the vendor's).
+
+    An EMPTY body is a genuine empty result and returns ``{}``. A NON-EMPTY body
+    that is not valid UTF-8 JSON, or that parses to something other than a JSON
+    object (an array, a scalar), is REFUSED with
+    :class:`MalformedResponseBodyError` rather than collapsed to ``{}``: a silent
+    ``{}`` on a 2xx is indistinguishable from a real empty body, so a caller reads
+    a reported success carrying no data with no signal to retry -- silent data
+    loss. The typed error is that signal.
     """
 
     if not reply.body:
         return {}
     try:
         parsed = json.loads(reply.body.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise MalformedResponseBodyError(
+            "a non-empty 2xx body could not be read as JSON; refusing to report it "
+            "as an empty success"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise MalformedResponseBodyError(
+            "a non-empty 2xx body parsed as JSON but not as an object; refusing to "
+            "report it as an empty success"
+        )
+    return parsed
 
 
 __all__ = [
@@ -1488,6 +1701,7 @@ __all__ = [
     "HttpReply",
     "HttpRequest",
     "HttpSend",
+    "MalformedResponseBodyError",
     "RedirectHop",
     "RedirectRefusedError",
     "RequestLocator",

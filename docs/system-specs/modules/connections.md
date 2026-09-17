@@ -1142,6 +1142,7 @@ docstring), each with a counterexample test:
 | **Scope only narrows** | *At mint:* `derive_handle(binding, granted_scopes=…, requested_scopes=…, …)` refuses any requested scope the binding does not grant with a typed RUN-01 `scope` error (`HandleScopeError`) and mints NO handle — never silently dropped to what is granted. *At use:* `ensure_usable` refuses a handle whose presented `scopes` are not a subset of the RECORD's scopes (`HandleTamperedError`, typed `auth`) — a caller who widens the dict after minting is refused, not obeyed. The binding record itself carries no scope set; the authorized-scope set is supplied by the layer that owns it (e.g. L06 governance) and passed in, and this module treats scopes as opaque strings — it never consults or mutates `platform/governance.SCOPE_CATALOG`. |
 | **Expiry is enforced** | `ensure_usable` first refuses a non-finite `now` (a `NaN` clock would make `now >= not_after` silently False and let an expired handle through), then compares the caller's `now` against the RECORD's `not_after` (inclusive) and refuses an expired handle with a typed RUN-01 `input` error (`HandleExpiredError`) — pushing the handle's own `not_after` changes nothing, and a claimed expiry later than the record's is itself a tamper refusal. At mint, `ttl_seconds`/`now` must be FINITE and `ttl_seconds > 0`, and `now + ttl_seconds` must not overflow to `inf`; otherwise `ValueError`. |
 | **Routing/auth axes are trusted, not caller-chosen** | `ensure_usable` also checks the handle's `service_id` and `credential_mode` against the record and refuses a mismatch (`HandleTamperedError`, typed `auth`) — a caller cannot flip `service_id` to redirect a Graph handle at another provider, or swap the credential mode. And it does not return `None`: on success it returns a **`TrustedHandleView`** built from the RECORD. |
+| **A malformed handle is refused, not crashed** | Because the handle's fields are UNTRUSTED, the very FIRST step of `ensure_usable` validates the COMPLETE shape — that the handle is a mapping, every required field is present, and each value is of a type the enforcement can operate on (a `handle_id` that keys the registry, a `scopes` that `set()` accepts, a `not_after` that `>=` orders). A missing or wrong-typed field is the SAME class of untrusted input as a widened scope, so it is a typed RUN-01 `auth` refusal (`HandleTamperedError`) whose `detail` names only the offending field (never its value, and redacted regardless) — never a bare `KeyError` / `TypeError` that would carry no `error_class`, skip the audit, and jump the decision chain onto the caller. The boolean predicate `is_expired` shares the registry lookup's crash surface but is not allowed to raise (its contract routes the typed refusal to `ensure_usable`), so a malformed handle — weaker than "unknown" — fails CLOSED there too: `is_expired` answers `True` (treated as expired) rather than crashing. |
 | **Cannot reconstruct the binding** | The handle carries NOTHING that rebuilds its binding: no `binding_id`, no `subject_ref` / `tenant_ref`, no `secret_ref` (the handle deliberately carries no secret reference at all). Its own `handle_id` is random (`secrets.token_hex(16)`), independent of the binding. The sole link back is `binding_fingerprint` — a ONE-WAY keyed digest (HMAC-SHA256 under a per-process random key) of `binding_id`, which L04 revoke fencing can MATCH against a candidate binding but which no handle holder can INVERT to recover the id. |
 
 **A consumer routes on the returned view, never on the handle fields.**
@@ -1225,6 +1226,67 @@ valid file is dropped fail-closed. The L04 symbols (`BindingStore`,
 `StoredBinding`, `LIFECYCLE_SCHEMA_VERSION`, `store_path`) are canonical to
 `control_plane` and are NOT re-exported as top-level `connections` aliases,
 guarded by test.
+
+### The ACL binding-resolver adapter (L04): the host side of the knowledge seam
+
+The knowledge subsystem's ACL (`kiro_crew.knowledge.acl`) gates every managed
+(cloud/structured) item behind a per-candidate identity check, and it does NOT
+know how a principal maps to a provider account — that is a host/W01 concern. It
+declares a `@runtime_checkable` `Protocol`,
+`BindingResolver.resolve(principal, provider, account) -> AccessContext | None`,
+and its own docstring says *"Implemented by the host/W01 layer, not here."*
+`control_plane/acl_binding_resolver.py` is that host implementation, backed by
+the L04 trusted store.
+
+**It matches the CALL SHAPE, not by import — and matching the signature is not
+the whole contract.** A `Protocol` is structural, so the adapter matches
+`resolve(self, principal, provider, account) -> …|None` by shape and does NOT
+import — MUST NOT import — `kiro_crew.knowledge.acl` (that module lives on an
+un-merged branch; importing it would invert the dependency and is not reachable
+from a control-plane wheel). But **the ACL gate reads a field W01 does not
+produce**: `_subject_tenant_ok` evaluates `grant.subjects & ctx.subject_ids`,
+where `ctx.subject_ids` is a `@property` on ACL's `AccessContext`
+(`frozenset({subject, *groups})`). `subject_ids` exists **nowhere in W01**, so the
+`AccessGrant` this adapter returns cannot be handed to the ACL gate as-is — it
+would raise `AttributeError` at `ctx.subject_ids`. This section therefore makes
+**no** claim of structural equivalence or drop-in injection (that would be the
+"documented property that does not exist" trap this stack has hit before).
+
+**The actual bridge chain** has two halves. (1) W01 hands the ACL an `AccessGrant`
+carrying the provider-mapped, VERIFIED identity for one candidate (`subject` /
+`tenant` from the binding's `subject_ref` / `tenant_ref`; `groups` empty). (2) The
+ACL side consumes commit `dd715f12a` via ordinary git and, **on the ACL side**,
+bridges `AccessGrant` into its own `AccessContext`
+(`AccessContext(subject=grant.subject, tenant=grant.tenant, groups=grant.groups)`),
+which is where the `subject_ids` property comes into existence. `subject_ids` is
+an **ACL-owned derivation**, explicitly NOT a field W01 emits. So `AccessGrant` is
+a plainly-named W01 transport record, deliberately not a copy of ACL's
+`AccessContext` (no `subject_ids`, no `__post_init__`); every symbol it uses
+(`BindingStore`, `ServiceId`, `map_provider_to_service_id`,
+`ControlPlaneBindingResolver`, `AccessGrant`, `AccountToDeployment`) is real,
+importable, and tested — nothing is a "the ACL will call …" placeholder.
+
+| Concern | How the adapter closes it |
+|---|---|
+| **CALL-shape adapter, fail-closed** | `ControlPlaneBindingResolver.resolve(self, principal, provider, account)` (positional, matching the Protocol) maps the ACL inputs onto the store's keyword-only lookup and returns an `AccessGrant` or `None`. It returns `None` — deny this candidate, no fallback — for an unmappable provider, an unverified/empty/`local_library` principal, an `account` the host cannot map to a deployment, and a principal holding no (or a revoked) binding on the resolved `(deployment, service)`. It raises only when the store itself is unreadable (corruption is surfaced, never read as "no binding"). |
+| **`provider` lands on a CLOSED set** | `map_provider_to_service_id(provider)` maps the ACL connector-id to W01's closed `ServiceId` set: a verbatim member maps 1:1, the one alias `excel → excel_shared_engine` is translated, and ANY other string (unknown, misspelled, free-form) returns `None` → REFUSE. No lenient acceptance of arbitrary strings. |
+| **`resolve_ref(principal, ref)` is the single judgment path (endpoint-discriminated)** | The ACL adopted the four-field contract: `resolve_ref(principal, ref) -> AccessGrant \| None`, consuming the `ProviderResourceRef` STRUCTURALLY (`.provider`/`.account`/`.resource_id`/`.locator`, no ACL import). It carries the endpoint the bare `(provider, account)` pair lacks. Five FAIL-CLOSED checks in order: (1) principal established (see the trust row); (2) provider → `ServiceId` closed set; (3) the service's REQUIRED locator keys present (from `_LOCATOR_SPECS`), no best-effort completion; (4) the endpoint (read from the ref's locator) must be REGISTERED in the trusted store — `BindingStore.resolve_deployment_for_account_endpoint` returns a deployment only for a stored `(service, account, endpoint)`, so a caller-supplied endpoint the store never registered does not match; (5) ambiguity denies. The returned view comes ENTIRELY from the store's verified record; **the ref is a lookup key only, never an identity source**. The old two-arg `resolve(provider, account)` is now a THIN SHELL that builds an endpoint-less ref and defers to `resolve_ref` — NOT a second judgment path, and it fail-closes for any endpoint-requiring provider. Only three providers have a real connector today: **salesforce** carries the real endpoint `instanceUrl` (the two-deployment discriminator); **github**'s connector emits `{owner,repo,…}` with NO endpoint field yet (W02 owns adding it — NOT fabricated here, so github stays fail-closed on the endpoint axis); **google_drive** `{fileId,[driveId]}` has no host endpoint. The Microsoft Graph family + gmail/zoom/slack/asana are PROPOSED shapes (no connector emits them) and are marked proposed, not invented as wired. |
+| **`account` is NOT a `deployment_id` — a store-backed mapping, not a silent equation** | The ACL keys on `(provider, account)`, where `account` is the VENDOR-side account/org/tenant/**driveId** an object lives in (per acl.py: "a Graph tenant id, a Salesforce org id, a Drive driveId, a GitHub org/login, a Slack workspace id"). L04's `deployment_id` is instead the **provider-side deployment that hosts** the account (a GHE host, a Salesforce org, a Graph tenant deployment) — DIFFERENT axes (a GitHub org/login is not a GHE host; a Graph driveId is a resource, not the tenant deployment). The adapter does NOT pass `deployment_id=account`. The persisted store records each binding's vendor `account` AND its `endpoint` alongside its `deployment_id` (optional `StoredBinding.account`/`endpoint`, threaded through `insert`, carried through `rotate`/`revoke`, in `_same_stored_binding` and `_well_formed`; L02's `Binding` is untouched). `resolve_ref` keys on `(service, account, endpoint)`; the endpoint-less two-key `StoreBackedAccountToDeployment` remains as a store method but is no longer the judgment path (it fail-closes the same-name-cross-host case the endpoint discriminator resolves). |
+| **Principal trust: a bare session-key is not proof** | An ACL `QueryPrincipal` carries `principal_id`/`local_library` but NO verification provenance, and the ACL side has minted a principal from a bare `X-Session-Key` fallback (`a31`). A bare session key is not an authentication proof, so the adapter does NOT trust `principal_id` on its face: it accepts a principal as an authorization subject ONLY when a wired `principal_verified` predicate vouches its verification is established, and FAILS CLOSED otherwise (no predicate wired ⇒ no principal accepted). The predicate is the trust-contract seam the ACL/request layer must supply — the concrete discriminator (a verified marker / the signed request context the id was derived from) is NAMED, same discipline as `tenant_ref`/`subject_ref`: only verifier-produced identity counts, never a caller self-report. |
+| **GitHub trusted tenant** | The returned `subject`/`tenant` are the resolved binding's `subject_ref`/`tenant_ref`, which the `SubjectTenantVerifier` produced at INSERT time and the store persisted. `resolve_for_acl` takes NO caller-claimed subject/tenant and runs no verifier (the ACL contract carries none), so the tenant a caller ultimately sees is a VERIFIED provider tenant read from the trusted store, never a value the caller asserted. |
+| **`groups` empty, `bypass_acl` never true** | `AccessGrant.groups` is ALWAYS `frozenset()`: W01 does not produce or invent a group/role dimension — group membership is a separate authority (the provider's directory) the ACL folds into `subject_ids` on its side. `AccessGrant.bypass_acl` is ALWAYS `False`: `bypass_acl=True` is the ACL-side local-single-user library context, and a provider binding is a managed, cross-identity path. |
+| **Shared handler stays on the ACL side** | W01 does not build a second ACL or shared handler and does not extend any handle's self-reported fields to satisfy `AccessContext`. Authorization/routing consume only what a trusted read returns; the adapter's job ends at handing the ACL a provider-mapped `AccessGrant`. |
+
+**Not covered by W01, left to the ACL bridge (named, not hidden):** `subject_ids`
+(the `frozenset({subject, *groups})` derivation the ACL gate reads). Because the
+Protocol type is not reachable here, `isinstance(adapter, BindingResolver)` cannot
+be asserted; the tests pin the CALL shape directly AND pin the bridge-chain
+contract — that `AccessGrant` carries exactly `subject`/`tenant`/`groups`/`bypass_acl`
+and that `subject_ids` is NOT among them (`test_access_grant_does_not_provide_subject_ids…`).
+The adapter symbols (`AccessGrant`, `AccountToDeployment`,
+`ControlPlaneBindingResolver`, `map_provider_to_service_id`) are canonical to
+`control_plane`, not re-exported as top-level `connections` aliases, guarded by
+test.
 
 ### Two orthogonal axes, the same word in this repo, kept apart on purpose
 

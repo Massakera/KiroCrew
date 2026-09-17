@@ -43,6 +43,7 @@ import datetime
 import http.server
 import inspect
 import json
+import os
 import ssl
 import subprocess
 import sys
@@ -86,10 +87,45 @@ from kiro_crew.connections.control_plane.result import (
     OperationResult,
     result_with_payload,
 )
+from kiro_crew.connections.control_plane.writes import (
+    ATTEMPT_FAILED_NOT_APPLIED,
+    ATTEMPT_UNKNOWN,
+    REPLAY_REFUSE,
+    args_fingerprint,
+    record_attempt,
+    replay_decision,
+)
 from kiro_crew.secrets import SecretVault
 
 _T0 = 1_000_000.0
 _GRANTED = ("mail.read", "mail.send")
+
+
+def _default_verifier(
+    *, claimed_subject: str, claimed_tenant: str, service_id: str
+) -> Dict[str, str]:
+    return {
+        "subject_ref": f"subject://verified/{claimed_subject}",
+        "tenant_ref": f"tenant://verified/{claimed_tenant}",
+    }
+
+
+def _make_default_binding() -> Binding:
+    from kiro_crew.connections.control_plane.binding import create_binding
+
+    return create_binding(
+        service_id="outlook",
+        claimed_subject="alice",
+        claimed_tenant="acme",
+        credential_mode="oauth_user",
+        verifier=_default_verifier,  # type: ignore[arg-type]
+        slug="outlook",
+    )
+
+
+#: Minted ONCE by the real constructor so ``real_vault`` seeds the credential
+#: under its OWN per-binding scoped secret_ref name (never a slug name).
+_DEFAULT_BINDING: Binding = _make_default_binding()
 
 #: A genuinely binary body: a real ZIP local-file header (what an ``xlsx`` starts
 #: with), every byte value 0..255 -- so a NUL is in there -- and an invalid-UTF-8
@@ -207,6 +243,7 @@ def _handler_for(
 def _https_server(handler_cls: Any, certfile: Path, keyfile: Path) -> Iterator[int]:
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(certfile), str(keyfile))
     server.socket = context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -249,12 +286,14 @@ def trust_loopback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Tuple[Pat
 
 @pytest.fixture
 def real_vault(tmp_path: Path) -> SecretVault:
-    """A REAL, isolated, AES-256-GCM vault on disk holding the binding secret."""
+    """A REAL, isolated, AES-256-GCM vault on disk holding the binding secret.
 
-    from kiro_crew.connections.control_plane.binding import binding_secret_ref
+    Seeded under the shared default binding's OWN per-binding scoped secret_ref
+    name, so the fenced ``select_secret`` read resolves the per-binding entry.
+    """
 
     vault = SecretVault(tmp_path / "crewhome")
-    vault.set_sync(binding_secret_ref("outlook")["name"], "outlook-live-token")
+    vault.set_sync(_DEFAULT_BINDING["secret_ref"]["name"], "outlook-live-token")
     store = tmp_path / "crewhome" / ".vault" / "secrets.enc"
     # Guard for the guard: a stub vault would make every custody claim vacuous.
     assert store.is_file() and b"outlook-live-token" not in store.read_bytes()
@@ -276,24 +315,29 @@ def _bound(
 ) -> Tuple[Binding, DerivedHandle]:
     """A binding and a handle derived from it (the binding is what gets fenced).
 
-    ``secret_name`` overrides the binding's recorded vault-entry NAME, which is how
-    a test gives two bindings of the SAME provider two DIFFERENT credentials -- the
-    axis a slug-derived name cannot express.
+    With no override this returns the shared ``_DEFAULT_BINDING`` (its per-binding
+    scoped secret_ref, the constructor's own record, is what ``real_vault`` seeds --
+    the per-binding path). A test that needs two DIFFERENT credentials under one
+    provider passes ``secret_name`` (and usually a distinct subject/tenant), which
+    mints a fresh binding and stamps that name.
     """
 
     from kiro_crew.connections.control_plane.binding import create_binding
 
-    binding = create_binding(
-        service_id="outlook",
-        claimed_subject=subject,
-        claimed_tenant=tenant,
-        credential_mode="oauth_user",
-        verifier=_verifier,  # type: ignore[arg-type]
-        slug="outlook",
-    )
-    if secret_name is not None:
-        binding["secret_ref"] = dict(binding["secret_ref"])  # type: ignore[typeddict-item]
-        binding["secret_ref"]["name"] = secret_name
+    if subject == "alice" and tenant == "acme" and secret_name is None:
+        binding: Binding = dict(_DEFAULT_BINDING)  # type: ignore[assignment]
+    else:
+        binding = create_binding(
+            service_id="outlook",
+            claimed_subject=subject,
+            claimed_tenant=tenant,
+            credential_mode="oauth_user",
+            verifier=_verifier,  # type: ignore[arg-type]
+            slug="outlook",
+        )
+        if secret_name is not None:
+            binding["secret_ref"] = dict(binding["secret_ref"])  # type: ignore[typeddict-item]
+            binding["secret_ref"]["name"] = secret_name
     handle = derive_handle(
         binding,
         granted_scopes=_GRANTED,
@@ -856,10 +900,12 @@ def locator_for(port, path):
 certfile, keyfile = mint(WORK)
 os.environ["SSL_CERT_FILE"] = certfile
 vault = SecretVault(os.path.join(WORK, "crewhome"))
-vault.set_sync(binding_secret_ref("outlook")["name"], "outlook-live-token")
 
 binding = create_binding(service_id="outlook", claimed_subject="alice", claimed_tenant="acme",
                          credential_mode="oauth_user", verifier=verifier, slug="outlook")
+# Seed the vault under the binding's OWN per-binding secret_ref name (what the
+# store records and select_secret reads), not the slug name.
+vault.set_sync(binding["secret_ref"]["name"], "outlook-live-token")
 handle = derive_handle(binding, granted_scopes=("mail.read",), requested_scopes=("mail.read",),
                        now=T0, ttl_seconds=300.0)
 view = ensure_usable(handle, now=T0)
@@ -946,15 +992,44 @@ def test_a_fresh_interpreter_outside_the_source_tree_carries_all_three_shapes(
     assert src_root.name == "src" and (src_root / "kiro_crew").is_dir()
     assert src_root not in workdir.parents and workdir != src_root
 
+    # The child runs off an absolute PYTHONPATH with a cwd outside the source tree
+    # -- the property under test. But a WHOLLY replaced env breaks Windows: Winsock
+    # initialisation (the child imports asyncio via the package, pulling in
+    # `_overlapped`) needs `SystemRoot`/`SystemDrive`, and a POSIX `PATH` names
+    # directories that do not exist there -> `WinError 10106`. So carry over ONLY
+    # the OS-essential, non-source variables (never a source path, never the
+    # parent's PYTHONPATH), then set the controlled ones on top. This keeps the
+    # "reachable only through the explicit PYTHONPATH, off-source" guarantee while
+    # letting the interpreter start on every platform.
+    _OS_ESSENTIAL = (
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "TEMP",
+        "TMP",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PATHEXT",
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+    )
+    child_env = {k: os.environ[k] for k in _OS_ESSENTIAL if k in os.environ}
+    child_env.update(
+        {
+            "PYTHONPATH": str(src_root),
+            # A real PATH from the OS default (never the parent's, which could
+            # carry a source dir); on POSIX this is "/usr/bin:/bin"-shaped, on
+            # Windows it includes System32 so the loader finds Winsock's DLLs.
+            "PATH": os.environ.get("PATH", os.defpath) if os.name == "nt" else "/usr/bin:/bin",
+            "HOME": str(workdir),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
     completed = subprocess.run(
         [sys.executable, str(script), str(workdir)],
         cwd=str(workdir),
-        env={
-            "PYTHONPATH": str(src_root),
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(workdir),
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
+        env=child_env,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -1024,12 +1099,11 @@ def test_evidence_1_two_bindings_resolve_two_different_secrets_over_real_tls(
     from kiro_crew.connections.control_plane.binding import binding_secret_ref
 
     certfile, keyfile = trust_loopback
-    binding_a, handle_a = _bound(
-        subject="alice", tenant="acme", secret_name="CONNECTIONS_OUTLOOK_BINDING_SECRET__A"
-    )
-    binding_b, handle_b = _bound(
-        subject="bob", tenant="globex", secret_name="CONNECTIONS_OUTLOOK_BINDING_SECRET__B"
-    )
+    binding_a, handle_a = _bound(subject="alice", tenant="acme")
+    binding_b, handle_b = _bound(subject="bob", tenant="globex")
+    # The two per-binding names come from the CONSTRUCTOR's own records (not stamped
+    # by the test) and differ, which is the axis a slug name cannot express.
+    assert binding_a["secret_ref"]["name"] != binding_b["secret_ref"]["name"]
     # Same service and same credential mode -- the two axes the executor passes --
     # so nothing but the binding tells these apart.
     view_a, view_b = ensure_usable(handle_a, now=_T0), ensure_usable(handle_b, now=_T0)
@@ -1316,3 +1390,108 @@ def test_evidence_4_a_revoke_between_page_1_and_page_2_refuses_page_2(
     # The walk stopped rather than looping on a refusal.
     assert walk.done is True
     assert walk.pages == 1
+
+
+def _drop_after_commit_handler(received: List[bytes]) -> Any:
+    """A TLS handler that CONSUMES the request body, then drops the connection.
+
+    It reads the whole request (the server has "committed" -- the bytes arrived
+    and were accepted) and then closes the socket WITHOUT writing any status
+    line. On the client that surfaces as a raw ``http.client.RemoteDisconnected``
+    ("Remote end closed connection without response") on the real TLS path -- the
+    exact ambiguity a server-committed-then-dropped write produces, and the one
+    the old ``except`` tuple let escape.
+    """
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            received.append(self.rfile.read(length) if length else b"")
+            # Committed: request consumed. Now drop without a response line.
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+
+        def log_message(self, *args: Any) -> None:
+            return
+
+    return _H
+
+
+def _post_locator(port: int, path: str) -> Any:
+    def _locate(*, request_args: Mapping[str, Any], **_: Any) -> "production_module.HttpRequest":
+        return production_module.HttpRequest(
+            method="POST",
+            url=f"https://localhost:{port}{path}",
+            headers={"Accept": "*/*", "Content-Type": "application/json"},
+            body=b'{"to":"someone@example.invalid"}',
+        )
+
+    return _locate
+
+
+def test_a_real_tls_server_committed_then_disconnect_is_unknown_and_refuses_replay(
+    fresh_install: Path, trust_loopback: Tuple[Path, Path], real_vault: SecretVault
+) -> None:
+    """On the REAL TLS path: server consumes the write then drops -> unknown, replay refused.
+
+    The injected-sender regression (production test) proves the except tuple
+    catches ``RemoteDisconnected``; this proves it on a genuine TLS socket, where
+    the disconnect is produced by the wire rather than a raised stub. A
+    non-idempotent write (``external_send``) whose reply is dropped after the
+    server accepted the body must record ``write_outcome=unknown`` (NOT
+    ``failed_not_applied``) so L07 refuses a blind replay -- otherwise it double-sends.
+    """
+
+    certfile, keyfile = trust_loopback
+    binding, handle = _bound(subject="alice", tenant="acme")
+    store = _live_store(fresh_install, binding)
+    received: List[bytes] = []
+    descriptor: OperationDescriptor = {
+        "operation_id": "outlook.messages.send",
+        "service_id": "outlook",
+        "operation_kind": "mutation",
+        "effect": "external_send",
+        "credential_modes": ("oauth_user",),
+    }
+    args = {"to": "someone@example.invalid"}
+
+    with _https_server(_drop_after_commit_handler(received), certfile, keyfile) as port:
+        transport = build_production_transport(
+            gate=_gate_for(binding, handle),
+            store=store,
+            vault=real_vault,
+            locator=_post_locator(port, "/v1.0/me/sendMail"),
+        )
+        outcome = execute(
+            descriptor,
+            handle,
+            transport,
+            request_args=args,
+            request_idempotency_key="idem-tls-disc-1",
+            **_kw(governance_item="messages.send"),
+        )
+
+    # The server DID receive (commit) the request body -- the ambiguity is real.
+    assert received and received[0] == b'{"to":"someone@example.invalid"}'
+    # The raw RemoteDisconnected off the real socket is caught, not propagated.
+    assert outcome.error is not None
+    assert outcome.write_outcome == ATTEMPT_UNKNOWN
+    assert outcome.write_outcome != ATTEMPT_FAILED_NOT_APPLIED
+
+    # L07 refuses to replay the non-idempotent write on that `unknown`.
+    record = record_attempt(
+        operation_id=descriptor["operation_id"],
+        args_fingerprint=args_fingerprint(args),
+        idempotency_key="idem-tls-disc-1",
+        outcome="unknown",
+    )
+    assert (
+        replay_decision(
+            descriptor, record, request_args=args, request_idempotency_key="idem-tls-disc-1"
+        )["verdict"]
+        == REPLAY_REFUSE
+    )
