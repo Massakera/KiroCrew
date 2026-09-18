@@ -412,25 +412,42 @@ describe('SkillBrowserModal', () => {
     expect(screen.queryByTestId('skill-preview-error')).not.toBeInTheDocument()
   })
 
-  it('Try again is disabled while the refetch is in flight, so a second click cannot queue a duplicate', async () => {
-    await openFailedPreview(new TypeError('Failed to fetch'))
+  it('Try again is disabled while a refetch over a cached preview is in flight, so a second click cannot queue a duplicate', async () => {
+    // With no cached preview a retry shows the loading state (the notice and
+    // its button unmount, so there is nothing to double-click). With a cached
+    // preview the query keeps its error while refetching, the notice stays up,
+    // and the button itself has to refuse the second click.
+    mockApi.discoverSkills.mockResolvedValue({ results: [aSkill()], providers: ['skillsh'] })
+    mockApi.previewDiscoveredSkill.mockResolvedValue({
+      name: 'widget-wrangler',
+      description: 'Preview description',
+      content: '# first',
+    } satisfies DiscoverSkillPreview)
+    const { qc } = renderModal()
+    await search('widget')
+    fireEvent.click(await screen.findByRole('option', { name: 'widget-wrangler' }))
+    expect(await screen.findByTestId('md')).toHaveTextContent('# first')
+
+    // A later refetch fails: the notice appears over the cached preview.
+    mockApi.previewDiscoveredSkill.mockRejectedValue(new TypeError('Failed to fetch'))
+    await act(async () => { await qc.invalidateQueries({ queryKey: ['skill-preview'] }) })
+    expect(await screen.findByTestId('skill-preview-error')).toHaveTextContent(CONNECTION_HINT)
+    expect(mockApi.previewDiscoveredSkill).toHaveBeenCalledTimes(2)
+
     const pending = deferred<DiscoverSkillPreview>()
     mockApi.previewDiscoveredSkill.mockReturnValue(pending.promise)
     expect(screen.getByTestId('skill-preview-retry')).not.toBeDisabled()
-
     fireEvent.click(screen.getByTestId('skill-preview-retry'))
     await waitFor(() => expect(screen.getByTestId('skill-preview-retry')).toBeDisabled())
-    // The notice stays up while the answer is pending, and the disabled
-    // button swallows the second click.
     expect(screen.getByTestId('skill-preview-error')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('skill-preview-retry'))
-    expect(mockApi.previewDiscoveredSkill).toHaveBeenCalledTimes(2)
+    expect(mockApi.previewDiscoveredSkill).toHaveBeenCalledTimes(3)
 
     await act(async () => {
-      pending.settle({ name: 'widget-wrangler', description: 'now it loads', content: '# Widget Wrangler' })
+      pending.settle({ name: 'widget-wrangler', description: 'now it loads', content: '# second' })
       await vi.advanceTimersByTimeAsync(0)
     })
-    expect(await screen.findByTestId('md')).toBeInTheDocument()
+    expect(await screen.findByTestId('md')).toHaveTextContent('# second')
     expect(screen.queryByTestId('skill-preview-error')).not.toBeInTheDocument()
   })
 
