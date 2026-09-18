@@ -15,6 +15,11 @@ superseded-by: []
 
 # RFC: Append-only ledger — one record per unit, every view a fold
 
+> **Naming:** the mechanism this RFC specifies is called the **crew log** (agreed
+> with Joe Guo, 2026-09-17). Where the text below says "ledger" for the per-unit
+> append-only file, read "crew log". The RFC's file name and title are left as they
+> were so external links keep resolving; only the name of the thing changed.
+
 Status: in-progress. The storage below, and the first emitter that writes to it, land
 together in [#10091](https://github.com/kirodotdev/KiroCrew/pull/10091). Nothing is on
 main yet: there `members.py` writes pointer entries with no `type` and no `seq`, and
@@ -53,7 +58,7 @@ the code (`session_ledger.py`, `work_ledger.py`): a **ledger** is the append-onl
   instead. Message BODIES are in scope and are written, because they are redacted before
   they reach the file -- exfiltration URLs then credentials, in the writer rather than at
   the call sites, so a new call site cannot forget -- and a redaction that fails yields the
-  empty string, never the input. Bodies on disk are GATED: `KIROCREW_SESSION_LEDGER` may
+  empty string, never the input. Bodies on disk are GATED: `KIROCREW_CREW_LOG` may
   not default to on until session trash and permanent delete reach a session's ledger
   directory and `StorageReport` counts its bytes. Until both land, "delete this
   conversation" would not delete it and the disk-use surface would understate it, which are
@@ -190,7 +195,7 @@ answers, because a reader told the lines were pruned stops looking -- torn-tail 
 deterministic closer — an interrupted turn gets `turn/completed {stop_reason: interrupted}`
 stamped at the last real entry's time, so two readers of the same bytes agree — and the
 OS-masked `ledgers/` leaf. Its first writer ships with it: the session emitter behind
-`KIROCREW_SESSION_LEDGER=1`, default off, INCLUDING message bodies. The `ref` back-pointer
+`KIROCREW_CREW_LOG=1`, default off, INCLUDING message bodies. The `ref` back-pointer
 to a transcript position and the `session/seeded` import are migration steps and follow;
 until then the transcript file is still written and still the read path. There is no
 streaming-delta emitter: redacting one delta at a time cannot see a credential split across
@@ -214,7 +219,7 @@ of the crew store's JSON files and of the work ledger, and the secretaries.
 
 Three corrections to the sections above, from implementing them. The model is one base
 envelope plus session-only and crew-only halves, and the sections were written with the two
-halves mixed. `docs/system-specs/modules/ledger-core.md` sections 4, 4a, 4b and 6 are the
+halves mixed. `docs/system-specs/modules/crew-log-core.md` sections 4, 4a, 4b and 6 are the
 current specification of all three.
 
 **The signed family is two plain crew-owned types.** §4's `crew:<parent>/dispatch` and
@@ -242,3 +247,33 @@ two: a session ledger takes `gateway` and `acp`, a crew ledger takes `gateway`,
 inside a single session's turn history, and `src` is what a reader attributes an entry to.
 `session:<id>` is accepted by neither kind: no emitter writes it, and adding a source to a
 kind is additive, since no reader validates `src`.
+
+## Amendment 2026-09-16 — the vocabulary trim
+
+Three corrections to the sections above, from implementing them. The body is left as
+written; where the two disagree, this section is what holds.
+
+**The session vocabulary is nine types shorter.** §4 and the storage spec named types with
+no site that could honestly produce them, or that would record a second time a fact another
+entry already carries. Gone: `session/seeded`, `message/steered`, `tool/searched`,
+`tool/loaded`, `skill/searched`, `skill/loaded`, `summary/written`, `remote/placed`,
+`remote/lost`, and `digest` as a `background/completed.kind`. The vocabulary is therefore a
+statement about what the log contains rather than about what it might one day contain,
+which is what makes a reader's declared type set worth anything. Any of them returns when a
+real source exists. Three domains empty out with them and leave `TYPE_OWNERSHIP`: `skill`,
+`summary`, `remote`. The `remote` HEADER field is unrelated and stays.
+
+**The parallel lifecycle-event stream is retired, not coexisting.** §1 counts "a lifecycle
+event schema with no writer" among the five heads this design replaces, and §3 records that
+the two envelopes are field-compatible so one projection could fold both. That package had
+no emitter, no reader and no directory on any host, and each of its kinds names a fact this
+format owns as a `type` -- so it is deleted rather than kept as a second vocabulary every
+future emitter would have to choose between. A fact with no unit to belong to (a script
+cron, gateway lifecycle) gets a `gateway`-kind ledger when something needs to record one.
+
+**The format is pre-release, not frozen.** The storage spec froze the wire format in the
+commit that introduced it. `KIROCREW_SESSION_LEDGER` defaults off and no user data exists on
+disk, so a shape change breaks nothing and the freeze bought only the appearance of one. The
+freeze point is the release that turns the flag on by default: from there a reader may hold
+files, so that change is the one that decides the compatibility strategy -- additive fields
+plus the `ignorable` skip, or migrations -- and `version` is the escape hatch it spends.

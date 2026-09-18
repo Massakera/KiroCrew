@@ -96,6 +96,7 @@ _PROJECT_NAMES_CACHE: dict[str, tuple[tuple[_ListAgentsSig, ...], frozenset[str]
 # ``data`` dicts as read-only.
 _PARSED_SPECS_LOCK = threading.Lock()
 _PARSED_SPECS_CACHE: dict[str, tuple[_ListAgentsSig, list[tuple[dict[str, Any], Path]]]] = {}
+_PARSED_SPECS_REFRESHING: set[str] = set()  # Guarded by _PARSED_SPECS_LOCK.
 # Bumped by clear_list_agents_cache() under the lock. A parse snapshot records
 # the generation it started under and is discarded instead of stored when a
 # clear landed meanwhile — otherwise an in-flight parse could re-publish rows
@@ -981,6 +982,55 @@ def parsed_agent_specs(
     return list(rows)
 
 
+def cached_agent_specs(
+    agents_dir: Path | None = None,
+    *,
+    operation: str,
+    source: str,
+) -> list[tuple[dict[str, Any], Path]]:
+    """Return cached specs without filesystem calls on the caller's thread.
+
+    The caller only reads the snapshot dict; every scandir, stat and parse runs
+    on ``mc-discovery``. A cold, just-cleared or changed snapshot serves the
+    previous rows (or none) until the worker refresh lands. A loop-thread model
+    lookup therefore briefly degrades rather than blocking on filesystem I/O or
+    queuing a full parse behind ``mc-pathres`` and triggering the watchdog exit.
+    Off-loop callers needing current rows should use :func:`parsed_agent_specs`
+    directly.
+
+    Returned lists are copies; their rows remain read-only. Revalidations
+    preserve the caller's *operation*/*source* audit labels, with at most one
+    in-flight revalidation per directory, even across cache invalidation. A
+    warm worker revalidation scans the signature without parsing specs again.
+    """
+    d = agents_dir or _kiro_agents_dir()
+    key = str(d)
+    with _PARSED_SPECS_LOCK:
+        cached = _PARSED_SPECS_CACHE.get(key)
+        rows = list(cached[1]) if cached is not None else []
+        if key in _PARSED_SPECS_REFRESHING:
+            return rows
+        _PARSED_SPECS_REFRESHING.add(key)
+
+    def refresh() -> None:
+        try:
+            parsed_agent_specs(d, operation=operation, source=source)
+        except Exception:
+            # The future is fire-and-forget, so nothing else surfaces this:
+            # without the log a persistent parse failure degrades silently.
+            logger.warning("agent spec snapshot refresh failed for %s", d, exc_info=True)
+        finally:
+            with _PARSED_SPECS_LOCK:
+                _PARSED_SPECS_REFRESHING.discard(key)
+
+    try:
+        discovery_executor().submit(refresh)
+    except RuntimeError:  # The executor is shutting down; leave the lookup degraded.
+        with _PARSED_SPECS_LOCK:
+            _PARSED_SPECS_REFRESHING.discard(key)
+    return rows
+
+
 def agent_skill_globs(agent: str, agents_dir: Path | None = None) -> list[str]:
     """Return fnmatch globs for the skills mapped to *agent*, or ``[]``.
 
@@ -1000,6 +1050,99 @@ def agent_skill_globs(agent: str, agents_dir: Path | None = None) -> list[str]:
             continue
         return [g for uri in skill_resource_uris(data) if (g := expand_skill_uri(uri, f))]
     return []
+
+
+#: Ceiling on a ``welcomeMessage`` rendered into a chat transcript. The field is
+#: authored in a user-writable, tool-shared directory, so its length is not a
+#: trusted quantity: an unbounded value would be persisted into the slot window
+#: and re-broadcast to every open tab on each restore. Truncated rather than
+#: refused — a long hint is still the author's intent, and dropping it silently
+#: reproduces exactly the "accepted but invisible" behaviour this reader exists
+#: to remove.
+WELCOME_MESSAGE_MAX_CHARS = 2000
+
+
+def spec_welcome_message(data: dict[str, Any]) -> str:
+    """The display-ready ``welcomeMessage`` of a parsed agent spec, or ``""``.
+
+    Coerced through :func:`spec_str` for the reason documented there: this key
+    is read from ``~/.kiro/agents``, a directory other tools also write, so a
+    structured or ``null`` value is "absent" rather than an error. Surrounding
+    whitespace is stripped and a whitespace-only value collapses to ``""``, so
+    a blank hint renders nothing instead of an empty bubble.
+
+    Truncated at :data:`WELCOME_MESSAGE_MAX_CHARS` with an ellipsis, so the
+    caller can append the result without re-checking its size.
+    """
+    text = spec_str(data, "welcomeMessage").strip()
+    if len(text) > WELCOME_MESSAGE_MAX_CHARS:
+        # The ellipsis is part of the budget, not an addition to it: the ceiling
+        # is what callers are promised, so a result of cap+1 would break the one
+        # guarantee this function makes.
+        text = text[: WELCOME_MESSAGE_MAX_CHARS - 1].rstrip() + "\u2026"
+    return text
+
+
+def agent_welcome_message(
+    agent: str,
+    *,
+    project: str | Path | None = None,
+    agents_dir: Path | None = None,
+) -> str:
+    """*agent*'s ``welcomeMessage`` as display-ready text, or ``""``.
+
+    The one reader of the field. Blocking (it scans agent directories), so an
+    event-loop caller must offload it — the dashboard chat runner does.
+
+    WHICH spec is live is answered by :func:`list_agents`, not re-decided here.
+    That roster is what the agent picker shows and what the backend activates, so
+    the hint has to come from the row it selected or the greeting describes an
+    agent that is not running. Every rule that choice needs already lives there
+    and nowhere else: project scope shadowing the user directory, a declared
+    ``name`` outranking a matching filename, package-installed winning a
+    duplicate name, and last-seen winning among duplicate project specs. Reading
+    the winner instead of reproducing the rules is what keeps the two from
+    drifting; a second copy of the precedence, however well tested, is a copy
+    that can disagree.
+
+    Only the winning file is then parsed, through the same hardened reader under
+    this function's own *operation* label, so a denial is attributed to the hint
+    rather than to a listing. That read applies the full guard set again (size
+    cap, sidecars, sensitive symlink targets, non-object JSON), so reopening by
+    name is not an unguarded second read.
+
+    Best-effort and never raises: an unknown agent, an unreadable or oversized
+    spec, or a roster row whose file is gone all yield ``""``. A missing hint and
+    an unreadable one are deliberately the same answer — the field is decoration,
+    and no chat turn should fail over it.
+    """
+    if not agent:
+        return ""
+    project_dir = str(project) if project else None
+    try:
+        rows = list_agents(agents_dir=agents_dir, project_dir=project_dir)
+    except Exception:  # noqa: BLE001 - decoration must never fail a turn
+        logger.debug("Agent roster unreadable for welcomeMessage %r", agent, exc_info=True)
+        return ""
+    winner = next((row for row in rows if row.name == agent), None)
+    if winner is None or not winner.filename:
+        return ""
+    # The roster records a bare filename plus the scope it was found in, which is
+    # what says which of the two directories to reopen it from.
+    if winner.scope == SCOPE_PROJECT:
+        if not project_dir:
+            return ""
+        directory = project_agents_dir(project_dir)
+    else:
+        directory = agents_dir if agents_dir is not None else _kiro_agents_dir()
+    data = _read_agent_spec(
+        directory / winner.filename,
+        operation="agent_welcome_message",
+        source="unknown",
+    )
+    if data is None:
+        return ""
+    return spec_welcome_message(data)
 
 
 def _dir_signature(d: Path) -> _ListAgentsSig:

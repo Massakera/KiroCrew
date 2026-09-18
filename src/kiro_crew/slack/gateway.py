@@ -220,7 +220,13 @@ from kiro_crew.mcp_gateway.rewriter import (
 from kiro_crew.mcp_hot_reload import parse_kiro_cli_version
 from kiro_crew.memory import MemoryStore
 from kiro_crew.messaging import APPROVAL_INTERACTIVE, TurnDriver, inbound_spool, registry
-from kiro_crew.messaging.dispatch import build_directive_consumer, build_tool_gate
+from kiro_crew.messaging.dispatch import (
+    build_directive_consumer,
+    build_tool_gate,
+    consume_reinjection,
+    rearm_reinjection,
+    stop_reason_landed,
+)
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -240,11 +246,14 @@ from kiro_crew.monitoring.completion import (
     is_monitor_completion_evidence,
 )
 from kiro_crew.monitoring.models import (
+    DEFAULT_MONITOR_STALL_MIN_SECS,
+    DEFAULT_MONITOR_STALL_TICKS,
     MONITOR_STOP_APPROVAL_STALL,
     MONITOR_STOP_COMPLETION_UNAVAILABLE,
     MONITOR_STOP_INVALID_RECORD,
     MONITOR_STOP_SESSION_UNAVAILABLE,
     MONITOR_STOP_UNSUPPORTED_VERSION,
+    MONITOR_STOP_VERDICT_STALL,
     MonitorActionDisposition,
     MonitorDispatchResult,
     MonitorOutcome,
@@ -3995,7 +4004,7 @@ class GatewayOrchestrator:
                                     wrapped,
                                     _directive_user_origin=False,
                                     # Structural provenance for the session
-                                    # ledger: the queued twin above carries
+                                    # crew log: the queued twin above carries
                                     # CRON_NOTIFICATION_KIND, and this branch is
                                     # the same injector dispatching directly.
                                     _turn_actor="cron",
@@ -5143,6 +5152,22 @@ class GatewayOrchestrator:
                     if self.cron_svc is not None:
                         self.cron_svc.register_active_session_key(job.id, agent_session_key)
                     _acq = False
+                    # Post-compaction re-injection bookkeeping for the finally:
+                    # consumed the one-shot flag / turn landed. The stream
+                    # returns text only, so the completion's stop reason is
+                    # captured through on_complete (last completion wins: a
+                    # post-token resume's continuation is the turn that ended).
+                    _seq_reinjection = False
+                    _seq_landed = False
+                    # None until a completion is observed: a stream that ends
+                    # without one is not landed.
+                    _seq_stop: dict[str, str | None] = {"reason": None}
+
+                    def _seq_note_complete(
+                        ev: Any, _box: dict[str, str | None] = _seq_stop
+                    ) -> None:
+                        _box["reason"] = str(getattr(ev, "stop_reason", "") or "")
+
                     try:
                         client, is_new, _resumed, _downgraded = await _acquire_with_model_fallback(
                             agent_session_key, agent
@@ -5161,6 +5186,10 @@ class GatewayOrchestrator:
                         # empty parent ("notification only (parent=)") unless an
                         # unrelated surface happened to be mid-turn.
                         await publish_turn_identity(self.sessions, agent_session_key)
+                        # A compaction drops session-start context. Read-and-clear
+                        # the one-shot flag so this turn re-injects it exactly
+                        # once; the finally re-arms it if the turn never lands.
+                        _seq_reinjection = consume_reinjection(self.sessions, agent_session_key)
                         # Off-loop: build_message embeds the episodic query.
                         full_message, _ = await run_in_embed_pool(
                             self.ctx_builder.build_message,
@@ -5172,6 +5201,7 @@ class GatewayOrchestrator:
                             memory_store=cron_memory_store or None,
                             context_provider=client,
                             resumed=_resumed,
+                            needs_reinjection=_seq_reinjection,
                             minimal_context=job.minimal_context,
                         )
                         # Wall clock for the cron agent turn: acp never assigns
@@ -5196,8 +5226,13 @@ class GatewayOrchestrator:
                                 else self._interactive_approval("cron")
                             ),
                             on_tool_gate=_gate.note,
+                            on_complete=_seq_note_complete,
                             fallback_models=configured_fallback_chain(),
                         )
+                        # The prompt reached the model and the turn completed, so
+                        # the finally must NOT restore the re-injection flag --
+                        # only for a succeeded stop reason.
+                        _seq_landed = stop_reason_landed(_seq_stop["reason"])
                         if not result_text:
                             result_text = "_No response._"
                         result_text = _annotate_model_fallback(result_text, client)
@@ -5239,6 +5274,15 @@ class GatewayOrchestrator:
                         except Exception:
                             logger.debug("usage row (cron seq) persist failed", exc_info=True)
                     finally:
+                        # Before the reset below: a turn that consumed the
+                        # post-compaction flag but never landed puts it back so
+                        # a session that survives (deferred reset) re-injects.
+                        rearm_reinjection(
+                            self.sessions,
+                            agent_session_key,
+                            consumed=_seq_reinjection,
+                            landed=_seq_landed,
+                        )
                         if _acq:
                             self.sessions.release(agent_session_key)
                             # Mirror the single-agent finally below: defer the
@@ -5291,6 +5335,16 @@ class GatewayOrchestrator:
             # Set when the gate verdict below already counted this run, so the
             # exception handler does not count it a second time.
             _gate_counted = False
+            # Post-compaction re-injection bookkeeping for the finally: consumed
+            # the one-shot flag / turn landed. Stop reason captured through
+            # on_complete, as on the sequential path above.
+            _needs_reinjection = False
+            _turn_landed = False
+            _turn_stop: dict[str, str | None] = {"reason": None}
+
+            def _note_complete(ev: Any, _box: dict[str, str | None] = _turn_stop) -> None:
+                _box["reason"] = str(getattr(ev, "stop_reason", "") or "")
+
             try:
                 assert self.sessions is not None
                 assert self.ctx_builder is not None
@@ -5309,6 +5363,10 @@ class GatewayOrchestrator:
                         + "\n".join(f"- {a}" for a in job.acked_items)
                     )
                 _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
+                # A compaction drops session-start context. Read-and-clear the
+                # one-shot flag so this turn re-injects it exactly once; the
+                # finally re-arms it if the turn never lands.
+                _needs_reinjection = consume_reinjection(self.sessions, session_key)
                 # Off-loop: build_message embeds the episodic query.
                 full_message, _ = await run_in_embed_pool(
                     self.ctx_builder.build_message,
@@ -5320,6 +5378,7 @@ class GatewayOrchestrator:
                     memory_store=cron_memory_store or None,
                     context_provider=client,
                     resumed=_resumed,
+                    needs_reinjection=_needs_reinjection,
                     provider_type=_provider,
                     minimal_context=job.minimal_context,
                 )
@@ -5343,8 +5402,14 @@ class GatewayOrchestrator:
                         None if job.approval_mode == "auto" else self._interactive_approval("cron")
                     ),
                     on_tool_gate=_gate.note,
+                    on_complete=_note_complete,
                     fallback_models=configured_fallback_chain(),
                 )
+
+                # The prompt reached the model and the turn completed, so the
+                # finally must NOT restore the re-injection flag -- only for a
+                # succeeded stop reason.
+                _turn_landed = stop_reason_landed(_turn_stop["reason"])
 
                 if not result_text:
                     result_text = "_No response._"
@@ -5673,6 +5738,15 @@ class GatewayOrchestrator:
                             self.sessions.release(session_key)
                             _acquired = False
                         await self.sessions.reset(session_key)
+                        # The reset destroyed the live session that carried the
+                        # consumed re-injection flag, and the retry starts the
+                        # replacement cold (session-start context comes with a
+                        # fresh session). Hand the bookkeeping to the retry, as
+                        # the transient arm does, or the finally below would
+                        # re-arm the REPLACEMENT after the retry lands and keeps
+                        # it (deferred reset for pending sub-agents) -- one
+                        # duplicated re-injection on its next turn.
+                        _needs_reinjection = False
                         return await _cron_callback(job)
                     except Exception:
                         pass  # retry failed — fall through to dedup + alert
@@ -5726,6 +5800,18 @@ class GatewayOrchestrator:
                                 _acquired = False
                         except Exception:
                             logger.debug("release before transient retry failed", exc_info=True)
+                        # The retry re-enters this callback on the SAME live
+                        # session (no reset on this arm), so give it back the
+                        # re-injection this attempt consumed and never delivered
+                        # -- and hand the bookkeeping to the retry, or the
+                        # finally below would re-arm a second time after it lands.
+                        rearm_reinjection(
+                            self.sessions,
+                            session_key,
+                            consumed=_needs_reinjection,
+                            landed=_turn_landed,
+                        )
+                        _needs_reinjection = False
                         await asyncio.sleep(_delay)
                         return await _cron_callback(job)
                     # Retries exhausted — fall through to dedup + alert +
@@ -5972,6 +6058,12 @@ class GatewayOrchestrator:
                 raise
             finally:
                 assert self.sessions is not None
+                # Before the reset below: a turn that consumed the post-compaction
+                # flag but never landed puts it back so a session that survives
+                # (deferred reset) re-injects on its next turn.
+                rearm_reinjection(
+                    self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
+                )
                 if _acquired:
                     self.sessions.release(session_key)
                     # Defer session reset if subagents are still running,
@@ -7446,6 +7538,23 @@ class GatewayOrchestrator:
                         "The pull request was closed without merging. Decide whether "
                         "to reopen it or abandon this watch. Restart the monitor if you reopen it."
                     )
+                elif reason == MONITOR_STOP_VERDICT_STALL:
+                    # NOT the terminal-blocker map below, whose copy sends the reader to
+                    # repair something. But it must not claim the opposite either: the
+                    # DOMINANT way a watch reaches twelve identical ticks is an
+                    # already-alerted red sitting inside its re-alert interval, so
+                    # "nothing is wrong" would be false exactly when it matters. Name the
+                    # verdict it kept reaching and let the reader judge it. The minutes
+                    # are derived so the sentence cannot outlive the floor.
+                    last_seen = monitor.last_observation_reason_code or "no change"
+                    title = "Pull request monitor stopped — its verdict stopped moving"
+                    body = (
+                        f"The monitor reached the same conclusion {DEFAULT_MONITOR_STALL_TICKS} "
+                        f"checks in a row, over at least {DEFAULT_MONITOR_STALL_MIN_SECS // 60} "
+                        f"minutes. Last seen: {last_seen}. It stopped because nothing was "
+                        "moving, not because of a new problem -- act on that verdict yourself, "
+                        "or start a new watch if you expect it to change."
+                    )
                 else:
                     title = "Pull request monitor stopped on a terminal blocker"
                     body = {
@@ -8914,7 +9023,7 @@ class GatewayOrchestrator:
                                     announce,
                                     _directive_user_origin=False,
                                     # Structural provenance for the session
-                                    # ledger: the queued twin above carries
+                                    # crew log: the queued twin above carries
                                     # SUBAGENT_COMPLETION_KIND, and this branch
                                     # is the same injector dispatching directly.
                                     _turn_actor="subagent",
@@ -13108,7 +13217,7 @@ class GatewayOrchestrator:
         # session by this point, so the sweep is not racing a mapping publisher --
         # the same position the sweep already held here before this change.
         await asyncio.to_thread(cleanup_orphaned_sessions)
-        # The session ledger's buffered appends, for EVERY gateway mode. The
+        # The session's log's buffered appends, for EVERY gateway mode. The
         # dashboard registers its own cleanup hook, but a mode that builds no
         # dashboard app -- slack-only is the plain case -- never runs one, and
         # os._exit below skips atexit, so without this the buffer dies with the
@@ -13120,12 +13229,12 @@ class GatewayOrchestrator:
             # Imported HERE, not at module scope: AUTOSDE's
             # no-new-work-on-gateway-boot-path rule asks for an optional subsystem's
             # import to be gated, and a shutdown drain is the only use in this module.
-            from kiro_crew import session_ledger_emit
+            from kiro_crew.crew_log import emit as crew_log_emit
 
-            if not await asyncio.to_thread(session_ledger_emit.drain_for_shutdown):
-                logger.warning("session ledger did not fully drain before exit")
+            if not await asyncio.to_thread(crew_log_emit.drain_for_shutdown):
+                logger.warning("the session's log did not fully drain before exit")
         except Exception:  # noqa: BLE001 - shutdown must not raise
-            logger.debug("session ledger drain failed during shutdown", exc_info=True)
+            logger.debug("the session's log drain failed during shutdown", exc_info=True)
         # This is a hard exit too: os._exit skips atexit, so the log queue's
         # drain hook never runs here either. Without this the whole shutdown
         # tail is lost -- including the "Graceful shutdown timed out" warning

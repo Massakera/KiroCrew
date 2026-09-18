@@ -927,6 +927,24 @@ a per-agent model pin (per-agent pin > global default). Reads only the kiro
 `model` slot. `agents_dir` is a dependency-injection seam for tests; defaults to
 `kiro_agents_dir()`.
 
+Reads the `agent_discovery.parsed_agent_specs` snapshot (stat-signature
+revalidated, the same cache behind `agent_skill_globs`) rather than re-parsing
+every spec per call. It runs synchronously on the event loop from the provider
+factory — every session start and every background recycle — and a per-call
+scan of a ~125-file agents directory was ~125 `realpath` calls plus twice as many
+`is_sensitive_path` round trips through the two-worker `mc-pathres` pool; with
+the skill scanner's bulk traffic on the same pool those waits queued and their
+sum crossed the loop-stall watchdog (eight of eight dumps on the reporting host).
+On-loop calls read only the cached snapshot dict and schedule at most one
+in-flight revalidation per directory on `mc-discovery`; every `scandir`, stat
+and parse stays on that worker. Cold or changed snapshots serve previous rows
+(or no pin until the first refresh lands). A warm worker revalidation costs one
+`scandir` and no parses, whereas off-loop callers revalidate and parse inline.
+JSON-first
+precedence for two live specs of different stems declaring one name is kept by
+a stable sort on suffix, and any failure to import, walk or parse is `""`, never
+an exception into model resolution.
+
 ### `kiro_agents_dir() -> Path` (`config/paths.py`)
 Leaf helper returning `~/.kiro/agents` — the **user-level** scope. Lives in the leaf
 module so `loader.py` (and `_resolve_named_agent_model`'s `agents_dir` DI seam) can
@@ -989,6 +1007,17 @@ Resolution order:
 3. otherwise `config.default_agent`, then the first available alias, then bare
    defaults.
 
+`selection_kind="template"` restricts an existing conversation to the materialized
+template namespace even if discovery has imported a same-named member.
+`selection_kind="member"` requires the configured alias instead of falling back
+to a same-named template. Both still report an unavailable explicit selection
+through `requested_resolved=False`; neither flag authorizes private memory.
+Dashboard callers obtain this choice from the protected per-session record
+described in [session](session.md#agent-selection-provenance).
+The session resolver rejects a different agent name when a protected record
+exists. Live provider switches publish their validated template choice before
+history changes; ordinary resolution cannot replace provenance from metadata.
+
 Rung 2 exists because an app's agents are materialized into `~/.kiro/agents/` by
 `bridges._register_agents` under a namespaced FILENAME (`<app>--<agent>.json`)
 while the config inside keeps the app's own bare `name`, and **nothing adds them
@@ -1034,19 +1063,24 @@ a second directory instead would stall the gateway.
 **filename** and reads at most the one matching spec — resolving every spec's declared
 name would stall Slack on a checkout with many agents.
 
-**Only the warm is offloaded — never `resolve_agent_bindings` itself.** The resolver
-can raise `StopIteration` (its defensive `next(iter(config.agents))` branch on a
-malformed config), and `StopIteration` cannot be delivered through a `Future`:
-asyncio rejects it, so an awaiting caller hangs instead of seeing the error, and the
-`except Exception` that callers rely on never runs. Keeping resolution synchronous
-preserves its exception contract for every call site.
+Dashboard turns and eager allocation offload full binding resolution because it
+also validates protected provenance and private memory files. Their
+`resolve_session_agent_bindings` wrapper converts a resolver's `StopIteration`
+into an explicit unavailable-selection error before it crosses the worker
+Future: asyncio cannot deliver `StopIteration` through that boundary.
 
 `ResolvedBindings` additionally reports `requested_resolved` (whether the
 requested name was honored — False means the default answered) and
-`resolved_alias` (the alias key whose bindings were used). Callers that store a
-name must store `resolved_alias`, never `kiro_agent`: the stored value is
-re-resolved later with aliases matched FIRST, so a physical agent name that also
-happens to be an alias key would dispatch that alias's target instead.
+`resolved_alias` (the alias key whose bindings were used). `selection_kind`
+records whether the explicit selection was a template or member. Callers
+persisting a member name use `resolved_alias`, never its `kiro_agent`; dashboard
+template conversations retain their requested name together with protected
+namespace provenance so later alias discovery cannot change the selection.
+The session resolver also captures `selection_revision` before resolving:
+an empty string observes no protected record, while `None` means the caller
+did not make an observation. Automatic publication checks that revision under
+the writer lock before replacing a record. This transient field guards
+publication; it does not change dispatch identity or grant memory access.
 
 #### App-slot cold-snapshot self-heal & fail-loud (`dashboard/chat_runner._run_chat`)
 The one-turn cold fallback above is acceptable for an ordinary session (the next

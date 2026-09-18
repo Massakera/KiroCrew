@@ -99,9 +99,9 @@ Two grants are excluded, and the exclusions are load-bearing:
 
 The posture that transfers is the one held at **allocation**, read off the
 re-resolved caller in the synchronous window after the last gate — not the one
-read on entry. Creation suspends three times before the slot exists (project
-directory, config load, folder confirmation), and an operator selecting `normal`
-in any of those windows would otherwise have a revoked posture resurrected by a
+read on entry. Creation awaits project and agent resolution, private-memory
+delegation validation and optional folder confirmation before the slot exists.
+An operator selecting `normal` in any of those windows would otherwise have a revoked posture resurrected by a
 create already in flight. Revoking mid-call yields an untrusted child.
 
 Nothing about trust is persisted at birth. The birth metadata carries
@@ -154,6 +154,8 @@ that is out of bounds is visible after the fact even though nothing happened.
 | Caller's own session is no longer open | 403 | Nothing to attribute the operation to |
 | Caller changed workspace while a creation was in flight | 403 | Creation resolves the workspace's project directory off-loop, so it suspends between authorizing the caller and allocating the slot. Both decisions that read the caller's workspace -- the memory boundary the child inherits, and whether the answering agent is bound to that workspace -- are invalidated by a move, and re-deciding the binding here is not available: it needs a config load, which must not run on the event loop |
 | Named agent does not resolve to a configured one | 403 | The resolver falls back to the default agent, which passes the workspace check because it is the caller's own default -- so no boundary is crossed, but the created session would store and advertise a name that is not what answers. `ResolvedBindings.requested_resolved` states that contract for callers that store the requested name. Refused rather than rewritten to the effective agent: nothing exists yet, so a corrected name costs one retry, whereas an existing slot keeps its stored name verbatim so a momentarily stale resolution cannot permanently rebind it |
+| Private caller selects another memory store, or its protected identity is unreadable | 403 | `memory_delegation_denied`; creation checks the canonical caller identity with `require_memory_delegation` before slot allocation or protected child binding. Same-store workers remain allowed; Global callers retain member assignment |
+| Caller changes history key, agent or memory store during creation | 400 | `caller_memory_changed`; the live caller must still match the identity checked before awaited preparation |
 | Target is the caller | 403 | A session controlling itself has no exit |
 | Target is unattended (`cron-*`, `workflow-*`) | 403 | A `workflow-<run_id>` slot is display-only and a cron's turns are driven by a schedule. Not exempted for a cron CALLER: a cron may create and drive its own children, never another job's tab |
 | Target is incognito or temporary | 403 | Never addressable, matching `list_sessions` |
@@ -193,6 +195,79 @@ operator configuration. Two rules give it that shape:
   to member callers unchanged.
 
 Ordinary (non-member) callers are untouched: they still require the switch.
+
+#### The strict-internal surface admits a member DM slot, not any private caller
+
+The five routes sit behind `_require_internal`, which first refuses anything
+without a valid `X-Internal-Secret`, and then — on the authenticated branch —
+runs one private-member gate (`_private_caller_refusal`). That gate resolves the
+caller's private authority ONCE (`internal_memory_scope`) and decides:
+
+- an **owner / Global-V1 caller** (no private scope) falls through to the handler,
+  exactly as the surface behaved before member dispatch existed;
+- a **crew-member DM slot** (a `member-*` session key) is ADMITTED while the
+  surface is reachable for it — `agent.member_dispatch` OR the global
+  `agent.session_control` switch — so its request reaches `session_control.py`
+  where the creator-ownership fence above does the real gating;
+- **every other verified private V2 caller** — an ordinary private member, or a
+  member while BOTH switches are off — keeps the `member_scope_denied` 403;
+- an **unverifiable caller** keeps the `member_session_unverified` 403.
+
+The gate reads the SAME two switches the switch gate does — `member_dispatch` is
+a bypass ON TOP of `session_control`, not a replacement, so a member with
+`member_dispatch` off falls back UNDER the global switch rather than out of a
+surface the operator left open to everyone. Both reads fail closed on an
+unreadable config, so the surface can never open wider than the two switches
+behind it. This gate replaced a blanket refusal that returned `member_scope_denied`
+to every verified V2 caller — which made the member operating model unreachable
+even though `session_control.py` already carried the member fence. The refusal for
+a non-member private caller is unchanged; only the member DM slot's admission is
+new.
+
+#### A member-created worker stays inside its own private memory
+
+Two guards in `create_session` keep a member's dispatch from laundering work out
+of its private store:
+
+- **`require_memory_delegation`** runs before the slot is minted. A workspace is
+  not a memory silo — it can host agents bound to different stores — so a private
+  V2 member could otherwise resolve an agent bound to `default`/global or a peer's
+  store. The guard (the one the private spawn path uses) is a no-op for a caller
+  with no private record and a refusal of any target store that is not the private
+  V2 caller's own; the refusal, and a corrupt/unreadable binding file, both map to
+  the `memory_delegation_denied` 403 rather than an unhandled 500. A 403, not a
+  validation 4xx: the store is a legal name and the request is well formed, so the
+  answer is "you may not delegate there", and the refusal carries a FIXED message
+  with `from None` — the guard reads binding files, so its own text can name one.
+- **The caller's protected record** is read to decide whether the child may
+  inherit private authority, and it is read under the caller's CANONICAL history
+  key. `caller_session_key` arrives as any of three spellings of the same session
+  (canonical key, slot key, transcript stem) while the protected read recognizes
+  only the canonical one, so keying it on the raw argument makes the caller's own
+  authority depend on the spelling it chose — the slot and stem forms read back as
+  unbound. For an authorization input that is a bypass, not a lenient read.
+- **The child's private binding** is written before the slot's birth metadata or
+  broadcast, using the child's effective session key — the key the turn path's
+  `_bind_private_slot_memory` reads. Without it a member's worker cannot take its
+  first turn. A version-read or binding-write failure retracts an idle, empty child
+  and reports `agent_store_mismatch`; cancellation retracts the same way and
+  propagates. Work already running is never orphaned by retraction.
+- **The birth-time pin is fenced to the authorized store.**
+  `_pin_private_agent_assignment` derives the store to pin from the SELECTED
+  AGENT's config entry, which is a different value from the
+  `bindings.memory_store_name` the delegation guard checked. `create_session`
+  therefore passes that authorized store down, and the pin writes nothing when the
+  two disagree — otherwise the guard clears one store and the pin binds another,
+  leaving a session running on private memory its own `slot.memory_store` does not
+  name. The owner's own agent picks pass no authorized store, because there the
+  pick IS the authority.
+
+  An unbound/global caller keeps ordinary creation behavior and gains nothing: its
+  own protected record is untouched. Its child, however, IS bound — to the selected
+  member's own store, the store the guard authorized. Leaving that child unbound
+  while `slot.memory_store` names a V2 store is not the safe reading: the turn path
+  raises `memory_unavailable` on exactly that pair, so the session could never take
+  a turn.
 
 ### The fence propagates to what a fenced caller creates
 

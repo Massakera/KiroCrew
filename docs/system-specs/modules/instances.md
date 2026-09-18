@@ -1448,7 +1448,7 @@ versions is what lets a v2 instance still receive a copy from a v1 one.
 |---|---|
 | `POST /api/instances/{id}/send-session` | Sending side. Body `{"slot": "<local slot key>"}`. Bundles the local session and delivers it over that instance's open tunnel. |
 | `GET /api/chat/slots/{slot}/export` | Sending side, file hop. Streams the SAME bundle as a gzipped download instead of over a tunnel — see §14.7. |
-| `POST /api/chat/slots/import` | Receiving side. Accepts a bundle and materialises a new slot. |
+| `POST /api/chat/slots/import` | Receiving side, for BOTH arrival routes. Accepts a bundle — gzipped or plain JSON, sniffed from its own bytes — and materialises a new slot. See §14.5a. |
 
 `send-session` goes through the same `_guard()` as every other route in §6
 (owner-only, never Slack, feature-gated, SEL-audited as
@@ -1493,6 +1493,67 @@ re-reads, so:
   agent-facing "send a message to a peer" tool: no inbound text can make a
   remote agent act.
 
+### 14.5a Arrival: one route, one set of rules
+
+`POST /api/chat/slots/import` is the **only** server route behind both ways a
+session can arrive — a peer's `send_session_bundle` pushing over the tunnel, and
+a person importing an exported file from `ImportSessionItem`. So everything
+that must hold for "a session arrived here" is written in `api_chat_slot_import`
+and nowhere else. One rule lives there.
+
+**The body is gzip or plain JSON, decided by its own first two bytes.** Not by
+`Content-Type`: `GET .../export` answers `application/gzip`, a browser uploading
+that same file off disk sends whatever its platform guesses, and the tunnel sends
+`application/json` — sniffing the magic (`1f 8b`) keeps all three working without
+asking any caller to relabel what it already sends. The tunnel's plain-JSON body
+is unchanged on purpose: the sender is an independently-updated install, so a
+receiver that started demanding compression would refuse every peer that has not
+shipped this yet.
+
+A compressed upload is an amplifier, so the expansion is bounded **while it is
+being produced** rather than measured afterwards — `_gunzip_bounded` decompresses
+in chunks and refuses at `_MAX_DECOMPRESSED_BYTES`, holding at most one chunk
+past the cap.
+
+What makes that ceiling safe is the comparison to the gateway's own body limit,
+not the arithmetic behind it. `client_max_size` is 60 MiB and applies to every
+body, compressed or not, so the PLAIN path can never deliver more than that much
+JSON; the ceiling sits above it, which means the gzip path accepts strictly more
+than the plain path can and a body it refuses is one the plain path refuses too.
+The magnitude is taken from §14.5's own ceilings
+(`_MAX_TOTAL_CHARS + _MAX_LAYER_B_CHARS` plus a structural allowance) so the
+number moves with them, but it is deliberately NOT the worst-case ENCODED width:
+those ceilings count CHARACTERS and `ensure_ascii` renders one non-ASCII
+character as six bytes, so sizing for that case would admit a ~360 MB allocation
+on an authenticated write route to accommodate a bundle `client_max_size` already
+refuses.
+
+The per-body ceiling bounds ONE request; the sum across concurrent requests is
+what reaches a host, so expansion is also ADMITTED rather than merely started.
+`_expansion_admission` caps how many bodies expand at once and keeps a short
+queue in front; anything past the queue answers `429 transfer_expansion_busy`
+immediately rather than parking, because a queue that grows without limit is the
+same failure with a delay in front of it.
+
+A permit is held for the whole ARRIVAL, not for the decompression: it is entered
+on an `AsyncExitStack` the handler owns, which is why the arrival is a separate
+function from the route. What has to be bounded is how many decompressed bundles
+are RESIDENT at once, and a bundle is resident — first as bytes, then as the
+parsed document — through validation, redaction and persistence. A permit ending
+at the gunzip would bound the CPU of expansion while leaving that count
+unbounded, which is the sum the admission exists to bound; the cost is
+throughput, since concurrent importers now reach the queue sooner. The plain-JSON
+path takes no permit: it is bounded by the Application's own `client_max_size`
+(60 MiB) and is not amplified, so a peer posting uncompressed cannot be refused
+with `429` by a busy host.
+
+A corrupt or truncated stream answers `transfer_invalid_gzip`, distinct from
+`transfer_invalid_json`, because "your file did not survive the trip" and "your
+document has a syntax error" send a reader to different places. A concatenated
+(multi-member) gzip is refused rather than decoded to its first member: the
+export writes exactly one member, so decoding one and dropping the rest would be
+a truncation nobody asked for.
+
 ### 14.6 Direction and topology
 
 The submenu on a given dashboard lists **that** gateway's registry, so a push
@@ -1509,7 +1570,8 @@ remote → hub and remote → remote work without any reverse reachability.
 The same bundle, written to a file instead of pushed down a tunnel. Code:
 `src/kiro_crew/dashboard/session_export.py`, with the menu action
 `ExportSessionItem` mounted beside `SendToInstanceSubmenu` in the shared
-`SessionActionsMenu`.
+`SessionActionsMenu`, and `ImportSessionItem` — the reverse direction — mounted
+directly beside it, because the file this reads is the file that row writes.
 
 **Why the hop exists.** §14.4's send is a request/response between two live
 gateways, so it needs both machines up at the same moment, reachable from one
@@ -1565,18 +1627,27 @@ on purpose.
 
 Three properties worth stating because they are easy to lose:
 
-- **Layer A only — the context window does not travel in a file.** §14.1a's
-  byte-exact, unredacted Layer B is justified by its DESTINATION, not by its
-  payload: a send reaches the operator's own authenticated peer, which stores it
-  `0600`, so the context never leaves their trust boundary. A file has no
-  destination — it can sit in a download, a bucket or on a USB stick — so that
-  justification does not carry over: an export withholds Layer B and sets
-  `layer_b_skipped`, so the loss is stated rather than inferred from an absent
-  key. Redacting it instead is not available, because the thinking-block
-  signatures inside it are validated on replay (§14.1a) and redacting and
-  transplanting cannot both hold. The cost is real and accepted — a session
-  installed from a file resumes from its transcript rather than through
-  `session/load`.
+- **Layer B leaves in an export only on an explicit operator opt-in, and is
+  withheld by default.** An export CAN carry §14.1a's byte-exact, unredacted
+  Layer B so an installed file RESUMES through `session/load` rather than
+  replaying a lossy prefix. Byte-exact is forced, not chosen: the thinking-block
+  signatures inside Layer B are validated on replay (§14.1a), so redacting and
+  transplanting cannot both hold and there is no redacted variant. Because an
+  export can be shared with another person, unredacted context must not ride
+  along unasked: `rfc-s3-backup.md` O1 assigns that risk to the operator, not the
+  exporter, and its minimum bar for a sensitive payload in a bundle is
+  conjunctive (`rfc-s3-backup.md`:317-319) -- a config key OFF by default AND an
+  explicit per-invocation flag. So Layer B travels only when BOTH
+  `dashboard.export_include_layer_b` is enabled (standing permission, default
+  `false`) AND the request carries `?include_layer_b=true` (this export asked).
+  A default-on would ship the implementer's decision to everyone who never chose,
+  the opposite of what O1 assigns, so the default withholds: the export sets
+  `layer_b_skipped`, the loss is stated rather than inferred from an absent key,
+  and the importer marks the arriving tab "transcript only". Layer B is also
+  withheld with the same flag for a mid-turn snapshot (its context would lag the
+  visible transcript); a session that never opened a kiro-cli context sets neither
+  key (it had nothing to carry). When both conditions hold and Layer B is carried,
+  `layer_b_skipped` is absent and the tab is not marked.
 - **The filename is an egress surface, not decoration.** A name is displayed by
   whatever holds the file — a share, a bucket listing, a chat attachment — so the
   slug is built from the bundle's **already-redacted** title and never from
@@ -1590,8 +1661,8 @@ Three properties worth stating because they are easy to lose:
   FLUSHES a dirty slot first, because slicing a stale transcript would ship a
   superseded turn — so an export can persist pending session state and fails
   rather than exporting when that write fails. Reading such a file back is
-  separate work that does not exist yet: today a file is installed by POSTing its
-  decompressed contents to `/api/chat/slots/import` with a dashboard credential.
+  `ImportSessionItem` beside this row, which posts the file's bytes unchanged to
+  `/api/chat/slots/import` — see §14.5a for what that route accepts.
 
 ### 14.8 The `source` provenance record — recorded, never applied
 

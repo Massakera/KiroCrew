@@ -161,7 +161,6 @@
     "dsk": "DSK",
     "expand_sidebar": "展开侧边栏",
     "gateway_connected": "网关已连接",
-    "gateway_offline": "网关离线",
     "gateway_offline_reconnecting": "网关离线 — 正在重连",
     "gateway_offline_session_expired_see_banner_above": "网关离线 — 会话已过期，见上方横幅",
     "gateway_restarting_reconnecting": "网关正在重启 — 正在重连…",
@@ -4026,6 +4025,10 @@
         "one_notification_per_state_change_never_per_hear": "每次状态变化通知一次，绝不按心跳通知：一直不通的源只报一次，而不是每两分钟报一次。同一事件的重复通知会堆叠成一行。",
         "only_the_on_call_instance_picks_up_work": "只有值班中的实例才接手工作",
         "pagerduty_user_id_help": "用来与 PagerDuty 报告的值班人比对，这样此实例就能判断呼叫是不是给你的。保存在代理碰不到的地方 — 留空则把排班表上任何人都当成你。",
+        "incidentio_user_id_help": "用来与 incident.io 排班表上的用户比对，这样此实例就能判断这个班次是不是你的。保存在代理碰不到的地方 — 留空则把排班表上任何人都当成你。 已设置 ID 但未配置排班表时，此实例将保持非值班状态。",
+        "identity_save_refused": "你的 ID 未保存 — 设置存储拒绝了本次写入。请重试。",
+        "change_save_refused": "你的更改未保存 — 设置存储拒绝了本次写入。请重试。",
+        "value_too_long_refused": "该值过长，因此未保存。",
         "prod_star": "prod-*",
         "providers": "提供方",
         "pushes_stay_refused_until": "推送会一直遭拒，直到",
@@ -4065,6 +4068,7 @@
         "wrong_local_branch": "本地分支不对",
         "your_github_login": "你的 GitHub 登录名",
         "your_pagerduty_user_id": "你的 PagerDuty 用户 ID",
+        "your_incident_io_user_id": "你的 incident.io 用户 ID",
         "your_team_s_ledger_is_still_being_exchanged_sync": "你们团队的账本仍在交换 — 同步每次都会显式指定"
       },
       "signalsPanel": {
@@ -4793,6 +4797,7 @@
       "cmd_search_sessions": "搜索会话",
       "fallback_sessions": "在会话中搜索“{{query}}”",
       "group_apps": "应用",
+      "group_folders": "文件夹",
       "group_commands": "命令",
       "group_settings": "设置",
       "leave_scope": "返回全部命令",
@@ -4816,6 +4821,7 @@
       "retry": "重试",
       "kind": {
         "app": "应用",
+        "folder": "文件夹",
         "command": "命令",
         "setting": "设置",
         "view": "视图"
@@ -5552,6 +5558,7 @@
       "reads_tooltip": "{{productName}} 会自行查阅信息，但在做出更改前会先询问",
       "trust_desc": "在此对话中，{{productName}} 无需先询问即可工作",
       "trust_label": "信任",
+      "chat_mode_hint": "对话模式",
       "trust_tooltip": "在此对话中，{{productName}} 无需先询问即可工作",
       "yolo_desc": "在每个对话中，{{productName}} 无需先询问即可工作",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",
@@ -5642,6 +5649,9 @@
         "capability_backend": "在 {{productName}} 打开期间，在这台电脑上后台持续运行它自己的程序",
         "capability_shell": "在这台电脑上执行命令，命令来自应用自带的、你从未看过的清单",
         "capability_note": "信任该应用会一次性授予以上三项能力，无论它是否全部用到。{{productName}} 无法只授予其中一部分。",
+        "session_approval_heading": "该应用还请求控制你的对话",
+        "session_approval_desc": "在你的对话中发送消息或选择回复选项，批准或拒绝工具请求，以及切换对话的审批模式。",
+        "session_approval_modes": "它可以设置的对话审批模式",
         "revocable": "你可以随时在“设置 → 安全 → 受信任的第三方应用”中撤销。撤销后该应用就会停止工作。",
         "source": "发布于",
         "not_reviewed": "{{productName}} 只是收录了这个应用，并未审查它的代码；上面显示的名称也由应用自己提供。",
@@ -6377,6 +6387,18 @@
       "comment_unread_other": "{{count}} 条评论 · 未读",
       "open_comment_thread": "打开评论话题"
     },
+    "importSessionItem": {
+      "failed": "失败",
+      "import_from_file": "从文件导入会话",
+      "refusal_damaged_file": "无法读取此文件。它可能已损坏，或者不是导出的会话。",
+      "refusal_not_a_session": "此文件不是导出的会话。",
+      "refusal_too_large": "此文件太大，无法导入。",
+      "refusal_upload_failed": "无法上传此文件。连接可能已中断。",
+      "refusal_busy": "当前正在进行的导入过多。请稍后重试。",
+      "imported": "已导入",
+      "imported_named": "已导入：{{title}}",
+      "unknown_error": "导入失败"
+    },
     "instanceTabBar": {
       "connected": "已连接",
       "connected_refresh": "已连接 · {{time}} 后刷新",
@@ -6727,6 +6749,7 @@
       "discard_unsaved_changes": "放弃未保存的更改？",
       "download": "下载",
       "download_failed": "下载失败",
+      "download_blocked_credentials": "下载已阻止：此文件的内容被凭据扫描标记。请删除密钥后重试。",
       "edit": "编辑",
       "exit_full_screen": "退出全屏",
       "exit_full_screen_esc": "退出全屏（Esc）",
@@ -6782,6 +6805,10 @@
       "diff_status_failed": "无法检查此文件的 git 更改。"
     },
     "markdownRenderer": {
+      "download_failed": "无法下载图表。请重试。",
+      "diagram_actions": "更多操作",
+      "download_svg": "下载 SVG",
+      "download_png": "下载 PNG",
       "click_to_browse_shift_click_to_open_in_file_explorer": "点击浏览 / Shift+点击在文件资源管理器中显示",
       "click_to_browse_shift_click_to_reveal_in_finder": "点击浏览 / Shift+点击在 Finder 中显示",
       "click_to_browse_shift_click_to_show_in_file_manager": "点击浏览 / Shift+点击在文件管理器中显示",
@@ -7056,12 +7083,20 @@
       "highlighting_unavailable_reload": "语法高亮不可用。请保存或复制草稿，然后重新加载以恢复语法高亮；仍可继续编辑。"
     },
     "projectPicker": {
+      "all_drives": "所有驱动器",
       "back": "返回",
+      "back_to": "返回 {{path}}",
       "browse": "浏览",
+      "drive_example_d": "D:\\",
+      "drive_example_e": "E:\\",
+      "drives_failed": "无法显示驱动器列表——下方列表仍显示 {{path}}。要使用其他驱动器，请在上方输入，例如 {{example}}，或再试一次“所有驱动器”。",
+      "listing_failed": "无法打开 {{failed}}——下方列表仍显示 {{path}}。请检查路径，或从列表中选择一个文件夹。",
+      "listing_failed_no_path": "无法打开 {{failed}}。请检查后重试。",
       "no_matching_projects": "无匹配的项目",
       "no_recent_projects": "无最近项目",
       "no_subdirectories": "无子目录",
       "path_to_project": "/path/to/project",
+      "path_to_project_drive": "例如 D:\\path\\to\\project",
       "project_directory_path": "项目目录路径",
       "recent": "最近",
       "recent_projects": "最近项目",
@@ -8716,6 +8751,9 @@
       "open_screenshot": "打开截图 {{n}}",
       "origin": "安装来源：",
       "permissions": "权限",
+      "session_approval_desc": "可以在你的对话中发送消息和选择回复选项，批准或拒绝工具请求，并切换对话的审批模式。",
+      "session_approval_modes": "它可以设置的对话审批模式",
+      "session_approval_manifest_key": "清单键",
       "platform": "平台：",
       "previous": "上一步",
       "removes_kirocrew_metadata_only_the_app_itself_is": "仅移除 {{productName}} 元数据 — 应用本身由外部管理",
@@ -8742,7 +8780,10 @@
       "websocket_events": "WebSocket 事件",
       "all_contributors": "所有贡献者",
       "contributors": "贡献者",
-      "retry": "重试"
+      "retry": "重试",
+      "enable_and_allow_chat_control": "启用并允许控制聊天",
+      "session_approval_confirm_title": "允许“{{name}}”控制你的聊天？",
+      "session_approval_reconsent_notice": "{{name}} 已被禁用，因为它新增了控制你对话的请求。请在此页面查看该权限，然后再启用它。"
     },
     "appPage": {
       "loading_app": "加载应用…",
@@ -8814,6 +8855,7 @@
       "synced_from_its_source_directory": "已从源目录同步 {{name}}。",
       "updated_app_other": "已更新 {{count}} 个应用。",
       "updated_from_the_registry": "已从注册表更新 {{name}}。",
+      "updated_needs_session_approval_consent": "{{name}} 已被禁用，因为它新增了控制你对话的请求。请在应用详情中查看该权限，然后启用它。",
       "refresh_store": "刷新商店"
     },
     "artifactDeployPage": {
@@ -9372,7 +9414,8 @@
         "waiting_to_start_queued_behind_the_concurrency_l": "等待开始 — 受并发上限限制正在排队",
         "workflows": "工作流",
         "workspace_empty": "此工作区还没有文件",
-        "workspace_truncated": "工作区较大 — 仅显示前 10,000 个文件",
+        "workspace_truncated": "工作区较大：最多显示 10,000 个文件；所有文件夹仍可访问",
+        "workspace_directory_truncated": "部分文件已隐藏",
         "output_load_failed": "无法加载输出",
         "retry": "重试",
         "cancel_failed": "无法取消该子代理",
@@ -9902,6 +9945,7 @@
         "content_placeholder": "在文件中搜索…",
         "content_searching": "正在搜索…",
         "ctx_add_to_chat": "添加到聊天",
+        "ctx_download": "下载",
         "filter_placeholder": "筛选文件…",
         "git_status_failed": "无法读取 Git 状态",
         "mode_content": "内容",
@@ -10079,6 +10123,7 @@
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "（跳过 1 个 — 当前已选中）",
+      "no_sessions_match_folders": "没有匹配的会话 — 只有文件夹名称匹配",
       "add_column_after_this_one": "在此列之后添加列",
       "agent_finished_your_turn": "代理已完成 — 轮到你了",
       "all_sessions": "全部会话",
@@ -10262,8 +10307,6 @@
       "stale_collapse_paused_hint": "列表处于搜索、筛选或非“最新优先”排序时暂停折叠。",
       "stale_collapse_row": "休眠会话",
       "stale_collapse_row_ungrouped": "文件夹外",
-      "started_in_channel": "此对话开始于 {{channel}}。",
-      "started_in_direct_message": "此对话开始于私信。",
       "stop_filtering_by_tag": "取消按 {{name}} 筛选",
       "streaming": "流式输出中",
       "sub_agent_needs_approval_other": "{{count}} 个子代理待审批",
@@ -10684,6 +10727,27 @@
     "developer": {
       "agentBackendTab": {
         "agent_backend": "代理后端",
+        "approval_agent_spec": "每次用工具前都会先问，因为 {{productName}} 就是这么定的。",
+        "approval_seeded_settings": "只有它自己的设置这么写时，才会每次用工具前先问。{{productName}} 会写入这项设置，但无法确认是否真的生效。",
+        "approval_session_config": "运行命令或改动文件前会先问。{{productName}} 打开这个开关并做检查。只是读取时不会问。",
+        "approval_unverified": "没有证据表明这个代理用工具前会先问。",
+        "approval_verified_gate_extension": "通过 {{productName}} 装入并检查过的扩展，每次用工具前都会先问。",
+        "approval_verified_seeded_settings": "每次用工具前都会先问。{{productName}} 写入这项设置，并读回来确认。",
+        "card_available": "可用。",
+        "card_crew_tools": "{{productName}} 自带的工具能在聊天里使用",
+        "card_manual_compact": "/compact 命令可用",
+        "card_markdown_agents": "用单个 markdown 文件写的代理可用",
+        "card_member_saved_agent": "成员会完整加载自己保存的代理",
+        "card_member_thread_tools": "成员聊天会挂上会话工具",
+        "card_mid_turn_steer": "它正在干活时也能再发一条消息",
+        "card_model_switch": "可以在聊天里换模型",
+        "card_not_available": "不可用。",
+        "card_operator_notes": "值得知道",
+        "card_private_member_sessions": "成员的私有聊天可以启动",
+        "card_reasoning_effort": "可以调整思考力度",
+        "card_side_chat_tools": "Side Chat 可以运行只读工具",
+        "card_subagent_continuation": "子代理的聊天以后还能接着聊",
+        "card_supports_n_of_m": "{{name}} 支持 {{total}} 项功能中的 {{available}} 项",
         "claude_code": "Claude Code",
         "claude_uses_its_own_permissions": "Claude Code 通常会先请求批准，{{productName}} 会对该请求做把关。但如果某个工具已在 Claude 自身设置里预先批准（包括项目内那份 .claude/settings.json），它就不会再请求，因此拒绝规则和审计日志看不到这次调用。",
         "could_not_load_the_agent_backend": "无法加载代理后端。",
@@ -10698,6 +10762,15 @@
         "missing_components": "本机缺少：{{components}}",
         "missing_components_with_command": "本机缺少：{{components}}。安装命令：{{command}}",
         "new_sessions_use_this_agent_a_session_that_is_al": "新会话使用此代理。已打开的会话保持启动时所用的代理；在此切换不影响正在进行的会话。",
+        "not_offered_by_this_build": "这个构建不提供这个代理。",
+        "note_crew_command_channel": "斜杠命令走 {{productName}} 自己的命令通道。",
+        "note_crew_sandbox_stands_down": "它有自己的隔离环境。在 macOS 和 Windows 上，{{productName}} 的隔离不再介入。",
+        "note_harness_model_list": "模型列表来自代理，不是来自 {{productName}}。",
+        "note_host_credential_to_child": "完成 Kiro 登录后，{{productName}} 可以把这个账号交给这个代理。",
+        "note_keeps_own_chat_record": "这个代理会自己留一份聊天记录。",
+        "note_own_credential_store": "它用自己的文件登录，不用 Kiro 登录。",
+        "note_pod_home_relocated": "在 pod 里，它的主目录会挪到 pod 上，保存的登录也一起挪过去。",
+        "note_refuses_unclassified_tools": "认不出种类的工具调用会被拒绝，而不是放过。",
         "retry": "重试",
         "set_is_fixed_at_gateway_start": "此处显示哪些 agent 在 gateway 启动时确定。受管部署可通过策略限制该集合；修改策略需下次启动才生效。"
       },
@@ -10722,7 +10795,14 @@
           "crew_media_members": "Crew Members 页面，选中了一个成员并打开了它的活动面板。"
         },
         "crew_members": "团队成员",
-        "crew_members_desc": "团队成员（Crew Members）页面：列出你拥有的每个代理，各有自己的话题。仍在建设中，开启后才会提供。"
+        "crew_members_desc": "团队成员（Crew Members）页面：列出你拥有的每个代理，各有自己的话题。仍在建设中，开启后才会提供。",
+        "decisions": "决策（Jev）",
+        "decisions_desc": "Jev 是一个小而便宜的决策模型。这个预览让 {{productName}} 在三个时刻先问它一个是非题或单选题：为你这条消息加载哪些技能、刚学到的技能是否和已有技能重复、定时任务结果里是否有新信息。本版本只做影子运行——Jev 的回答不改变 {{productName}} 的行为，每条回答写入本机日志，供事后对比。这个开关保存在运行 {{productName}} 的机器上，不在浏览器里，所以你在任何设备上打开都生效。",
+        "decisions_egress": "开启后，你的消息文本和技能描述会离开本机，通过互联网发送到这台 {{productName}} 配置使用的决策服务。关闭时不发送任何内容。",
+        "decisions_backend_required": "运行这个面板的 {{productName}} 比开关本身旧：设置里还没有 decisions 段，因此暂时无法开启。请先更新。",
+        "decisions_points": "下面每一项都显示它运行的模式。",
+        "decisions_config_unavailable": "无法读取设置，因此不提供此开关。请重新加载后再试。",
+        "decisions_save_failed": "无法保存此设置。开关已恢复为已保存的值。"
       },
       "kiroSignInCard": {
         "title": "Kiro 登录",
@@ -10749,7 +10829,7 @@
       "feature_previews_moved": "功能预览已移至“设置 > 开发者”",
       "tabs": {
         "agentBackend": {
-          "description": "新会话启动哪个代理 — Kiro CLI、Claude Code 或 KAS",
+          "description": "新会话启动哪个代理",
           "label": "代理后端"
         },
         "archive": {
@@ -12823,7 +12903,11 @@
         "auto_download_save_failed": "无法保存自动下载设置。",
         "auto_update_setting_unavailable": "无法加载自动更新设置。加载完成前，开关显示的是默认值。",
         "copy_failed_select_the_command_and_copy_it_manually": "复制失败。请选中命令并手动复制。",
-        "update_info_unavailable": "无法从应用读取此构建的版本和更新渠道。"
+        "update_info_unavailable": "无法从应用读取此构建的版本和更新渠道。",
+        "app_lane_label": "应用",
+        "app_lane_title": "你安装的桌面应用。它有自己的版本，与下方的服务相互独立。",
+        "gateway_lane_label": "网关",
+        "gateway_lane_title": "运行你的智能体并提供此仪表板的后台服务。分支和提交标签显示的是它的构建。"
       },
       "botChannelPanel": {
         "allowed_user_ids": "允许的用户 ID",
@@ -13193,7 +13277,7 @@
         "developer_mode": "开发者模式",
         "developer_tools": "开发者工具",
         "feature_previews": "功能预览",
-        "feature_previews_desc": "尚未发布的功能和页面。在此开启之前，这些页面不会出现在侧边栏和全局搜索中；下面的开关本身则可以通过设置搜索找到。设置仅对本设备生效，且这些内容有意保留未完善的状态。",
+        "feature_previews_desc": "尚未发布的功能和页面。在此开启之前，这些页面不会出现在侧边栏和全局搜索中；下面的开关本身则可以通过设置搜索找到。这些内容有意保留未完善的状态；除卡片另有说明外，开关仅对本设备生效。",
         "gateway": "网关",
         "open_developer_page": "打开开发者页面",
         "run_a_local_gateway": "运行本地网关",
@@ -14731,6 +14815,7 @@
       "show_controls": "展开控制项"
     },
     "membersPage": {
+      "drawer_delegated_working": "委派的任务正在运行",
       "agent_template": "Agent 模板",
       "configuration": "配置",
       "crew_summary": "成员概览",

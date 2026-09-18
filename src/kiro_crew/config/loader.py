@@ -1159,6 +1159,33 @@ def file_delivery_consent_path() -> Path:
     return config_dir() / "file_delivery_consent.json"
 
 
+def ssh_auth_sock_consent_path() -> Path:
+    """Return path to ssh_auth_sock_consent.json -- the SSH-agent forward consent.
+
+    Same KEYSTONE reasoning as :func:`aws_consent_path` and
+    :func:`file_delivery_consent_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: keeping
+    ``SSH_AUTH_SOCK`` in the agent subprocess environment grants USE of the
+    operator's ssh-agent keys -- signing, git-over-SSH, and any authentication
+    the socket reaches -- for the lifetime of the session. That is an
+    authorization, not a preference. Stored in the agent-readable ``config.json``
+    it would be writable by any auto-approved agent shell, so a prompt-injected
+    agent could flip its own forwarding on and a subagent it spawns would then
+    authenticate as the operator with keys the sandbox exists to keep out of its
+    reach. ``is_sensitive_path`` blocks the tool path and the OS sandbox mounts
+    the keystone read-only for the agent's shell, so the consent is
+    un-flippable from inside the sandbox.
+
+    Holds ``{"enabled": bool, "granted_at": str}``; every read fails soft to
+    DISABLED (see ``ssh_auth_sock_consent.is_granted``). The only writer is the
+    authenticated, OWNER-gated dashboard handler, which opens the path directly
+    rather than through this gate. There is deliberately NO CLI verb -- a
+    terminal command that records the grant on request is a grant an automated
+    caller can take. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "ssh_auth_sock_consent.json"
+
+
 def read_local_secret(port: int) -> str:
     """Read the internal-API credential for the gateway on *port*.
 
@@ -5137,14 +5164,45 @@ class KiroCrewConfig:
         ``model`` slot only; ``""`` when the agent declares none, so the caller
         falls back to the global. ``agents_dir`` overrides the lookup directory
         (a dependency-injection seam for tests); defaults to ``kiro_agents_dir()``.
+
+        Reads the ``agent_discovery.parsed_agent_specs`` snapshot -- the same
+        stat-signature-revalidated cache behind ``agent_skill_globs`` -- rather
+        than re-parsing every spec per call. This runs SYNCHRONOUSLY on the event
+        loop from the provider factory (every session start, every background
+        recycle), and a per-call scan of a ~125-file agents directory is ~125
+        ``realpath`` calls plus twice as many ``is_sensitive_path`` round trips
+        through the two-worker ``mc-pathres`` pool; when that pool is also
+        serving the skill scanner's bulk traffic, those waits queue and their
+        sum crosses the loop-stall watchdog. A warm call now costs one
+        ``scandir``. On the loop, cold or changed snapshots refresh in the
+        ``mc-discovery`` pool while this lookup serves previous rows (or no
+        pin until the first refresh lands). Off-loop callers parse inline.
+
+        JSON-first precedence is kept: with two live specs of DIFFERENT stems
+        both declaring this name, the ``.json`` one wins, as the unordered
+        first-match scan this replaces guaranteed (``iter_agent_spec_files``
+        lists JSON entries first). Never raises -- a failure to import, walk or
+        parse is "no pin here", never an exception into model resolution.
         """
         if not agent:
             return ""
         base = agents_dir if agents_dir is not None else kiro_agents_dir()
-        for af in iter_agent_spec_files(base, ordered=False):
-            ad = _read_hardened_agent_spec(af)
-            if ad is None:
-                continue
+        try:
+            # Deferred import: agent_discovery imports kiro_crew.hooks, whose
+            # closure reaches back into this module (see _project_declares_agent).
+            from kiro_crew.agent_discovery import cached_agent_specs, parsed_agent_specs
+
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                rows = parsed_agent_specs(base, operation="load_config", source="unknown")
+            else:
+                rows = cached_agent_specs(base, operation="load_config", source="unknown")
+        except Exception:
+            return ""
+        # Stable sort: JSON rows first, filename order preserved within each group.
+        rows.sort(key=lambda row: row[1].suffix.lower() != ".json")
+        for ad, af in rows:
             # Skip stray non-object JSON a user may have dropped in the dir.
             if isinstance(ad, dict) and (ad.get("name") == agent or af.stem == agent):
                 return ad.get("model") or ""
@@ -6133,10 +6191,14 @@ def resolve_crew_identity(
     return ""
 
 
-def _resolve_agent_selection(config, agent_name=None, project_dir=None):
+def _resolve_agent_selection(config, agent_name=None, project_dir=None, *, selection_kind=""):
     """Select a config record/template without accessing any memory files."""
-    alias_hit = bool(agent_name) and agent_name in config.agents
-    passthrough = "" if alias_hit else _materialized_kiro_agent(agent_name, project_dir)
+    alias_hit = selection_kind != "template" and bool(agent_name) and agent_name in config.agents
+    passthrough = (
+        ""
+        if alias_hit or selection_kind == "member"
+        else _materialized_kiro_agent(agent_name, project_dir)
+    )
     requested_resolved = (not agent_name) or alias_hit or bool(passthrough)
     if alias_hit:
         alias = agent_name
@@ -6150,13 +6212,15 @@ def _resolve_agent_selection(config, agent_name=None, project_dir=None):
     return config.agents.get(alias), alias, passthrough, requested_resolved
 
 
-def resolve_agent_identity(config, agent_name=None) -> tuple[str, str, str]:
+def resolve_agent_identity(config, agent_name=None, *, selection_kind="") -> tuple[str, str, str]:
     """Alias, provider template and model pin for display/configuration only.
 
     This does not authorize memory access. Runtime callers must resolve the full
     bindings; a model chip remains inspectable while private memory is unavailable.
     """
-    record, alias, passthrough, _ = _resolve_agent_selection(config, agent_name)
+    record, alias, passthrough, _ = _resolve_agent_selection(
+        config, agent_name, selection_kind=selection_kind
+    )
     return (
         alias,
         passthrough or (record.kiro_agent if record else config.agent.default_agent),
@@ -6170,6 +6234,7 @@ def resolve_agent_bindings(
     project_dir: str | None = None,
     *,
     validate_memory_files: bool = True,
+    selection_kind: str = "",
 ) -> ResolvedBindings:
     """Resolve workspace, memory store, and kiro agent for a session.
 
@@ -6191,7 +6256,7 @@ def resolve_agent_bindings(
     import dataclasses as _dc
 
     agent_cfg, resolved_alias, passthrough, requested_resolved = _resolve_agent_selection(
-        config, agent_name, project_dir
+        config, agent_name, project_dir, selection_kind=selection_kind
     )
     if agent_cfg is None:
         logger.warning("No agents configured, using bare defaults")
@@ -6201,6 +6266,7 @@ def resolve_agent_bindings(
             effective_memory_config=_dc.asdict(config.memory),
             kiro_agent=passthrough or config.agent.default_agent,
             requested_resolved=requested_resolved,
+            selection_kind="template" if passthrough else "",
         )
 
     # Resolve workspace
@@ -6244,12 +6310,15 @@ def resolve_agent_bindings(
         model=normalize_agent_model(agent_cfg.model),
         requested_resolved=requested_resolved,
         resolved_alias=resolved_alias,
+        selection_kind="template" if passthrough else "member",
     )
 
 
 def resolve_effective_model(
     config: KiroCrewConfig,
     agent_name: str | None = None,
+    *,
+    selection_kind: str = "",
 ) -> str:
     """Return the model a new session on *agent_name* would start with.
 
@@ -6267,7 +6336,9 @@ def resolve_effective_model(
     caller holds it. Returns ``""`` when every tier defers, meaning the backend
     picks (kiro-cli's own ``chat.defaultModel``).
     """
-    _, kiro_agent, model_pin = resolve_agent_identity(config, agent_name)
+    _, kiro_agent, model_pin = resolve_agent_identity(
+        config, agent_name, selection_kind=selection_kind
+    )
     if model_pin:
         return model_pin
     if kiro_agent and kiro_agent != "kirocrew":

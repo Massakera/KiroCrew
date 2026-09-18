@@ -1275,6 +1275,58 @@ export interface AcpBackendProbe {
     sign_in_remedy: string
     signs_in_separately: boolean
   }
+  /**
+   * The capability card: what this harness can do, projected on the server from
+   * the capability memberships it already declared
+   * (`agent_sdk/backend_cards.py`). OPTIONAL, like `auth`, because a gateway
+   * that predates it sends none and the panel says nothing about what it was
+   * not told.
+   *
+   * A LIST and not a map, so the SERVER owns the order: a new line appears in
+   * the right place with no edit here. `id` is a stable machine key and the
+   * LABEL is this frontend's, which is what makes the labels translatable at
+   * all -- a label is written once per capability and every harness reuses it.
+   * An id with no label here is SKIPPED rather than rendered raw, the opposite
+   * of the `policy_id` fallback for a name: a bare `private_memory_mcp` in
+   * front of a reader is worse than one line fewer, while a chip with no text
+   * at all is worse than a policy id.
+   */
+  capabilities?: { id: string; available: boolean }[]
+  /**
+   * Ids of the SECURITY notes that hold for this harness: which layer confines
+   * the agent, whether Crew hands its own credential to the child, how an
+   * unclassifiable approval is answered.
+   *
+   * A separate list from `operator_notes` because the panel renders them in two
+   * places. These go OUTSIDE every disclosure, beside `tool_approval`: "Crew's
+   * sandbox is not confining this child" is as material as how the harness is
+   * made to ask, and a fact behind a closed disclosure is one an operator
+   * comparing harnesses does not see. The split is the SERVER's, so this frontend
+   * cannot promote or bury a note by accident.
+   */
+  security_notes?: string[]
+  /**
+   * Ids of the where-it-lives notes that hold: whose disk holds the transcript,
+   * which side supplies the model list, which channel carries a command. Ids
+   * only, because a note is either raised or absent -- "this harness does not
+   * relocate its home on a pod" is not a line anyone reads.
+   */
+  operator_notes?: string[]
+  /**
+   * How this harness is made to ask before it runs a tool: the core's own
+   * `Routing` value, as the string. The one GRADED line on the card, and the
+   * reason the card is otherwise two-level -- a membership set carries one bit,
+   * while this enum already names five mechanisms and one "not established".
+   */
+  tool_approval?: string
+  /**
+   * Whether the BUILD offers this harness as a choice, before deployment policy
+   * narrows anything. False means known-but-never-offered, which is a different
+   * state from policy-denied and is the one the panel shows rather than hides:
+   * a policy denial is not the reader's to fix, and a build exclusion is a
+   * standing fact the tool-approval line explains.
+   */
+  offered_by_build?: boolean
 }
 
 let _sessionExpiredShown = false
@@ -2892,6 +2944,32 @@ export const api = {
     a.remove()
     URL.revokeObjectURL(url)
   },
+  /** Install a session from an exported file, as its own new session.
+   *
+   *  Posts the file's BYTES unchanged — no gunzip, no re-encode, no JSON wrapper.
+   *  The endpoint reads the format off the first two bytes, so a `.gz` straight
+   *  off disk and a plain `.json` a user unpacked by hand both work, and the
+   *  browser never has to know which it was handed. Sending
+   *  `application/octet-stream` is honest for the same reason: the file's type is
+   *  whatever the platform recorded, and it is not this call's to assert.
+   *
+   *  An install ADDS a session and touches no existing one, so a repeat needs no
+   *  confirm step: installing the same file twice is two sessions, which is the
+   *  documented behaviour rather than an accident to guard against. */
+  importSessionFromFile: async (file: Blob) => {
+    const r = await fetch('/api/chat/slots/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', ..._sk },
+      body: file,
+    })
+    return (await j(r)) as {
+      ok: boolean
+      key: string
+      title: string
+      messages: number
+      resume_mode: string
+    }
+  },
   sendSessionToInstance: (id: string, slot: string) =>
     post('/api/instances/' + encodeURIComponent(id) + '/send-session', { slot }).then(j) as Promise<{
       ok: boolean
@@ -3238,11 +3316,13 @@ export const api = {
     }>,
   recentProjects: () => fetch('/api/recent-projects').then(j) as Promise<{ dirs: string[] }>,
   browseDirs: (path?: string) => fetch('/api/browse-dirs' + (path ? '?path=' + encodeURIComponent(path) : '')).then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string }[] }>,
+  /** Windows only: the mounted drive roots, as the virtual level above every `X:\`. `path` is `""`: this listing is not a directory. */
+  browseDrives: () => fetch('/api/browse-dirs?drives=1').then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string }[] }>,
   browseFiles: (path?: string) => fetch('/api/browse-files' + (path ? '?path=' + encodeURIComponent(path) : '')).then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string; mtime: number }[]; files: { name: string; path: string; mtime: number }[] }>,
   projectGit: (path: string) => fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{ path: string; repo: boolean; repoRoot?: string; branch?: string; detached?: boolean; head?: string }>,
   projectGitStatus: (path: string) => fetch('/api/project/git/status?path=' + encodeURIComponent(path)).then(j) as Promise<{ repo: boolean; repoRoot?: string; branch?: string; ahead?: number; behind?: number; files: { path: string; status: string; staged: boolean; additions?: number; deletions?: number }[] }>,
   projectGitLog: (path: string, limit = 20) => fetch('/api/project/git/log?path=' + encodeURIComponent(path) + '&limit=' + limit).then(j) as Promise<{ repo: boolean; commits: { sha: string; message: string; author: string; date: string; isHead: boolean }[] }>,
-  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; repo: boolean; truncated?: boolean }>,
+  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; directories?: string[]; repo: boolean; truncated?: boolean; truncatedDirectories?: string[] }>,
   workspaces: () => fetch('/api/workspaces').then(j),
   createWorkspace: (body: object) => post('/api/workspaces', body).then(j),
   updateWorkspace: (name: string, body: object) =>
@@ -3810,6 +3890,14 @@ export const api = {
   createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; tags?: string[] }) =>
     post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
   updateChatFolder: (id: string, body: object) => patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
+  /** Set several folders' `order` in ONE atomic request. The sidebar drag
+   *  renumbers a run of siblings, and one PATCH per row has no transaction: a
+   *  failure partway leaves a mix of old and new order numbers. This posts the
+   *  whole list to the reorder endpoint, which applies it all-or-none under the
+   *  folder-store lock, so a rejected write leaves the stored order untouched
+   *  rather than half-applied (issue #10406). */
+  reorderChatFolders: (orders: { id: string; order: number }[]) =>
+    post('/api/chat/folders/reorder', { orders }).then(j),
   deleteChatFolder: (id: string) => del('/api/chat/folders/' + encodeURIComponent(id)).then(j),
   setSlotFolder: (slot: string, folderId: string | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/folder', { folder_id: folderId || '' }).then(j),
   setSlotColor: (slot: string, colorIndex: number | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_index: colorIndex }).then(j),
@@ -4261,7 +4349,7 @@ export const api = {
   getApp: (name: string) => fetch('/api/apps/' + encodeURIComponent(name)).then(j).then(normalizeInstalledApp),
   getAppManifest: (name: string) => fetch('/api/apps/' + encodeURIComponent(name) + '/manifest').then(j),
   installApp: (source: string) => post('/api/apps/install', { source }).then(j),
-  enableApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/enable').then(j),
+  enableApp: (name: string, sessionApprovalConsent = false) => post('/api/apps/' + encodeURIComponent(name) + '/enable', { sessionApprovalConsent }).then(j),
   disableApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/disable').then(j),
   openApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/open').then(j),
   uninstallApp: (name: string, keepData = true, keepDependencies?: boolean, keepSpecific?: string[]) =>

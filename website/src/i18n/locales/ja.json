@@ -161,7 +161,6 @@
     "dsk": "DSK",
     "expand_sidebar": "サイドバーを展開",
     "gateway_connected": "ゲートウェイに接続済み",
-    "gateway_offline": "ゲートウェイがオフライン",
     "gateway_offline_reconnecting": "ゲートウェイがオフライン — 再接続中",
     "gateway_offline_session_expired_see_banner_above": "ゲートウェイがオフライン — セッションの有効期限が切れました。上のバナーを参照してください",
     "gateway_restarting_reconnecting": "ゲートウェイを再起動中 — 再接続中…",
@@ -1111,6 +1110,7 @@
       "cmd_search_sessions": "セッションを検索",
       "fallback_sessions": "セッションを「{{query}}」で検索",
       "group_apps": "アプリ",
+      "group_folders": "フォルダー",
       "group_commands": "コマンド",
       "group_settings": "設定",
       "leave_scope": "すべてのコマンドに戻る",
@@ -1134,6 +1134,7 @@
       "retry": "再試行",
       "kind": {
         "app": "アプリ",
+        "folder": "フォルダー",
         "command": "コマンド",
         "setting": "設定",
         "view": "ビュー"
@@ -4077,6 +4078,10 @@
         "one_notification_per_state_change_never_per_hear": "ステート変更ごとに1つの通知で、ハートビートごとではありません：\n        ダウン状態が続くソースは2分ごとではなく1回報告されます。\n        同じインシデントスタックの繰り返しは1行に集約されます。",
         "only_the_on_call_instance_picks_up_work": "当番のインスタンスのみが作業を受け取ります",
         "pagerduty_user_id_help": "PagerDutyが当番として報告する対象にマッチするため、このインスタンスはポケベルがあなたのものかどうかを判断できます。エージェントが到達できない場所に保存されます — スケジュール上の誰でもあなたとして扱うには空のままにしてください。",
+        "incidentio_user_id_help": "incident.io のスケジュールに登録されているユーザーと照合するため、このインスタンスはそのシフトがあなたのものかどうかを判断できます。エージェントが到達できない場所に保存されます — スケジュール上の誰でもあなたとして扱うには空のままにしてください。 ID が設定されていてスケジュールが未設定の場合、このインスタンスはシフト外のままになります。",
+        "identity_save_refused": "ID は保存されませんでした — 設定ストアが書き込みを拒否しました。もう一度お試しください。",
+        "change_save_refused": "変更は保存されませんでした — 設定ストアが書き込みを拒否しました。もう一度お試しください。",
+        "value_too_long_refused": "その値は長すぎるため保存されませんでした。",
         "prod_star": "prod-*",
         "providers": "プロバイダー",
         "pushes_stay_refused_until": "プッシュは以下まで拒否されたままです",
@@ -4116,6 +4121,7 @@
         "wrong_local_branch": "ローカルブランチが間違っています",
         "your_github_login": "GitHub ログイン",
         "your_pagerduty_user_id": "PagerDuty ユーザーID",
+        "your_incident_io_user_id": "incident.io ユーザーID",
         "your_team_s_ledger_is_still_being_exchanged_sync": "チームの台帳はまだ交換中です。名前を同期します"
       },
       "signalsPanel": {
@@ -5534,6 +5540,7 @@
       "reads_tooltip": "{{productName}} は独力で検索しますが、変更する前に確認します",
       "trust_desc": "このチャットでは、{{productName}} は最初に確認せずに機能します",
       "trust_label": "信頼",
+      "chat_mode_hint": "チャットモード",
       "trust_tooltip": "このチャットでは、{{productName}} は最初に確認せずに機能します",
       "yolo_desc": "すべてのチャットで、{{productName}} は最初に確認せずに機能します",
       "yolo_expiration_timed": "{{duration}} 後に自動的にオフになり、その後再び確認します。",
@@ -5624,6 +5631,9 @@
         "capability_backend": "{{productName}} が開いている間、このコンピューターのバックグラウンドで独自のプログラムを実行し続けます",
         "capability_shell": "アプリに同梱された、あなたがまだ見ていない一覧から、このコンピューターでコマンドを実行します",
         "capability_note": "アプリを信頼すると、実際にすべてを使うかどうかにかかわらず3つすべてが許可されます。{{productName}} はこれより狭く制限できません。",
+        "session_approval_heading": "このアプリはチャットの制御も要求しています",
+        "session_approval_desc": "あなたのチャットでメッセージを送信するか返信オプションを選び、ツール要求を承認または拒否し、チャットの承認モードを切り替えること。",
+        "session_approval_modes": "設定できるチャットの承認モード",
         "revocable": "設定 → セキュリティ → 信頼済みサードパーティーアプリで、いつでも取り消せます。取り消すとそのアプリは動作を停止します。",
         "source": "公開元",
         "not_reviewed": "{{productName}} はこのアプリを掲載していますが、そのコードをレビューしていません。上記の名前もアプリ自身が申告したものです。",
@@ -6377,6 +6387,18 @@
       "comment_unread_other": "{{count}}件のコメント · 未読",
       "open_comment_thread": "コメントスレッドを開く"
     },
+    "importSessionItem": {
+      "failed": "失敗",
+      "import_from_file": "ファイルからセッションをインポート",
+      "refusal_damaged_file": "このファイルを読み取れませんでした。破損しているか、エクスポートされたセッションではない可能性があります。",
+      "refusal_not_a_session": "このファイルはエクスポートされたセッションではありません。",
+      "refusal_too_large": "このファイルはサイズが大きすぎるためインポートできません。",
+      "refusal_upload_failed": "このファイルをアップロードできませんでした。接続が切断された可能性があります。",
+      "refusal_busy": "現在インポートの実行が多すぎます。少し待ってからもう一度お試しください。",
+      "imported": "インポートしました",
+      "imported_named": "インポートしました: {{title}}",
+      "unknown_error": "インポートに失敗しました"
+    },
     "instanceTabBar": {
       "connected": "接続済み",
       "connected_refresh": "接続済み · {{time}} に更新",
@@ -6727,6 +6749,7 @@
       "discard_unsaved_changes": "保存されていない変更を破棄しますか？",
       "download": "ダウンロード",
       "download_failed": "ダウンロードに失敗しました",
+      "download_blocked_credentials": "ダウンロードがブロックされました。このファイルの内容が資格情報スキャンで検出されました。シークレットを削除して再度お試しください。",
       "edit": "編集",
       "exit_full_screen": "フルスクリーンを終了",
       "exit_full_screen_esc": "フルスクリーンを終了 (Esc)",
@@ -6782,6 +6805,10 @@
       "diff_status_failed": "このファイルの git の変更を確認できませんでした。"
     },
     "markdownRenderer": {
+      "download_failed": "図をダウンロードできませんでした。もう一度お試しください。",
+      "diagram_actions": "その他の操作",
+      "download_svg": "SVG をダウンロード",
+      "download_png": "PNG をダウンロード",
       "click_to_browse_shift_click_to_open_in_file_explorer": "クリックして参照 / Shift+クリックでエクスプローラーに表示",
       "click_to_browse_shift_click_to_reveal_in_finder": "クリックして参照 / Shift+クリックで Finder に表示",
       "click_to_browse_shift_click_to_show_in_file_manager": "クリックして参照 / Shift+クリックでファイルマネージャーに表示",
@@ -7056,12 +7083,20 @@
       "highlighting_unavailable_reload": "構文ハイライトを利用できません。下書きを保存またはコピーしてから、構文ハイライトを復元するために再読み込みしてください。編集は続けられます。"
     },
     "projectPicker": {
+      "all_drives": "すべてのドライブ",
       "back": "戻る",
+      "back_to": "{{path}} に戻る",
       "browse": "参照",
+      "drive_example_d": "D:\\",
+      "drive_example_e": "E:\\",
+      "drives_failed": "ドライブの一覧を表示できません。下の一覧は引き続き {{path}} を表示しています。別のドライブを使うには、上に {{example}} のように入力するか、「すべてのドライブ」をもう一度お試しください。",
+      "listing_failed": "{{failed}} を開けません。下の一覧は引き続き {{path}} を表示しています。パスを確認するか、一覧からフォルダーを選んでください。",
+      "listing_failed_no_path": "{{failed}} を開けません。確認してからもう一度お試しください。",
       "no_matching_projects": "一致するプロジェクトはありません",
       "no_recent_projects": "最近のプロジェクトはありません",
       "no_subdirectories": "サブディレクトリがありません",
       "path_to_project": "/path/to/project",
+      "path_to_project_drive": "例: D:\\path\\to\\project",
       "project_directory_path": "プロジェクトディレクトリパス",
       "recent": "最近",
       "recent_projects": "最近のプロジェクト",
@@ -8716,6 +8751,9 @@
       "open_screenshot": "スクリーンショット {{n}} を開く",
       "origin": "起源:",
       "permissions": "権限",
+      "session_approval_desc": "あなたのチャットでメッセージを送信して返信オプションを選び、ツール要求を承認または拒否し、チャットの承認モードを切り替えられます。",
+      "session_approval_modes": "設定できるチャットの承認モード",
+      "session_approval_manifest_key": "マニフェストキー",
       "platform": "プラットフォーム:",
       "previous": "前へ",
       "removes_kirocrew_metadata_only_the_app_itself_is": "{{productName}} メタデータのみを削除します — アプリ自体は外部で管理されます",
@@ -8742,7 +8780,10 @@
       "websocket_events": "WebSocket イベント",
       "all_contributors": "すべての貢献者",
       "contributors": "貢献者",
-      "retry": "再試行"
+      "retry": "再試行",
+      "enable_and_allow_chat_control": "有効にしてチャット操作を許可",
+      "session_approval_confirm_title": "「{{name}}」にチャットの操作を許可しますか？",
+      "session_approval_reconsent_notice": "{{name}} は新たにチャットの制御を要求するため、無効になっています。有効にする前に、このページで権限を確認してください。"
     },
     "appPage": {
       "loading_app": "アプリを読み込み中…",
@@ -8814,6 +8855,7 @@
       "synced_from_its_source_directory": "{{name}} をソースディレクトリから同期しました。",
       "updated_app_other": "{{count}} アプリを更新しました。",
       "updated_from_the_registry": "{{name}} をレジストリから更新しました。",
+      "updated_needs_session_approval_consent": "{{name}} は新たにチャットの制御を要求するため、無効になっています。アプリの詳細で権限を確認し、有効にしてください。",
       "refresh_store": "ストアを更新"
     },
     "artifactDeployPage": {
@@ -9372,7 +9414,8 @@
         "waiting_to_start_queued_behind_the_concurrency_l": "開始を待機中 — 同時実行制限の後ろのキューに入っています",
         "workflows": "ワークフロー",
         "workspace_empty": "このワークスペースにはまだファイルがありません",
-        "workspace_truncated": "大規模なワークスペース — 最初の10,000ファイルのみ表示しています",
+        "workspace_truncated": "大規模なワークスペース：最大10,000ファイルを表示しています。すべてのフォルダーを参照できます",
+        "workspace_directory_truncated": "一部のファイルは非表示",
         "output_load_failed": "出力を読み込めませんでした",
         "retry": "再試行",
         "cancel_failed": "サブエージェントをキャンセルできませんでした",
@@ -9902,6 +9945,7 @@
         "content_placeholder": "ファイル内を検索…",
         "content_searching": "検索中…",
         "ctx_add_to_chat": "チャットに追加",
+        "ctx_download": "ダウンロード",
         "filter_placeholder": "ファイルを絞り込む…",
         "git_status_failed": "Git の状態を読み取れませんでした",
         "mode_content": "内容",
@@ -10079,6 +10123,7 @@
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "(1 件を除外 — 現在選択中)",
+      "no_sessions_match_folders": "一致するセッションはありません — フォルダー名のみ一致",
       "add_column_after_this_one": "この列の後に列を追加",
       "agent_finished_your_turn": "エージェントが完了しました — あなたの番です",
       "all_sessions": "すべてのセッション",
@@ -10260,8 +10305,6 @@
       "stale_collapse_paused_hint": "検索・フィルター中、または「新しい順」以外の並び替え中は一時停止します。",
       "stale_collapse_row": "休眠中のセッション",
       "stale_collapse_row_ungrouped": "フォルダー外",
-      "started_in_channel": "この会話は {{channel}} で始まりました。",
-      "started_in_direct_message": "この会話はダイレクトメッセージで始まりました。",
       "stop_filtering_by_tag": "{{name}} でのフィルターを解除",
       "streaming": "ストリーミング中",
       "sub_agent_needs_approval_other": "{{count}} 個のサブエージェントが承認待ち",
@@ -10684,6 +10727,27 @@
     "developer": {
       "agentBackendTab": {
         "agent_backend": "エージェントバックエンド",
+        "approval_agent_spec": "{{productName}} がそう指定するため、ツールごとに確認します。",
+        "approval_seeded_settings": "自分の設定でそう決まっている場合だけ、ツールごとに確認します。{{productName}} はその設定を書き込みますが、効いたかどうかは確認できません。",
+        "approval_session_config": "コマンドの実行やファイルの変更の前に確認します。{{productName}} がその設定を入れ、確認します。読み取りだけなら確認しません。",
+        "approval_unverified": "このエージェントがツールの前に確認するという裏づけはありません。",
+        "approval_verified_gate_extension": "{{productName}} が読み込んで確認する拡張を通して、ツールごとに確認します。",
+        "approval_verified_seeded_settings": "ツールごとに確認します。{{productName}} がその設定を入れ、読み返します。",
+        "card_available": "利用できます。",
+        "card_crew_tools": "{{productName}} のツールがチャットで使えます",
+        "card_manual_compact": "/compact コマンドが使えます",
+        "card_markdown_agents": "markdown 1 ファイルで書いたエージェントが動きます",
+        "card_member_saved_agent": "メンバーは保存したエージェントをそのまま読み込めます",
+        "card_member_thread_tools": "メンバーのチャットにセッション用ツールが入ります",
+        "card_mid_turn_steer": "作業中でもメッセージを追加できます",
+        "card_model_switch": "チャットの中でモデルを切り替えられます",
+        "card_not_available": "利用できません。",
+        "card_operator_notes": "知っておくこと",
+        "card_private_member_sessions": "メンバーの非公開チャットを開始できます",
+        "card_reasoning_effort": "思考の深さを変更できます",
+        "card_side_chat_tools": "Side Chat で読み取り専用のツールを実行できます",
+        "card_subagent_continuation": "サブエージェントのチャットは後から続けられます",
+        "card_supports_n_of_m": "{{name}} は {{total}} 機能のうち {{available}} 機能に対応",
         "claude_code": "Claude Code",
         "claude_uses_its_own_permissions": "Claude Code は通常、実行前に承認を求め、{{productName}} がその要求を審査します。しかし Claude 自身の設定（プロジェクト内の .claude/settings.json を含む）で事前承認されたツールは要求を出さないため、拒否ルールと監査ログはその呼び出しを認識しません。",
         "could_not_load_the_agent_backend": "エージェントバックエンドを読み込めませんでした。",
@@ -10698,6 +10762,15 @@
         "missing_components": "このマシンにありません: {{components}}",
         "missing_components_with_command": "このマシンにありません: {{components}}。次でインストールします: {{command}}",
         "new_sessions_use_this_agent_a_session_that_is_al": "新しいセッションはこのエージェントを使用します。すでに開いているセッションは開始時のエージェントを維持し、ここで切り替えてもセッション中に変わることはありません。",
+        "not_offered_by_this_build": "このビルドはこのエージェントを提供しません。",
+        "note_crew_command_channel": "スラッシュコマンドは {{productName}} のコマンド経路を通ります。",
+        "note_crew_sandbox_stands_down": "自分専用の隔離環境を持ちます。macOS と Windows では {{productName}} 側の隔離は行いません。",
+        "note_harness_model_list": "モデルの一覧は {{productName}} ではなくエージェントから来ます。",
+        "note_host_credential_to_child": "Kiro サインインが済んでいれば、{{productName}} はそのアカウントをこのエージェントに渡せます。",
+        "note_keeps_own_chat_record": "このエージェントは会話の記録を自分でも持ちます。",
+        "note_own_credential_store": "Kiro サインインではなく、自分のファイルでサインインします。",
+        "note_pod_home_relocated": "ポッド内ではホームフォルダーがポッド側へ移り、保存済みのサインインも一緒に移ります。",
+        "note_refuses_unclassified_tools": "種類を判別できないツール呼び出しは、承認せずに拒否します。",
         "retry": "再試行",
         "set_is_fixed_at_gateway_start": "ここに表示されるエージェントは gateway の起動時に決まります。管理された環境ではポリシーで対象を制限できます。ポリシーの変更は次回の起動時に反映されます。"
       },
@@ -10722,7 +10795,14 @@
           "crew_media_members": "Crew Members ページ。メンバーを 1 人選び、アクティビティパネルを開いた状態。"
         },
         "crew_members": "クルーメンバー",
-        "crew_members_desc": "Crew Members ページ。あなたのすべてのエージェントが、それぞれ自分のスレッドを持って並びます。まだ開発中のため、オンにするまで表示されません。"
+        "crew_members_desc": "Crew Members ページ。あなたのすべてのエージェントが、それぞれ自分のスレッドを持って並びます。まだ開発中のため、オンにするまで表示されません。",
+        "decisions": "判断（Jev）",
+        "decisions_desc": "Jev は小さくて安価な判断モデルです。このプレビューでは、{{productName}} が三つの場面で Jev に「はい／いいえ」か「どれか一つ」を尋ねます。あなたのメッセージにどのスキルを読み込むか、覚えたばかりのスキルが既存のものと重複していないか、定期実行の結果に新しい情報があるか。このリリースではシャドウ実行のみです。Jev の答えは {{productName}} の動作を変えず、後で比較できるようこのマシンのログに書き出されます。このスイッチはブラウザーではなく {{productName}} を動かしているマシンに保存されるため、どの端末から開いても有効です。",
+        "decisions_egress": "オンの間、あなたのメッセージの文面とスキルの説明はこのマシンから外に出ます。この {{productName}} が使うよう設定された判断サービスへ、インターネット経由で送信されます。オフの間は何も送信されません。",
+        "decisions_backend_required": "このダッシュボードを動かしている {{productName}} はこのスイッチより古く、設定に decisions セクションがまだありません。オンにできるものがないので、先に更新してください。",
+        "decisions_points": "下の各項目は、実行中のモードを表示します。",
+        "decisions_config_unavailable": "設定を読み取れなかったため、このスイッチは提供されません。再読み込みしてお試しください。",
+        "decisions_save_failed": "この設定を保存できませんでした。スイッチは保存済みの値に戻っています。"
       },
       "kiroSignInCard": {
         "title": "Kiro サインイン",
@@ -10749,7 +10829,7 @@
       "feature_previews_moved": "機能プレビューは「設定 > デベロッパー」に移動しました",
       "tabs": {
         "agentBackend": {
-          "description": "新しいセッションが起動するエージェント — Kiro CLI、Claude Code、KAS",
+          "description": "新しいセッションが起動するエージェント",
           "label": "エージェントバックエンド"
         },
         "archive": {
@@ -12823,7 +12903,11 @@
         "auto_download_save_failed": "自動ダウンロードの設定を保存できませんでした。",
         "auto_update_setting_unavailable": "自動更新の設定を読み込めませんでした。読み込まれるまで、スイッチはデフォルト値を表示します。",
         "copy_failed_select_the_command_and_copy_it_manually": "コピーに失敗しました。コマンドを選択して手動でコピーしてください。",
-        "update_info_unavailable": "このビルドのバージョンと更新チャネルをアプリから読み取れませんでした。"
+        "update_info_unavailable": "このビルドのバージョンと更新チャネルをアプリから読み取れませんでした。",
+        "app_lane_label": "アプリ",
+        "app_lane_title": "インストールしたデスクトップアプリ。下のサービスとは別の独自のバージョンです。",
+        "gateway_lane_label": "ゲートウェイ",
+        "gateway_lane_title": "エージェントを実行し、このダッシュボードを提供するバックグラウンドサービス。ブランチとコミットのチップはそのビルドです。"
       },
       "botChannelPanel": {
         "allowed_user_ids": "許可されたユーザー ID",
@@ -13193,7 +13277,7 @@
         "developer_mode": "開発者モード",
         "developer_tools": "開発者ツール",
         "feature_previews": "機能プレビュー",
-        "feature_previews_desc": "未リリースの機能とページです。ここでオンにするまで、ページ自体はサイドバーと「すべてから検索」には表示されませんが、下のスイッチは設定の検索で見つかります。この設定はこのデバイスのみに適用され、内容は意図的に未完成のままです。",
+        "feature_previews_desc": "未リリースの機能とページです。ここでオンにするまで、ページ自体はサイドバーと「すべてから検索」には表示されませんが、下のスイッチは設定の検索で見つかります。内容は意図的に未完成のままです。カードに別の記載がない限り、設定はこのデバイスのみに適用されます。",
         "gateway": "ゲートウェイ",
         "open_developer_page": "開発者ページを開く",
         "run_a_local_gateway": "ローカルゲートウェイを実行する",
@@ -14731,6 +14815,7 @@
       "show_controls": "コントロールを表示"
     },
     "membersPage": {
+      "drawer_delegated_working": "委任したタスクを実行中",
       "agent_template": "エージェントテンプレート",
       "configuration": "設定",
       "crew_summary": "メンバー概要",

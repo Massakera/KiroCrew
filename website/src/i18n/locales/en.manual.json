@@ -148,7 +148,6 @@
     "disk_unavailable": "Disk: unavailable",
     "expand_sidebar": "Expand sidebar",
     "gateway_connected": "Gateway connected",
-    "gateway_offline": "Gateway offline",
     "gateway_restarting_reconnecting": "Gateway is restarting — reconnecting…",
     "hide_full_changelog": "▾ Hide Full Changelog",
     "i_d_like_to_request_a_feature": "I’d like to request a feature!",
@@ -1355,6 +1354,7 @@
       "cmd_search_sessions": "Search Sessions",
       "fallback_sessions": "Search sessions for “{{query}}”",
       "group_apps": "Apps",
+      "group_folders": "Folders",
       "group_commands": "Commands",
       "group_settings": "Settings",
       "leave_scope": "Back to all commands",
@@ -1384,6 +1384,7 @@
       "no_match_show_recent": "No sessions match “{{query}}” — show recent instead",
       "kind": {
         "app": "App",
+        "folder": "Folder",
         "command": "Command",
         "setting": "Setting",
         "view": "View"
@@ -1646,6 +1647,7 @@
       "reads_tooltip": "{{productName}} looks things up on its own, but asks before making changes",
       "reads_desc": "{{productName}} looks things up on its own, but asks before making any changes",
       "trust_label": "Trust",
+      "chat_mode_hint": "chat mode",
       "trust_tooltip": "In this chat, {{productName}} works without asking you first",
       "trust_desc": "In this chat, {{productName}} works without asking you first",
       "yolo_label": "YOLO",
@@ -1695,6 +1697,9 @@
         "capability_backend": "Keep a program of its own running on this computer, in the background, while {{productName}} is open",
         "capability_shell": "Run commands on this computer, from a list the app ships with that you have not seen",
         "capability_note": "Trusting the app grants all three, whether or not it uses them all. {{productName}} cannot limit it to less.",
+        "session_approval_heading": "This app also asks to control your chats",
+        "session_approval_desc": "Sending messages or choosing response options in your chats, approving or denying tool prompts, and switching a chat's approval mode.",
+        "session_approval_modes": "Chat approval modes it can set",
         "revocable": "You can take this back at any time in Settings → Security → Trusted third-party apps. The app stops working when you do.",
         "source": "Published at",
         "not_reviewed": "{{productName}} lists this app but has not reviewed its code, and the name above comes from the app itself.",
@@ -2329,6 +2334,7 @@
       "discard_comment_button": "Discard comment",
       "discard_unsaved_comment": "Discard your unsaved comment?",
       "download_failed": "Download failed",
+      "download_blocked_credentials": "Download blocked: this file's content was flagged by the credential scan. Remove the secret and try again.",
       "edit": "Edit",
       "failed_to_add_source": "Failed to add source",
       "file_too_large_to_add": "File is too large to add",
@@ -2359,6 +2365,10 @@
       "diff_status_failed": "Couldn’t check this file’s git changes."
     },
     "markdownRenderer": {
+      "download_failed": "Couldn't download the diagram. Try again.",
+      "diagram_actions": "More actions",
+      "download_svg": "Download SVG",
+      "download_png": "Download PNG",
       "click_to_browse_shift_click_to_open_in_file_explorer": "Click to browse / Shift+click to open in File Explorer",
       "click_to_browse_shift_click_to_reveal_in_finder": "Click to browse / Shift+click to reveal in Finder",
       "click_to_browse_shift_click_to_show_in_file_manager": "Click to browse / Shift+click to show in file manager",
@@ -3403,7 +3413,10 @@
       "installed_version": "Installed (v{{version}})",
       "removing": "Removing…",
       "starting_install": "Starting install…",
-      "retry": "Retry"
+      "retry": "Retry",
+      "enable_and_allow_chat_control": "Enable and allow chat control",
+      "session_approval_confirm_title": "Allow “{{name}}” to control your chats?",
+      "session_approval_reconsent_notice": "{{name}} is disabled because it newly asks to control your chats. Review the permission on this page before enabling it."
     },
     "appsPage": {
       "action_failed": "Failed to {{action}} {{name}}",
@@ -3703,7 +3716,8 @@
         "model_effective": "Running on {{model}} (backend selects the model)",
         "workflows": "Workflows",
         "workspace_empty": "No files in this workspace yet",
-        "workspace_truncated": "Large workspace — showing the first 10,000 files",
+        "workspace_truncated": "Large workspace: showing up to 10,000 files; all folders remain available",
+        "workspace_directory_truncated": "files hidden",
         "output_load_failed": "Couldn't load the output",
         "retry": "Retry",
         "cancel_failed": "Couldn't cancel the subagent",
@@ -3950,6 +3964,7 @@
         "content_placeholder": "Search in files…",
         "content_searching": "Searching…",
         "ctx_add_to_chat": "Add to chat",
+        "ctx_download": "Download",
         "filter_placeholder": "Filter files…",
         "git_status_failed": "Couldn't read the git status",
         "mode_content": "Content",
@@ -4115,6 +4130,7 @@
     },
     "chatSidebar": {
       "adopt_failed": "Could not open this session here.",
+      "no_sessions_match_folders": "No sessions match — only a folder name did",
       "adopt_target_unknown": "This session is no longer open on {{name}}.",
       "answered_by": "answered by {{agent}}",
       "archive_session_one": "Archive {{count}} session",
@@ -4166,8 +4182,6 @@
       "connected_to": "Connected to {{label}}",
       "session_failed_to_switch_one": "{{count}} session failed to switch",
       "session_failed_to_switch_other": "{{count}} sessions failed to switch",
-      "started_in_channel": "This conversation started in {{channel}}.",
-      "started_in_direct_message": "This conversation started in a direct message.",
       "session_source": "Session",
       "new": "New",
       "new_chat": "New chat",
@@ -4468,7 +4482,7 @@
       "feature_previews_moved": "Feature Previews moved to Settings > Developer",
       "tabs": {
         "agentBackend": {
-          "description": "Which agent new sessions start — Kiro CLI, Claude Code, or KAS",
+          "description": "Which agent new sessions start",
           "label": "Agent Backend"
         },
         "archive": {
@@ -5419,11 +5433,15 @@
         "auto_download_save_failed": "Couldn't save the automatic download setting.",
         "auto_update_setting_unavailable": "Couldn't load the auto-update setting. The switch shows the default until it loads.",
         "copy_failed_select_the_command_and_copy_it_manually": "Copy failed. Select the command and copy it manually.",
-        "update_info_unavailable": "Couldn't read this build's version and update channel from the app."
+        "update_info_unavailable": "Couldn't read this build's version and update channel from the app.",
+        "app_lane_label": "App",
+        "app_lane_title": "The desktop app you installed. Its own version, separate from the service below.",
+        "gateway_lane_label": "Gateway",
+        "gateway_lane_title": "The background service that runs your agents and serves this dashboard. The branch and commit chips are its build."
       },
       "developerPanel": {
         "feature_previews": "Feature Previews",
-        "feature_previews_desc": "Unreleased features and pages. The pages stay hidden from the sidebar and from Search Everywhere until you turn them on here; the switches themselves do show up in Settings search. Per-device, and unpolished on purpose."
+        "feature_previews_desc": "Unreleased features and pages. The pages stay hidden from the sidebar and from Search Everywhere until you turn them on here; the switches themselves do show up in Settings search. Unpolished on purpose, and per-device unless a card says otherwise."
       },
       "computerUsePanel": {
         "computer_use_lets_the_agent_read_any_app_window": "Computer use lets the agent read any app window and send clicks and keystrokes into it. Most clicks are delivered straight to the app and leave your pointer alone, but the agent can ask to move the real pointer when a target needs it. Password fields are never read; nothing else limits which apps it may drive.",
@@ -6331,7 +6349,14 @@
           "crew_media_members": "The Crew Members page, with one member selected and its activity panel open."
         },
         "crew_members": "Crew Members",
-        "crew_members_desc": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on."
+        "crew_members_desc": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
+        "decisions": "Decisions (Jev)",
+        "decisions_desc": "Jev is a small, cheap decision model. This preview lets {{productName}} ask it one yes-or-no or pick-one question at three moments: which skills to load for your message, whether a skill it has just learned repeats one you already have, and whether a scheduled job's result says anything new. Shadow-only in this release — nothing Jev answers changes what {{productName}} does; each answer is written to a log on this machine so the two can be compared. This switch is saved on the machine that runs {{productName}}, not in this browser, so it applies on every device you open it from.",
+        "decisions_egress": "While this is on, the text of your messages and the descriptions of your skills leave this machine. They are sent over the internet to the decision service this {{productName}} is set up to use. Nothing is sent while this is off.",
+        "decisions_backend_required": "The {{productName}} running this dashboard is older than this switch: its settings have no decisions section yet, so there is nothing to turn on. Update it first.",
+        "decisions_points": "Each check below shows the mode it runs in.",
+        "decisions_config_unavailable": "Could not read the settings, so this switch is not offered. Reload to try again.",
+        "decisions_save_failed": "Could not save this setting. The switch is showing the saved value again."
       },
       "kiroSignInCard": {
         "title": "Kiro sign-in",
@@ -6359,6 +6384,7 @@
       "failed_to_load_app": "Failed to load app"
     },
     "membersPage": {
+      "drawer_delegated_working": "Delegated work running",
       "setup_in_crew_manager": "Set up private memory"
     }
   },

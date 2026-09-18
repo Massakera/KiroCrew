@@ -162,7 +162,6 @@
     "dsk": "DSK",
     "expand_sidebar": "সাইডবার প্রসারিত করো",
     "gateway_connected": "গেটওয়ে সংযুক্ত",
-    "gateway_offline": "গেটওয়ে অফলাইন",
     "gateway_offline_reconnecting": "গেটওয়ে অফলাইন — আবার কানেক্ট হচ্ছে",
     "gateway_offline_session_expired_see_banner_above": "গেটওয়ে অফলাইন — সেশনের মেয়াদ শেষ, উপরের ব্যানার দেখো",
     "gateway_restarting_reconnecting": "গেটওয়ে রিস্টার্ট হচ্ছে — আবার কানেক্ট হচ্ছে…",
@@ -4092,6 +4091,10 @@
         "one_notification_per_state_change_never_per_hear": "প্রতি অবস্থা বদলে একটি নোটিফিকেশন, কখনও প্রতি হার্টবিটে নয়: যে সোর্স বন্ধ হয়ে থাকে\n        তার কথা একবারই জানানো হয়, প্রতি দুই মিনিটে নয়। একই ইনসিডেন্টের বারবারগুলো এক\n        সারিতেই জমা হয়।",
         "only_the_on_call_instance_picks_up_work": "শুধু অন-কল ইনস্ট্যান্সই কাজ হাতে নেয়",
         "pagerduty_user_id_help": "PagerDuty কাকে অন-কল বলে জানায় তার সঙ্গে মিলিয়ে দেখা হয়, যাতে এই ইনস্ট্যান্স বুঝতে পারে পেজারটি তোমার কি না। এজেন্ট যেখানে পৌঁছাতে পারে না সেখানে রাখা — ফাঁকা রাখলে সময়সূচিতে থাকা যে কাউকেই তুমি ধরে নেওয়া হবে।",
+        "incidentio_user_id_help": "তোমার incident.io সময়সূচিতে থাকা ইউজারদের সঙ্গে মিলিয়ে দেখা হয়, যাতে এই ইনস্ট্যান্স বুঝতে পারে শিফটটি তোমার কি না। এজেন্ট যেখানে পৌঁছাতে পারে না সেখানে রাখা — ফাঁকা রাখলে সময়সূচিতে থাকা যে কাউকেই তুমি ধরে নেওয়া হবে। ID সেট থাকলেও কোনো সময়সূচি কনফিগার করা না থাকলে, এই ইনস্ট্যান্স শিফটের বাইরেই থাকে।",
+        "identity_save_refused": "তোমার ID সংরক্ষণ হয়নি — সেটিংস স্টোর লেখাটি প্রত্যাখ্যান করেছে। আবার চেষ্টা করো।",
+        "change_save_refused": "তোমার পরিবর্তন সংরক্ষণ হয়নি — সেটিংস স্টোর লেখাটি প্রত্যাখ্যান করেছে। আবার চেষ্টা করো।",
+        "value_too_long_refused": "মানটি খুব দীর্ঘ, তাই এটি সংরক্ষণ করা হয়নি।",
         "prod_star": "prod-*",
         "providers": "প্রদানকারী",
         "pushes_stay_refused_until": "push আটকে থাকবে যতক্ষণ না",
@@ -4131,6 +4134,7 @@
         "wrong_local_branch": "ভুল লোকাল ব্রাঞ্চ",
         "your_github_login": "তোমার GitHub লগইন",
         "your_pagerduty_user_id": "তোমার PagerDuty ইউজার ID",
+        "your_incident_io_user_id": "তোমার incident.io ইউজার ID",
         "your_team_s_ledger_is_still_being_exchanged_sync": "তোমার টিমের লেজার এখনও আদানপ্রদান হচ্ছে — সিঙ্ক যে নাম বলছে সেটি হল"
       },
       "signalsPanel": {
@@ -4872,6 +4876,7 @@
       "cmd_search_sessions": "সেশন খুঁজুন",
       "fallback_sessions": "সেশনে “{{query}}” খুঁজুন",
       "group_apps": "অ্যাপ",
+      "group_folders": "ফোল্ডার",
       "group_commands": "কমান্ড",
       "group_settings": "সেটিংস",
       "leave_scope": "সব কমান্ডে ফিরে যান",
@@ -4895,6 +4900,7 @@
       "retry": "আবার চেষ্টা করুন",
       "kind": {
         "app": "অ্যাপ",
+        "folder": "ফোল্ডার",
         "command": "কমান্ড",
         "setting": "সেটিং",
         "view": "ভিউ"
@@ -5642,6 +5648,7 @@
       "reads_tooltip": "{{productName}} নিজে থেকে তথ্য খোঁজে, তবে পরিবর্তন করার আগে জিজ্ঞাসা করে",
       "trust_desc": "এই চ্যাটে, {{productName}} আগে জিজ্ঞাসা না করেই কাজ করে",
       "trust_label": "ট্রাস্ট",
+      "chat_mode_hint": "চ্যাট মোড",
       "trust_tooltip": "এই চ্যাটে, {{productName}} আগে জিজ্ঞাসা না করেই কাজ করে",
       "yolo_desc": "প্রতিটি চ্যাটে, {{productName}} আগে জিজ্ঞাসা না করেই কাজ করে",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",
@@ -5733,6 +5740,9 @@
         "capability_backend": "{{productName}} খোলা থাকা অবস্থায় এই কম্পিউটারে ব্যাকগ্রাউন্ডে নিজের একটি প্রোগ্রাম চালু রাখা",
         "capability_shell": "এই কম্পিউটারে কমান্ড চালানো, অ্যাপের সঙ্গে আসা এমন একটি তালিকা থেকে যা আপনি কখনও দেখেননি",
         "capability_note": "বিশ্বাস করলে তিনটিই একসঙ্গে দেওয়া হয়, অ্যাপ সবগুলো ব্যবহার করুক বা না করুক। {{productName}} এর চেয়ে কম দিতে পারে না।",
+        "session_approval_heading": "এই অ্যাপটি তোমার চ্যাট নিয়ন্ত্রণ করার অনুমতিও চায়",
+        "session_approval_desc": "তোমার চ্যাটে বার্তা পাঠানো বা উত্তরের বিকল্প বেছে নেওয়া, টুল অনুরোধ অনুমোদন বা প্রত্যাখ্যান করা এবং চ্যাটের অনুমোদন মোড বদলানো।",
+        "session_approval_modes": "চ্যাট অনুমোদন মোড যা এটি সেট করতে পারে",
         "revocable": "আপনি যেকোনো সময় সেটিংস → নিরাপত্তা → বিশ্বাসযোগ্য তৃতীয় পক্ষের অ্যাপ থেকে এটি ফিরিয়ে নিতে পারেন। তখন অ্যাপটি কাজ করা বন্ধ করে দেয়।",
         "source": "প্রকাশিত হয়েছে",
         "not_reviewed": "{{productName}} এই অ্যাপটি তালিকায় রাখে, তবে এর কোড পরীক্ষা করেনি, আর উপরের নামটি অ্যাপ নিজেই দিয়েছে।",
@@ -6480,6 +6490,18 @@
       "comment_unread_other": "{{count}}টি মন্তব্য · অপঠিত",
       "open_comment_thread": "কমেন্ট থ্রেড খুলুন"
     },
+    "importSessionItem": {
+      "failed": "ব্যর্থ",
+      "import_from_file": "ফাইল থেকে একটি সেশন আমদানি করো",
+      "refusal_damaged_file": "এই ফাইলটি পড়া যায়নি। এটি ক্ষতিগ্রস্ত হতে পারে, বা এটি রপ্তানি করা সেশন নয়।",
+      "refusal_not_a_session": "এই ফাইলটি রপ্তানি করা সেশন নয়।",
+      "refusal_too_large": "এই ফাইলটি আমদানি করার জন্য অত্যন্ত বড়।",
+      "refusal_upload_failed": "এই ফাইলটি আপলোড করা যায়নি। সংযোগ বিচ্ছিন্ন হয়ে থাকতে পারে।",
+      "refusal_busy": "এখন অনেকগুলি আমদানি চলছে। কিছুক্ষণ পরে আবার চেষ্টা করো।",
+      "imported": "ইমপোর্ট হয়েছে",
+      "imported_named": "ইমপোর্ট হয়েছে: {{title}}",
+      "unknown_error": "ইমপোর্ট ব্যর্থ হয়েছে"
+    },
     "instanceTabBar": {
       "connected": "সংযুক্ত",
       "connected_refresh": "সংযুক্ত · রিফ্রেশ {{time}}",
@@ -6830,6 +6852,7 @@
       "discard_unsaved_changes": "অসংরক্ষিত পরিবর্তন বাতিল করবেন?",
       "download": "ডাউনলোড",
       "download_failed": "ডাউনলোড ব্যর্থ হয়েছে",
+      "download_blocked_credentials": "ডাউনলোড ব্লক করা হয়েছে: এই ফাইলের বিষয়বস্তু ক্রেডেন্শাল স্ক্যানে চিহ্নিত হয়েছে। গোপন তথ্যটি সরিয়ে আবার চেষ্টা করো।",
       "edit": "সম্পাদনা",
       "exit_full_screen": "ফুল স্ক্রিন থেকে বেরোন",
       "exit_full_screen_esc": "ফুল স্ক্রিন থেকে বেরোন (Esc)",
@@ -6885,6 +6908,10 @@
       "diff_status_failed": "এই ফাইলের git পরিবর্তন পরীক্ষা করা যায়নি।"
     },
     "markdownRenderer": {
+      "download_failed": "ডায়াগ্রাম ডাউনলোড করা যায়নি। আবার চেষ্টা করুন।",
+      "diagram_actions": "আরও অ্যাকশন",
+      "download_svg": "SVG ডাউনলোড করুন",
+      "download_png": "PNG ডাউনলোড করুন",
       "click_to_browse_shift_click_to_open_in_file_explorer": "ব্রাউজ করতে ক্লিক করুন / File Explorer-এ দেখাতে Shift+ক্লিক করুন",
       "click_to_browse_shift_click_to_reveal_in_finder": "ব্রাউজ করতে ক্লিক করুন / Finder-এ দেখাতে Shift+ক্লিক করুন",
       "click_to_browse_shift_click_to_show_in_file_manager": "ব্রাউজ করতে ক্লিক করুন / ফাইল ম্যানেজারে দেখাতে Shift+ক্লিক করুন",
@@ -7161,12 +7188,20 @@
       "highlighting_unavailable_reload": "সিনট্যাক্স হাইলাইটিং অনুপলব্ধ। আপনার খসড়া সংরক্ষণ বা অনুলিপি করুন, তারপর সিনট্যাক্স হাইলাইটিং পুনরুদ্ধার করতে পুনরায় লোড করুন; সম্পাদনা করা যাবে।"
     },
     "projectPicker": {
+      "all_drives": "সব ড্রাইভ",
       "back": "পেছনে",
+      "back_to": "{{path}}-এ ফিরে যান",
       "browse": "ব্রাউজ করুন",
+      "drive_example_d": "D:\\",
+      "drive_example_e": "E:\\",
+      "drives_failed": "ড্রাইভের তালিকা দেখানো যায়নি — নিচের তালিকায় এখনও {{path}} দেখানো হচ্ছে। অন্য ড্রাইভ ব্যবহার করতে উপরে লেখো, যেমন {{example}}, অথবা “সব ড্রাইভ” আবার চেষ্টা করো।",
+      "listing_failed": "{{failed}} খোলা যায়নি — নিচের তালিকায় এখনও {{path}} দেখানো হচ্ছে। পাথটি পরীক্ষা করো, অথবা তালিকা থেকে একটি ফোল্ডার বেছে নাও।",
+      "listing_failed_no_path": "{{failed}} খোলা যায়নি। পাথটি পরীক্ষা করে আবার চেষ্টা করো।",
       "no_matching_projects": "মিলে যাওয়া কোনো প্রকল্প নেই",
       "no_recent_projects": "সাম্প্রতিক কোনো প্রকল্প নেই",
       "no_subdirectories": "কোনো সাব-ডিরেক্টরি নেই",
       "path_to_project": "/path/to/project",
+      "path_to_project_drive": "যেমন D:\\path\\to\\project",
       "project_directory_path": "প্রকল্প ডিরেক্টরির পথ",
       "recent": "সাম্প্রতিক",
       "recent_projects": "সাম্প্রতিক প্রকল্প",
@@ -8833,6 +8868,9 @@
       "open_screenshot": "স্ক্রিনশট {{n}} খোলো",
       "origin": "উৎস:",
       "permissions": "অনুমতি",
+      "session_approval_desc": "তোমার চ্যাটে বার্তা পাঠাতে ও উত্তরের বিকল্প বেছে নিতে, টুল অনুরোধ অনুমোদন বা প্রত্যাখ্যান করতে এবং চ্যাটের অনুমোদন মোড বদলাতে পারে।",
+      "session_approval_modes": "চ্যাট অনুমোদন মোড যা এটি সেট করতে পারে",
+      "session_approval_manifest_key": "ম্যানিফেস্ট কী",
       "platform": "প্ল্যাটফর্ম:",
       "previous": "পূর্ববর্তী",
       "removes_kirocrew_metadata_only_the_app_itself_is": "শুধুমাত্র {{productName}} মেটাডেটা সরানো হয় — অ্যাপটি নিজে বাইরে থেকে পরিচালিত হয়",
@@ -8859,7 +8897,10 @@
       "websocket_events": "WebSocket ইভেন্ট",
       "all_contributors": "সব অবদানকারী",
       "contributors": "অবদানকারী",
-      "retry": "আবার চেষ্টা করুন"
+      "retry": "আবার চেষ্টা করো",
+      "enable_and_allow_chat_control": "চালু করো এবং চ্যাট নিয়ন্ত্রণের অনুমতি দাও",
+      "session_approval_confirm_title": "“{{name}}”-কে তোমার চ্যাট নিয়ন্ত্রণ করার অনুমতি দেবে?",
+      "session_approval_reconsent_notice": "{{name}} বন্ধ আছে, কারণ এটি নতুন করে তোমার চ্যাট নিয়ন্ত্রণের অনুমতি চাইছে। চালু করার আগে এই পৃষ্ঠায় অনুমতিটি দেখে নাও।"
     },
     "appPage": {
       "loading_app": "অ্যাপ লোড হচ্ছে…",
@@ -8939,6 +8980,7 @@
       "installed_app_find_in_library_and_enable": "{{name}} ইনস্টল হয়েছে। লাইব্রেরিতে এটি চালু করুন।",
       "synced_from_its_source_directory": "{{name}} তার সোর্স ডিরেক্টরি থেকে সিঙ্ক করা হয়েছে।",
       "updated_from_the_registry": "{{name}} রেজিস্ট্রি থেকে আপডেট করা হয়েছে।",
+      "updated_needs_session_approval_consent": "{{name}} বন্ধ আছে, কারণ এটি নতুন করে তোমার চ্যাট নিয়ন্ত্রণের অনুমতি চাইছে। অ্যাপের বিবরণে অনুমতিটি দেখো, তারপর চালু করো।",
       "refresh_store": "স্টোর রিফ্রেশ করুন"
     },
     "artifactDeployPage": {
@@ -9504,7 +9546,8 @@
         "waiting_to_start_queued_behind_the_concurrency_l": "শুরুর অপেক্ষায় — কনকারেন্সি সীমার পেছনে সারিতে আছে",
         "workflows": "ওয়ার্কফ্লো",
         "workspace_empty": "এই ওয়ার্কস্পেসে এখনও কোনো ফাইল নেই",
-        "workspace_truncated": "বড় ওয়ার্কস্পেস — প্রথম ১০,০০০টি ফাইল দেখানো হচ্ছে",
+        "workspace_truncated": "বড় ওয়ার্কস্পেস: সর্বাধিক ১০,০০০টি ফাইল দেখানো হচ্ছে; সব ফোল্ডার উপলভ্য রয়েছে",
+        "workspace_directory_truncated": "কিছু ফাইল লুকানো আছে",
         "output_load_failed": "আউটপুট লোড করা যায়নি",
         "retry": "আবার চেষ্টা করুন",
         "cancel_failed": "সাবএজেন্ট বাতিল করা যায়নি",
@@ -10045,6 +10088,7 @@
         "content_placeholder": "ফাইলের ভেতরে খুঁজুন…",
         "content_searching": "খোঁজা হচ্ছে…",
         "ctx_add_to_chat": "চ্যাটে যোগ করুন",
+        "ctx_download": "ডাউনলোড",
         "filter_placeholder": "ফাইল ফিল্টার করুন…",
         "git_status_failed": "Git স্ট্যাটাস পড়া যায়নি",
         "mode_content": "বিষয়বস্তু",
@@ -10223,6 +10267,7 @@
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "(1টি এড়িয়ে যাওয়া হয়েছে — এখন বেছে নেওয়া আছে)",
+      "no_sessions_match_folders": "কোনও সেশন মেলেনি — কেবল একটি ফোল্ডারের নাম মিলেছে",
       "add_column_after_this_one": "এটির পরে কলাম যোগ করুন",
       "agent_finished_your_turn": "এজেন্ট শেষ করেছে — এখন আপনার পালা",
       "all_sessions": "সব সেশন",
@@ -10414,8 +10459,6 @@
       "stale_collapse_paused_hint": "তালিকা অনুসন্ধান, ফিল্টার বা “নতুন আগে” ছাড়া অন্য ক্রমে থাকলে বিরতিতে থাকে।",
       "stale_collapse_row": "সুপ্ত সেশন",
       "stale_collapse_row_ungrouped": "ফোল্ডারের বাইরে",
-      "started_in_channel": "এই কথোপকথন {{channel}}-এ শুরু হয়েছিল।",
-      "started_in_direct_message": "এই কথোপকথন একটি সরাসরি মেসেজে শুরু হয়েছিল।",
       "stop_filtering_by_tag": "{{name}} দিয়ে ফিল্টার করা বন্ধ করুন",
       "streaming": "স্ট্রিমিং",
       "sub_agent_needs_approval_one": "{{count}}টি সাবএজেন্টের অনুমোদন প্রয়োজন",
@@ -10841,6 +10884,27 @@
     "developer": {
       "agentBackendTab": {
         "agent_backend": "এজেন্ট ব্যাকএন্ড",
+        "approval_agent_spec": "প্রতিটি টুলের আগে জিজ্ঞেস করে, কারণ {{productName}} তাই ঠিক করে দেয়।",
+        "approval_seeded_settings": "নিজের সেটিংস তাই বললে তবেই প্রতিটি টুলের আগে জিজ্ঞেস করে। {{productName}} সেই সেটিং লেখে, কিন্তু তা কাজে লেগেছে কিনা নিশ্চিত করতে পারে না।",
+        "approval_session_config": "কোনো কমান্ড চালানো বা ফাইল বদলানোর আগে জিজ্ঞেস করে। {{productName}} সেটি চালু করে ও যাচাই করে। শুধু পড়ার সময় জিজ্ঞেস করে না।",
+        "approval_unverified": "এই এজেন্ট টুল চালানোর আগে জিজ্ঞেস করে, এমন কোনও প্রমাণ নেই।",
+        "approval_verified_gate_extension": "{{productName}} যে অ্যাড-অন লোড করে যাচাই করে, তার মাধ্যমে প্রতিটি টুলের আগে জিজ্ঞেস করে।",
+        "approval_verified_seeded_settings": "প্রতিটি টুলের আগে জিজ্ঞেস করে। {{productName}} সেটি বসায় ও পড়ে যাচাই করে।",
+        "card_available": "পাওয়া যায়।",
+        "card_crew_tools": "{{productName}} এর নিজের টুল চ্যাটে কাজ করে",
+        "card_manual_compact": "/compact কমান্ড কাজ করে",
+        "card_markdown_agents": "একটি markdown ফাইলে লেখা এজেন্ট কাজ করে",
+        "card_member_saved_agent": "সদস্যরা তাঁদের পুরো সংরক্ষিত এজেন্ট লোড করেন",
+        "card_member_thread_tools": "সদস্যের চ্যাটে সেশন টুল যুক্ত হয়",
+        "card_mid_turn_steer": "কাজ চলার সময়েও বার্তা পাঠানো যায়",
+        "card_model_switch": "চ্যাটের ভেতরেই মডেল বদলানো যায়",
+        "card_not_available": "পাওয়া যায় না।",
+        "card_operator_notes": "জেনে রাখা ভালো",
+        "card_private_member_sessions": "সদস্যের ব্যক্তিগত চ্যাট শুরু করা যায়",
+        "card_reasoning_effort": "ভাবনার গভীরতা বদলানো যায়",
+        "card_side_chat_tools": "Side Chat শুধু পড়ার টুল চালাতে পারে",
+        "card_subagent_continuation": "সাব-এজেন্টের চ্যাট পরে আবার চালানো যায়",
+        "card_supports_n_of_m": "{{name}} {{total}} টি বৈশিষ্ট্যের মধ্যে {{available}} টি সমর্থন করে",
         "claude_code": "Claude Code",
         "claude_uses_its_own_permissions": "Claude Code সাধারণত কাজ করার আগে অনুমতি চায়, এবং {{productName}} সেই অনুরোধ যাচাই করে। কিন্তু Claude-এর নিজের সেটিংসে আগেই অনুমোদিত টুল — প্রকল্পের ভিতরের .claude/settings.json সহ — কিছু জিজ্ঞাসা করে না, তাই অস্বীকৃতির নিয়ম ও অডিট লগ সেই কলটি দেখতে পায় না।",
         "could_not_load_the_agent_backend": "এজেন্ট ব্যাকএন্ড লোড করা যায়নি।",
@@ -10855,6 +10919,15 @@
         "missing_components": "এই মেশিনে অনুপস্থিত: {{components}}",
         "missing_components_with_command": "এই মেশিনে অনুপস্থিত: {{components}}। ইনস্টল করুন: {{command}}",
         "new_sessions_use_this_agent_a_session_that_is_al": "নতুন সেশনগুলি এই এজেন্ট ব্যবহার করে। ইতিমধ্যে খোলা সেশন যে এজেন্টে শুরু হয়েছিল সেটিই ধরে রাখে — এখানে বদলালে চলমান সেশন বদলায় না।",
+        "not_offered_by_this_build": "এই বিল্ড এই এজেন্ট দেয় না।",
+        "note_crew_command_channel": "স্ল্যাশ কমান্ড {{productName}} এর কমান্ড চ্যানেল দিয়ে যায়।",
+        "note_crew_sandbox_stands_down": "এর নিজের আলাদা ঘের আছে। macOS ও Windows-এ {{productName}} এর ঘের এর জন্য সরে যায়।",
+        "note_harness_model_list": "মডেলের তালিকা আসে এজেন্ট থেকে, {{productName}} থেকে নয়।",
+        "note_host_credential_to_child": "Kiro সাইন-ইন হয়ে গেলে {{productName}} সেই অ্যাকাউন্ট এই এজেন্টের হাতে তুলে দিতে পারে।",
+        "note_keeps_own_chat_record": "এই এজেন্ট আলাপের নিজস্ব একটি কপি রাখে।",
+        "note_own_credential_store": "এটি Kiro সাইন-ইন নয়, নিজের ফাইল দিয়ে সাইন ইন করে।",
+        "note_pod_home_relocated": "পডের ভিতরে এর হোম ফোল্ডার পডে সরে যায়, আর সংরক্ষিত সাইন-ইনও সঙ্গে যায়।",
+        "note_refuses_unclassified_tools": "যে টুল কলের ধরন চেনা যায় না, তা অনুমোদন নয়, বাতিল করা হয়।",
         "retry": "আবার চেষ্টা করুন",
         "set_is_fixed_at_gateway_start": "এখানে কোন এজেন্টগুলি দেখা যাবে তা gateway চালু হওয়ার সময় নির্ধারিত হয়। পরিচালিত ডিপ্লয়মেন্ট নীতির মাধ্যমে এই সেট সীমিত করতে পারে; নীতি সম্পাদনা পরবর্তী চালুর সময় কার্যকর হয়।"
       },
@@ -10879,7 +10952,14 @@
           "crew_media_members": "Crew Members পেজ, একটি সদস্য নির্বাচিত এবং তার কার্যকলাপ প্যানেল খোলা।"
         },
         "crew_members": "ক্রু সদস্যরা",
-        "crew_members_desc": "Crew Members পেজ: আপনার সব এজেন্ট, প্রত্যেকের নিজস্ব থ্রেড। এখনও তৈরি হচ্ছে, তাই এটি চালু না করা পর্যন্ত দেখানো হয় না।"
+        "crew_members_desc": "Crew Members পেজ: আপনার সব এজেন্ট, প্রত্যেকের নিজস্ব থ্রেড। এখনও তৈরি হচ্ছে, তাই এটি চালু না করা পর্যন্ত দেখানো হয় না।",
+        "decisions": "সিদ্ধান্ত (Jev)",
+        "decisions_desc": "Jev একটি ছোট ও সস্তা সিদ্ধান্ত মডেল। এই প্রিভিউতে {{productName}} তিনটি জায়গায় ওকে একটি হ্যাঁ/না বা একটি বেছে নেওয়ার প্রশ্ন করে: তোমার মেসেজের জন্য কোন স্কিল লোড করা হবে, সদ্য শেখা স্কিলটি আগের কোনো স্কিলের পুনরাবৃত্তি কি না, এবং নির্ধারিত কাজের ফলাফলে নতুন কিছু আছে কি না। এই রিলিজে শুধু শ্যাডো: Jev-এর উত্তর {{productName}}-এর কাজ বদলায় না, প্রতিটি উত্তর এই মেশিনের লগে লেখা হয় যাতে দুটি মিলিয়ে দেখা যায়। এই সুইচ ব্রাউজারে নয়, {{productName}} যে মেশিনে চলে সেখানে সেভ হয়, তাই তুমি যে ডিভাইস থেকেই খোলো, এটি প্রযোজ্য।",
+        "decisions_egress": "চালু থাকলে তোমার মেসেজের লেখা আর স্কিলের বিবরণ এই মেশিন ছেড়ে যায়। ইন্টারনেটের মাধ্যমে সেগুলো সেই সিদ্ধান্ত সেবার কাছে পাঠানো হয় যেটি এই {{productName}}-এর জন্য সেট করা আছে। বন্ধ থাকলে কিছুই পাঠানো হয় না।",
+        "decisions_backend_required": "এই ড্যাশবোর্ড যে {{productName}} চালাচ্ছে সেটি এই সুইচের চেয়ে পুরোনো: তার সেটিংসে এখনও decisions সেকশন নেই, তাই চালু করার কিছু নেই। আগে সেটি আপডেট করো।",
+        "decisions_points": "নিচের প্রতিটি পরীক্ষা তার চালু মোড দেখায়।",
+        "decisions_config_unavailable": "সেটিংস পড়া যায়নি, তাই এই সুইচ দেওয়া হচ্ছে না। আবার চেষ্টা করতে রিলোড করো।",
+        "decisions_save_failed": "এই সেটিং সেভ করা যায়নি। সুইচ আবার সেভ করা মানটি দেখাচ্ছে।"
       },
       "kiroSignInCard": {
         "title": "Kiro সাইন-ইন",
@@ -10906,7 +10986,7 @@
       "feature_previews_moved": "ফিচার প্রিভিউ এখন সেটিংস > ডেভেলপার-এ আছে",
       "tabs": {
         "agentBackend": {
-          "description": "নতুন সেশন কোন এজেন্ট চালু করে — Kiro CLI, Claude Code বা KAS",
+          "description": "নতুন সেশন কোন এজেন্ট চালু করে",
           "label": "এজেন্ট ব্যাকএন্ড"
         },
         "archive": {
@@ -13007,7 +13087,11 @@
         "auto_download_save_failed": "স্বয়ংক্রিয় ডাউনলোড সেটিং সংরক্ষণ করা যায়নি।",
         "auto_update_setting_unavailable": "স্বয়ংক্রিয়-আপডেট সেটিং লোড করা যায়নি। লোড হওয়া পর্যন্ত সুইচটি ডিফল্ট দেখাবে।",
         "copy_failed_select_the_command_and_copy_it_manually": "কপি করা যায়নি। কমান্ডটি সিলেক্ট করে নিজে কপি করো।",
-        "update_info_unavailable": "অ্যাপ থেকে এই বিল্ডের সংস্করণ ও আপডেট চ্যানেল পড়া যায়নি।"
+        "update_info_unavailable": "অ্যাপ থেকে এই বিল্ডের সংস্করণ ও আপডেট চ্যানেল পড়া যায়নি।",
+        "app_lane_label": "অ্যাপ",
+        "app_lane_title": "তুমি যে ডেস্কটপ অ্যাপটি ইনস্টল করেছ। এর নিজস্ব সংস্করণ, নিচের সার্ভিস থেকে আলাদা।",
+        "gateway_lane_label": "গেটওয়ে",
+        "gateway_lane_title": "যে ব্যাকগ্রাউন্ড সার্ভিস তোমার এজেন্টগুলো চালায় এবং এই ড্যাশবোর্ড পরিবেশন করে। ব্রাঞ্চ ও কমিট চিপগুলো এর বিল্ড।"
       },
       "botChannelPanel": {
         "allowed_user_ids": "অনুমোদিত ইউজার ID",
@@ -13377,7 +13461,7 @@
         "developer_mode": "ডেভেলপার মোড",
         "developer_tools": "ডেভেলপার টুল",
         "feature_previews": "ফিচার প্রিভিউ",
-        "feature_previews_desc": "অপ্রকাশিত ফিচার ও পেজ। এখানে চালু না করা পর্যন্ত এই পেজগুলো সাইডবারে ও সর্বত্র অনুসন্ধান করুন-এ দেখা যায় না; তবে নিচের সুইচগুলো সেটিংস অনুসন্ধানে খুঁজে পাওয়া যায়। সেটিংটি শুধু এই ডিভাইসে প্রযোজ্য, আর এগুলো ইচ্ছাকৃতভাবেই অসম্পূর্ণ।",
+        "feature_previews_desc": "অপ্রকাশিত ফিচার ও পেজ। এখানে চালু না করা পর্যন্ত এই পেজগুলো সাইডবারে ও সর্বত্র সার্চ-এ দেখা যায় না; তবে নিচের সুইচগুলো সেটিংস অনুসন্ধানে খুঁজে পাওয়া যায়। এগুলো ইচ্ছাকৃতভাবেই অসম্পূর্ণ এবং শুধু এই ডিভাইসে প্রযোজ্য, যদি না কোনো কার্ডে অন্য কিছু লেখা থাকে।",
         "gateway": "গেটওয়ে",
         "open_developer_page": "ডেভেলপার পেজ খুলুন",
         "run_a_local_gateway": "লোকাল গেটওয়ে চালান",
@@ -14924,6 +15008,7 @@
       "show_controls": "কন্ট্রোল দেখাও"
     },
     "membersPage": {
+      "drawer_delegated_working": "অর্পিত কাজ চলছে",
       "agent_template": "এজেন্ট টেমপ্লেট",
       "configuration": "কনফিগারেশন",
       "crew_summary": "সদস্যের সারসংক্ষেপ",

@@ -19,7 +19,6 @@ from kiro_crew import (
     model_registry,
     resource_status,
     session_directive,
-    session_ledger_emit,
 )
 from kiro_crew.acp.client import (
     AcpAuthRequired,
@@ -54,7 +53,7 @@ from kiro_crew.acp.types import (
     classify_stop_reason,
 )
 from kiro_crew.acp_backends import ACP_BACKENDS_COMPACT
-from kiro_crew.agent_discovery import warm_project_agent_names
+from kiro_crew.agent_discovery import agent_welcome_message, warm_project_agent_names
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.autonudge import get_instance
@@ -67,6 +66,7 @@ from kiro_crew.config.loader import (
     resolve_agent_bindings,
     resolve_effective_model,
 )
+from kiro_crew.config.sections import ResolvedBindings
 from kiro_crew.connections import get_visible_providers
 from kiro_crew.constants import strip_control_comments
 from kiro_crew.context import prepare_store_vectors
@@ -83,6 +83,7 @@ from kiro_crew.context_management import (
     strip_plan_markers,
     validate_plan_format,
 )
+from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard.chat_delivery import (
     STEER_STATE_CONSUMED,
@@ -124,6 +125,7 @@ from kiro_crew.dashboard.chat_utils import (
     build_recovery_requeue,
     chat_done_payload,
     chunk_generation,
+    drained_to_thread,
     effective_session_key,
     expire_slack_options,
     is_harness_slash_command,
@@ -248,6 +250,7 @@ from kiro_crew.llm_helpers import (
 )
 from kiro_crew.mcp_discovery import kirocrew_managed_names
 from kiro_crew.members import member_lifecycle, record_activity
+from kiro_crew.messaging.dispatch import consume_reinjection, rearm_reinjection
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -309,6 +312,13 @@ from kiro_crew.security import (
 from kiro_crew.security.readonly_bash import is_read_only_bash, unsafe_bash_reason
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionClosingError, SpeculativeResumeRefused
+from kiro_crew.session_agent_selection import (
+    record_agent_selection,
+    record_provider_agent_switch,
+    resolve_session_agent_bindings,
+    restore_agent_selection,
+    session_agent_selection_kind,
+)
 from kiro_crew.slack.handler import post_linked_approval, resolve_linked_approval
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.trust_patterns import (  # noqa: F401 -- compatibility re-export
@@ -638,6 +648,65 @@ def _redact_display_text(text: str) -> str:
     text, _ = redact_exfiltration_urls(text)
     text, _ = redact_credentials(text)
     return text
+
+
+async def _surface_agent_welcome(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    agent: str,
+) -> None:
+    """Render *agent*'s ``welcomeMessage`` into *slot*, at most once per activation.
+
+    The one consumer of the agent-config field. An agent JSON may carry a
+    ``welcomeMessage`` — a usage hint its author wants the user to read when the
+    agent takes over — and this is the only place it reaches a user. Kiro Crew's
+    own bundled agents ship one, so the field is not a niche extension point.
+
+    Three properties are the whole design, and each one rules out an
+    alternative that looks simpler:
+
+    * **A transcript row, not prompt context.** Role ``notice``: durable (not in
+      ``_TRANSIENT_ROLES``, so it persists and survives a reload) but NOT one of
+      the ``user``/``assistant`` roles the history replay feeds back to the
+      model. Inlining the hint into the system prompt is the workaround the
+      issue reports as the thing to remove — it re-sends the text every turn.
+    * **One shot per activation.** Both call sites clear through
+      ``slot._welcomed_agent``, because a switch and the session start its own
+      reset produces are two events for ONE activation, and each path would
+      otherwise emit for the other.
+    * **Untrusted text.** The field is read from a user-writable, tool-shared
+      directory. ``NoticeCard`` renders a ``notice`` row as plain text (no
+      markdown, no HTML), the reader caps its length, and it is passed through
+      the same display redactors as any other foreign string reaching a
+      transcript — so a hint carrying a credential or an exfil URL cannot ship
+      one into the persisted window.
+
+    Best-effort: the disk read is offloaded (this runs on the gateway's shared
+    event loop) and a failure renders nothing rather than failing the turn.
+    """
+    if not agent:
+        # The default crew has no spec, so there is nothing to render — but the
+        # claim is RELEASED rather than merely skipped: leaving it set made
+        # A -> default -> A read as "already welcomed A" and swallow A's second
+        # activation, which the one-shot rule is per activation, not per slot.
+        slot._welcomed_agent = ""
+        return
+    if slot._welcomed_agent == agent:
+        return
+    # Claimed BEFORE the await: two events for one activation can both reach
+    # this point, and the offload yields the loop between the guard and the
+    # append. Recording the failure case as "welcomed" too is deliberate — a
+    # hint that could not be read is not worth retrying on every later event
+    # for the same agent.
+    slot._welcomed_agent = agent
+    try:
+        text = await asyncio.to_thread(agent_welcome_message, agent, project=slot.project or None)
+    except Exception:  # noqa: BLE001 - decoration must never fail a turn
+        logger.debug("Failed to read welcomeMessage for agent %r", agent, exc_info=True)
+        return
+    if not text:
+        return
+    append_and_surface(state, slot, "notice", _redact_display_text(text), "msg msg-info")
 
 
 def _redacted_hook_block(event: Any, pre_hook_results: Any) -> tuple[str, str]:
@@ -1134,6 +1203,11 @@ def _default_session_model(
     if slot.model or agent_model or cfg is None:
         return ""
     try:
+        kind = session_agent_selection_kind(
+            effective_session_key(slot), slot.agent or cfg.default_agent
+        )
+        if kind == "template":
+            return resolve_effective_model(cfg, slot.agent or None, selection_kind=kind)
         return resolve_effective_model(cfg, slot.agent or None)
     except Exception:  # noqa: BLE001 — includes StopIteration; see docstring
         logger.warning("Failed to resolve the default model for slot %s", slot.key, exc_info=True)
@@ -1237,7 +1311,7 @@ def _ledger_model(slot: Any, fallback: str = "") -> str:
     entry therefore states a model that was not used, in a file nothing rewrites.
 
     ``served_model`` is the session fact, and it is empty when the backend serves
-    its own default. The ledger records that emptiness rather than naming a model,
+    its own default. The crew log records that emptiness rather than naming a model,
     for the same reason it omits an unmeasured token count: absent beats false.
 
     *fallback* covers only a slot shape that cannot report the fact at all -- the
@@ -3957,10 +4031,10 @@ def _flush_segment(
     # is read from the slot's client and the emitter's live record, so there is one
     # source for it rather than a copy threaded through every caller; the step is
     # derived inside the emitter from the same record.
-    _ledger_sid_here = session_ledger_emit.session_id_of(getattr(slot, "_acp_client", None))
-    session_ledger_emit.on_message_sent(
+    _ledger_sid_here = crew_log_emit.session_id_of(getattr(slot, "_acp_client", None))
+    crew_log_emit.on_message_sent(
         _ledger_sid_here,
-        session_ledger_emit.live_turn(_ledger_sid_here),
+        crew_log_emit.live_turn(_ledger_sid_here),
         text=redacted,
         interrupted=interrupted,
     )
@@ -5049,7 +5123,7 @@ def schedule_eager_spawn(
 
 async def _recover_app_agent_binding(
     cfg: "KiroCrewConfig", slot: "_ChatSlot", *, project: str | None
-) -> Any:
+) -> ResolvedBindings:
     """Re-register an app-owned slot's resources from source, then re-resolve.
 
     The last recovery rung for an app slot whose agent stayed unresolved after
@@ -5096,7 +5170,14 @@ async def _recover_app_agent_binding(
             exc_info=True,
         )
     selected_agent = slot.agent
-    bindings = await asyncio.to_thread(resolve_agent_bindings, cfg, selected_agent or None, project)
+    bindings = await asyncio.to_thread(
+        resolve_session_agent_bindings,
+        resolve_agent_bindings,
+        cfg,
+        effective_session_key(slot),
+        selected_agent or None,
+        project,
+    )
     if slot.agent != selected_agent:
         raise _MemoryUnavailable(
             "memory_unavailable: agent changed during recovery; retry the turn"
@@ -5219,7 +5300,13 @@ async def _eager_spawn(
             try:
                 cfg = KiroCrewConfig.load()
                 loaded_cfg = cfg
-                bindings = await asyncio.to_thread(resolve_agent_bindings, cfg, _bound[0] or None)
+                bindings = await asyncio.to_thread(
+                    resolve_session_agent_bindings,
+                    resolve_agent_bindings,
+                    cfg,
+                    session_key,
+                    _bound[0] or None,
+                )
                 kiro_agent = bindings.kiro_agent
                 crew_alias = bindings.resolved_alias
                 agent_model = normalize_agent_model(bindings.model)
@@ -5247,7 +5334,11 @@ async def _eager_spawn(
                             exc_info=True,
                         )
                     bindings = await asyncio.to_thread(
-                        resolve_agent_bindings, cfg, _bound[0] or None
+                        resolve_session_agent_bindings,
+                        resolve_agent_bindings,
+                        cfg,
+                        session_key,
+                        _bound[0] or None,
                     )
                     kiro_agent = bindings.kiro_agent
                     crew_alias = bindings.resolved_alias
@@ -5257,6 +5348,8 @@ async def _eager_spawn(
                         kiro_agent = bindings.kiro_agent
                         crew_alias = bindings.resolved_alias
                         agent_model = normalize_agent_model(bindings.model)
+                if bindings.selection_kind == "template":
+                    crew_alias = ""
                 resolved_ok = bindings.requested_resolved
                 await asyncio.to_thread(
                     _require_session_memory_assignment, session_key, bindings.memory_store_name
@@ -5347,6 +5440,13 @@ async def _eager_spawn(
             # turn or a slot mutation may therefore have landed after the
             # initial gate. Nothing is registered yet, so simply stand down;
             # the current owner will allocate from its current bindings.
+            if (
+                state.get_slot(slot.key) is not slot
+                or slot.running
+                or _slot_binding(slot) != _bound
+            ):
+                return
+            await asyncio.to_thread(record_agent_selection, session_key, _bound[0], bindings)
             if (
                 state.get_slot(slot.key) is not slot
                 or slot.running
@@ -5854,12 +5954,12 @@ def _settle_consumed_steers(
                     _confirmed_ids = set()
                     slot._steer_confirmed = _confirmed_ids
                 _confirmed_ids.add(_cdid)
-            # No `message/steered` from here, and none from the delivery either --
-            # this family has no emitter yet, deliberately. Its POSITION needs two
-            # coroutines to agree, and neither of them can.
+            # No ledger entry from here, and none from the delivery either: the
+            # session vocabulary carries no steer type, because its POSITION needs
+            # two coroutines to agree and neither of them can.
             #
             # This echo is the only positive evidence that a turn consumed the text
-            # and the only site that knows which turn did, so this is where the
+            # and the only site that knows which turn did, so this is where such an
             # entry would have to be written. But the text the steer INTERRUPTED
             # reaches the log later, from the handler's segment cut, which runs when
             # `client.steer()` returns. Under stdin backpressure that RPC is still
@@ -5869,10 +5969,8 @@ def _settle_consumed_steers(
             #
             # Cutting the segment from here instead trades the defect for a worse
             # one: post-steer text arriving in the same window would be flushed
-            # above the steer row in the transcript. The honest fix is a resolver
-            # that owns both facts, which is the same reason `skill/*`,
-            # `background/completed`, `subagent/*` and `approval/*` have no emitter
-            # in this change. The type stays specified; a reader sees the steer as a
+            # above the steer row in the transcript. Recording it at all therefore
+            # waits on a resolver that owns both facts. A reader sees the steer as a
             # `message/received` on the next turn, which is what the transcript
             # shows too.
             # `remaining + [_msg]` is the live-steer list, NOT `_pending_steers`:
@@ -6153,7 +6251,7 @@ TURN_ACTOR_META_KEY = "turnActor"
 #: the producer at ``queue_append`` and is not derivable from the entry's text,
 #: which is the point: the banners these two injections wrap their text in
 #: (``CRON_NOTIFY_PREFIX``, ``SUBAGENT_COMPLETION_PREFIXES``) are strings a user
-#: can type, and attributing a turn in the session ledger is a claim a reader
+#: can type, and attributing a turn in the session's log is a claim a reader
 #: takes as fact. Same source, same reason as ``is_system_injection_item``.
 #:
 #: ``SYNTHETIC_RECOVERY_KIND`` is deliberately absent: a recovery's actor is
@@ -6179,7 +6277,7 @@ def _actor_for_queue_items(items: "list[dict]") -> str:
     for item in items:
         meta = item.get("meta")
         stamped = meta.get(TURN_ACTOR_META_KEY, "") if isinstance(meta, dict) else ""
-        if isinstance(stamped, str) and stamped in session_ledger_emit.ACTORS:
+        if isinstance(stamped, str) and stamped in crew_log_emit.ACTORS:
             return stamped
     return ""
 
@@ -6800,11 +6898,11 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         "_directive_user_origin": directive_user_origin,
         "_directive_channel_origin": directive_channel_origin,
     }
-    # Provenance for the session ledger, from the enqueue-time ``kind`` tag — the
+    # Provenance for the session's log, from the enqueue-time ``kind`` tag — the
     # same unforgeable source ``is_system_injection_item`` classifies on, and for
     # the same reason: the banner these injections wrap their text in is something
     # a user can type. Left unset when no consumed entry carries a mapped kind,
-    # which the ledger records as a user turn.
+    # which the crew log records as a user turn.
     _queue_actor = _actor_for_queue_items(consumed)
     if _queue_actor:
         _run_kwargs["_turn_actor"] = _queue_actor
@@ -6813,7 +6911,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     if _irreversible_delivery_callbacks:
         _run_kwargs["_on_irreversibly_consumed"] = _note_irreversibly_consumed
     # The row this turn runs carried its attachment lists through the queue, and this
-    # is the site that has the item, so the ledger's ids come from here. Collected
+    # is the site that has the item, so the crew log's ids come from here. Collected
     # across `consumed` because a row that carries attachments drains ALONE
     # (`carries_attachments`), so there is exactly one such row to read.
     _drained_attachment_meta: dict[str, list[str]] = {}
@@ -7124,10 +7222,10 @@ async def _run_chat(
     _directive_channel_origin: bool = False,
     # Who caused this turn, from the dispatch that knows -- a consumed queue
     # entry's enqueue-time ``kind`` tag, or an injector calling this runner
-    # directly. Recorded in the session ledger, so it must not be derivable from
+    # directly. Recorded in the session's log, so it must not be derivable from
     # the message TEXT: a user can type the cron or sub-agent banner, and the
-    # ledger's whole premise is that a reader takes it as fact. Empty means no
-    # dispatch claimed it, which the ledger records as ``user``.
+    # crew log's whole premise is that a reader takes it as fact. Empty means no
+    # dispatch claimed it, which the crew log records as ``user``.
     _turn_actor: str = "",
     regenerate_hint: str = "",
     _on_consumed: "Callable[[bool], None] | None" = None,
@@ -7236,7 +7334,7 @@ async def _run_chat(
     # message, which the user writes.
     _ledger_actor = _turn_actor or ("autonudge" if _directive_self_wake else "user")
 
-    # Append-only session ledger identity, declared HERE rather than only where
+    # Append-only the session's log identity, declared HERE rather than only where
     # it is filled in below: the mid-turn steer cut flushes a segment from a
     # nested closure, and a closure reading one of these before the turn path
     # assigns it would raise instead of simply recording nothing. Each is
@@ -7244,16 +7342,16 @@ async def _run_chat(
     # makes every emitter call a no-op.
     _ledger_sid = ""
     _turn_msg_boundary = 0
-    # The turn's ORDINAL for the ledger, kept separate from the message-slice
+    # The turn's ORDINAL for the crew log, kept separate from the message-slice
     # index above even though both start at the same value. The slice index is
     # reset when a mid-turn clear empties the message list, because the turn-stats
     # scan is relative to that list -- and a shared local would silently move the
-    # ledger's ordinal to 0 at the same moment, so the turn's own closers would
+    # crew log's ordinal to 0 at the same moment, so the turn's own closers would
     # name a turn that never started.
     _ledger_turn_no = 0
     _ledger_step = 0
     _ledger_step_t0 = time.monotonic()
-    # The turn's terminal ledger payload, captured at the terminal event and
+    # The turn's terminal crew log payload, captured at the terminal event and
     # emitted in the finally: the closers must follow the turn's last flushed
     # assistant message, which happens after the stream loop breaks.
     _ledger_terminal: "dict | None" = None
@@ -7444,7 +7542,7 @@ async def _run_chat(
         ONE helper for every recovery path, so the log copy cannot be forgotten by
         the next path added -- the same reason redaction lives at the emitter's
         boundary rather than at its call sites. Four handlers had this block
-        inline and none of them reached the ledger, so a turn that streamed text
+        inline and none of them reached the crew log, so a turn that streamed text
         the user watched got a closer saying it ended and nothing saying what it
         had produced.
 
@@ -7460,7 +7558,7 @@ async def _run_chat(
         _redacted = redact_credentials(redact_exfiltration_urls(assistant_text)[0])[0]
         slot.append("assistant", _redacted, "msg msg-a")
         _append_redaction_notice(slot, _redacted)
-        session_ledger_emit.on_message_sent(
+        crew_log_emit.on_message_sent(
             _ledger_sid,
             _ledger_turn_no,
             step=_ledger_step,
@@ -7539,10 +7637,9 @@ async def _run_chat(
             # `interrupted`: this text was CUT OFF, and this site is the one that
             # knows it -- it is cutting the segment precisely because a steer
             # arrived. Without the mark the log cannot tell a reply the user
-            # interrupted from one the model finished, which is most of what the
-            # absent `message/steered` entry would have said. It needs no
-            # coordination with the echo that proves consumption, which is why
-            # this fact is recordable and that one is not.
+            # interrupted from one the model finished. It needs no coordination
+            # with the echo that proves consumption, which is why this fact is
+            # recordable where a steer entry of its own is not.
             _flush_segment(
                 state,
                 slot,
@@ -8304,6 +8401,7 @@ async def _run_chat(
         # failure (see `provider_name`), and the default-model resolve below
         # needs the loaded object.
         loaded_cfg: KiroCrewConfig | None = None
+        bindings: ResolvedBindings | None = None
         # Read the provider into a local alongside the other bindings. Both model
         # branches below need it, and `cfg` is only bound inside the try — a
         # malformed config raises, the except swallows it, and touching
@@ -8359,8 +8457,10 @@ async def _run_chat(
                 selected_binding[1], operation="chat_turn", source="unknown"
             )
             bindings = await asyncio.to_thread(
+                resolve_session_agent_bindings,
                 resolve_agent_bindings,
                 cfg,
+                session_key,
                 selected_binding[0] or None,
                 selected_binding[1] or None,
             )
@@ -8399,8 +8499,10 @@ async def _run_chat(
                         exc_info=True,
                     )
                 bindings = await asyncio.to_thread(
+                    resolve_session_agent_bindings,
                     resolve_agent_bindings,
                     cfg,
+                    session_key,
                     selected_binding[0] or None,
                     selected_binding[1] or None,
                 )
@@ -8418,6 +8520,9 @@ async def _run_chat(
                     crew_alias = bindings.resolved_alias
                     memory_store = bindings.memory_store_name
                     agent_model = normalize_agent_model(bindings.model)
+            # A fallback alias supplies defaults, not this template's member identity.
+            if bindings.selection_kind == "template":
+                crew_alias = ""
             _app_agent_unresolved = bool(slot._app) and not bindings.requested_resolved
             if slot.agent and not slot._app and not bindings.requested_resolved:
                 from kiro_crew.memory_stores import UnknownMemoryStore
@@ -8485,6 +8590,12 @@ async def _run_chat(
             await prepare_store_vectors(
                 state.context_builder, memory_store, session_key=session_key
             )
+        _require_current_binding()
+        if bindings is not None:
+            await asyncio.to_thread(
+                record_agent_selection, session_key, selected_binding[0], bindings
+            )
+            _require_current_binding()
 
         # FAIL-LOUD: an app-owned slot whose agent STILL did not resolve after the
         # self-heal must NOT run the default agent — that generic-substitution is
@@ -8583,6 +8694,18 @@ async def _run_chat(
                 needs_reinjection=False,
             ).delivers_section
         )
+        # Session start on a named agent: the greeting belongs to the moment
+        # the agent becomes the one answering, which for a cold start is here.
+        # `kiro_agent` FIRST, because that is the spec that answers: a crew
+        # alias's `slot.agent` is the member the human picked, which names no
+        # agent spec, so the roster lookup finds nothing and the running
+        # template's hint is dropped. Falls back to `slot.agent` for an ordinary
+        # slot, where no template resolution happened and the two are the same
+        # name. Both empty means the default crew, which has no spec to carry a
+        # hint. Guarded per activation, so the cold start that an agent switch's
+        # own session reset produces does not re-emit the row it appended.
+        if is_new:
+            await _surface_agent_welcome(state, slot, kiro_agent or slot.agent)
         # Member activity pointer — once per SESSION, not per turn: the log
         # answers "which sessions did this member take part in", so a per-turn
         # append would inflate every count taken from it. `slot.agent` is the
@@ -8607,11 +8730,11 @@ async def _run_chat(
         # (the dashboard steer handler) can reach the running session's client
         # to inject a mid-turn steer. Cleared in the finally below.
         slot._acp_client = getattr(client, "client", None)
-        # Append-only session ledger (flag-gated, fail-soft). The id is read
+        # Append-only the session's log (flag-gated, fail-soft). The id is read
         # once here and reused at every emit site below, so a turn that never
         # got a session id emits nothing rather than guessing one. ``owner`` is
         # "default" because a crew-bound slot never reaches this local runner.
-        _ledger_sid = session_ledger_emit.session_id_of(client)
+        _ledger_sid = crew_log_emit.session_id_of(client)
         # This consumer implements the low-fidelity child downgrade (the
         # interactive card) — opt in so the handle-level fail-close gate
         # yields those events here instead of rejecting them itself.
@@ -8741,14 +8864,14 @@ async def _run_chat(
                 f"will be used automatically once it's offered again.",
                 "msg msg-info",
             )
-        # Append-only session ledger (flag-gated, fail-soft). Written HERE rather
+        # Append-only the session's log (flag-gated, fail-soft). Written HERE rather
         # than at session acquisition, because `model` has to name what the session
         # RUNS on and that is not settled until the verdict above: a withheld pin is
         # kept on the slot, and an unpinned slot's pin is backfilled, both after the
         # handle exists. This is still ahead of every turn entry, and the announce
         # decision itself is latched inside the emitter, so a retry after the header
         # landed cannot skip it.
-        session_ledger_emit.on_session_opened(
+        crew_log_emit.on_session_opened(
             _ledger_sid,
             agent=slot.agent or "",
             slot=slot.key,
@@ -9145,7 +9268,7 @@ async def _run_chat(
             # A compaction on the PREVIOUS turn dropped the session-start
             # context, taking the skills index with it. Read-and-clear the flag
             # here so this turn re-injects the index exactly once.
-            _needs_reinjection = state.sessions.consume_needs_reinjection(session_key)
+            _needs_reinjection = consume_reinjection(state.sessions, session_key)
             # Stand up this crew's OWN vector store before the offloaded build.
             # It has to happen here, on the loop, because init() is blocking file
             # IO (sqlite connect, migrations, a FAISS load) that build_message's
@@ -9543,7 +9666,7 @@ async def _run_chat(
         _turn_cost_usd = 0.0
         _turn_model = ""
         _turn_msg_boundary = len(slot.messages)
-        # The ledger ordinal is the ABSOLUTE durable position, not the window
+        # The crew log ordinal is the ABSOLUTE durable position, not the window
         # length. `slot.messages` is front-trimmed at `_MAX_SLOT_MESSAGES`, so past
         # that cap its length stops growing and every later turn drew the SAME
         # ordinal -- the emitter then read distinct turns as retries of one and
@@ -9569,7 +9692,7 @@ async def _run_chat(
             getattr(slot, "_disk_older_durable_count", 0) or 0
         ) + durable_row_count(slot.messages)
 
-        # Append-only session ledger: what the request was configured as, what
+        # Append-only the session's log: what the request was configured as, what
         # the gateway put in front of the model, and the body it accepted. All
         # three name ``_ledger_turn_no``, the one ordinal every entry of this
         # turn uses, and all three are written BEFORE the dispatch gates below --
@@ -9578,7 +9701,7 @@ async def _run_chat(
         # The accepted input first, then the two facts DERIVED from it. Context is
         # composed from this message, so a fold that read the composition first
         # would see a derived fact before its cause.
-        session_ledger_emit.on_message_received(
+        crew_log_emit.on_message_received(
             _ledger_sid,
             _ledger_turn_no,
             role="user",
@@ -9586,14 +9709,14 @@ async def _run_chat(
             source=telemetry_channel_of(session_key),
             attachments=_attachments,
         )
-        session_ledger_emit.on_request_configured(
+        crew_log_emit.on_request_configured(
             _ledger_sid,
             _ledger_turn_no,
             model=_ledger_model(slot, slot.model or agent_model),
             provider=provider_name,
             context_window=read_context_tokens(client)[1],
         )
-        session_ledger_emit.on_context_composed(
+        crew_log_emit.on_context_composed(
             _ledger_sid,
             _ledger_turn_no,
             blocks=slot_ctx_blocks,
@@ -9613,7 +9736,7 @@ async def _run_chat(
         try:
             if monitor_completion is not None:
                 if not await monitor_completion.authorize():
-                    session_ledger_emit.on_turn_refused(
+                    crew_log_emit.on_turn_refused(
                         _ledger_sid,
                         _ledger_turn_no,
                         "not_authorized",
@@ -9624,7 +9747,7 @@ async def _run_chat(
             state.sessions.begin_turn(session_key)
         except SessionClosingError:
             logger.info("Aborting dispatch for %s — gateway is shutting down", session_key)
-            session_ledger_emit.on_turn_refused(
+            crew_log_emit.on_turn_refused(
                 _ledger_sid,
                 _ledger_turn_no,
                 "gateway_closing",
@@ -9650,7 +9773,7 @@ async def _run_chat(
                 "was still being prepared (no session existed to cancel yet)",
                 session_key,
             )
-            session_ledger_emit.on_turn_refused(
+            crew_log_emit.on_turn_refused(
                 _ledger_sid,
                 _ledger_turn_no,
                 "stopped_before_dispatch",
@@ -9680,7 +9803,7 @@ async def _run_chat(
                 "the turn was being prepared",
                 session_key,
             )
-            session_ledger_emit.on_turn_refused(
+            crew_log_emit.on_turn_refused(
                 _ledger_sid,
                 _ledger_turn_no,
                 "replay_superseded_before_dispatch",
@@ -9694,7 +9817,7 @@ async def _run_chat(
             return
         if monitor_completion is not None:
             monitor_completion.mark_accepted()
-        # Append-only session ledger (flag-gated, fail-soft). Emitted HERE, after
+        # Append-only the session's log (flag-gated, fail-soft). Emitted HERE, after
         # every gate above has passed, because ``turn/started`` asserts that the
         # turn RAN: a start written before authorization leaves an orphan for each
         # refusal, and the interrupted-turn repair would later close it as though
@@ -9704,7 +9827,7 @@ async def _run_chat(
         # stop-generation read above and the stream's turn registration below --
         # the emitter hands the write to its own thread and returns -- so the
         # atomic span those two gates rely on is unchanged.
-        session_ledger_emit.on_turn_started(
+        crew_log_emit.on_turn_started(
             _ledger_sid,
             _ledger_turn_no,
             _ledger_actor,
@@ -9719,7 +9842,7 @@ async def _run_chat(
         # dispatch would leave a step/started for a model call that never ran and
         # never completes -- the same reason turn/started waits for the gates -- and
         # the step's duration would include the time the gates took.
-        _ledger_step = session_ledger_emit.on_step_started(_ledger_sid, _ledger_turn_no)
+        _ledger_step = crew_log_emit.on_step_started(_ledger_sid, _ledger_turn_no)
         _ledger_step_t0 = time.monotonic()
         event_stream = client.stream_command(message) if is_slash else client.stream(full_message)
         async for event in event_stream:
@@ -9801,7 +9924,7 @@ async def _run_chat(
                     # went on to produce this text, so the tools it was waiting on
                     # did finish. The turn-end closers cannot say that and take the
                     # emitter's `unknown` default instead.
-                    session_ledger_emit.close_open_tool_calls(
+                    crew_log_emit.close_open_tool_calls(
                         _ledger_sid, _ledger_turn_no, status="completed"
                     )
                     # Text after a tool group means the model was called AGAIN:
@@ -9809,13 +9932,13 @@ async def _run_chat(
                     # This transition is the only per-model-call boundary the
                     # stream exposes -- its terminal event is the turn's, not a
                     # call's -- so the step is derived here rather than reported.
-                    session_ledger_emit.on_step_completed(
+                    crew_log_emit.on_step_completed(
                         _ledger_sid,
                         _ledger_turn_no,
                         _ledger_step,
                         ms=int((time.monotonic() - _ledger_step_t0) * 1000),
                     )
-                    _ledger_step = session_ledger_emit.on_step_started(_ledger_sid, _ledger_turn_no)
+                    _ledger_step = crew_log_emit.on_step_started(_ledger_sid, _ledger_turn_no)
                     _ledger_step_t0 = time.monotonic()
                 in_tool_group = False
                 # The streamed delta is NOT written to the ledger. Redacting each
@@ -9921,7 +10044,7 @@ async def _run_chat(
                 # emitting the call first put the tool ahead of the text that
                 # preceded it and a fold would read the narration as the call's
                 # result.
-                session_ledger_emit.on_tool_called(
+                crew_log_emit.on_tool_called(
                     _ledger_sid,
                     _ledger_turn_no,
                     name=event.tool_name or "",
@@ -9930,7 +10053,7 @@ async def _run_chat(
                     call_id=event.tool_call_id or "",
                     # Digested to a hash and a size, never recorded: that answers
                     # "same arguments as last time" and "how big was it" without
-                    # the ledger becoming where a shell command's secrets land.
+                    # the crew log becoming where a shell command's secrets land.
                     # This is the already-redacted display string, so a value the
                     # user could not see is not hashed into a durable file either.
                     args=event.tool_input or "",
@@ -10270,7 +10393,7 @@ async def _run_chat(
                         if event.refusal
                         else (event.tool_status or ("completed" if event.tool_final else "unknown"))
                     )
-                    session_ledger_emit.on_tool_completed(
+                    crew_log_emit.on_tool_completed(
                         _ledger_sid,
                         _ledger_turn_no,
                         name=event.tool_name or "",
@@ -12048,7 +12171,7 @@ async def _run_chat(
                 # Advance the durable POSITION base by the rows this clear
                 # evicts, exactly as the trim path does (`_ChatSlot.append`)
                 # and as every restore path recomputes it. The base plus the
-                # window's durable rows is the ledger turn ordinal and the
+                # window's durable rows is the crew log turn ordinal and the
                 # session_control `since` cursor space; emptying the window
                 # without crediting the base made the next turn draw an
                 # ordinal an earlier turn already wrote (two unrelated turns
@@ -12141,7 +12264,45 @@ async def _run_chat(
                     # out of a turn that must not continue.
                     break
                 elif new_agent:
+                    # A live provider event can change a template selection.
+                    # Restore cannot infer that authority from a different
+                    # transcript name, including a partially persisted switch.
+                    needs_session_reset = True
+                    _produced_visible_output = True
+                    _require_current_binding()
+                    switch_cfg = await asyncio.to_thread(KiroCrewConfig.load)
+                    _require_current_binding()
+                    switch_writer = asyncio.create_task(
+                        asyncio.to_thread(
+                            record_provider_agent_switch,
+                            switch_cfg,
+                            session_key,
+                            slot.agent or None,
+                            new_agent,
+                            slot.project or None,
+                        )
+                    )
+                    switch_change = None
+                    switch_cancelled = None
+                    try:
+                        while True:
+                            try:
+                                switch_change = await asyncio.shield(switch_writer)
+                                break
+                            except asyncio.CancelledError as exc:
+                                if switch_writer.cancelled():
+                                    raise
+                                # Closing the turn cannot abandon a thread that
+                                # may still publish a different durable agent.
+                                switch_cancelled = exc
+                        if switch_cancelled is not None:
+                            raise switch_cancelled
+                        _require_current_binding()
+                    except (Exception, asyncio.CancelledError):
+                        await drained_to_thread(restore_agent_selection, session_key, switch_change)
+                        raise
                     slot.agent = new_agent
+                    selected_binding = _current_binding()
                     assistant_text = ""
                     _wsred.reset()
                     _produced_visible_output = True
@@ -12150,11 +12311,15 @@ async def _run_chat(
                         f"🔄 Switched to agent: {new_agent}",
                         "msg msg-a",
                     )
+                    # The new agent's own greeting, beside the line announcing
+                    # it. After the switch row so the two read in causal order,
+                    # and after `slot.agent` is set so the guard is keyed on the
+                    # agent now active.
+                    await _surface_agent_welcome(state, slot, new_agent)
                     state.broadcast_ws(
                         "slot_agent_switch",
                         {"slot": slot.key, "agent": new_agent},
                     )
-                    needs_session_reset = True
             elif event.kind == EVENT_MCP_OAUTH_REQUEST:
                 # kiro-cli emits this notification when an MCP server's token
                 # has expired or never existed. Surface as an inline banner —
@@ -12505,7 +12670,7 @@ async def _run_chat(
                 #      joins. Attributing the sample to the slot would file every
                 #      linked Slack or Telegram turn under ``dashboard`` — the
                 #      same blind spot in a new place.
-                # The turn's ledger closers are STASHED, not emitted here. This
+                # The turn's crew log closers are STASHED, not emitted here. This
                 # point is inside the stream loop, and the turn's LAST assistant
                 # message is flushed after the loop breaks -- so emitting now puts
                 # `turn/completed` in the file ahead of a `message/sent` belonging
@@ -14593,12 +14758,12 @@ async def _run_chat(
             and not _should_suppress_requeue(slot)
             and (_fb_candidate := await _fallback_swap_for_turn(slot, client)) is not None
         ):
-            # Append-only session ledger (flag-gated, fail-soft). Emitted HERE,
+            # Append-only the session's log (flag-gated, fail-soft). Emitted HERE,
             # in the branch body, so it runs after _fallback_swap_for_turn has
             # released slot._model_pick_lock rather than while it is held. This
             # is the one model decision a transcript cannot answer afterwards:
             # the user picked the primary and the turn ran somewhere else.
-            session_ledger_emit.on_model_selected(
+            crew_log_emit.on_model_selected(
                 _ledger_sid, _fb_candidate, "fallback", turn=_ledger_turn_no
             )
             # ── Throttle-exhaustion model fallback (agent.fallback_model) ──
@@ -15113,7 +15278,7 @@ async def _run_chat(
         if not (isinstance(exc, MemoryStartupUnavailable) and not _memory_preparation_admitted):
             await state.sessions.record_failure(session_key)
     finally:
-        # The turn's ledger closers, in the one order a reader can trust: every
+        # The turn's crew log closers, in the one order a reader can trust: every
         # `message/sent` for this turn has now been flushed, so the tool closer,
         # the last step's completion and the turn's own completion land after the
         # text they close over. Emitted HERE rather than at the terminal event
@@ -15124,16 +15289,16 @@ async def _run_chat(
             # before the turn completes so a turn never completes with an open
             # call inside it -- the shape the interrupted-turn repair exists to
             # fix, which a live turn must not produce in the first place.
-            session_ledger_emit.close_open_tool_calls(_ledger_sid, _ledger_turn_no)
+            crew_log_emit.close_open_tool_calls(_ledger_sid, _ledger_turn_no)
             # The turn's LAST model call has no tool group after it to close it,
             # so the turn's end does.
-            session_ledger_emit.on_step_completed(
+            crew_log_emit.on_step_completed(
                 _ledger_sid,
                 _ledger_turn_no,
                 _ledger_step,
                 ms=int((time.monotonic() - _ledger_step_t0) * 1000),
             )
-            session_ledger_emit.on_turn_completed(_ledger_sid, _ledger_turn_no, **_ledger_terminal)
+            crew_log_emit.on_turn_completed(_ledger_sid, _ledger_turn_no, **_ledger_terminal)
             _ledger_terminal = None
             _ledger_turn_open = False
         elif _ledger_turn_open:
@@ -15151,14 +15316,14 @@ async def _run_chat(
             # `_record_model` are assigned inside the terminal-event arm, so
             # naming them here would raise inside a `finally` and mask the very
             # exception that brought us here.
-            session_ledger_emit.close_open_tool_calls(_ledger_sid, _ledger_turn_no)
-            session_ledger_emit.on_step_completed(
+            crew_log_emit.close_open_tool_calls(_ledger_sid, _ledger_turn_no)
+            crew_log_emit.on_step_completed(
                 _ledger_sid,
                 _ledger_turn_no,
                 _ledger_step,
                 ms=int((time.monotonic() - _ledger_step_t0) * 1000),
             )
-            session_ledger_emit.on_turn_failed(
+            crew_log_emit.on_turn_failed(
                 _ledger_sid,
                 _ledger_turn_no,
                 error=_ledger_error,
@@ -15270,11 +15435,12 @@ async def _run_chat(
         # Re-arming here (the one block on EVERY exit path) makes the next turn
         # rebuild the member section; the rules read inside stays fail-closed
         # until the user repairs or clears the file.
-        if (_needs_reinjection or _member_session_start_pending) and not _turn_landed:
-            try:
-                state.sessions.mark_needs_reinjection(session_key)
-            except Exception:
-                logger.debug("re-arming skills re-injection failed", exc_info=True)
+        rearm_reinjection(
+            state.sessions,
+            session_key,
+            consumed=_needs_reinjection or _member_session_start_pending,
+            landed=_turn_landed,
+        )
         # ── AutoNudge: (re)arm the idle timer on EVERY turn-exit path. ──
         # Must be in finally, not the happy path: a turn that ends via timeout
         # / AcpProcessDied / AcpError / cancel would otherwise never re-arm,

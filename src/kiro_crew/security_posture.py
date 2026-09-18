@@ -113,10 +113,10 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "source-content digests remain server-side.",
     ),
     (
-        "Session ledger entries",
-        "session_ledger_emit.py",
-        "Message bodies written to the append-only per-session ledger under "
-        "`<home>/ledgers/sessions/` -- what the user typed and what the model "
+        "Crew log entries",
+        "crew_log/emit.py",
+        "Message bodies written to the append-only per-session crew log under "
+        "`<home>/crew-log/sessions/` -- what the user typed and what the model "
         "answered. This sink is a FILE rather than "
         "a response, so what it writes outlives the process and is read back "
         "later by folds and the session panel; that makes it an output boundary "
@@ -224,15 +224,6 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "role ARN, and an endpoint override can carry an inline-credential URL -- "
         "so the first stderr line goes through the shared credential + "
         "exfiltration-URL chain at the source, before it is put on an `Identity`.",
-    ),
-    (
-        "Event backfill report samples",
-        "events/backfill.py",
-        "One serialized sample event per kind in the backfill validator's "
-        "report, printed to CLI stdout. Store fields folded into samples "
-        "(subagent task previews, cron names) can carry tokens the operator "
-        "pasted into a task, so each sample passes the shared two-pass "
-        "redaction before leaving the process.",
     ),
     (
         "Browser CLI install failures",

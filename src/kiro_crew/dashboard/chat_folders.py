@@ -17,8 +17,15 @@ from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_tags import tags_write_lock, validate_folder_tag_ids
 from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
 from kiro_crew.dashboard.create_rate_limit import FOLDER_CREATE, allow_create
+from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot, derive_caller_app
+from kiro_crew.dashboard.token_auth import (
+    KNOWN_INTERNAL_CALLERS,
+    app_owns_transcript,
+    effective_request_app,
+    refuse_unattributable_caller,
+    request_origin,
+)
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.loop_lock import LoopBoundLock
@@ -246,53 +253,20 @@ async def _unhide_folder(state: DashboardState, folder_id: str) -> bool:
     return await state.mutate_folders(_clear)
 
 
-# The internal callers this module recognizes on ``X-Internal-Caller``.
-# Exact-listed and ratcheted in ``test_chat_folder_audit_origin.py``: adding a
-# caller here must be a conscious edit paired with a test, never a silent
-# widen — the point of the header is that a NEW internal caller surfaces as
-# ``unknown-internal`` in the audit until someone decides what to call it,
-# instead of silently inheriting another component's label.
-_KNOWN_INTERNAL_CALLERS = frozenset({"kirocrew-dashboard"})
+# The internal callers this module recognizes on ``X-Internal-Caller`` — the
+# shared set, ratcheted in ``test_chat_folder_audit_origin.py`` under this name.
+_KNOWN_INTERNAL_CALLERS = KNOWN_INTERNAL_CALLERS
 
 
 def _audit_origin(request: web.Request) -> tuple[str, str]:
     """SEL ``(source, caller)`` for a folder mutation.
 
-    ``source`` stays in SEL's documented *interface* vocabulary (``dashboard``,
-    ``mcp``, ...) so operator queries like ``source == "mcp"`` keep matching
-    every MCP-driven event uniformly; the validated component identity rides
-    in ``caller``, which SEL already carries for exactly this purpose.
-
-    These endpoints are driven by BOTH the browser and the ``chat_folder_*``
-    MCP tools (``/api/chat`` is a mixed-internal path). A request without
-    ``X-Internal-Secret`` is the browser: ``("dashboard", "dashboard")``. An
-    internal request names its component in ``X-Internal-Caller`` (attached by
-    the MCP stdio servers' shared loopback request helpers — see
-    ``mcp_shared.set_internal_caller``), validated against
-    ``_KNOWN_INTERNAL_CALLERS``. Inferring the identity from the secret alone
-    was correct only while exactly one internal caller existed, and would
-    silently mislabel every write the moment a second one is added.
-
-    Trust model: the secret is verified by the token-auth middleware before
-    this handler runs, so authentication is settled here. The caller header is
-    ATTRIBUTION on top of that — it grants nothing (a browser sending the
-    header without the secret still audits as ``dashboard``), and an
-    unrecognized or missing value on an authenticated internal request is
-    recorded as ``caller="unknown-internal"`` with a warning rather than
-    trusted into the audit log.
+    The rule is :func:`token_auth.request_origin`, shared with the tag routes so
+    a new internal caller is classified once. The warning for an unrecognized
+    caller is emitted under this module's logger, where the folder audit tests
+    listen for it.
     """
-    if request.headers.get("X-Internal-Secret") is None:
-        return "dashboard", "dashboard"
-    caller = (request.headers.get("X-Internal-Caller") or "").strip()
-    if caller in _KNOWN_INTERNAL_CALLERS:
-        return "mcp", caller
-    logger.warning(
-        "internal folder write without a recognized X-Internal-Caller (got %r) — "
-        "audited as unknown-internal; a new internal caller must be added to "
-        "_KNOWN_INTERNAL_CALLERS alongside its ratchet test",
-        caller[:64],
-    )
-    return "mcp", "unknown-internal"
+    return request_origin(request, what="folder write", log=logger)
 
 
 async def api_chat_folders(request: web.Request) -> web.Response:
@@ -384,45 +358,11 @@ def _refuse_unattributable_caller(
 ) -> web.Response | None:
     """403 when the caller NAMES a dashboard slot that is gone, else None.
 
-    ``_effective_request_app`` answers ``""`` both for the person and for a
-    caller it cannot place, and the tree-shaping rules read ``""`` as the
-    person's full authority. That is sound for a caller that never had a slot --
-    a Slack thread, a channel session, the person's own cron -- but not for a
-    ``dashboard:`` key, which NAMES a slot: absence there is not "nothing to
-    confine me to", it is "the app I would have been confined to is exactly what
-    got popped". A tab closing while one of its tool calls is still in flight
-    produces precisely that, because the slot is popped synchronously without
-    draining in-flight MCP calls.
-
-    So an app-owned session going through that race would otherwise arrive here
-    with an empty scope and be handed the person's authority over the person's
-    own folders. ``mcp_dashboard._caller_app_scope`` already refuses this class
-    for its own tool set; ``caller_names_a_missing_slot`` exists so a route
-    outside that set applies the same rule, and it is deliberately NOT in the
-    middleware -- a popped slot no longer says whose tab it was, so refusing
-    there would also refuse the person's own in-flight calls on every internal
-    route at once. Each route that could not attribute a write decides for
-    itself, and a write to the shared folder tree is one of those.
+    The rule and its rationale are :func:`token_auth.refuse_unattributable_caller`,
+    shared with the tag routes; this wrapper fixes the audit ``operation`` for the
+    folder-tree writes and keeps the name the folder routes call.
     """
-    if caller_names_a_missing_slot(
-        getattr(state, "_slots", None), request.headers.get("X-Session-Key", "")
-    ):
-        sel().log_api_access(
-            caller="unattributable",
-            operation="chat.folder_write",
-            outcome="denied",
-            source="app_isolation",
-            resources=request.path,
-            error="caller names a dashboard slot that is gone",
-        )
-        return web.json_response(
-            {
-                "error": "the calling session is gone, so this write cannot be attributed",
-                "code": "caller_unattributable",
-            },
-            status=403,
-        )
-    return None
+    return refuse_unattributable_caller(state, request, "chat.folder_write")
 
 
 def _folder_owner_app(folder: dict[str, Any]) -> str:
@@ -933,15 +873,17 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
             if request_app and dest is not None and _folder_owner_app(dest) != request_app:
                 return False, "forbidden_parent"
         if (
-            reparenting
-            and request_app
+            request_app
+            and (reparenting or "order" in changes)
             and _subtree_holds_foreign_folder(folders, root_id=fid, request_app=request_app)
         ):
-            # A move takes the whole subtree with it, so a folder the person
-            # nested inside this one would be relocated by an app's write. Only
-            # the reparent is gated: a rename, a colour or a collapse changes
-            # nothing about where the descendants sit. Checked for a move to the
-            # top level too -- "" is still a move.
+            # A move OR a reposition relocates the whole subtree with it, so a
+            # folder the person nested inside this one would be relocated by an
+            # app's write. Both a reparent and an order change are gated: a
+            # rename, a colour or a collapse changes nothing about where the
+            # descendants sit, but a reposition changes where the subtree
+            # renders exactly as a reparent does. Checked for a move to the top
+            # level too -- "" is still a move.
             return False, "foreign_descendant"
         target.update(changes)
         if not target.get("color"):
@@ -1016,6 +958,202 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         resources=fid,
     )
     return web.json_response(folder)
+
+
+#: The most rows one reorder request may carry. A reorder writes one row per
+#: sibling touched, and the store itself is capped at :data:`MAX_CHAT_FOLDERS`,
+#: so a request naming more entries than there can be folders is malformed
+#: rather than large. The cap is the folder ceiling, not a smaller number: a
+#: person renumbering a flat tree of the maximum size sends exactly that many
+#: rows in one legitimate drag.
+_MAX_REORDER_ENTRIES = MAX_CHAT_FOLDERS
+
+#: Byte ceiling for a reorder body, sized from the entry cap rather than the
+#: shared 64 KB default: a legitimate max-size flat-tree reorder carries
+#: :data:`_MAX_REORDER_ENTRIES` entries, each ``{"id": "<uuid>", "order": <int>}``
+#: comfortably under 256 bytes with its JSON envelope, so 500 rows can exceed
+#: the shared default. The bound is that entry budget, so the largest legal
+#: request is admitted while an oversized body is rejected before decoding.
+_MAX_REORDER_BODY_BYTES = _MAX_REORDER_ENTRIES * 256
+
+
+async def api_chat_folder_reorder(request: web.Request) -> web.Response:
+    """POST /api/chat/folders/reorder -- set several folders' ``order`` atomically.
+
+    The one way to express a reorder as a SINGLE transaction. ``PATCH
+    /api/chat/folders/{id}`` takes one row per request, so a caller renumbering
+    several siblings issues N requests with no transaction between them: a
+    failure partway leaves the tree carrying a mix of old and new ``order``
+    numbers until the action is repeated. This endpoint applies the whole list
+    in one ``mutate_folders`` pass under the folder-store lock, all-or-none -- so
+    a rejected row leaves the stored order exactly as it was, never half-applied.
+
+    Body: ``{"orders": [{"id": str, "order": int}, ...]}``. Every entry is
+    validated into a pending map BEFORE the lock is taken (the same shape
+    discipline ``api_chat_folder_update`` uses for its single row), so a
+    malformed request is a 400 that never touches the store.
+
+    Ownership is re-decided per row INSIDE the lock, exactly as ``_apply`` does
+    for one row: an app may reorder only the folders it owns, and a batch naming
+    one it does not is refused whole. Row ownership is not the whole rule --
+    repositioning a folder relocates its whole subtree, so a row the app owns
+    whose descendants include the person's is refused too, the same violation
+    the reparent PATCH refuses one level down. Both live here because the reorder
+    that composes these writes is the one place under the lock that sees the
+    subtree, so a positioning caller states the whole renumber as a single batch
+    and relies on this endpoint to authorize it.
+
+    Reorder touches only ``order``: it never reparents, renames, recolors or
+    retags. A row naming a folder absent from the store is a 404 for the whole
+    batch (the reorder the caller computed describes a tree that has since
+    shifted), so no partial renumber lands against a shifted tree.
+    """
+    state: DashboardState = request.app["state"]
+    if (refusal := _refuse_unattributable_caller(state, request)) is not None:
+        return refusal
+    request_app = _effective_request_app(state, request)
+    body, body_err = await read_bounded_json(request, max_bytes=_MAX_REORDER_BODY_BYTES)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
+    raw_orders = body.get("orders")
+    if not isinstance(raw_orders, list):
+        return web.json_response(
+            {"error": "orders must be an array", "code": "orders_not_array"}, status=400
+        )
+    if len(raw_orders) > _MAX_REORDER_ENTRIES:
+        return web.json_response(
+            {"error": "too many folders in one reorder", "code": "orders_too_many"}, status=400
+        )
+    # Validate every entry into an id -> order map BEFORE the lock is taken, the
+    # same shape discipline api_chat_folder_update applies to its single row: a
+    # malformed batch is a 400 that never touches the store. Last-writer-wins on
+    # a duplicate id, matching how the store tolerates two rows sharing a number.
+    pending: dict[str, int] = {}
+    for entry in raw_orders:
+        if not isinstance(entry, dict):
+            return web.json_response(
+                {"error": "each order entry must be an object", "code": "order_entry_invalid"},
+                status=400,
+            )
+        fid = str(entry.get("id") or "")
+        if not fid:
+            return web.json_response(
+                {"error": "each order entry needs an id", "code": "order_id_missing"}, status=400
+            )
+        # A non-numeric, null, or non-finite order is caller error, not a server
+        # fault -- matching the single-row PATCH, which skips such a field. Here
+        # the field IS the request, so a bad value is a 400 rather than a
+        # silent skip: a caller sending it meant to move the row, and dropping
+        # it would leave that row where the reorder did not want it.
+        #
+        # ``type(...) is int`` not ``isinstance`` and not a bare ``int(...)``:
+        # a JSON boolean is a Python ``bool`` (an ``int`` subclass, so ``True``
+        # would slip through as 1) and a JSON float like ``1.5`` would be
+        # truncated by ``int()`` -- both violate the integer-only contract, so
+        # they are 400s, not coerced.
+        try:
+            order_val = entry["order"]
+        except KeyError:
+            return web.json_response(
+                {"error": "each order must be an integer", "code": "order_not_int"}, status=400
+            )
+        if type(order_val) is not int:
+            return web.json_response(
+                {"error": "each order must be an integer", "code": "order_not_int"}, status=400
+            )
+        pending[fid] = order_val
+
+    if not pending:
+        # An empty reorder changes nothing; report success without a store write.
+        return web.json_response({"ok": True})
+
+    def _apply(folders: list[dict[str, Any]]) -> tuple[bool, str]:
+        by_id = {f["id"]: f for f in folders}
+        # Re-find and re-authorize EVERY row under the lock before mutating any,
+        # so the pass is all-or-none: a missing or foreign row aborts with the
+        # store untouched, never half-renumbered. Mirrors _apply's single-row
+        # re-find + ownership check, applied to each entry.
+        for fid, _order in pending.items():
+            target = by_id.get(fid)
+            if target is None:
+                return False, "not_found"
+            if request_app and _folder_owner_app(target) != request_app:
+                return False, "not_owned"
+            # Ownership of the row itself is not the whole rule: repositioning a
+            # folder relocates its whole subtree, so a row the app owns whose
+            # descendants include the person's relocates theirs -- the same
+            # violation the reparent PATCH refuses one level down, reached here
+            # for a position that sends no parent_id. The reorder that composes
+            # these writes is the only place that sees the subtree, so the
+            # subtree rule is enforced here, per row, before any write lands.
+            if request_app and _subtree_holds_foreign_folder(
+                folders, root_id=fid, request_app=request_app
+            ):
+                return False, "subtree_not_owned"
+        changed = False
+        for fid, order in pending.items():
+            target = by_id[fid]
+            if target.get("order") != order:
+                target["order"] = order
+                changed = True
+        return changed, ""
+
+    err = await state.mutate_folders(_apply)
+    if err == "not_found":
+        # A folder named in the batch is absent from the store: it was deleted
+        # between the caller reading the tree and this write. The reorder
+        # describes a tree that has since changed, so none of it lands.
+        return web.json_response(
+            {"error": "a folder in the reorder no longer exists", "code": "folder_not_found"},
+            status=404,
+        )
+    if err == "not_owned":
+        # One row named a folder this app does not own. Refused whole, and
+        # distinguished only in the audit -- the same one code for the caller
+        # api_chat_folder_update uses, so the response reports no folder as
+        # foreign.
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.folder_reorder",
+            outcome="denied",
+            source="app_isolation",
+            resources=",".join(list(pending)[:10]),
+            error="app cannot reorder a folder it does not own",
+        )
+        return web.json_response(
+            {"error": "this app does not own one of those folders", "code": "folder_not_owned"},
+            status=403,
+        )
+    if err == "subtree_not_owned":
+        # A row the app owns has descendants the person owns. Repositioning it
+        # relocates theirs, which is the reparent-path violation reached one
+        # level down, so the whole batch is refused with the store untouched.
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.folder_reorder",
+            outcome="denied",
+            source="app_isolation",
+            resources=",".join(list(pending)[:10]),
+            error="app cannot reposition a folder whose subtree holds the person's",
+        )
+        return web.json_response(
+            {
+                "error": "one of those folders contains folders this app does not own",
+                "code": "folder_not_owned",
+            },
+            status=403,
+        )
+    state.push_slots_update()
+    source, caller = _audit_origin(request)
+    sel().log_api_access(
+        caller=caller,
+        operation="chat.folder_reorder",
+        outcome="allowed",
+        source=source,
+        resources=",".join(list(pending)[:10]),
+    )
+    return web.json_response({"ok": True})
 
 
 async def api_chat_folder_delete(request: web.Request) -> web.Response:
@@ -1188,29 +1326,12 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-def _effective_request_app(state: DashboardState, request: web.Request) -> str:
-    """App identity to enforce ownership against, or "" for the dashboard user.
-
-    Reads the claim ``token_auth_middleware`` publishes, and re-derives through
-    the SAME shared rule (``token_auth.derive_caller_app``) when it is absent.
-
-    The internal-secret transport (the managed MCP set) carries no app claim of
-    its own, so the middleware derives one for every route on that transport.
-    The re-derivation here is defense-in-depth for a caller that reaches the
-    handler without having passed that branch, and it calls the shared function
-    rather than restating the rule so the two can never disagree.
-
-    Never read from request BODY or tool arguments — a caller that could name
-    its own scope could name someone else's.
-    """
-    declared = request.get("app", "")
-    if declared:
-        return str(declared)
-    app_name = derive_caller_app(
-        getattr(state, "_slots", None),
-        request.headers.get("X-Session-Key", ""),
-    )
-    return app_name
+# The authorization-identity helper is homed in ``token_auth`` beside the rule it
+# wraps; this module keeps its historical private name because
+# ``chat_folder_scaffold`` imports it from here and
+# ``test_internal_secret_app_identity_3690`` addresses it as
+# ``chat_folders._effective_request_app``.
+_effective_request_app = effective_request_app
 
 
 # Per-STATE metadata-write transaction lock for the slot metadata PATCH
@@ -1273,6 +1394,10 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     # app holding this route could reach a session it does not own. Reported as
     # the same 404 for both reasons on purpose — a distinct code per reason
     # would turn it into an existence oracle for slots the caller cannot see.
+    # A caller whose tab closed mid-call is refused first: its derived app
+    # would be "" and read as the person (the same guard the tree writes apply).
+    if (refusal := refuse_unattributable_caller(state, request, "chat.slot_folder")) is not None:
+        return refusal
     request_app = _effective_request_app(state, request)
     if request_app and getattr(slot, "_app", "") != request_app:
         sel().log_api_access(
@@ -1296,6 +1421,20 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     # save's expected_history_key pin together keep this request's write on
     # the transcript it was authorized against.
     authorized_history_key = slot_history_key(slot)
+    # ``_app`` says who owns the slot OBJECT; the write persists into the
+    # TRANSCRIPT that key names, which a linked slot can point at another
+    # owner's session. Both must resolve to the caller's app (same rule as
+    # ``chat_tags.api_chat_slot_tags``), same indistinguishable 404.
+    if not app_owns_transcript(state._slots, request_app, authorized_history_key):
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.slot_folder",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={slot.key}",
+            error="app does not own this slot's transcript",
+        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
     try:
         body = await request.json()
     except Exception:
@@ -1333,6 +1472,7 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
             state._slots.get(name) is not slot
             or slot_history_key(slot) != authorized_history_key
             or (expected_created and slot.created_at != expected_created)
+            or not app_owns_transcript(state._slots, request_app, authorized_history_key)
         ):
             source, caller = _audit_origin(request)
             sel().log_api_access(
@@ -1505,7 +1645,11 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     # `/api/chat` could otherwise list a foreign slot and PATCH it into (or out
     # of) crew mode, changing a session it does not own. One code for both
     # reasons on purpose — a distinct code per reason would turn this 404 into an
-    # existence oracle for slots the caller may not know about.
+    # existence oracle for slots the caller may not know about. A caller whose
+    # tab closed mid-call is refused first: its derived app would be "" and read
+    # as the person (the same guard the tree writes apply).
+    if (refusal := refuse_unattributable_caller(state, request, "chat.slot_mode")) is not None:
+        return refusal
     request_app = request.get("app", "")
     if request_app and getattr(slot, "_app", "") != request_app:
         sel().log_api_access(
@@ -1519,6 +1663,19 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
                 if not getattr(slot, "_app", "")
                 else "app does not own this slot"
             ),
+        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # ``_app`` says who owns the slot OBJECT; the write persists into the
+    # TRANSCRIPT ``authorized_history_key`` names. Same rule as the folder and
+    # tag writes, same indistinguishable 404.
+    if not app_owns_transcript(state._slots, request_app, authorized_history_key):
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.slot_mode",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={slot.key}",
+            error="app does not own this slot's transcript",
         )
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
     try:
@@ -1564,8 +1721,13 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     async with _slot_meta_txn_lock(state):
         # Re-authorize after the awaits above (body parse, lock acquisition):
         # same slot OBJECT still registered under the name, routing still on
-        # the transcript captured before the first await.
-        if state._slots.get(name) is not slot or slot_history_key(slot) != authorized_history_key:
+        # the transcript captured before the first await, and that transcript
+        # still owned by the caller's app.
+        if (
+            state._slots.get(name) is not slot
+            or slot_history_key(slot) != authorized_history_key
+            or not app_owns_transcript(state._slots, request_app, authorized_history_key)
+        ):
             sel().log_api_access(
                 caller="dashboard",
                 operation="chat.slot_mode",

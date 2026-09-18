@@ -474,27 +474,27 @@ async def test_a_requeued_steer_records_queued_and_never_steered(tmp_path, monke
     """The append-only log must not claim a steer cut a turn that never got it.
 
     ``steered`` only means the client accepted the write. If the turn ends during
-    the await, the teardown requeues the text and it runs LATER -- so a
-    ``message/steered`` written on the RPC's return is a permanent false statement
-    about a turn, and the body would also be logged twice once the requeue path
-    records it.
+    the await, the teardown requeues the text and it runs LATER -- so a steer entry
+    written on the RPC's return is a permanent false statement about a turn, and the
+    body would also be logged twice once the requeue path records it. That is why the
+    vocabulary carries no steer type at all.
 
     Exactly one entry, and it is ``message/queued``: the requeue moves the text
     straight into the slot queue without passing the append that records a queued
     message, so this is the only place that can record it at all.
     """
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("KIROCREW_SESSION_LEDGER", "1")
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "1")
     import json
 
-    from kiro_crew import ledger as lg
-    from kiro_crew import session_ledger_emit
+    from kiro_crew import crew_log as lg
+    from kiro_crew.crew_log import emit as crew_log_emit
 
-    session_ledger_emit.reset_caches()
+    crew_log_emit.reset_caches()
     sid = "sess-steer-requeue"
-    session_ledger_emit.on_session_opened(sid, agent="kirocrew", slot="chat-1")
-    session_ledger_emit.on_turn_started(sid, 1, "user")
-    assert session_ledger_emit.flush()
+    crew_log_emit.on_session_opened(sid, agent="kirocrew", slot="chat-1")
+    crew_log_emit.on_turn_started(sid, 1, "user")
+    assert crew_log_emit.flush()
 
     state = _make_state(tmp_path)
     slot = _busy(_slot(state, "chat-1"))
@@ -515,19 +515,18 @@ async def test_a_requeued_steer_records_queued_and_never_steered(tmp_path, monke
     outcome = await cd.steer_into_running_turn(state, slot, "run this instead")
 
     assert outcome == cd.STEER_REQUEUED
-    assert session_ledger_emit.flush()
+    assert crew_log_emit.flush()
     body = [
         json.loads(line)
         for line in lg.ledger_path("session", sid).read_text(encoding="utf-8").splitlines()[1:]
     ]
-    mine = [e for e in body if e["type"] in ("message/steered", "message/queued")]
+    # Every message-domain entry, not one named type: an entry claiming the turn
+    # received the steer would be caught whatever it was called.
+    mine = [e for e in body if e["type"].startswith("message/")]
     assert len(mine) == 1, f"expected one entry for one message, got {[e['type'] for e in mine]}"
     assert mine[0]["type"] == "message/queued"
     assert mine[0]["data"]["source"] == "steer"
-    assert not [
-        e for e in body if e["type"] == "message/steered"
-    ], "a requeued steer was recorded as having cut the turn"
-    session_ledger_emit.reset_caches()
+    crew_log_emit.reset_caches()
 
 
 @pytest.mark.asyncio
@@ -2236,6 +2235,338 @@ def test_created_session_inherits_the_callers_workspace(tmp_path, monkeypatch):
     )
 
 
+@pytest.fixture
+def private_dispatch(tmp_path, monkeypatch):
+    from member_memory_helpers import patch_private_memory_supported
+
+    from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+    from kiro_crew.memory_stores import provision_member_memory
+
+    patch_private_memory_supported(monkeypatch)
+    cfg = KiroCrewConfig.load()
+    cfg.agents["writer"] = KiroCrewAgentConfig(kiro_agent="kirocrew", triggers="write")
+    store = provision_member_memory(cfg, "writer")
+    cfg.save()
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-conductor")
+    return state, caller, store
+
+
+@pytest.mark.parametrize("caller_form", ["canonical", "slot", "stem"])
+@pytest.mark.parametrize("target", ["writer", "public-worker"])
+def test_private_creator_cannot_change_memory(private_dispatch, monkeypatch, caller_form, target):
+    from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+    from kiro_crew.history import transcript_stem
+    from kiro_crew.member_memory_auth import bind_private_session_store, read_private_session_store
+    from kiro_crew.memory_stores import provision_member_memory
+
+    state, caller, _store = private_dispatch
+    cfg = KiroCrewConfig.load()
+    cfg.agents["reader"] = KiroCrewAgentConfig(kiro_agent="kirocrew")
+    cfg.agents["public-worker"] = KiroCrewAgentConfig(kiro_agent="kirocrew", memory_store="default")
+    caller.memory_store = provision_member_memory(cfg, "reader")
+    caller.agent = "reader"
+    cfg.save()
+    key = _key(caller)
+    bind_private_session_store(key, caller.memory_store)
+    state.conversation_log.update_metadata(key, {"memory_store": caller.memory_store})
+    child_key = "chat-forbidden-delegation"
+    monkeypatch.setattr("kiro_crew.dashboard.state._mint_slot_key", lambda *args: child_key)
+    identity = {"canonical": key, "slot": caller.key, "stem": transcript_stem(key)}[caller_form]
+    before = set(state._slots)
+
+    with pytest.raises(sc.SessionControlError) as exc:
+        asyncio.run(sc.create_session(state, caller_session_key=identity, agent=target))
+
+    assert exc.value.code == "memory_delegation_denied"
+    assert exc.value.status == 403
+    assert set(state._slots) == before
+    assert read_private_session_store(f"dashboard:{child_key}") is None
+    assert not state.conversation_log.has_log(f"dashboard:{child_key}")
+
+
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+def test_create_refuses_unreadable_delegation_identity(private_dispatch, monkeypatch, error_type):
+    from kiro_crew import context
+
+    state, caller, _store = private_dispatch
+    before = set(state._slots)
+
+    def unavailable(*args):
+        raise error_type("/private/identity/path")
+
+    monkeypatch.setattr(context, "require_memory_delegation", unavailable)
+    with pytest.raises(sc.SessionControlError) as exc:
+        asyncio.run(sc.create_session(state, caller_session_key=_key(caller), agent="writer"))
+    assert exc.value.status == 403
+    assert exc.value.code == "memory_delegation_denied"
+    assert "/private/identity/path" not in str(exc.value)
+    assert set(state._slots) == before
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_private_creator_keeps_its_memory(private_dispatch, explicit):
+    from kiro_crew.member_memory_auth import bind_private_session_store, read_private_session_store
+
+    state, caller, store = private_dispatch
+    caller.agent = "writer"
+    caller.memory_store = store
+    bind_private_session_store(_key(caller), store)
+    state.conversation_log.update_metadata(_key(caller), {"memory_store": store})
+    created = asyncio.run(
+        sc.create_session(
+            state, caller_session_key=_key(caller), agent="writer" if explicit else ""
+        )
+    )
+    child = state.get_slot(created["target"])
+    assert child.memory_store == store
+    assert read_private_session_store(_key(child)) == store
+
+
+@pytest.mark.parametrize("changed_field", ["agent", "memory_store", "linked_session_key"])
+def test_create_rechecks_caller_identity_after_delegation(
+    private_dispatch, monkeypatch, changed_field
+):
+    from kiro_crew import context
+
+    state, caller, _store = private_dispatch
+    original = context.require_memory_delegation
+    before = set(state._slots)
+    threads = []
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        changed = threading.Event()
+
+        def check(log, key, target):
+            threads.append(threading.get_ident())
+            original(log, key, target)
+
+            def mutate():
+                setattr(caller, changed_field, "changed-selection")
+                changed.set()
+
+            loop.call_soon_threadsafe(mutate)
+            assert changed.wait(5)
+
+        monkeypatch.setattr(context, "require_memory_delegation", check)
+        with pytest.raises(sc.SessionControlError) as exc:
+            await asyncio.wait_for(
+                sc.create_session(state, caller_session_key=_key(caller), agent="writer"), 10
+            )
+        assert exc.value.code == "caller_memory_changed"
+
+    asyncio.run(exercise())
+    assert set(state._slots) == before
+    assert threads and threading.get_ident() not in threads
+
+
+@pytest.mark.parametrize("restored", [False, True])
+def test_created_private_worker_can_start_after_birth_history(private_dispatch, tmp_path, restored):
+    from kiro_crew.dashboard.chat_runner import _bind_private_slot_memory
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.member_memory_auth import read_private_session_store
+
+    state, caller, store = private_dispatch
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller), agent="writer"))
+    child = state.get_slot(created["target"])
+    key = _key(child)
+    log = state.conversation_log
+    assert log.has_log(key), "the test must exercise the persisted-at-birth path"
+    if restored:
+        log = ConversationLog(base_dir=tmp_path)
+    # The first turn confirms the protected assignment written before birth
+    # metadata. Reopening the log must not be what grants that assignment.
+    _bind_private_slot_memory(key, store)
+    assert read_private_session_store(key) == store
+    assert log.get_metadata(key)["memory_store"] == store
+
+
+def test_private_worker_assignment_precedes_birth_history(private_dispatch, monkeypatch):
+    from kiro_crew.member_memory_auth import read_private_session_store
+
+    state, caller, store = private_dispatch
+    log = state.conversation_log
+    real_update = log.update_metadata
+    assignments = []
+    loop_threads = []
+
+    def persist(key, metadata):
+        loop_threads.append(threading.get_ident())
+        assignments.append(read_private_session_store(key))
+        return real_update(key, metadata)
+
+    monkeypatch.setattr(log, "update_metadata", persist)
+    asyncio.run(sc.create_session(state, caller_session_key=_key(caller), agent="writer"))
+    assert assignments == [store]
+    assert loop_threads and threading.get_ident() not in loop_threads
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_created_template_keeps_namespace_after_member_discovery(tmp_path, monkeypatch, explicit):
+    from member_memory_helpers import patch_private_memory_supported
+
+    from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, resolve_agent_bindings
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.memory_stores import provision_member_memory
+    from kiro_crew.session_agent_selection import resolve_session_agent_bindings
+
+    patch_private_memory_supported(monkeypatch)
+    template = "dispatched-template"
+    monkeypatch.setattr(
+        loader,
+        "_materialized_kiro_agent",
+        lambda name, project_dir=None: template if name == template else "",
+    )
+    cfg = KiroCrewConfig.load()
+    assert template not in cfg.agents
+    cfg.save()
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-conductor", agent=template)
+    created = asyncio.run(
+        sc.create_session(
+            state,
+            caller_session_key=_key(caller),
+            agent=template if explicit else "",
+        )
+    )
+    child = state.get_slot(created["target"])
+    key = _key(child)
+    assert state.conversation_log.get_metadata(key)["agent"] == template
+
+    # Discovery imports the same template as a private roster member before
+    # this empty conversation's first turn. The earlier choice must survive.
+    cfg = KiroCrewConfig.load()
+    cfg.agents[template] = KiroCrewAgentConfig(kiro_agent=template)
+    member_store = provision_member_memory(cfg, template)
+    cfg.save()
+    cfg = KiroCrewConfig.load()
+    assert resolve_agent_bindings(cfg, template, child.project).memory_store_name == member_store
+    chosen = resolve_session_agent_bindings(
+        resolve_agent_bindings, cfg, key, template, child.project
+    )
+    assert chosen.memory_store_name == "default"
+    assert chosen.selection_kind == "template"
+    assert read_private_session_store(key) is None
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+@pytest.mark.parametrize("started_turn", [False, True])
+def test_failed_private_birth_retains_its_permanent_assignment(
+    private_dispatch, monkeypatch, preexisting, started_turn
+):
+    from kiro_crew.dashboard.chat_runner import _require_session_memory_assignment
+    from kiro_crew.member_memory_auth import bind_private_session_store, read_private_session_store
+    from kiro_crew.memory_stores import UnknownMemoryStore
+    from kiro_crew.session_agent_selection import session_agent_selection_kind
+
+    state, caller, store = private_dispatch
+    before = set(state._slots)
+    child_name = "chat-failed-private-birth"
+    key = f"dashboard:{child_name}"
+    monkeypatch.setattr("kiro_crew.dashboard.state._mint_slot_key", lambda *args: child_name)
+    if preexisting:
+        bind_private_session_store(key, store)
+
+    def fail_history(requested_key, metadata):
+        assert requested_key == key
+        assert read_private_session_store(key) == store
+        if started_turn:
+            _require_session_memory_assignment(key, store)
+            state._slots[child_name].append("user", "work already started", "msg msg-u")
+        raise OSError("birth metadata could not be written")
+
+    monkeypatch.setattr(state.conversation_log, "update_metadata", fail_history)
+    with pytest.raises(OSError, match="birth metadata"):
+        asyncio.run(sc.create_session(state, caller_session_key=_key(caller), agent="writer"))
+    assert set(state._slots) == (before | {child_name} if started_turn else before)
+    # The birth was authorized and its slot was already addressable. History
+    # failure cannot prove no turn consumed this identity, so the lifetime pin
+    # must remain; neither Global nor another member may adopt the key later.
+    assert read_private_session_store(key) == store
+    assert session_agent_selection_kind(key, "writer") == "member"
+    _require_session_memory_assignment(key, store)
+    for other in ("default", "another-member-store"):
+        with pytest.raises(UnknownMemoryStore, match="retains its private memory assignment"):
+            _require_session_memory_assignment(key, other)
+
+
+def test_cancelled_private_birth_drains_before_returning(private_dispatch, monkeypatch):
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.session_agent_selection import session_agent_selection_kind
+
+    state, caller, store = private_dispatch
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    keys = []
+    real_update = state.conversation_log.update_metadata
+
+    def blocked_history(key, metadata):
+        keys.append(key)
+        entered.set()
+        assert release.wait(5), "the test must release the birth writer"
+        try:
+            return real_update(key, metadata)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(state.conversation_log, "update_metadata", blocked_history)
+
+    async def exercise():
+        task = asyncio.create_task(
+            sc.create_session(state, caller_session_key=_key(caller), agent="writer")
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done(), "cancellation must not abandon the history writer"
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+            assert finished.is_set()
+        finally:
+            release.set()
+            if not task.done():
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+    assert len(keys) == 1
+    key = keys[0]
+    child = next(slot for slot in state._slots.values() if _key(slot) == key)
+    assert child._created_by == caller.key
+    assert state.conversation_log.get_metadata(key)["memory_store"] == store
+    assert read_private_session_store(key) == store
+    assert session_agent_selection_kind(key, "writer") == "member"
+
+
+@pytest.mark.parametrize("prior_context", ["history", "native"])
+def test_private_worker_creation_cannot_adopt_an_old_session(
+    private_dispatch, monkeypatch, prior_context
+):
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    state, caller, _store = private_dispatch
+    before = set(state._slots)
+    child_name = "chat-private-worker-collision"
+    key = f"dashboard:{child_name}"
+    monkeypatch.setattr("kiro_crew.dashboard.state._mint_slot_key", lambda *args: child_name)
+    if prior_context == "history":
+        state.conversation_log.append(key, "user", "Existing conversation", agent="default")
+    else:
+        state.sessions.resumable_sid.side_effect = lambda requested: (
+            "old-native-session" if requested == key else None
+        )
+    with pytest.raises(UnknownMemoryStore, match="V1 history"):
+        asyncio.run(sc.create_session(state, caller_session_key=_key(caller), agent="writer"))
+    assert read_private_session_store(key) is None
+    assert set(state._slots) == before
+
+
 def test_create_checks_the_workspace_binding_even_when_no_agent_is_named(tmp_path, monkeypatch):
     """An omitted agent is not an unchecked agent.
 
@@ -3589,15 +3920,15 @@ def test_the_delivery_path_never_claims_a_turn_consumed_a_steer(tmp_path, monkey
     """The steer RPC proves the bytes left, not that any turn received them.
 
     A steer reported delivered can still be sitting pending when its turn ends, and
-    that turn's teardown requeues it to a LATER turn. A `message/steered` written
-    from here would already be on disk saying the earlier turn received it, and an
+    that turn's teardown requeues it to a LATER turn. A ledger entry written from
+    here would already be on disk saying the earlier turn received it, and an
     append-only entry cannot be moved the way the transcript row can. So this path
-    writes no ledger entry at all; the `steering_consumed` echo owns that fact.
+    writes no ledger entry at all, which is why the vocabulary carries no steer type.
 
     Mutation guard: recording the delivered case here -- from a live ordinal or any
     other guess -- reddens this.
     """
-    from kiro_crew import session_ledger_emit
+    from kiro_crew.crew_log import emit as crew_log_emit
     from kiro_crew.dashboard import chat_delivery
 
     state = _make_state(tmp_path)
@@ -3605,17 +3936,21 @@ def test_the_delivery_path_never_claims_a_turn_consumed_a_steer(tmp_path, monkey
     text = "use the other branch"
     slot._acp_client = _steerable(accepted=True)
 
-    steered_at: list[int] = []
+    appended: list[str] = []
     queued_for: list[str] = []
-    monkeypatch.setattr(session_ledger_emit, "session_id_of", lambda _client: "acp-1")
+    monkeypatch.setattr(crew_log_emit, "session_id_of", lambda _client: "acp-1")
+    # Spied on the shared write seam rather than on one entry point, so an entry
+    # written under ANY type is caught rather than only a steer-shaped one.
     monkeypatch.setattr(
-        session_ledger_emit, "on_message_steered", lambda *a, **kw: steered_at.append(1)
+        crew_log_emit,
+        "_write",
+        lambda _sid, entry_type, *a, **kw: appended.append(entry_type),
     )
     monkeypatch.setattr(
-        session_ledger_emit, "on_message_queued", lambda sid, **_kw: queued_for.append(sid)
+        crew_log_emit, "on_message_queued", lambda sid, **_kw: queued_for.append(sid)
     )
     # A turn IS running, so a guess would have had something plausible to record.
-    monkeypatch.setattr(session_ledger_emit, "live_turn", lambda _sid: 13)
+    monkeypatch.setattr(crew_log_emit, "live_turn", lambda _sid: 13)
 
     def _consume_inside_the_rpc(*_a, **_kw):
         # The running turn takes the registration, which is what makes the
@@ -3629,7 +3964,7 @@ def test_the_delivery_path_never_claims_a_turn_consumed_a_steer(tmp_path, monkey
     result = asyncio.run(chat_delivery.steer_into_running_turn(state, slot, text))
 
     assert result == chat_delivery.STEER_STEERED
-    assert steered_at == [], "the delivery path must not assert consumption"
+    assert appended == [], "the delivery path must not assert consumption"
     assert queued_for == [], "and it is not a queued message either"
 
 
@@ -3644,7 +3979,7 @@ def test_a_stop_race_that_only_expects_a_requeue_records_nothing(tmp_path, monke
 
     Mutation guard: recording the queued outcome here reddens this.
     """
-    from kiro_crew import session_ledger_emit
+    from kiro_crew.crew_log import emit as crew_log_emit
     from kiro_crew.dashboard import chat_delivery
 
     state = _make_state(tmp_path)
@@ -3653,10 +3988,8 @@ def test_a_stop_race_that_only_expects_a_requeue_records_nothing(tmp_path, monke
     slot._acp_client = _steerable(accepted=True)
 
     queued: list[str] = []
-    monkeypatch.setattr(session_ledger_emit, "session_id_of", lambda _client: "acp-1")
-    monkeypatch.setattr(
-        session_ledger_emit, "on_message_queued", lambda sid, **_kw: queued.append(sid)
-    )
+    monkeypatch.setattr(crew_log_emit, "session_id_of", lambda _client: "acp-1")
+    monkeypatch.setattr(crew_log_emit, "on_message_queued", lambda sid, **_kw: queued.append(sid))
 
     def _stop_without_requeueing(*_a, **_kw):
         # A stop lands while the steer is still registered, and nothing has moved
@@ -3685,7 +4018,7 @@ def test_a_requeued_steer_is_recorded_as_a_queued_message(tmp_path, monkeypatch)
 
     Mutation guard: recording `send_id` reddens this, because the two differ here.
     """
-    from kiro_crew import session_ledger_emit
+    from kiro_crew.crew_log import emit as crew_log_emit
     from kiro_crew.dashboard import chat_delivery
 
     state = _make_state(tmp_path)
@@ -3694,9 +4027,9 @@ def test_a_requeued_steer_is_recorded_as_a_queued_message(tmp_path, monkeypatch)
     slot._acp_client = _steerable(accepted=True)
 
     queued: list[dict] = []
-    monkeypatch.setattr(session_ledger_emit, "session_id_of", lambda _client: "acp-1")
+    monkeypatch.setattr(crew_log_emit, "session_id_of", lambda _client: "acp-1")
     monkeypatch.setattr(
-        session_ledger_emit, "on_message_queued", lambda sid, **kw: queued.append(dict(kw))
+        crew_log_emit, "on_message_queued", lambda sid, **kw: queued.append(dict(kw))
     )
     seen: dict[str, str] = {}
 

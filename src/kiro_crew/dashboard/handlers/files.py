@@ -3172,7 +3172,9 @@ async def api_file_download(request: web.Request) -> web.Response:
             outcome="denied", resources=path, error="content_redacted",
         )
         return web.json_response(
-            {"error": "file content was redacted; download aborted"}, status=400,
+            {"error": "file content was redacted; download aborted",
+             "code": "content_redacted"},
+            status=400,
         )
 
     safe_name = urllib.parse.quote(os.path.basename(path), safe="")
@@ -5331,9 +5333,65 @@ def _browse_files_sync(base: str, skip: set[str]) -> tuple[list[dict], list[dict
     return dirs, files
 
 
+#: A Windows drive root -- ``C:``, ``C:\\`` or ``C:/`` -- with nothing after it.
+#: Only such a path has a parent the filesystem cannot name: ``ntpath.dirname``
+#: answers ``C:\\`` for ``C:\\``, which the browser reads as "no parent" and
+#: hides its Back control on, stranding the user on one drive.
+_WIN_DRIVE_ROOT_RE = re.compile(r"[A-Za-z]:[\\/]?")
+
+
+def _is_windows_drive_root(path: str) -> bool:
+    return platform_compat.IS_WINDOWS and _WIN_DRIVE_ROOT_RE.fullmatch(path) is not None
+
+
+def _browse_drives_sync() -> list[dict[str, str]]:
+    """Enumerate the mounted Windows drive roots, as browse-dirs rows.
+
+    Blocking -- callers run it on the transfer pool, like the other listings.
+    ``os.listdrives`` exists on every supported interpreter (``requires-python
+    >= 3.12``); it is reached through ``getattr`` only because typeshed declares
+    it under ``sys.platform == "win32"``, so a direct attribute fails mypy on
+    the Linux CI runner. The caller has already refused non-Windows hosts.
+    """
+    roots = list(getattr(os, "listdrives")())
+    return [{"name": r, "path": r} for r in roots]
+
+
+def _browse_parent(base: str) -> str:
+    """The Back target for *base*: its dirname, or ``""`` for a Windows drive root.
+
+    Shared by ``/api/browse-dirs`` and ``/api/browse-files`` so both listings
+    describe a drive root the same way. ``""`` is the caller's cue that the level
+    above is the virtual drive list (``?drives=1``), not a directory; a consumer
+    without a drive list (the folder panel) reads it as "top", exactly as it
+    read the old ``C:\\`` == ``C:\\`` answer. A POSIX ``/`` keeps ``dirname``'s
+    answer of ``/`` -- equal to itself, which every consumer already reads as
+    "top".
+    """
+    if _is_windows_drive_root(base):
+        return ""
+    return os.path.dirname(base)
+
+
 async def api_browse_dirs(request: web.Request) -> web.Response:
-    """GET /api/browse-dirs?path=... — list subdirectories for directory browser."""
+    """GET /api/browse-dirs?path=... — list subdirectories for directory browser.
+
+    ``?drives=1`` (Windows only) lists the mounted drive roots instead, as the
+    virtual level above every ``X:\\``; the response carries ``path: ""`` --
+    the one listing that is not a directory -- and ``parent: ""`` so the picker
+    knows it is at the top. On other platforms the flag is a 400: there is no
+    such level to show.
+    """
     caller = request.get("user", "dashboard")
+    if request.query.get("drives") == "1":
+        if not platform_compat.IS_WINDOWS:
+            return web.json_response({"error": "Drive listing is only available on Windows", "code": "drives_windows_only"}, status=400)
+        try:
+            drives = await _run_path_probe(_browse_drives_sync, transfer=True)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource="drives", operation="browse_dirs", caller=caller)
+        _sel().log_api_access(caller=caller, operation="browse_dirs", outcome="allowed", resources="drives")
+        return web.json_response({"path": "", "parent": "", "dirs": drives})
     raw = request.query.get("path", "").strip()
     # Off-loop: realpath then the isdir probe, on a caller-supplied root (the
     # shared resolver answers $HOME for an unnamed one). is_sensitive_path below
@@ -5353,7 +5411,7 @@ async def api_browse_dirs(request: web.Request) -> web.Response:
     except _PathProbeBusy:
         return _probe_busy_response(resource=base, operation="browse_dirs", caller=caller)
     _sel().log_api_access(caller=caller, operation="browse_dirs", outcome="allowed", resources=base)
-    return web.json_response({"path": base, "parent": os.path.dirname(base), "dirs": dirs})
+    return web.json_response({"path": base, "parent": _browse_parent(base), "dirs": dirs})
 
 
 #: Depth ceiling for the walk-up that looks for a repository root. A project
@@ -5622,7 +5680,7 @@ async def api_browse_files(request: web.Request) -> web.Response:
     except _PathProbeBusy:
         return _probe_busy_response(resource=base, operation="browse_files", caller=caller)
     _sel().log_api_access(caller=caller, operation="browse_files", outcome="allowed", resources=base)
-    return web.json_response({"path": base, "parent": os.path.dirname(base), "dirs": dirs, "files": files})
+    return web.json_response({"path": base, "parent": _browse_parent(base), "dirs": dirs, "files": files})
 
 
 async def api_dashboard_config(request: web.Request) -> web.Response:
@@ -7032,9 +7090,10 @@ async def api_project_git_status(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
-# Cap on entries returned by api_project_tree. The dashboard tree virtualizes
-# rendering, so the cap bounds response size and walk time, not the UI.
+# Cap on FILES returned by api_project_tree. Directory rows are returned
+# separately and uncapped so manual navigation never loses a subtree.
 _PROJECT_TREE_MAX_ENTRIES = 10_000
+
 
 # Directories never worth listing in a workspace tree. Applied only on the
 # non-git fallback walk — git listings already honor .gitignore.
@@ -7062,14 +7121,67 @@ _PROJECT_TREE_SKIP_DIRS = frozenset(
 )
 
 
+def _project_tree_directories(paths: list[str]) -> list[str]:
+    """Return every POSIX parent directory named by *paths*."""
+    directories: set[str] = set()
+    for path in paths:
+        parent = posixpath.dirname(path)
+        while parent:
+            directories.add(parent)
+            parent = posixpath.dirname(parent)
+    return sorted(directories)
+
+
+def _project_tree_file_quotas(file_counts: dict[str, int], limit: int) -> dict[str, int]:
+    """Split *limit* round-robin across directories that directly own files."""
+    quotas = {directory: 0 for directory in file_counts}
+    active = sorted(directory for directory, count in file_counts.items() if count > 0)
+    remaining = min(max(limit, 0), sum(file_counts.values()))
+    while active and remaining:
+        next_active: list[str] = []
+        for directory in active:
+            if remaining == 0:
+                break
+            quotas[directory] += 1
+            remaining -= 1
+            if quotas[directory] < file_counts[directory]:
+                next_active.append(directory)
+        active = next_active
+    return quotas
+
+
+def _project_tree_sample_files(paths: list[str], limit: int) -> tuple[list[str], list[str]]:
+    """Cap files fairly by direct parent and report parents that lost files."""
+    file_counts: dict[str, int] = {}
+    for path in paths:
+        parent = posixpath.dirname(path)
+        file_counts[parent] = file_counts.get(parent, 0) + 1
+    quotas = _project_tree_file_quotas(file_counts, limit)
+    selected_counts = {directory: 0 for directory in file_counts}
+    selected: list[str] = []
+    for path in paths:
+        parent = posixpath.dirname(path)
+        if selected_counts[parent] >= quotas[parent]:
+            continue
+        selected.append(path)
+        selected_counts[parent] += 1
+    truncated_directories = sorted(
+        directory
+        for directory, count in file_counts.items()
+        if selected_counts[directory] < count
+    )
+    return selected, truncated_directories
+
+
 async def api_project_tree(request: web.Request) -> web.Response:
     """GET /api/project/tree?path=... - workspace file listing for a project dir.
 
     Returns project-relative POSIX file paths for rendering a workspace tree.
     Inside a git repository the listing is ``git ls-files --cached --others
     --exclude-standard`` scoped to the project dir (tracked + untracked,
-    .gitignore honored); outside one it is a bounded directory walk. Path must
-    match a known project directory (same allow-list as api_project_git).
+    .gitignore honored); outside one it walks the complete directory skeleton
+    while capping returned files. Path must match a known project directory
+    (same allow-list as api_project_git).
     """
     state: DashboardState = request.app["state"]
     caller = request.get("user", "dashboard")
@@ -7107,7 +7219,15 @@ async def api_project_tree(request: web.Request) -> web.Response:
         caller=caller, operation="project_tree", outcome="allowed", resources=base
     )
     if not await asyncio.to_thread(os.path.isdir, base):
-        return web.json_response({"root": redact(base), "paths": [], "repo": False})
+        return web.json_response(
+            {
+                "root": redact(base),
+                "paths": [],
+                "directories": [],
+                "repo": False,
+                "truncatedDirectories": [],
+            }
+        )
 
     def _run() -> dict:
         # git listing first: honors .gitignore, includes tracked-but-deleted
@@ -7134,50 +7254,60 @@ async def api_project_tree(request: web.Request) -> web.Response:
                 timeout=15,
             )
             if ls_rc == 0:
-                # SORT BEFORE THE CAP. `ls-files --cached --others` is not one
-                # sorted stream: git emits every untracked entry as a complete
-                # block and only then the tracked ones (its own emission order
-                # -- unchanged if the flags are written the other way round, and
-                # git-ls-files(1) documents no order at all). A prefix cut of
-                # that therefore never reaches the tracked block once untracked
-                # alone fill the cap, and the whole source tree loses its rows:
-                # the dashboard infers a directory row only from the file paths
-                # present, so those folders go absent rather than collapsed.
-                # Sorting spends the budget by path instead of by whichever
-                # block git happened to emit first. It does NOT make the two
-                # branches emit the same order: the fallback walk below sorts
-                # within each level but is depth-first overall, so it yields a
-                # root `z.txt` before `a/x` where sorted() orders them the other
-                # way. What the branches share is narrower and is the actual
-                # warrant for sorting here -- this handler establishes its own
-                # path order rather than passing through a source's arbitrary
-                # emission order.
+                # Git emits tracked and untracked files in separate blocks and
+                # documents no combined order. Sort once, then distribute the
+                # file budget round-robin across direct parent directories so a
+                # large subtree cannot consume every file row.
                 listed = sorted(p for p in ls_out.split("\0") if p)
-                truncated = len(listed) > _PROJECT_TREE_MAX_ENTRIES
+                selected_paths, truncated_directories = _project_tree_sample_files(
+                    listed, _PROJECT_TREE_MAX_ENTRIES
+                )
                 return {
                     "root": base,
-                    "paths": listed[:_PROJECT_TREE_MAX_ENTRIES],
+                    "paths": selected_paths,
+                    "directories": _project_tree_directories(listed),
                     "repo": True,
-                    "truncated": truncated,
+                    "truncated": bool(truncated_directories),
+                    "truncatedDirectories": truncated_directories,
                 }
 
-        # Fallback: bounded filesystem walk (non-repo project dirs).
-        paths: list[str] = []
-        truncated = False
+        # Fallback: walk twice so the first pass can compute fair per-directory
+        # quotas without retaining every filename in memory. The complete walk
+        # is required to return the directory skeleton past the file cap.
+        directories: list[str] = []
+        file_counts: dict[str, int] = {}
         for dirpath, dirnames, filenames in os.walk(base):
             dirnames[:] = sorted(
                 d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
             )
             rel_dir = os.path.relpath(dirpath, base)
-            prefix = "" if rel_dir == "." else rel_dir.replace(os.sep, "/") + "/"
-            for name in sorted(filenames):
+            directory = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
+            if directory:
+                directories.append(directory)
+            file_counts[directory] = len(filenames)
+
+        quotas = _project_tree_file_quotas(file_counts, _PROJECT_TREE_MAX_ENTRIES)
+        truncated_directories = sorted(
+            directory for directory, count in file_counts.items() if quotas[directory] < count
+        )
+        paths: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
+            )
+            rel_dir = os.path.relpath(dirpath, base)
+            directory = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
+            prefix = "" if not directory else directory + "/"
+            for name in sorted(filenames)[: quotas.get(directory, 0)]:
                 paths.append(prefix + name)
-                if len(paths) >= _PROJECT_TREE_MAX_ENTRIES:
-                    truncated = True
-                    break
-            if truncated:
-                break
-        return {"root": base, "paths": paths, "repo": False, "truncated": truncated}
+        return {
+            "root": base,
+            "paths": paths,
+            "directories": directories,
+            "repo": False,
+            "truncated": bool(truncated_directories),
+            "truncatedDirectories": truncated_directories,
+        }
 
     result = await asyncio.to_thread(_run)
     # Egress redaction, same rationale as api_project_git_status: listed names
@@ -7199,9 +7329,10 @@ async def api_project_tree(request: web.Request) -> web.Response:
     # "Duplicate path" on adjacent identical entries. dict.fromkeys keeps first
     # occurrence. This does not affect "truncated": the cap is applied to the
     # raw listing above.
-    result["paths"] = list(
-        dict.fromkeys(redact_path_segments(p, redact) for p in result["paths"])
-    )
+    for key in ("paths", "directories", "truncatedDirectories"):
+        result[key] = list(
+            dict.fromkeys(redact_path_segments(p, redact) for p in result[key])
+        )
     return web.json_response(result)
 
 

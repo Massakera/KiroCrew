@@ -2220,6 +2220,7 @@ class _ChatSlot:
         "_wait_steer_baseline",
         "_wait_contested",
         "_question_pending",
+        "_welcomed_agent",
     )
 
     def __init__(
@@ -2236,6 +2237,14 @@ class _ChatSlot:
         self.key = key
         self.title = title or key
         self.agent = agent
+        # The agent whose ``welcomeMessage`` this slot has already rendered.
+        # The hint is a ONE-SHOT per activation: the switch row emits it and
+        # the session start that the switch's own reset produces must not emit
+        # it again, so both paths clear through this single field rather than
+        # each guessing whether the other already ran. Not persisted — the row
+        # itself is, and a re-emit after a gateway restart costs one duplicated
+        # notice rather than a per-turn repeat.
+        self._welcomed_agent: str = ""
         self.model = model
         # Spawn-time withhold verdict for `model`, and the model id it was
         # computed for. Read through the `model_withheld` property, never these
@@ -4693,7 +4702,18 @@ class DashboardState:
         update_can_arm: bool = False,
         version_display: str = "",
     ) -> dict[str, Any]:
-        """Core status fields shared by /api/status, SSE, and WebSocket pushes."""
+        """Core status fields shared by /api/status, SSE, and WebSocket pushes.
+
+        ``cron_jobs`` and ``lessons`` are supplied by the caller and never
+        computed here: the only production caller is
+        ``status_counts.cached_status_snapshot``, which loads both counts off
+        the event loop through the shared count cache. Computing them inline
+        would run ``_count_lessons`` (a JSONL read plus a SQLite ``COUNT(*)``)
+        and ``crons.count_enabled_from_disk`` (a ``crons.json`` parse) on the
+        loop thread -- the ``no-blocking-call-on-event-loop`` freeze class this
+        emitter path exists to avoid. ``None`` means the count is unknown and
+        renders as a loading skeleton, never an authoritative 0.
+        """
         uptime = int(time.time() - self.start_time)
         branch, commit = self._build_info
         return {
@@ -4705,8 +4725,8 @@ class DashboardState:
             "start_time": self.start_time,
             "sessions": self.sessions.count,
             "messages": self.messages_received,
-            "cron_jobs": cron_jobs if cron_jobs is not None else len(self.crons.list_jobs()),
-            "lessons": lessons if lessons is not None else self._count_lessons(),
+            "cron_jobs": cron_jobs,
+            "lessons": lessons,
             "subagents": self.subagents.count if self.subagents else 0,
             "update_available": update_available,
             # Can THIS install replace its own code without the user leaving the
@@ -5568,7 +5588,7 @@ class DashboardState:
             slot.channel_origin = True
         if linked_session_key:
             slot.linked_session_key = linked_session_key
-        elif self.sessions:
+        elif self.sessions and not app:
             # No caller-supplied binding, but a channel-stem name means this slot
             # displays a conversation that runs on the channel's own session.
             # Resolving it HERE rather than in each caller is what makes the
@@ -5582,6 +5602,11 @@ class DashboardState:
             # only a real channel key may become a binding, so a malformed map
             # answer leaves the slot unbound (a supported state) rather than
             # routing the user's replies to a session no channel reads.
+            #
+            # Never for an APP-owned slot: a channel thread is the person's
+            # conversation, and the name is app-supplied, so resolving it here
+            # would let an app that knows a stem mint a slot bound to — and
+            # writing metadata into — a transcript it does not own.
             if is_channel_session_key(name):
                 resolved = self.sessions.channel_key_for_stem(name)
                 if isinstance(resolved, str) and is_channel_session_key(resolved):
@@ -6148,10 +6173,16 @@ class DashboardState:
                     # Keep rows the active list dropped verbatim so the seed/
                     # back-fill save below (and every later save) round-trips
                     # them back instead of erasing a hand-edited-but-typo'd row
-                    # at boot with no user action.
+                    # at boot with no user action. An ``id`` that is not a
+                    # non-empty string is such a row: every reader keys on the
+                    # id (set membership, dict keys, ``str(t["id"])``), and an
+                    # unhashable or non-string one would raise there, so it is
+                    # preserved on disk but not activated.
                     self._tags, unparsed = self._partition_preserving(
                         raw,
-                        lambda t: isinstance(t, dict) and bool(t.get("id")),
+                        lambda t: isinstance(t, dict)
+                        and isinstance(t.get("id"), str)
+                        and bool(t["id"]),
                         "tag entr(ies)",
                         self._TAGS_FILE,
                     )
@@ -6238,10 +6269,12 @@ class DashboardState:
                 if isinstance(raw, list):
                     # Preserve dropped columns verbatim so a later save
                     # round-trips them rather than erasing a hand-edited-but-
-                    # typo'd column.
+                    # typo'd column. Same id rule as the tag rows above.
                     self._tag_boards, unparsed_cols = self._partition_preserving(
                         raw,
-                        lambda c: isinstance(c, dict) and bool(c.get("id")),
+                        lambda c: isinstance(c, dict)
+                        and isinstance(c.get("id"), str)
+                        and bool(c["id"]),
                         "sidebar column(s)",
                         self._TAG_BOARDS_FILE,
                     )

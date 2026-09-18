@@ -110,10 +110,15 @@ the same displays.
   unauthenticated session, and Kiro Crew only sends a model the session
   advertised, so a session may simply run KAS's own default model.
 
+KAS reports managed MCP startup through session-scoped `_kiro/mcp/status` and
+`_kiro/tools/didChange` notifications. Kiro Crew waits for the selected agent's
+required managed servers and tool exposure before its first prompt, including
+after resume. Tools intentionally excluded by the agent remain excluded; their
+absence does not block startup. Failure or missing readiness produces a startup
+error within the configured session-start timeout.
+
 **Signals with no KAS analog** (documented so they are not mistaken for gaps):
-KAS has no `clear/status` notification, and its MCP methods (`_kiro/mcp/status`,
-`_kiro/mcp/toggle`) are request-side only — it emits no MCP server-init
-notification for Kiro Crew to surface. A resumable-session existence probe would
+KAS has no `clear/status` notification. A resumable-session existence probe would
 use KAS's `_kiro/session/list` (which returns the full `sessions[]` to search by
 id); that is deferred to the session-lifecycle work, not the display path.
 
@@ -431,7 +436,7 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.history_idle_hours` | Hours of inactivity before history consolidation | `3.0` |
 | `memory.history_max_days` | Days of history to retain before pruning | `365` |
 | `memory.private_provisioning_enabled` | Allow new private V2 stores for member creation, discovery sync and explicit V1-to-V2 setup; turning off leaves existing stores and their isolation active | `true` |
-| `memory.backup_enabled` | Periodic rotating backups of active member V2 stores only; V1 backups remain manual and retention does not delete active V2 memories | `true` |
+| `memory.backup_enabled` | Periodic rotating backups of every active memory store (the default store, named V1 stores and member V2 stores); retention does not delete active memories | `true` |
 | `memory.backup_keep` | Backup copies retained per store, with a minimum of one | `7` |
 
 Decay, episodic capacity eviction and history age pruning apply to V1 only.

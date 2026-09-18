@@ -163,7 +163,6 @@
     "dsk": "DSK",
     "expand_sidebar": "Expandir barra lateral",
     "gateway_connected": "Gateway conectado",
-    "gateway_offline": "Gateway offline",
     "gateway_offline_reconnecting": "Gateway offline — reconectando",
     "gateway_offline_session_expired_see_banner_above": "Gateway offline — sessão expirada, veja o banner acima",
     "gateway_restarting_reconnecting": "O gateway está reiniciando — reconectando…",
@@ -4158,6 +4157,10 @@
         "one_notification_per_state_change_never_per_hear": "One notification per state change, never per heartbeat: a source that stays down\n        is reported once, not every two minutes. Repeats for the same incident stack into\n        one row.",
         "only_the_on_call_instance_picks_up_work": "Only the on-call instance picks up work",
         "pagerduty_user_id_help": "Matched against who PagerDuty reports on call, so this instance can tell whether the pager is yours. Stored where the agent cannot reach it — leave blank to treat anyone on the schedule as you.",
+        "incidentio_user_id_help": "É comparado com os utilizadores da tua escala do incident.io, para que esta instância saiba se o turno é teu. Fica guardado onde o agente não consegue chegar — deixa em branco para tratar qualquer pessoa da escala como tu. Com um ID definido mas sem escalas configuradas, esta instância fica fora do turno.",
+        "identity_save_refused": "O teu ID não foi guardado — o repositório de definições recusou a escrita. Tenta novamente.",
+        "change_save_refused": "A tua alteração não foi guardada — o repositório de definições recusou a escrita. Tenta novamente.",
+        "value_too_long_refused": "Esse valor é demasiado longo, por isso não foi guardado.",
         "prod_star": "prod-*",
         "providers": "Providers",
         "pushes_stay_refused_until": "Pushes stay refused until",
@@ -4197,6 +4200,7 @@
         "wrong_local_branch": "wrong local branch",
         "your_github_login": "Your GitHub login",
         "your_pagerduty_user_id": "Your PagerDuty user ID",
+        "your_incident_io_user_id": "Your incident.io user ID",
         "your_team_s_ledger_is_still_being_exchanged_sync": "Your team's ledger is still being exchanged — sync names"
       },
       "signalsPanel": {
@@ -4951,6 +4955,7 @@
       "cmd_search_sessions": "Pesquisar sessões",
       "fallback_sessions": "Pesquisar “{{query}}” nas sessões",
       "group_apps": "Aplicativos",
+      "group_folders": "Pastas",
       "group_commands": "Comandos",
       "group_settings": "Configurações",
       "leave_scope": "Voltar para todos os comandos",
@@ -4974,6 +4979,7 @@
       "retry": "Tentar novamente",
       "kind": {
         "app": "Aplicativo",
+        "folder": "Pasta",
         "command": "Comando",
         "setting": "Configuração",
         "view": "Visualização"
@@ -5732,6 +5738,7 @@
       "reads_tooltip": "O {{productName}} pesquisa por conta própria, mas pergunta antes de fazer alterações",
       "trust_desc": "Neste chat, o {{productName}} trabalha sem perguntar primeiro",
       "trust_label": "Confiança",
+      "chat_mode_hint": "modo de chat",
       "trust_tooltip": "Neste chat, o {{productName}} trabalha sem perguntar primeiro",
       "yolo_desc": "Em todos os chats, o {{productName}} trabalha sem perguntar primeiro",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",
@@ -5824,6 +5831,9 @@
         "capability_backend": "Manter um programa próprio rodando neste computador, em segundo plano, enquanto o {{productName}} estiver aberto",
         "capability_shell": "Executar comandos neste computador, a partir de uma lista que o app traz e que você nunca viu",
         "capability_note": "Confiar no app concede as três coisas, mesmo que ele não use todas. O {{productName}} não consegue conceder menos.",
+        "session_approval_heading": "Este app também pede para controlar seus chats",
+        "session_approval_desc": "Enviar mensagens ou escolher opções de resposta nos seus chats, aprovar ou negar solicitações de ferramentas e trocar o modo de aprovação de um chat.",
+        "session_approval_modes": "Modos de aprovação do chat que ele pode definir",
         "revocable": "Você pode desfazer isso quando quiser em Configurações → Segurança → Apps de terceiros confiáveis. O app para de funcionar quando você fizer isso.",
         "source": "Publicado em",
         "not_reviewed": "O {{productName}} lista este app, mas não revisou o código dele, e o nome acima vem do próprio app.",
@@ -6583,6 +6593,18 @@
       "comment_unread_other": "{{count}} comentários · não lidos",
       "open_comment_thread": "Abrir tópico de comentários"
     },
+    "importSessionItem": {
+      "failed": "Falhou",
+      "import_from_file": "Importar uma sessão de um arquivo",
+      "refusal_damaged_file": "Não foi possível ler este arquivo. Ele pode estar danificado ou não ser uma sessão exportada.",
+      "refusal_not_a_session": "Este arquivo não é uma sessão exportada.",
+      "refusal_too_large": "Este arquivo é muito grande para importar.",
+      "refusal_upload_failed": "Não foi possível enviar este arquivo. A conexão pode ter caído.",
+      "refusal_busy": "Há muitas importações em andamento. Tente novamente em instantes.",
+      "imported": "Importado",
+      "imported_named": "Importado: {{title}}",
+      "unknown_error": "A importação falhou"
+    },
     "instanceTabBar": {
       "connected": "conectado",
       "connected_refresh": "conectado · atualização {{time}}",
@@ -6933,6 +6955,7 @@
       "discard_unsaved_changes": "Descartar alterações não salvas?",
       "download": "Baixar",
       "download_failed": "Falha ao baixar",
+      "download_blocked_credentials": "Download bloqueado: o conteúdo deste arquivo foi sinalizado pela verificação de credenciais. Remova o segredo e tente novamente.",
       "edit": "Editar",
       "exit_full_screen": "Sair da tela cheia",
       "exit_full_screen_esc": "Sair da tela cheia (Esc)",
@@ -6988,6 +7011,10 @@
       "diff_status_failed": "Não foi possível verificar as alterações git deste arquivo."
     },
     "markdownRenderer": {
+      "download_failed": "Não foi possível baixar o diagrama. Tente novamente.",
+      "diagram_actions": "Mais ações",
+      "download_svg": "Baixar SVG",
+      "download_png": "Baixar PNG",
       "click_to_browse_shift_click_to_open_in_file_explorer": "Clique para navegar / Shift+clique para mostrar no Explorador de Arquivos",
       "click_to_browse_shift_click_to_reveal_in_finder": "Clique para navegar / Shift+clique para mostrar no Finder",
       "click_to_browse_shift_click_to_show_in_file_manager": "Clique para navegar / Shift+clique para mostrar no gerenciador de arquivos",
@@ -7266,12 +7293,20 @@
       "highlighting_unavailable_reload": "O realce de sintaxe está indisponível. Salve ou copie seu rascunho e recarregue para restaurá-lo; você pode continuar editando."
     },
     "projectPicker": {
+      "all_drives": "Todas as unidades",
       "back": "Voltar",
+      "back_to": "Voltar para {{path}}",
       "browse": "Procurar",
+      "drive_example_d": "D:\\",
+      "drive_example_e": "E:\\",
+      "drives_failed": "Não foi possível mostrar a lista de unidades – a lista abaixo continua mostrando {{path}}. Para usar outra unidade, digite-a acima, por exemplo {{example}}, ou tente “Todas as unidades” novamente.",
+      "listing_failed": "Não foi possível abrir {{failed}} – a lista abaixo continua mostrando {{path}}. Verifique o caminho ou escolha uma pasta da lista.",
+      "listing_failed_no_path": "Não foi possível abrir {{failed}}. Verifique o caminho e tente novamente.",
       "no_matching_projects": "Nenhum projeto correspondente",
       "no_recent_projects": "Nenhum projeto recente",
       "no_subdirectories": "Nenhum subdiretório",
       "path_to_project": "/path/to/project",
+      "path_to_project_drive": "ex.: D:\\caminho\\para\\projeto",
       "project_directory_path": "Caminho do diretório do projeto",
       "recent": "Recentes",
       "recent_projects": "Projetos recentes",
@@ -8950,6 +8985,9 @@
       "open_screenshot": "Abrir a captura de tela {{n}}",
       "origin": "Origem:",
       "permissions": "Permissões",
+      "session_approval_desc": "Pode enviar mensagens e escolher opções de resposta nos seus chats, aprovar ou negar solicitações de ferramentas e trocar o modo de aprovação de um chat.",
+      "session_approval_modes": "Modos de aprovação do chat que ele pode definir",
+      "session_approval_manifest_key": "Chave do manifesto",
       "platform": "Plataforma:",
       "previous": "Anterior",
       "removes_kirocrew_metadata_only_the_app_itself_is": "Remove apenas os metadados do {{productName}} — o app em si é gerenciado externamente",
@@ -8976,7 +9014,10 @@
       "websocket_events": "Eventos WebSocket",
       "all_contributors": "Todos os contribuidores",
       "contributors": "Contribuidores",
-      "retry": "Tentar novamente"
+      "retry": "Tentar novamente",
+      "enable_and_allow_chat_control": "Ativar e permitir o controle dos chats",
+      "session_approval_confirm_title": "Permitir que “{{name}}” controle seus chats?",
+      "session_approval_reconsent_notice": "{{name}} está desativado porque passou a pedir para controlar seus chats. Revise a permissão nesta página antes de ativá-lo."
     },
     "appPage": {
       "loading_app": "Carregando app…",
@@ -9064,6 +9105,7 @@
       "installed_app_find_in_library_and_enable": "{{name}} instalado. Ative-o na Biblioteca.",
       "synced_from_its_source_directory": "{{name}} sincronizado a partir do diretório de origem.",
       "updated_from_the_registry": "{{name}} atualizado a partir do registro.",
+      "updated_needs_session_approval_consent": "{{name}} está desativado porque passou a pedir para controlar seus chats. Revise a permissão nos detalhes do app e ative-o.",
       "refresh_store": "Atualizar a loja"
     },
     "artifactDeployPage": {
@@ -9636,7 +9678,8 @@
         "waiting_to_start_queued_behind_the_concurrency_l": "aguardando para iniciar — na fila devido ao limite de simultaneidade",
         "workflows": "Workflows",
         "workspace_empty": "Este espaço de trabalho ainda não tem arquivos",
-        "workspace_truncated": "Espaço de trabalho grande — mostrando os primeiros 10.000 arquivos",
+        "workspace_truncated": "Espaço de trabalho grande: mostrando até 10.000 arquivos; todas as pastas continuam disponíveis",
+        "workspace_directory_truncated": "arquivos ocultos",
         "output_load_failed": "Não foi possível carregar a saída",
         "retry": "Tentar novamente",
         "cancel_failed": "Não foi possível cancelar o subagente",
@@ -10188,6 +10231,7 @@
         "content_placeholder": "Buscar nos arquivos…",
         "content_searching": "Buscando…",
         "ctx_add_to_chat": "Adicionar à conversa",
+        "ctx_download": "Baixar",
         "filter_placeholder": "Filtrar arquivos…",
         "git_status_failed": "Não foi possível ler o status do git",
         "mode_content": "Conteúdo",
@@ -10367,6 +10411,7 @@
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "(1 ignorada — atualmente selecionada)",
+      "no_sessions_match_folders": "Nenhuma sessão corresponde — apenas o nome de uma pasta",
       "add_column_after_this_one": "Adicionar coluna depois desta",
       "agent_finished_your_turn": "O agente terminou — sua vez",
       "all_sessions": "Todas as sessões",
@@ -10566,8 +10611,6 @@
       "stale_collapse_paused_hint": "Pausado enquanto a lista está em busca, filtrada ou ordenada por algo diferente de mais recentes primeiro.",
       "stale_collapse_row": "Sessões adormecidas",
       "stale_collapse_row_ungrouped": "fora de pastas",
-      "started_in_channel": "Esta conversa começou em {{channel}}.",
-      "started_in_direct_message": "Esta conversa começou em uma mensagem direta.",
       "stop_filtering_by_tag": "Parar de filtrar por {{name}}",
       "streaming": "Transmitindo",
       "sub_agent_needs_approval_many": "{{count}} subagentes precisam de aprovação",
@@ -10998,6 +11041,27 @@
     "developer": {
       "agentBackendTab": {
         "agent_backend": "Backend do agente",
+        "approval_agent_spec": "Pergunta antes de cada ferramenta porque o {{productName}} manda.",
+        "approval_seeded_settings": "Pergunta antes de cada ferramenta só se as próprias configurações disserem isso. O {{productName}} escreve esse ajuste e não consegue confirmar que surtiu efeito.",
+        "approval_session_config": "Pergunta antes de rodar um comando ou alterar um arquivo. O {{productName}} liga isso e confere. Leituras simples não perguntam.",
+        "approval_unverified": "Nada mostra que este agente pergunta antes de usar uma ferramenta.",
+        "approval_verified_gate_extension": "Pergunta antes de cada ferramenta por meio de um complemento que o {{productName}} carrega e confere.",
+        "approval_verified_seeded_settings": "Pergunta antes de cada ferramenta. O {{productName}} ajusta isso e lê de volta.",
+        "card_available": "Disponível.",
+        "card_crew_tools": "As ferramentas do {{productName}} funcionam no chat",
+        "card_manual_compact": "O comando /compact funciona",
+        "card_markdown_agents": "Agentes escritos em um único arquivo markdown funcionam",
+        "card_member_saved_agent": "Os membros carregam todo o agente salvo",
+        "card_member_thread_tools": "Os chats de membros recebem ferramentas de sessão",
+        "card_mid_turn_steer": "Você pode enviar uma mensagem enquanto ele trabalha",
+        "card_model_switch": "O modelo pode ser trocado dentro do chat",
+        "card_not_available": "Indisponível.",
+        "card_operator_notes": "Bom saber",
+        "card_private_member_sessions": "Os chats privados de membros conseguem iniciar",
+        "card_reasoning_effort": "O esforço de raciocínio pode ser alterado",
+        "card_side_chat_tools": "O Side Chat pode usar ferramentas somente de leitura",
+        "card_subagent_continuation": "Um chat de subagente pode ser retomado depois",
+        "card_supports_n_of_m": "{{name}} suporta {{available}} de {{total}} recursos",
         "claude_code": "Claude Code",
         "claude_uses_its_own_permissions": "O Claude Code normalmente pede autorização antes de agir, e o {{productName}} filtra esse pedido. Mas uma ferramenta previamente aprovada nas configurações do próprio Claude — incluindo um .claude/settings.json dentro do projeto — não pergunta, pelo que as regras de recusa e o registo de auditoria não veem essa chamada.",
         "could_not_load_the_agent_backend": "Não foi possível carregar o backend do agente.",
@@ -11012,6 +11076,15 @@
         "missing_components": "Ausente nesta máquina: {{components}}",
         "missing_components_with_command": "Ausente nesta máquina: {{components}}. Instale com: {{command}}",
         "new_sessions_use_this_agent_a_session_that_is_al": "As novas sessões usam este agente. Uma sessão já aberta mantém aquele com que foi iniciada — alterar aqui não a modifica a meio da sessão.",
+        "not_offered_by_this_build": "Esta build não oferece este agente.",
+        "note_crew_command_channel": "Os comandos com barra passam pelo canal de comandos do {{productName}}.",
+        "note_crew_sandbox_stands_down": "Tem o próprio ambiente isolado. No macOS e no Windows, o isolamento do {{productName}} recua para ele.",
+        "note_harness_model_list": "A lista de modelos vem do agente, não do {{productName}}.",
+        "note_host_credential_to_child": "Feito o login do Kiro, o {{productName}} pode entregar essa conta a este agente.",
+        "note_keeps_own_chat_record": "Este agente guarda a própria cópia da conversa.",
+        "note_own_credential_store": "Entra com o próprio arquivo, não com o login do Kiro.",
+        "note_pod_home_relocated": "Dentro de um pod, a pasta pessoal dele vai para o pod, e o login salvo vai junto.",
+        "note_refuses_unclassified_tools": "Uma chamada de ferramenta que ele não consegue identificar é recusada, não aprovada.",
         "retry": "Tentar novamente",
         "set_is_fixed_at_gateway_start": "Quais agentes aparecem aqui é decidido quando o gateway inicia. Uma implantação gerenciada pode restringir o conjunto por política; editar essa política passa a valer no próximo início."
       },
@@ -11036,7 +11109,14 @@
           "crew_media_members": "A página Crew Members com um membro selecionado e o painel de atividade aberto."
         },
         "crew_members": "Membros da equipe",
-        "crew_members_desc": "A página Crew Members: todos os seus agentes, cada um com o próprio tópico. Ainda em construção, por isso não é oferecida até você ligar isto."
+        "crew_members_desc": "A página Crew Members: todos os seus agentes, cada um com o próprio tópico. Ainda em construção, por isso não é oferecida até você ligar isto.",
+        "decisions": "Decisões (Jev)",
+        "decisions_desc": "Jev é um modelo de decisão pequeno e barato. Nesta versão de prévia, o {{productName}} lhe faz uma pergunta de sim/não ou de escolher uma opção em três momentos: quais habilidades carregar para a sua mensagem, se uma habilidade recém-aprendida repete outra que você já tem e se o resultado de uma tarefa agendada traz algo novo. Nesta versão só funciona em sombra: as respostas do Jev não mudam o que o {{productName}} faz; cada uma é gravada em um log nesta máquina para que as duas possam ser comparadas. Este botão não é salvo no navegador, mas na máquina que executa o {{productName}}, então vale em todos os aparelhos de onde você o abrir.",
+        "decisions_egress": "Enquanto isso estiver ligado, o texto das suas mensagens e as descrições das suas habilidades saem desta máquina. Eles são enviados pela Internet ao serviço de decisão que este {{productName}} está configurado para usar. Enquanto estiver desligado, nada é enviado.",
+        "decisions_backend_required": "O {{productName}} que executa este painel é mais antigo que este botão: nas configurações dele ainda não existe uma seção decisions, então não há nada para ligar. Atualize-o primeiro.",
+        "decisions_points": "Cada verificação abaixo mostra o modo em que está rodando.",
+        "decisions_config_unavailable": "Não foi possível ler as configurações, então este botão não é oferecido. Recarregue para tentar de novo.",
+        "decisions_save_failed": "Não foi possível salvar esta configuração. O botão voltou a mostrar o valor salvo."
       },
       "kiroSignInCard": {
         "title": "Login do Kiro",
@@ -11063,7 +11143,7 @@
       "feature_previews_moved": "As prévias de recursos foram movidas para Configurações > Desenvolvedor",
       "tabs": {
         "agentBackend": {
-          "description": "Qual agente as novas sessões iniciam: Kiro CLI, Claude Code ou KAS",
+          "description": "Qual agente as novas sessões iniciam",
           "label": "Backend do agente"
         },
         "archive": {
@@ -13189,7 +13269,11 @@
         "auto_download_save_failed": "Não foi possível salvar a configuração de download automático.",
         "auto_update_setting_unavailable": "Não foi possível carregar a configuração de atualização automática. A chave mostra o padrão até que ela carregue.",
         "copy_failed_select_the_command_and_copy_it_manually": "Falha ao copiar. Selecione o comando e copie-o manualmente.",
-        "update_info_unavailable": "Não foi possível ler a versão e o canal de atualização desta build a partir do app."
+        "update_info_unavailable": "Não foi possível ler a versão e o canal de atualização desta build a partir do app.",
+        "app_lane_label": "Aplicativo",
+        "app_lane_title": "O app de desktop que você instalou. Sua própria versão, separada do serviço abaixo.",
+        "gateway_lane_label": "Gateway",
+        "gateway_lane_title": "O serviço em segundo plano que executa seus agentes e serve este painel. Os chips de branch e commit são o build dele."
       },
       "botChannelPanel": {
         "allowed_user_ids": "IDs de usuário permitidos",
@@ -13559,7 +13643,7 @@
         "developer_mode": "Modo desenvolvedor",
         "developer_tools": "Ferramentas de desenvolvedor",
         "feature_previews": "Prévias de recursos",
-        "feature_previews_desc": "Recursos e páginas não lançados. As páginas ficam ocultas da barra lateral e da Pesquisar em tudo até você ativá-las aqui; os próprios interruptores, porém, aparecem na busca das configurações. Valem só para este dispositivo e estão inacabados de propósito.",
+        "feature_previews_desc": "Recursos e páginas não lançados. As páginas ficam ocultas da barra lateral e da Pesquisar em tudo até você ativá-las aqui; os próprios interruptores, porém, aparecem na busca das configurações. Estão inacabados de propósito e valem só para este dispositivo, a menos que um cartão diga o contrário.",
         "gateway": "Gateway",
         "open_developer_page": "Abrir a página Desenvolvedor",
         "run_a_local_gateway": "Executar um gateway local",
@@ -15115,6 +15199,7 @@
       "show_controls": "Mostrar controles"
     },
     "membersPage": {
+      "drawer_delegated_working": "Tarefas delegadas em execução",
       "agent_template": "Modelo de agente",
       "configuration": "Configuração",
       "crew_summary": "Resumo do membro",

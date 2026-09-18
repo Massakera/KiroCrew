@@ -20,12 +20,13 @@ import type {
   ContextMenuOpenContext as FileTreeContextMenuOpenContext,
 } from '@pierre/trees'
 import { FileTree, useFileTree } from '@pierre/trees/react'
-import { AtSign, FileDiff, FolderOpen } from 'lucide-react'
+import { AtSign, Download, FileDiff, FolderOpen } from 'lucide-react'
 import { api } from '../api/client'
 import ErrorNotice from '../components/ErrorNotice'
 import { useMenuKeyboard } from '../hooks/useMenuKeyboard'
 import { i18nT } from '../i18n/t'
 import { useFileMenuItems, visibleFileMenuItems, invokeFileMenuItem, FileMenuItemIcon, FileMenuItemLabel, type ContributedFileMenuItem, type ReportFileMenuError } from '../apps/fileMenuContributions'
+import { downloadFileToDisk } from '../utils/fileReadUrl'
 import { normalizeWindowsPath } from '../utils/fileTokens'
 import { recallExpandedPaths, rememberExpandedPaths } from './treeExpansionMemory'
 import { TreeSkeleton } from './tree'
@@ -192,10 +193,15 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
       window.removeEventListener('resize', onDismiss)
     }
   }, [context])
-  // Render nothing rather than an empty bordered popup: with no host row AND no
-  // app row that its `when` admits for this node, there is nothing to show and
-  // no menuitem for the focus effect to land on.
-  if (!onAddToContext && rows.length === 0) return null
+  // Render nothing rather than an empty bordered popup: with no host row, no
+  // Download (a directory), AND no app row that its `when` admits for this
+  // node, there is nothing to show and no menuitem for the focus effect to land
+  // on.
+  // A file row also carries a built-in Download (retrieve the bytes onto the
+  // machine running the browser). Directories do not: the ask is file rows
+  // only, and /api/file-download serves a single file, not a folder.
+  const canDownload = !isDir
+  if (!onAddToContext && !canDownload && rows.length === 0) return null
   return createPortal(
     <div
       ref={menuRef}
@@ -215,6 +221,25 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
         >
           <AtSign className="lucide-inline text-muted" />
           {i18nT('pages.chat.fileBrowserRail.ctx_add_to_chat')}
+        </div>
+      )}
+      {/* Built-in Download for a file row. Streams the raw bytes through the
+          SAME /api/file-download path the viewer's Download uses, so the
+          endpoint's credential scan runs before any byte reaches the browser; a
+          refusal is surfaced through the tree's error notice, never bypassed.
+          Its ref is `firstItemRef` only when there is no Add-to-chat row above
+          it to own focus entry. */}
+      {canDownload && (
+        <div
+          ref={onAddToContext ? undefined : firstItemRef}
+          role="menuitem"
+          tabIndex={-1}
+          className={itemCls}
+          onClick={activate(() => { void downloadFileToDisk(abs, onError) })}
+          onKeyDown={activate(() => { void downloadFileToDisk(abs, onError) })}
+        >
+          <Download className="lucide-inline text-muted" />
+          {i18nT('pages.chat.fileBrowserRail.ctx_download')}
         </div>
       )}
       {/* App-contributed rows (contributes.fileMenuItems, surface 'tree-context').
@@ -237,7 +262,7 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
         return (
           <div
             key={`${mi.app}:${mi.id}`}
-            ref={!onAddToContext && idx === 0 ? firstItemRef : undefined}
+            ref={!onAddToContext && !canDownload && idx === 0 ? firstItemRef : undefined}
             role="menuitem"
             tabIndex={-1}
             className={itemCls}
@@ -312,6 +337,9 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     refetchInterval: 5_000,
     refetchOnWindowFocus: true,
   })
+  const truncatedDirectoriesRef = useRef<Set<string>>(new Set())
+  truncatedDirectoriesRef.current = new Set(tree?.truncatedDirectories ?? [])
+  const truncatedDirectoriesKey = (tree?.truncatedDirectories ?? []).join('\n')
 
   const { model } = useFileTree({
     paths: [],
@@ -329,6 +357,12 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     // for keyboards), the affordance shown only when the row is hovered/focused
     // so a narrow rail stays uncluttered.
     composition: { contextMenu: { triggerMode: 'both', buttonVisibility: 'when-needed' } },
+    renderRowDecoration: ({ item }) => {
+      const path = item.path.replace(/\/$/, '')
+      if (item.kind !== 'directory' || !truncatedDirectoriesRef.current.has(path)) return null
+      const label = i18nT('pages.chat.activityViewer.workspace_directory_truncated')
+      return { text: label, title: label }
+    },
   })
 
   // The tree endpoint returns paths relative to the PROJECT dir while git
@@ -371,11 +405,23 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
           // resetPaths useLayoutEffect below, taking down the whole route.
           // De-dup here (preserving order + first occurrence, mirroring the
           // `changed` branch's statusEntries seen-Set) so a duplicate degrades
-          // to a single (missing) row instead of a render crash.
-          Array.from(new Set(tree?.paths ?? [])),
+          // to a single (missing) row instead of a render crash. Explicit
+          // trailing-slash paths keep directory rows even when every direct
+          // file in that directory fell beyond the file budget.
+          Array.from(new Set([
+            ...(tree?.paths ?? []),
+            ...(tree?.directories ?? []).map(path => `${path.replace(/\/$/, '')}/`),
+          ])),
     [mode, statusEntries, tree],
   )
   const ready = mode === 'changed' ? status != null : tree != null
+
+  // The row-decoration callback reads a ref because Pierre creates the model
+  // once. Re-render its view when only the truncation set changes and the path
+  // set therefore does not reset the model.
+  useEffect(() => {
+    model.setComposition(model.getComposition())
+  }, [model, truncatedDirectoriesKey])
 
   // Feed data into the model imperatively (the model is created once; path
   // resets and git-status patches are the supported update API). Layout
@@ -618,11 +664,12 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
         model={model}
         className="pierre-tree"
         style={{ height: '100%', flex: 1, minHeight: 0 }}
-        // Wired only when there is a host to hand the row to: `hasContextMenu`
-        // (FileTree's own renderContextMenu != null check) forces the menu
-        // enabled unconditionally, so passing it regardless of onAddToContext
-        // would open a menu whose only action closes itself and does nothing.
-        renderContextMenu={(onAddToContext || treeItems.length > 0) ? renderContextMenu : undefined}
+        // Always wired: a file row now always carries a built-in Download, so
+        // the menu is useful for every file even with no host and no app rows.
+        // The per-node `TreeContextMenu` still renders NOTHING (returns null) for
+        // a node with no action — a directory with no host and no app row — so a
+        // right-click there opens no bordered popup despite the menu being wired.
+        renderContextMenu={renderContextMenu}
       />
     </div>
   )

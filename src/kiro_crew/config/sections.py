@@ -2143,8 +2143,9 @@ class MemoryConfig:
         default=True,
         metadata=_meta(
             "Automatic Memory Backups",
-            "Take a daily rotating copy of each active member V2 store. Global and "
-            "named V1 backups remain manual. This does not delete active memories.",
+            "Take a daily rotating copy of every active memory store: the default "
+            "store, named V1 stores and member V2 stores. This does not delete active "
+            "memories.",
         ),
     )
     backup_keep: int = field(
@@ -4838,6 +4839,12 @@ class ResolvedBindings:
     # to that alias's target instead — reintroducing the advertised-vs-answering
     # mismatch. An alias key round-trips to itself.
     resolved_alias: str = ""
+    # Positive selection provenance. A later discovered member with the same
+    # name must not change a conversation that selected the provider template.
+    selection_kind: str = ""
+    # Revision observed before resolution: "" means no protected record;
+    # None means no observation was made. Only automatic publication uses it.
+    selection_revision: str | None = None
 
     def same_dispatch_binding(self, other: "ResolvedBindings") -> bool:
         """Whether two resolutions name the SAME dispatch target.
@@ -4850,6 +4857,9 @@ class ResolvedBindings:
         field that changes what answers a turn — the kiro agent, workspace,
         memory store, and model — and deliberately not ``resolved_alias``
         (two names resolving to one alias's target ARE the same binding) or
+        ``selection_kind`` (the namespace is retained separately for later
+        resolution; identical current targets may still share a slot) or
+        ``selection_revision`` (a publication guard, not a dispatch target) or
         ``requested_resolved``/``effective_memory_config`` (the former is
         request metadata the caller checks separately; the latter is derived
         from ``memory_store_name`` plus global config shared by both sides).
