@@ -9,6 +9,7 @@ no-credential / two-axis invariants hold (negative).
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import pathlib

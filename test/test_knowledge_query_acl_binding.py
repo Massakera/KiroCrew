@@ -16,8 +16,8 @@ import time
 import pytest
 
 from kiro_crew.knowledge.acl import (
-    AccessContext,
     LOCAL_PRINCIPAL,
+    AccessContext,
     ProviderResourceRef,
     QueryPrincipal,
     RevalidationOutcome,

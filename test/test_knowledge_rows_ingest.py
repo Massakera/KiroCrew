@@ -16,8 +16,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kiro_crew.knowledge.acl import (
-    AccessContext,
     LOCAL_PRINCIPAL,
+    AccessContext,
     ProviderResourceRef,
     QueryPrincipal,
     RevalidationOutcome,

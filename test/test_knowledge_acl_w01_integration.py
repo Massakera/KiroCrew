@@ -78,7 +78,8 @@ def _seed(store, *, kiro_principal, subject_ref, tenant_ref,
     # Record the vendor ``account`` so the REAL store-backed account->deployment
     # mapping can resolve it (no lambda).
     return store.insert(binding, deployment_id=deployment,
-                        kiro_principal=kiro_principal, account=account)
+                        kiro_principal=kiro_principal, account=account,
+                        endpoint="https://acme.salesforce.example")
 
 
 def _resolver(bstore):
@@ -97,7 +98,8 @@ def _fresh_hook():
 def _managed_item(kb, title, content, subject_ref, tenant_ref, account=ACCOUNT):
     src = kb.add_source(f"sf-{title}", SERVICE, f"salesforce://{title}")
     item = kb.add_item(title, content, "record", source_id=src)
-    ref = ProviderResourceRef(provider=SERVICE, account=account, resource_id=title)
+    ref = ProviderResourceRef(provider=SERVICE, account=account, resource_id=title,
+                              locator={"instanceUrl": "https://acme.salesforce.example"})
     kb.set_item_acl(item, [subject_ref], tenant=tenant_ref, managed=True,
                     fresh_as_of=0.0, resource_ref=ref)
     return item

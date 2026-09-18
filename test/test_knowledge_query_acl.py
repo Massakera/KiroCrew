@@ -34,11 +34,11 @@ from kiro_crew.knowledge.acl import (
     PUBLIC_TENANT,
     TRUST_LOCAL,
     TRUST_MANAGED,
+    UNREADABLE_GRANT,
     AccessContext,
     ItemGrant,
     RevalidationOutcome,
     SubjectTenantAclPolicy,
-    UNREADABLE_GRANT,
     is_managed_trust_class,
 )
 from kiro_crew.knowledge.retrieval import HybridRetriever
