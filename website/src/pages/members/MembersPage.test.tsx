@@ -2380,8 +2380,26 @@ describe('MembersPage auto patrol (monitor loop status)', () => {
     expect(screen.queryByText(/nothing wakes this member/i)).toBeNull()
   })
 
-  it('without a live patrol the Wake sources empty line still renders', async () => {
+  it('a stopped patrol lists as a muted wake source instead of reading "nothing wakes this member"', async () => {
+    // This test asserted the opposite rule until UX read the shipped panel: a
+    // durably-stopped patrol is the state this surface exists to preserve
+    // across a restart, and routing it to the empty branch put "Patrol
+    // stopped. Interrupted by a restart." directly above "Nothing wakes this
+    // member automatically." A stopped patrol still IS a wake source, just not
+    // an armed one, so it lists muted the way a disabled job does.
     await openDrawerWith({ loops: [loop({ active: false, stopped_reason: 'manual' })] })
+    await waitFor(() => expect(screen.queryByTestId('member-wake-loading')).toBeNull())
+    const patrolRow = screen.getByTestId('member-wake-patrol')
+    expect(patrolRow).toHaveAttribute('data-patrol-state', 'stopped')
+    expect(patrolRow).toHaveTextContent(/auto patrol/i)
+    expect(screen.getByTestId('member-wake-patrol-stopped')).toHaveTextContent(/patrol stopped/i)
+    expect(screen.queryByText(/nothing wakes this member/i)).toBeNull()
+  })
+
+  it('with no patrol at all the Wake sources empty line still renders', async () => {
+    // The empty copy is still the honest answer when nothing wakes the member:
+    // the fix above narrows WHEN it fires, it does not remove it.
+    await openDrawerWith({ loops: [] })
     await waitFor(() => expect(screen.queryByTestId('member-wake-loading')).toBeNull())
     expect(screen.queryByTestId('member-wake-patrol')).toBeNull()
     expect(screen.getByText(/nothing wakes this member/i)).toBeInTheDocument()

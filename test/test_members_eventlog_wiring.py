@@ -177,10 +177,10 @@ class TestHistoryRoute:
         state = _make_state(tmp_path)
         async with TestClient(TestServer(_members_app(state))) as client:
             data = await (await client.get(f"/api/members/{slug}/history")).json()
-            assert [e["seq"] for e in data["events"]] == [4, 3, 2, 1, 0]
-            assert data["lastSeq"] == 4
-            paged = await (await client.get(f"/api/members/{slug}/history?before=2")).json()
-        assert [e["seq"] for e in paged["events"]] == [1, 0]
+            assert [e["seq"] for e in data["events"]] == [5, 4, 3, 2, 1]
+            assert data["lastSeq"] == 5
+            paged = await (await client.get(f"/api/members/{slug}/history?before=3")).json()
+        assert [e["seq"] for e in paged["events"]] == [2, 1]
 
     @pytest.mark.asyncio
     async def test_sensitive_event_data_is_redacted(self, tmp_path, monkeypatch):

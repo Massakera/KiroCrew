@@ -2883,7 +2883,7 @@ export default function MembersPage() {
                 is a reader pausing to work out whether they differ. The empty
                 state's is the one that survives, because that is where a reader
                 who has never made a schedule is looking. */}
-            {(wakeJobs.length > 0 || wakeHooks.length > 0 || patrolState === 'active') && (
+            {(wakeJobs.length > 0 || wakeHooks.length > 0 || patrolState !== 'none') && (
               <button
                 onClick={() => openSchedFor(active.name)}
                 className="inline-flex items-center gap-1 rounded px-1 py-0.5 hover:bg-accent/40 text-muted hover:text-text"
@@ -2978,7 +2978,7 @@ export default function MembersPage() {
                 testId="member-wake-error"
               />
             </div>
-          ) : wakeJobs.length === 0 && wakeHooks.length === 0 && patrolState !== 'active' ? (
+          ) : wakeJobs.length === 0 && wakeHooks.length === 0 && patrolState === 'none' ? (
             <div className="text-[11px] text-muted mb-4">
               {t('pages.membersPage.wake_none')}{' '}
               {/* The header's 12px icon is the wrong place to LEARN this exists,
@@ -2995,19 +2995,41 @@ export default function MembersPage() {
             </div>
           ) : (
             <ul className="list-none m-0 p-0 mb-4 space-y-1.5" data-testid="member-wake-sources">
-              {/* An active patrol IS a wake source — the one this member set
-                  for itself. Listing it here keeps the card from saying
+              {/* A patrol IS a wake source — the one this member set for
+                  itself. Listing it here keeps the card from saying
                   "Last wake 6m ago" above "Nothing wakes this member". The
                   armed-projection case (no loop record yet) has no interval to
                   show, so it lists the patrol without the "every N" detail
-                  rather than leaving the list empty under its heading. */}
-              {patrolState === 'active' && (
-                <li className="flex items-center gap-2 text-[11px]" data-testid="member-wake-patrol">
-                  <Goal size={12} className="lucide-inline text-accent shrink-0" aria-hidden="true" />
-                  <span className="min-w-0 truncate flex-1">{t('pages.membersPage.patrol_title')}</span>
-                  {activePatrol && (
-                    <span className="text-muted shrink-0">
-                      {t('pages.membersPage.wake_patrol_every', { every: intervalText(activePatrol.idle_secs) })}
+                  rather than leaving the list empty under its heading.
+
+                  A STOPPED patrol lists too, muted, the way a disabled job
+                  does. It is the state this surface exists to preserve across a
+                  restart, and routing it to the empty branch instead put
+                  "Patrol stopped. Interrupted by a restart." directly above
+                  "Nothing wakes this member automatically." */}
+              {patrolState !== 'none' && (
+                <li
+                  className="flex items-center gap-2 text-[11px]"
+                  data-testid="member-wake-patrol"
+                  data-patrol-state={patrolState}
+                >
+                  <Goal
+                    size={12}
+                    className={`lucide-inline shrink-0 ${patrolState === 'active' ? 'text-accent' : 'text-muted'}`}
+                    aria-hidden="true"
+                  />
+                  <span className={`min-w-0 truncate flex-1 ${patrolState === 'active' ? '' : 'text-muted'}`}>
+                    {t('pages.membersPage.patrol_title')}
+                  </span>
+                  {patrolState === 'active' ? (
+                    activePatrol && (
+                      <span className="text-muted shrink-0">
+                        {t('pages.membersPage.wake_patrol_every', { every: intervalText(activePatrol.idle_secs) })}
+                      </span>
+                    )
+                  ) : (
+                    <span className="text-muted shrink-0" data-testid="member-wake-patrol-stopped">
+                      {t('pages.membersPage.patrol_stopped')}
                     </span>
                   )}
                 </li>

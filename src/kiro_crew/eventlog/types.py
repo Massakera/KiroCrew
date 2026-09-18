@@ -8,7 +8,8 @@ Envelope (one JSON object per line after the header)::
 
     {"type": "<event type>", "seq": <int>, "time": <epoch ms>, "data": {...}}
 
-``seq`` is the zero-based position of the event after the header. The writer
+``seq`` is the crew log's own entry number, so the header is 0 and the first
+event is 1. The writer
 assigns it as ``len(events)`` and refuses anything else; the reader treats a
 gap inside the committed region as corruption.
 """

@@ -601,8 +601,12 @@ def resolve_unit(kind: str, id_: str) -> UnitKind:
 def _unit_log_exists(service: Any, id_: str) -> bool:
     """Whether the unit has a log at all, distinct from having no events yet.
 
-    ``last_seq`` answers -1 for both a missing log and an empty one, and a unit
-    whose log exists but holds no events is a legitimate append target.
+    A unit whose log exists but holds no events is a legitimate append target,
+    so existence is asked of the service's own roster rather than inferred from
+    a cursor. The member service does answer ``-1`` only for a MISSING log and
+    ``0`` for an empty one, which would make this redundant for that kind alone
+    -- but ``resolve_unit`` is generic over registered kinds, and a kind is free
+    to spell its empty cursor differently.
     """
     try:
         return id_ in set(service.slugs())

@@ -20,6 +20,12 @@ export interface MemberProjectionFrame {
   key: string
   value: unknown
   seq: number
+  /**
+   * The contributor's fold generation for a contributed row. Read BEFORE seq:
+   * the server accepts a publish whose stateVersion rose even when its seq did
+   * not advance, so seq alone would drop a frame it already committed.
+   */
+  stateVersion?: number
 }
 
 /**
@@ -45,6 +51,8 @@ export interface ProjectionsBlock {
   seqs?: { [key: string]: number }
   /** Per-key rendering, for contributed rows whose app published one (§7). */
   schemas?: { [key: string]: ProjectionSchema }
+  /** Per-key fold generation, for contributed rows. See `MemberProjectionFrame`. */
+  stateVersions?: { [key: string]: number }
 }
 
 /**

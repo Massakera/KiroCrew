@@ -114,6 +114,26 @@ class ProjectionRegistry:
             for key, view, seq in fired:
                 on_change(slug, key, view, seq)
 
+    # ---- observed ---------------------------------------------------------
+    def observed_floor(self, slug: str) -> int:
+        """The lowest seq EVERY registered unit has already folded for *slug*.
+
+        ``-1`` when any registered unit has no cell yet: such a cell folds from
+        ``init()`` over whatever it is first driven with, so a caller must
+        :meth:`prime` it rather than drive a range at it, and a floor would
+        invite exactly that. The service primes at load, so a cell is missing
+        only before the first read.
+        """
+        with self._lock:
+            floor: int | None = None
+            for key in self._defns:
+                cell = self._cells.get((key, slug))
+                if cell is None:
+                    return -1
+                if floor is None or cell.observed_seq < floor:
+                    floor = cell.observed_seq
+            return -1 if floor is None else floor
+
     # ---- snapshot ---------------------------------------------------------
     def snapshot(self, slug: str) -> dict:
         """{"asOfSeq": last_seq, "values": {key: view}} for one slug."""

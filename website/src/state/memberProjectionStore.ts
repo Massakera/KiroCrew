@@ -24,6 +24,20 @@ interface Row {
   seq: number
   /** Rendering declared by a contributor for an `<app>/<key>` view, if any. */
   schema?: ProjectionSchema
+  /**
+   * The contributor's own fold GENERATION for a contributed row, mirroring the
+   * server's `stateVersion`. Held because the two sides do not apply the same
+   * rule: the server accepts a publish whose stateVersion rose even when its seq
+   * did not advance (a contributor refolding from scratch), so seq alone would
+   * drop a frame the server already committed.
+   */
+  stateVersion: number
+  /**
+   * Monotonic write id, assigned by the store. Only `reconcileContributed` reads
+   * it, to tell a row that predates a baseline read from one a live frame wrote
+   * while that read was in flight.
+   */
+  writeId: number
 }
 
 /** The useSyncExternalStore-shaped view for a single (slug, key). */
@@ -35,6 +49,8 @@ export interface ProjectionFace {
 export class MemberProjectionStore {
   private readonly rows = new Map<string, Map<string, Row>>()
   private readonly listeners = new Map<string, Set<() => void>>()
+  /** Monotonic, store-wide. See `Row.writeId`. */
+  private writeCounter = 0
   /** Bumped whenever the SET of keys held for a slug changes, so a consumer
    *  listing contributed views re-renders on a new card rather than only on a
    *  value change to a card it already knows about. */
@@ -80,10 +96,31 @@ export class MemberProjectionStore {
    * value update or a removal that only fired the per-key face would leave the
    * rendered card list stale.
    */
-  apply(slug: string, key: string, value: unknown, seq: number, schema?: ProjectionSchema): void {
+  apply(
+    slug: string,
+    key: string,
+    value: unknown,
+    seq: number,
+    schema?: ProjectionSchema,
+    stateVersion = 0,
+  ): void {
     let byKey = this.rows.get(slug)
     const existing = byKey?.get(key)
-    if (existing && seq <= existing.seq) return
+    // stateVersion is asked FIRST, because it can legitimately carry a LOWER
+    // seq: a contributor that refolds from scratch bumps the version and starts
+    // its seq again, and the server accepts that (contrib.py
+    // `ExternalProjectionStore.publish`, `by_state_version`). Seq-wins alone
+    // dropped it and left the obsolete card on screen. A version that went
+    // BACKWARDS is stale by the same rule the server refuses it with.
+    if (existing) {
+      if (stateVersion > existing.stateVersion) {
+        // accept, whatever the seq says
+      } else if (stateVersion < existing.stateVersion) {
+        return
+      } else if (seq <= existing.seq) {
+        return
+      }
+    }
 
     const contributed = key.includes('/')
     const isTeardown = contributed && (value === null || value === undefined)
@@ -104,7 +141,13 @@ export class MemberProjectionStore {
       byKey = new Map<string, Row>()
       this.rows.set(slug, byKey)
     }
-    byKey.set(key, { value, seq, schema: schema ?? existing?.schema })
+    byKey.set(key, {
+      value,
+      seq,
+      schema: schema ?? existing?.schema,
+      stateVersion,
+      writeId: ++this.writeCounter,
+    })
     this.notify(slug, key)
     // A NEW built-in key changes the key set the same way it always did; a
     // contributed key notifies the contributed face on every change (new OR an
@@ -129,11 +172,50 @@ export class MemberProjectionStore {
     asOfSeq: number,
     seqs?: { [key: string]: number },
     schemas?: { [key: string]: ProjectionSchema },
+    stateVersions?: { [key: string]: number },
   ): void {
     for (const key of Object.keys(values)) {
       const seq = seqs && typeof seqs[key] === 'number' ? seqs[key] : asOfSeq
-      this.apply(slug, key, values[key], seq, schemas?.[key])
+      const version =
+        stateVersions && typeof stateVersions[key] === 'number' ? stateVersions[key] : 0
+      this.apply(slug, key, values[key], seq, schemas?.[key], version)
     }
+  }
+
+  /** The write id to hand `reconcileContributed` after a baseline read. */
+  mark(): number {
+    return this.writeCounter
+  }
+
+  /**
+   * Delete this slug's contributed rows that the authoritative baseline does not
+   * carry, so a card the server has already forgotten cannot outlive it.
+   *
+   * `truncate` deliberately leaves contributed keys alone (their seq is a
+   * different domain from the member log's), which left teardown resting on the
+   * one null-value frame §6 sends. A socket that drops at the wrong moment never
+   * delivers it, and the card then stayed on screen indefinitely — the baseline
+   * read is the only thing that can say the row is gone.
+   *
+   * `since` is a `mark()` taken BEFORE the baseline request went out: a row a
+   * live frame wrote while that request was in flight is newer than the answer,
+   * so it is kept rather than deleted for being absent from a stale snapshot.
+   */
+  reconcileContributed(slug: string, baselineKeys: Iterable<string>, since: number): void {
+    const byKey = this.rows.get(slug)
+    if (!byKey) return
+    const keep = new Set(baselineKeys)
+    let dropped = false
+    for (const [key, row] of byKey) {
+      if (!key.includes('/')) continue
+      if (keep.has(key)) continue
+      if (row.writeId > since) continue
+      byKey.delete(key)
+      this.notify(slug, key)
+      dropped = true
+    }
+    if (byKey.size === 0) this.rows.delete(slug)
+    if (dropped) this.notifyKeyset(slug)
   }
 
   /**

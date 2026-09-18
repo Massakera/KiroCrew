@@ -141,6 +141,66 @@ describe('MemberProjectionStore', () => {
     })
   })
 
+  describe('apply: stateVersion outranks seq', () => {
+    it('applies a refold whose stateVersion rose even though its seq went back', () => {
+      // The server accepts exactly this: a contributor that refolds from scratch
+      // bumps stateVersion and starts its seq again
+      // (ExternalProjectionStore.publish, by_state_version). Seq-wins alone
+      // dropped the frame and left the obsolete card on screen.
+      store.apply('a', 'demoapp/count', { n: 9 }, 40, undefined, 1)
+      store.apply('a', 'demoapp/count', { n: 1 }, 2, undefined, 2)
+      expect(store.get('a', 'demoapp/count')).toEqual({ n: 1 })
+    })
+
+    it('drops a frame whose stateVersion went backwards, whatever its seq', () => {
+      store.apply('a', 'demoapp/count', { n: 1 }, 2, undefined, 2)
+      store.apply('a', 'demoapp/count', { n: 9 }, 99, undefined, 1)
+      expect(store.get('a', 'demoapp/count')).toEqual({ n: 1 })
+    })
+
+    it('still applies seq-wins at an equal stateVersion', () => {
+      store.apply('a', 'demoapp/count', { n: 1 }, 5, undefined, 1)
+      store.apply('a', 'demoapp/count', { n: 2 }, 4, undefined, 1)
+      expect(store.get('a', 'demoapp/count')).toEqual({ n: 1 })
+      store.apply('a', 'demoapp/count', { n: 3 }, 6, undefined, 1)
+      expect(store.get('a', 'demoapp/count')).toEqual({ n: 3 })
+    })
+  })
+
+  describe('reconcileContributed', () => {
+    it('deletes a contributed row the authoritative baseline no longer carries', () => {
+      // Teardown otherwise rests entirely on the one null-value frame §6 sends,
+      // and a socket that drops at the wrong moment never delivers it -- the
+      // card then outlived the app that published it.
+      store.apply('a', 'demoapp/count', { n: 1 }, 1, undefined, 1)
+      store.apply('a', 'roster', { name: 'A' }, 1)
+      const mark = store.mark()
+      store.reconcileContributed('a', ['roster'], mark)
+      expect(store.get('a', 'demoapp/count')).toBeUndefined()
+      // A built-in key is not the contributed lifecycle's business.
+      expect(store.get('a', 'roster')).toEqual({ name: 'A' })
+    })
+
+    it('keeps a contributed row written after the mark, so a stale read cannot delete it', () => {
+      // The baseline read is not instantaneous. A live frame that lands while it
+      // is in flight is NEWER than the answer, so absence from that answer says
+      // nothing about it.
+      const mark = store.mark()
+      store.apply('a', 'demoapp/count', { n: 1 }, 1, undefined, 1)
+      store.reconcileContributed('a', [], mark)
+      expect(store.get('a', 'demoapp/count')).toEqual({ n: 1 })
+    })
+
+    it('notifies the key set when it drops a card', () => {
+      store.apply('a', 'demoapp/count', { n: 1 }, 1, undefined, 1)
+      let hits = 0
+      const unsub = store.contributedFace('a').subscribe(() => { hits += 1 })
+      store.reconcileContributed('a', [], store.mark())
+      unsub()
+      expect(hits).toBe(1)
+    })
+  })
+
   describe('has / clear', () => {
     it('reports whether a slug is held and clears everything', () => {
       store.apply('a', 'roster', 1, 1)

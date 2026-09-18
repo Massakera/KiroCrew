@@ -63,7 +63,8 @@ GET /api/eventlog/{kind}/{id}/events?after=<seq>&limit=<1..500>
   -> { "kind", "id", "<idField>", "events": [envelope...], "lastSeq": n }   oldest first, seq > after
 ```
 
-`after` defaults to -1 (from the beginning); `limit` defaults to 200. An out-of-range `limit` is
+`after` defaults to 0 (from the beginning, since the first event's `seq` is 1; -1 is accepted as the
+same for a client that computed its cursor from an empty fold); `limit` defaults to 200. An out-of-range `limit` is
 refused rather than clamped: a consumer that asked for 5000 and silently received 200 would read a
 short page as the end of the log. The response carries the id twice — once as `id` and once under the
 kind's own field name (`slug` for a member) — so a consumer can key on either.
@@ -117,7 +118,7 @@ POST /api/eventlog/{kind}/{id}/projections/{key}
 `seq` is the log position the view is current as of. The gateway keeps one row per `(kind, id, key)`:
 a publish with `seq` lower than or equal to the stored row is refused with `409 stale_seq` (a replay,
 or a slower contributor); higher wins and is pushed to dashboards as the existing
-`member_projection` frame `{slug, key, value, seq, schema?}` (for kind `member`; other kinds get a frame
+`member_projection` frame `{slug, key, value, seq, stateVersion, schema?}` (for kind `member`; other kinds get a frame
 of the same shape named for the kind). Contributed rows appear in the unit's `projections.values` block
 next to built-in keys, so a dashboard needs no new code path to receive them.
 
@@ -127,6 +128,11 @@ summarises many events, but not unbounded: this value is pushed whole to every d
 `stateVersion` is the contributor's fold version. A publish with a higher `stateVersion` than the stored
 row replaces it regardless of `seq`, so a contributor that changed its fold can re-publish from zero. A
 LOWER `stateVersion` is refused as stale.
+
+It therefore travels on the frame and in the baseline, and a client MUST read it BEFORE the seq rule:
+the two rules are not the same rule, and a client applying seq-wins alone drops the one frame this
+paragraph exists to allow — a refold the server has already accepted — and goes on rendering the
+obsolete card.
 
 Rows are durable. A contributor publishes on its own cadence, so an in-memory table would blank every
 contributed card on a gateway restart and leave the page empty until that contributor happened to
@@ -143,13 +149,43 @@ The `projections` block on a roster row therefore carries three maps:
 }
 ```
 
-`seqs` and `schemas` are present only for contributed rows. `seqs` is REQUIRED rather than cosmetic: a
-contributed row's seq is the contributor's own fold position, not the response's `asOfSeq`, and a client
-that seeded it at `asOfSeq` would drop the contributor's next live push under the higher-seq-wins rule
-and freeze the card at its baseline.
+`seqs`, `stateVersions` and `schemas` are present only for contributed rows. `seqs` is REQUIRED rather
+than cosmetic: a contributed row's seq is the contributor's own fold position, not the response's
+`asOfSeq`, and a client that seeded it at `asOfSeq` would drop the contributor's next live push under the
+higher-seq-wins rule and freeze the card at its baseline. `stateVersions` carries the same field the
+frame does, for the same reason.
+
+This block is also the AUTHORITATIVE set of contributed rows, and a client MUST delete the contributed
+rows it holds that the block does not carry. Teardown otherwise rests entirely on the single null-value
+frame §6 sends, and a socket that drops at the wrong moment never delivers it, so a withdrawn app's card
+outlives the app. A client that reconciles must not delete a row a live frame wrote while the read was in
+flight: such a row is newer than the answer, so absence from it says nothing.
 
 Folding happens in the contributor's process, against events read through §3. The gateway never
 executes contributor code.
+
+### 5.1 The published row is display-only, and forgeable
+
+Published rows live at `<data home>/eventlog/contrib/<kind>/<id>.json`, which is NOT under the fenced
+`crew-log/` root. An agent's file tools reach it, so a sandboxed agent can change what a contributed
+card shows.
+
+That is the recorded decision, not an oversight, and it rests on what the file is FOR: the authority for
+a contributed row is the contributor's own next publish, and the file exists only so a gateway restart
+does not blank every card until each contributor happens to re-publish. Nothing in the gateway reads a
+published row to decide anything: the rows reach the member drawer's cards and nowhere else, and the
+events a contributor appends — the part that IS history, and the part a member's trust reads — go to the
+member's crew log, which is fenced.
+
+The consequence, stated rather than implied: a forged row renders as that app's view until the
+contributor publishes again, and for a contributor that never publishes again, indefinitely. So a reader
+may not treat a contributed card as evidence of anything; a card is what an app last said, at whatever
+fold position the row carries.
+
+Fencing it is the resolution if that ever stops being enough — specifically if a published row gains a
+consumer that decides something, which would make it a record rather than a display. The fence is the
+same mechanism the member log uses (a leaf named in `_CREW_SECRET_LEAVES` and `_CREW_HIDDEN_LEAVES`), so
+the change is a move of the root, not a second fence.
 
 ## 6. Teardown
 

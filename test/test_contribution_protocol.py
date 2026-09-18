@@ -477,14 +477,14 @@ class TestCatchUpRead:
         for i in range(5):
             svc.append(SLUG, "demoapp/ping", {"i": i})
         page = svc.events_after(SLUG, after=1, limit=10)
-        assert [e["seq"] for e in page] == [2, 3, 4]
+        assert [e["seq"] for e in page] == [2, 3, 4, 5]
 
     def test_limit_bounds_the_page(self):
         _ensure_log()
         svc = get_service()
         for i in range(5):
             svc.append(SLUG, "demoapp/ping", {"i": i})
-        assert [e["seq"] for e in svc.events_after(SLUG, after=-1, limit=2)] == [0, 1]
+        assert [e["seq"] for e in svc.events_after(SLUG, after=0, limit=2)] == [1, 2]
 
     @pytest.mark.asyncio
     async def test_route_returns_a_page_and_last_seq(self, tmp_path, monkeypatch):
@@ -498,8 +498,8 @@ class TestCatchUpRead:
             res = await client.get(f"/api/eventlog/member/{SLUG}/events?after=0&limit=10")
             status, body = res.status, await res.json()
         assert status == 200
-        assert [e["seq"] for e in body["events"]] == [1, 2]
-        assert body["lastSeq"] == 2
+        assert [e["seq"] for e in body["events"]] == [1, 2, 3]
+        assert body["lastSeq"] == 3
         assert body["slug"] == SLUG
 
     @pytest.mark.asyncio
@@ -555,8 +555,8 @@ class TestAppendRoute:
             status, body = res.status, await res.json()
         assert status == 201
         # The contributor's seq/time are ignored; the gateway assigns both.
-        assert body["seq"] == 0 and body["time"] > 1
-        assert get_service().last_seq(SLUG) == 0
+        assert body["seq"] == 1 and body["time"] > 1
+        assert get_service().last_seq(SLUG) == 1
 
     @pytest.mark.asyncio
     async def test_an_undeclared_type_is_refused(self, tmp_path, monkeypatch):
@@ -569,7 +569,7 @@ class TestAppendRoute:
             )
             status, body = res.status, await res.json()
         assert status == 403 and body["code"] == "event_type_not_owned"
-        assert get_service().last_seq(SLUG) == -1
+        assert get_service().last_seq(SLUG) == 0
 
     @pytest.mark.asyncio
     async def test_a_dashboard_user_is_refused(self, tmp_path, monkeypatch):
@@ -642,7 +642,7 @@ class TestAppendRoute:
             over_status, over_body = over.status, await over.json()
         assert ok_status == 201
         assert over_status == 429 and over_body["code"] == "quota_exceeded"
-        assert get_service().last_seq(SLUG) == 0
+        assert get_service().last_seq(SLUG) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -666,10 +666,20 @@ class TestPublishRoute:
         assert status == 204
         assert get_store().get("member", SLUG, "demoapp/count").value == {"n": 3}
         # The EXISTING member_projection frame, so the page needs no new path.
+        # `stateVersion` rides it because the browser's rule and this server's
+        # rule are not the same rule: a publish whose stateVersion rose is
+        # accepted here with a seq that did not advance, and a client applying
+        # seq-wins alone would drop exactly that frame.
         assert pushed == [
             (
                 types.WS_MEMBER_PROJECTION,
-                {"slug": SLUG, "key": "demoapp/count", "value": {"n": 3}, "seq": 2},
+                {
+                    "slug": SLUG,
+                    "key": "demoapp/count",
+                    "value": {"n": 3},
+                    "seq": 2,
+                    "stateVersion": 1,
+                },
             )
         ]
 
@@ -855,7 +865,7 @@ class TestTeardown:
         assert pushed and pushed[-1][0] == types.WS_MEMBER_PROJECTION
         assert pushed[-1][1]["value"] is None and pushed[-1][1]["key"] == "demoapp/count"
         # Events STAY: they are history, and the log is never rewritten.
-        assert svc.last_seq(SLUG) == 0
+        assert svc.last_seq(SLUG) == 1
         assert svc.events_after(SLUG, after=-1, limit=10)[0]["type"] == "demoapp/ping"
 
     @pytest.mark.asyncio

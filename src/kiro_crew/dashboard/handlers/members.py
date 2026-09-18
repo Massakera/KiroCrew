@@ -335,6 +335,7 @@ async def api_members(request: web.Request) -> web.Response:
             block = out[slug]
             block.setdefault("values", {})
             seqs: dict[str, int] = block.setdefault("seqs", {})
+            versions: dict[str, int] = block.setdefault("stateVersions", {})
             schemas: dict[str, dict] = block.setdefault("schemas", {})
             for key, ext in external.items():
                 if ext.seq < 0 and ext.value is None:
@@ -342,6 +343,11 @@ async def api_members(request: web.Request) -> web.Response:
                     continue
                 block["values"][key] = ext.value
                 seqs[key] = ext.seq
+                # Seeded beside the seq because the two rules differ: a publish
+                # whose stateVersion rose is accepted with a seq that did not
+                # advance, so a client holding only the seq would drop the
+                # contributor's own refold.
+                versions[key] = ext.state_version
                 if ext.schema is not None:
                     schemas[key] = ext.schema
             if not schemas:

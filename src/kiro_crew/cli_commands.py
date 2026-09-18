@@ -954,6 +954,13 @@ def _handle_app_import(args: argparse.Namespace) -> None:
     try:
         manifest_path, _ = find_plugin_manifest(source)
         manifest_name = json.loads(manifest_path.read_text(encoding="utf-8")).get("name")
+        # A manifest is foreign input, so `name` can be any JSON type. Anything
+        # that is not a string is treated as absent rather than passed on:
+        # `normalize_app_name` calls `.strip()`, so a truthy non-string (a
+        # number, a list) would raise AttributeError past the arms below and
+        # abort with a traceback instead of the message they print.
+        if not isinstance(manifest_name, str):
+            manifest_name = None
         derived = normalize_app_name(
             getattr(args, "name", None) or (manifest_name or source.resolve().name)
         )

@@ -72,14 +72,6 @@ _ACTIVITY_LOG_MAX_BYTES = 1024 * 1024
 # so the shared cap has enormous headroom over anything legitimate.
 _RECORD_CAP = RECORD_CAP
 
-#: How many of the member's most recent events the ``dedupe_session`` probe
-#: scans for a matching (session, member) pair. The activity projection's own
-#: ring is 50, and a genuine duplicate is a cold-start replay of the SAME
-#: conversation, so it lands within the newest handful of events; a generous
-#: bound keeps the probe cheap while still catching a replay that trailed a
-#: burst of other records.
-_DEDUPE_SCAN_LIMIT = 200
-
 #: Crew-slug -> DM-thread binding inside a member's directory.
 DM_FILE_NAME = "dm.json"
 
@@ -1030,13 +1022,21 @@ def record_activity(
 
         svc = get_service()
         if dedupe_session:
-            # Check the member's own recent ACTIVITY_RECORD events for this
-            # session pair instead of scanning a file. Matched on BOTH fields:
-            # a colliding slug means one log can hold two members, so session
+            # Check the member's own ACTIVITY_RECORD events for this session
+            # pair instead of scanning a file. Matched on BOTH fields: a
+            # colliding slug means one log can hold two members, so session
             # alone would suppress the wrong entry. Only participation entries
             # carry `session`, which is also the only kind deduped — routing
             # decisions are distinct events.
-            recent = svc.history(slug, before=None, limit=_DEDUPE_SCAN_LIMIT)
+            #
+            # The scan is UNBOUNDED, and a bound is not an optimisation here: the
+            # log is already materialised in memory by the read below, so a limit
+            # only truncates a filter over a list that was loaded either way. A
+            # 200-event cap therefore bought no I/O and did buy a miss — a
+            # session resumed after 200 later events deduped against nothing and
+            # wrote a second participation record, inflating the activity
+            # projection it feeds.
+            recent = svc.history(slug, before=None, limit=None)
             for ev in recent:
                 if ev.get("type") != ACTIVITY_RECORD:
                     continue

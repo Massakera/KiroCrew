@@ -492,6 +492,29 @@ class TestIdentity:
             normalize_app_name(raw)
         assert exc.value.code == "invalid_app_name"
 
+    def test_a_non_string_manifest_name_falls_back_to_the_directory(self, tmp_path):
+        """A manifest is foreign input, so ``name`` can be any JSON type.
+
+        A truthy non-string reached ``normalize_app_name``, whose ``.strip()``
+        raised ``AttributeError`` past the handler's ``(OSError,
+        JSONDecodeError)`` arms, so ``kirocrew app import`` aborted with a
+        traceback. An unusable name is an ABSENT name, and an absent one already
+        has a documented fallback: the source directory.
+        """
+        import argparse
+
+        from kiro_crew.cli_commands import _handle_app_import
+
+        root = tmp_path / "src" / "my-plugin-dir"
+        root.mkdir(parents=True)
+        _write_json(root / ".codex-plugin" / "plugin.json", {"name": 123})
+        _skill(root / "skills", "greet")
+        out = tmp_path / "out"
+
+        _handle_app_import(argparse.Namespace(source=str(root), name=None, out=str(out)))
+
+        assert json.loads((out / "app.json").read_text(encoding="utf-8"))["name"] == "my-plugin-dir"
+
     def test_an_override_replaces_the_declared_name(self, tmp_path):
         root = _package(tmp_path, name="system")
         report = convert_plugin_package(root, tmp_path / "out", name_override="imported-demo")
@@ -581,6 +604,32 @@ class TestIdentity:
 
 
 class TestOutput:
+    def test_a_failure_after_the_copy_leaves_the_output_retryable(self, tmp_path):
+        """The retry has to work, and it did not.
+
+        Skills are copied into the output before the later manifest fields are
+        parsed, so an ordinary malformed one -- a non-list ``keywords`` -- raised
+        with the directory already holding half an app. The empty-directory
+        precondition then refused the retry of the very command that made the
+        mess, leaving the user to clean up by hand. The conversion now stages its
+        work and publishes only on success, so ANY failure below the copy leaves
+        the output as it was, not this one field order.
+        """
+        root = _package(tmp_path, keywords=5)
+        _skill(root / "skills", "greet")
+        out = tmp_path / "out"
+
+        with pytest.raises(TypeError):
+            convert_plugin_package(root, out)
+        assert not out.exists(), "a failed conversion must not leave an output directory"
+        assert not list(tmp_path.glob(".out.partial-*")), "staging directory left behind"
+
+        # The point of the above: fixing the manifest and running again works.
+        _write_json(root / ".codex-plugin" / "plugin.json", {"name": "demo-plugin", "keywords": ["a"]})
+        report = convert_plugin_package(root, out)
+        assert report.app_name == "demo-plugin"
+        assert (out / "app.json").exists()
+
     def test_a_second_conversion_into_the_same_directory_is_refused(self, tmp_path):
         root = _package(tmp_path)
         out = tmp_path / "out"

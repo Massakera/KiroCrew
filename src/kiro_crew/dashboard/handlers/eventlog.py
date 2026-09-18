@@ -131,7 +131,9 @@ def _parse_int(raw: str, code: str, message: str) -> int:
 async def api_eventlog_events_get(request: web.Request) -> web.Response:
     """GET /api/eventlog/{kind}/{id}/events?after=&limit= -- catch-up read (§3).
 
-    Oldest first, ``seq > after``. ``after`` defaults to -1 (from the beginning);
+    Oldest first, ``seq > after``. ``after`` defaults to 0 (from the beginning,
+    since a crew log's first entry is 1, and -1 is accepted as the same for a
+    client that computed its cursor from an empty fold);
     ``limit`` is clamped to 1..500 (default 200) and a bad value is refused with a
     coded 400 rather than silently substituted -- a consumer that asked for 5000
     and received 200 without being told would read a short page as the end of the
@@ -144,7 +146,7 @@ async def api_eventlog_events_get(request: web.Request) -> web.Response:
     if isinstance(app, web.Response):
         return app
     try:
-        unit = resolve_unit(kind, unit_id)
+        unit = await asyncio.to_thread(resolve_unit, kind, unit_id)
         if not grants.may_use_kind(app, kind):
             raise ContribError("unit_kind_not_granted", f"this app may not read {kind} units")
         raw_after = request.query.get("after", "")
@@ -220,7 +222,7 @@ async def api_eventlog_events_post(request: web.Request) -> web.Response:
 
     event_type = body.get("type", "")
     try:
-        unit = resolve_unit(kind, unit_id)
+        unit = await asyncio.to_thread(resolve_unit, kind, unit_id)
         if not isinstance(event_type, str) or not event_type:
             raise ContribError("event_type_not_owned", "type is required")
         if not grants.may_use_kind(app, kind):
@@ -275,7 +277,7 @@ async def api_eventlog_projection_put(request: web.Request) -> web.Response:
         return _err("invalid_projection_value", "body must be a JSON object")
 
     try:
-        unit = resolve_unit(kind, unit_id)
+        unit = await asyncio.to_thread(resolve_unit, kind, unit_id)
         if not grants.may_publish(app, kind, key):
             raise ContribError(
                 "projection_key_not_owned",
@@ -311,7 +313,14 @@ async def api_eventlog_projection_put(request: web.Request) -> web.Response:
         return _err(exc.code, str(exc))
 
     _push_projection(
-        request, unit, unit_id, key, result.row.value, result.row.seq, result.row.schema
+        request,
+        unit,
+        unit_id,
+        key,
+        result.row.value,
+        result.row.seq,
+        result.row.schema,
+        result.row.state_version,
     )
     _audit(
         app,
@@ -344,7 +353,7 @@ async def api_eventlog_projection_schema_put(request: web.Request) -> web.Respon
         return _err("invalid_projection_value", "body must be a JSON object")
 
     try:
-        unit = resolve_unit(kind, unit_id)
+        unit = await asyncio.to_thread(resolve_unit, kind, unit_id)
         if not grants.may_publish(app, kind, key):
             raise ContribError(
                 "projection_key_not_owned",
@@ -363,7 +372,9 @@ async def api_eventlog_projection_schema_put(request: web.Request) -> web.Respon
     # rendering without waiting for the contributor's next fold. Skipped for a
     # schema published before any value: there is nothing to render yet.
     if row.seq >= 0:
-        _push_projection(request, unit, unit_id, key, row.value, row.seq, row.schema)
+        _push_projection(
+            request, unit, unit_id, key, row.value, row.seq, row.schema, row.state_version
+        )
     _audit(app, "eventlog.schema", "granted", resources)
     return web.Response(status=204)
 
@@ -376,11 +387,18 @@ def _push_projection(
     value,
     seq: int,
     schema: dict | None,
+    state_version: int = 0,
 ) -> None:
     """Broadcast one contributed row on this kind's whole-value frame.
 
     Best-effort: the row is already durable, so a broadcast fault costs a
     dashboard one stale card until the next publish, not correctness.
+
+    ``state_version`` travels with the row because the store's rule and this
+    server's rule are not the same rule: a publish whose ``stateVersion`` ROSE is
+    accepted here even when its seq did not advance (a contributor refolding from
+    scratch), and a browser applying seq-wins alone would drop exactly that frame
+    and keep rendering the obsolete card.
     """
     state = request.app.get("state")
     broadcast = getattr(state, "broadcast_ws", None)
@@ -397,6 +415,7 @@ def _push_projection(
         "key": key,
         "value": _redact_projection_value(value),
         "seq": seq,
+        "stateVersion": state_version,
     }
     if schema is not None:
         # The schema crosses the same network boundary as ``value`` and is

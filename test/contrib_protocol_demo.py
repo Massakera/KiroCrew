@@ -159,7 +159,13 @@ class WebSocket:
         port = url.port or (443 if url.scheme == "https" else 80)
         raw = socket.create_connection((host, port), timeout=20)
         if url.scheme == "https":
-            raw = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+            ctx = ssl.create_default_context()
+            # The floor is PINNED rather than inherited. This file is the
+            # protocol's worked example, so a contributor copies it onto
+            # whatever runtime they have -- and an older one negotiates TLS
+            # 1.0/1.1, carrying the app token with it.
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            raw = ctx.wrap_socket(raw, server_hostname=host)
         key = base64.b64encode(secrets.token_bytes(16)).decode()
         handshake = (
             # The token rides the query string: the auth middleware reads
@@ -310,13 +316,15 @@ def main() -> int:
     count_key = f"{args.app}/count"
     print(f"[1/6] token exchanged for app {args.app!r}")
 
-    # Resume from the seq this contributor last folded, if it has one.
+    # Resume from the seq this contributor last folded, if it has one. 0 means
+    # "nothing folded yet": the log's first event is seq 1, so 0 is below every
+    # real one and `?after=0` reads from the beginning.
     state_path = Path(args.state) if args.state else None
-    folded_seq = -1
+    folded_seq = 0
     state: dict = {}
     if state_path and state_path.exists():
         stored = json.loads(state_path.read_text(encoding="utf-8"))
-        folded_seq = int(stored.get("seq", -1))
+        folded_seq = int(stored.get("seq", 0))
         state = stored.get("state", {})
         print(f"      resuming from seq {folded_seq} with {state.get('pings', 0)} ping(s) folded")
 

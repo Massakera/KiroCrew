@@ -30,8 +30,10 @@ arrived.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -766,8 +768,45 @@ def convert_plugin_package(
             else f"{out_dir} is not empty; choose an empty output directory"
         )
         raise PluginImportError("output_not_empty", detail)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Everything below writes into a STAGING directory, and ``out_dir`` gets it
+    # only once the whole conversion succeeds. That is what makes the order of
+    # the steps below stop mattering: skills are copied early and several
+    # manifest fields are parsed after, so an ordinary malformed one (a non-list
+    # ``keywords``, say) raises with files already written. Staged, such a failure
+    # leaves ``out_dir`` exactly as it was, so the retry of the same command is
+    # accepted rather than refused by the empty-directory precondition above.
+    #
+    # The staging dir is a sibling, so the publish is a same-filesystem rename,
+    # and it is removed on the way out whether or not the conversion worked.
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.partial-", dir=out_dir.parent))
+    try:
+        report = _convert_into(root, data, interface, app_name, staging, report)
+        # Publish. An empty ``out_dir`` the caller already created is removed
+        # first: ``os.replace`` onto an existing directory fails, and the
+        # precondition above has already proven this one holds nothing.
+        if out_dir.exists():
+            out_dir.rmdir()
+        os.replace(staging, out_dir)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return report
+
+
+def _convert_into(
+    root: Path,
+    data: dict,
+    interface: dict,
+    app_name: str,
+    out_dir: Path,
+    report: ImportReport,
+) -> ImportReport:
+    """The conversion itself, writing only inside *out_dir*.
+
+    Split out so :func:`convert_plugin_package` can hand it a staging directory
+    and publish atomically; it makes no other decision.
+    """
     version = _first_nonempty(data.get("version"))
     if not version or not SEMVER_RE.match(version):
         if version:
@@ -829,5 +868,5 @@ def convert_plugin_package(
             "the converted manifest did not validate: " + "; ".join(errors),
         )
 
-    existing.write_text(json.dumps(emitted, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "app.json").write_text(json.dumps(emitted, indent=2) + "\n", encoding="utf-8")
     return report
