@@ -32,6 +32,16 @@ the gate, never a provider message: a message is unbounded and can quote the
 request back, which is how a credential would reach the file the scrub exists to
 keep it out of.
 
+Two kinds of row, told apart by an absent field
+-----------------------------------------------
+A DECISION row carries no ``kind``; a ``kind="feedback"`` row carries a person's
+verdict on one turn (:func:`build_feedback_row`). A reader therefore tells them
+apart by ``kind`` being absent, which is the only test that also holds for the
+files this code has already written. A verdict is appended as its own row rather
+than merged into the decision it judges: the append is constant-cost by design,
+so an edit would have to rewrite the file, and it would lose both when the
+verdict was given and the fact that someone changed their mind.
+
 Why one synchronous append helper
 ---------------------------------
 The gate offloads this helper as one unit, including open, write and close, so
@@ -186,6 +196,56 @@ def build_row(
         "scrubbed": scrubbed is True,
         "answers": _answers_json(answers),
         "error": error,
+    }
+
+
+#: Longest ``turn_id`` kept on a feedback row. The value is a turn identifier the
+#: frontend echoes back from the strip it was given, so it is bounded already --
+#: this is the bound that holds when the caller is something else.
+_MAX_TURN_ID_CHARS = 200
+
+#: The verdicts a feedback row may carry. ``None`` is a real value: it is how the
+#: reader says "the person cleared their earlier verdict", which has to be
+#: distinguishable from never having given one.
+FEEDBACK_VERDICTS = ("right", "wrong")
+
+#: Which of the two answers the verdict is ABOUT. A verdict with no side names no
+#: answer, so there is no default -- the caller states it.
+FEEDBACK_SIDES = ("jev", "baseline")
+
+
+def build_feedback_row(
+    *,
+    turn_id: str,
+    verdict: str | None,
+    side: str,
+    ts: datetime | None = None,
+) -> dict[str, Any]:
+    """A ``kind="feedback"`` row: a person's verdict on one decision.
+
+    Carries ``kind`` where a decision row carries none, and that asymmetry is the
+    compatible one: a reader distinguishes the two by ``kind`` being ABSENT, which
+    is the one test that also holds for a day-file already on disk. A field that
+    had to be present on both kinds would have to be backfilled into files this
+    code cannot reach.
+
+    Appended, never merged into the decision row it refers to. The log is
+    append-only by construction (:func:`append` uses the platform append helper
+    precisely so a write is constant-cost and cannot rewrite a neighbour), and a
+    verdict is a SECOND event about the same turn -- recording it as an edit would
+    lose when it was given and make a changed mind unrecoverable.
+
+    ``turn_id`` is bounded and rendered as text for the reason every other value
+    in this file is: one malformed caller must not write an unbounded line into a
+    file every later row shares.
+    """
+    moment = ts or datetime.now(timezone.utc)
+    return {
+        "ts": moment.isoformat(),
+        "kind": "feedback",
+        "turn_id": str(turn_id)[:_MAX_TURN_ID_CHARS],
+        "verdict": verdict if verdict in FEEDBACK_VERDICTS else None,
+        "side": side if side in FEEDBACK_SIDES else "",
     }
 
 

@@ -51,6 +51,16 @@ Enabling Jev allows the message excerpt and candidate skill descriptions to leav
 
 A sampled selection waits for a bounded answer. `timeout_ms` controls the provider budget; its default is 1000 milliseconds. A missing key, unavailable provider or short budget can make the feature fall back without changing the selected skills. There is no automatic retry.
 
+## Seeing a decision in the chat
+
+When a sampled turn asks Jev which skill to load, the reply that turn produces carries a record of that decision, and Kiro Crew shows it as a small strip under the reply. The strip belongs to one reply. It is never copied onto a later one, and a turn that made no decision shows nothing at all.
+
+The record travels with the message, not in a side channel, so it is there when you scroll back to that reply and there when a second window opens the same chat. It holds what trigger matching chose, what Jev chose, whether the two agreed, the probability Jev reported and a few counts about the menu it was given. It does not hold your message or the skill descriptions.
+
+You can tell Kiro Crew whether the choice was right. The verdict is `right` or `wrong`, and it names which of the two answers you are judging -- Jev's or the normal trigger-matching one. Sending it again with a different verdict records the change of mind; sending it with no verdict takes your earlier one back. Each of these appends one row to the day-file described below and never edits a row already there, so the log reads as a history rather than a current opinion.
+
+The strip and its verdicts are yours: both the write and the folded read are refused for anyone but the dashboard owner, for the same reason the Decisions switch is.
+
 ## Basic logs
 
 Operational records are JSONL day-files under the gateway's data home, in the `decisions` directory. They contain the point name, hashed session identifier, elapsed time, bounded answer data and error categories. They do not contain the message body, candidate descriptions or credentials.

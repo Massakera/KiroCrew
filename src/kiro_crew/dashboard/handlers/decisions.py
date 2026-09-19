@@ -1,7 +1,9 @@
-"""Decision-seam consent REST API -- the operator's switch for Jev egress.
+"""Decision-seam REST API -- the operator's switch for Jev egress, and the strip.
 
-``GET /api/decisions/consent``   the keystone plus the endpoint config names now
-``PUT /api/decisions/consent``   ``{"enabled": bool}`` -> writes it, bound to that endpoint
+``GET  /api/decisions/consent``   the keystone plus the endpoint config names now
+``PUT  /api/decisions/consent``   ``{"enabled": bool}`` -> writes it, bound to that endpoint
+``POST /api/decisions/feedback``  a person's verdict on one turn -> one appended log row
+``GET  /api/decisions/summary``   the last N days of the log, folded into numbers
 
 Consent is bound to a destination: enabling records the provider endpoint the
 config names at that moment, and the gate sends only while the two still agree.
@@ -16,12 +18,18 @@ agent tool gate. The same shape as ``handlers/aws_consent.py``, for the same
 class of decision: consent to send the operator's data to a paid external
 service.
 
-**Dashboard OWNER only**, on the read as well as the write. An app token would
-otherwise let an agent that can author an app manifest mint a token and flip the
-switch it cannot write as a file; a Slack allow-listed non-owner authenticates
-with ``app == ""`` and would otherwise consent on the owner's behalf. Reads are
-refused too so a non-owner cannot learn whether the owner's messages are being
-sent off the machine.
+**Dashboard OWNER only**, on the read as well as the write, and on all four
+routes. An app token would otherwise let an agent that can author an app manifest
+mint a token and flip the switch it cannot write as a file; a Slack allow-listed
+non-owner authenticates with ``app == ""`` and would otherwise consent on the
+owner's behalf. Reads are refused too so a non-owner cannot learn whether the
+owner's messages are being sent off the machine.
+
+The same gate covers the strip's two routes, for reasons of their own. The
+feedback route is a WRITER of the decision log, so an app token that could reach
+it could grow that file and pollute the record the operator reads; and the summary
+route reports how the operator's own conversations were decided, which is the same
+class of fact as whether they are being sent at all.
 
 Blocking work is offloaded: the read and the atomic write touch the filesystem,
 and the SEL audit can too when the boot-time warm failed, so none of them runs on
@@ -52,9 +60,12 @@ _CODE_INVALID_JSON = "invalid_json"
 _CODE_INVALID_BODY = "decisions_consent_invalid_body"
 _CODE_CORRUPT = "decisions_consent_corrupt"
 _CODE_ENDPOINT_CHANGED = "decisions_consent_endpoint_changed"
+_CODE_FEEDBACK_INVALID_BODY = "decisions_feedback_invalid_body"
 
 OP_CONSENT_GET = "decisions_consent_get"
 OP_CONSENT_PUT = "decisions_consent_put"
+OP_FEEDBACK = "decisions_feedback_post"
+OP_SUMMARY = "decisions_summary_get"
 
 
 def _sel():
@@ -238,3 +249,117 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
         resources=f"decisions_consent.json endpoint={endpoint}",
     )
     return web.json_response(_payload(state))
+
+
+async def api_decisions_feedback(request: web.Request) -> web.Response:
+    """POST /api/decisions/feedback -- record one verdict about one turn.
+
+    Body: ``{"turn_id": str, "verdict": "right"|"wrong"|null, "side": "jev"|"baseline"}``.
+    ``verdict: null`` is a real value and means the person TOOK BACK an earlier
+    verdict, which the log has to be able to say; ``side`` names which of the two
+    answers the verdict is about and is required for every verdict, including a
+    cleared one, because a row that names no side names no decision.
+
+    Writes exactly one APPENDED row and never touches an existing one. A verdict
+    is a second event about the turn, not a correction of the row that recorded
+    it, so a changed mind reads as two rows with two timestamps -- which is what
+    makes "when did they change their mind" answerable at all. The append goes
+    through the log's own writer, off the event loop, so it inherits the pinned
+    destination, the per-file size ceiling and the day-file retention sweep rather
+    than re-implementing any of them
+    (:mod:`kiro_crew.decisions.log`, ``no-blocking-call-on-event-loop``).
+
+    Outcomes: ``200 {"ok": true}``; ``400`` for a body that is not a JSON object
+    with a non-empty ``turn_id``, a verdict in the allowed set (or ``null``) and a
+    side in the allowed set; ``403`` for a non-owner. There is no failure mode for
+    the write itself: ``log.append`` is best-effort by contract, because a verdict
+    the operator gave must not fail their click when the disk is full.
+    """
+    denied = await _deny_non_owner(request, OP_FEEDBACK)
+    if denied is not None:
+        return denied
+    from kiro_crew.decisions import log as _log
+
+    try:
+        body = await request.json()
+    except Exception:
+        await _audit(
+            request,
+            operation=OP_FEEDBACK,
+            outcome="denied",
+            error="invalid_json",
+            resources="decisions log",
+        )
+        return web.json_response({"error": "invalid JSON", "code": _CODE_INVALID_JSON}, status=400)
+    if not isinstance(body, dict):
+        body = {}
+    turn_id = body.get("turn_id")
+    verdict = body.get("verdict")
+    side = body.get("side")
+    # Validated, not coerced. A row filed under a turn nobody can name, or
+    # carrying a verdict outside the pair the reader folds, is a row that makes the
+    # summary wrong rather than one that makes it incomplete -- so it is refused
+    # here instead of being written and skipped later.
+    valid = (
+        isinstance(turn_id, str)
+        and turn_id.strip() != ""
+        and (verdict is None or verdict in _log.FEEDBACK_VERDICTS)
+        and side in _log.FEEDBACK_SIDES
+    )
+    if not valid:
+        await _audit(
+            request,
+            operation=OP_FEEDBACK,
+            outcome="denied",
+            error="invalid_body",
+            resources="decisions log",
+        )
+        return web.json_response(
+            {
+                "error": (
+                    'body must be {"turn_id": str, "verdict": "right"|"wrong"|null, '
+                    '"side": "jev"|"baseline"}'
+                ),
+                "code": _CODE_FEEDBACK_INVALID_BODY,
+            },
+            status=400,
+        )
+    row = _log.build_feedback_row(turn_id=turn_id, verdict=verdict, side=side)
+    await asyncio.to_thread(_log.append, row)
+    await _audit(
+        request,
+        operation=OP_FEEDBACK,
+        outcome="allowed",
+        resources=f"decisions log verdict={row['verdict']} side={row['side']}",
+    )
+    return web.json_response({"ok": True})
+
+
+async def api_decisions_summary(request: web.Request) -> web.Response:
+    """GET /api/decisions/summary?since=7d -- the log's last N days as numbers.
+
+    ``since`` is lenient on spelling (``7d``, ``7``) and strict on range: a value
+    outside the retention window reads as the 7-day default rather than widening
+    the read or failing the request, and the window actually folded comes back as
+    ``since_days`` so the caller renders what it got rather than what it asked for.
+
+    Always ``200`` for an owner. The reader skips an unparseable line and reports
+    how many it skipped (``unreadable``) instead of raising: a tooltip that refuses
+    to render because one byte of one row is wrong tells the operator nothing, and
+    the count is what keeps the skipping from being silent
+    (:mod:`kiro_crew.decisions.summary`). File reads are offloaded.
+    """
+    denied = await _deny_non_owner(request, OP_SUMMARY)
+    if denied is not None:
+        return denied
+    from kiro_crew.decisions import summary as _summary
+
+    days = _summary.parse_since(request.query.get("since"))
+    payload = await asyncio.to_thread(_summary.summarize, days)
+    await _audit(
+        request,
+        operation=OP_SUMMARY,
+        outcome="allowed",
+        resources=f"decisions log since_days={payload['since_days']}",
+    )
+    return web.json_response(payload)
