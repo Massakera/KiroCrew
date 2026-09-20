@@ -2840,6 +2840,17 @@ its own change; it is stated here rather than narrowed, because a better name ma
 reach it. The basename split handles `\` as well as `/` regardless, so a Windows-shaped
 argv0 in a command line that DOES get read is not carried whole into an exact-name test.
 
+RESIDUAL — reconfigured custom harness. The operator-named harness is recognised by the
+CURRENT spec's identity (`backends.custom_harness_identity`, read live), so a custom
+harness that outlives a gateway crash is not reclaimed if config then names a different
+command or none: it lingers until the operator kills it. The lingering process is the one
+the operator already launched, running with what it already had, so the gap spares a
+process and never kills an unrelated one — the same direction as the Windows residual
+above. It is stated rather than closed because the closing move, recording each PID's
+launch identity and honouring the record at reclaim, is exactly what the paragraph on the
+start token forbids: the tracking file is same-uid-writable, so a recorded identity may
+not authorize a signal.
+
 Windows synchronous provider fallback, including `_proc` and `_active_proc`
 shapes, uses the same exact-tree cleanup admission as ACP teardown. Capacity
 refusal preserves the root/tracking and never falls back to root-only signalling.
