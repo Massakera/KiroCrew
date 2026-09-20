@@ -2961,6 +2961,12 @@ class AcpRuntime:
                     exc_info=True,
                 )
                 raise
+            # Before the handle is dropped, exactly as the POSIX ladder does it:
+            # the death line was written pre-signal and says
+            # returncode=<not reaped>. The drain returns only once every
+            # member's exit is CONFIRMED, so the root's status is known here,
+            # and this is the last point at which anything can read it.
+            self._note_reaped_after_kill(process.returncode)
             self._process = None
             self._process_instance = ""
             # Tracking was retired by the shared drain under the original pin.
@@ -4176,6 +4182,11 @@ class AcpRuntime:
         ``last_error`` -- and one line is logged at the death's own severity
         so the gateway log holds the code too. Silent when the status is still
         unknown (both waits timed out): ``<not reaped>`` is then still true.
+
+        Called from BOTH teardowns, because ``kill`` has two of them: the POSIX
+        signal ladder and the Windows handle drain, which runs instead of that
+        ladder and returns from ``kill`` on its own. An amendment wired to one
+        path leaves the other reporting a status it holds and does not print.
         """
         if rc is None or self._death_summary is None:
             return

@@ -2034,6 +2034,33 @@ def _death_records(caplog):
     return [r for r in caplog.records if str(r.msg).startswith("AcpRuntime dead")]
 
 
+#: How long the stub drain below waits for the handle. Small because every test
+#: using it either reaps at once or deliberately never reaps; it exists so the
+#: second kind cannot hang the suite.
+_STUB_DRAIN_REAP_TIMEOUT = 0.05
+
+
+async def _stub_windows_drain(process):
+    """Stand in for ``terminate_windows_asyncio_tree``, keeping its one promise.
+
+    The real drain returns only once every member's exit is CONFIRMED, which is
+    what makes the root's status readable from the handle afterwards. A stub that
+    returned True without touching the handle would assert that guarantee and not
+    keep it -- and then every test reaching the Windows branch would be judging
+    the teardown against a drain that reaps nothing, which is a fiction no
+    production code can satisfy.
+
+    Bounded, and a timeout is NOT an error: a test that pins a handle which never
+    exits is describing a status that stays unknown, and the drain returning
+    without one is exactly how that reaches the code under test.
+    """
+    try:
+        await asyncio.wait_for(process.wait(), timeout=_STUB_DRAIN_REAP_TIMEOUT)
+    except asyncio.TimeoutError:
+        pass
+    return True
+
+
 def _neuter_kill_side_effects(monkeypatch, proc):
     """Keep kill() away from the host: never signal the fake PID (4242 could be
     a real process), never touch the PID-tracking files."""
@@ -2042,7 +2069,7 @@ def _neuter_kill_side_effects(monkeypatch, proc):
     proc.wait = AsyncMock(return_value=0)
     monkeypatch.setattr(rt_mod.platform_compat, "kill_process_tree", lambda *a, **k: None)
     monkeypatch.setattr(
-        rt_mod.platform_compat, "terminate_windows_asyncio_tree", AsyncMock(return_value=True)
+        rt_mod.platform_compat, "terminate_windows_asyncio_tree", _stub_windows_drain
     )
     monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: False)
     monkeypatch.setattr(rt_mod, "_untrack_pid", lambda p: None)
@@ -2330,6 +2357,116 @@ async def test_reap_amendment_leaves_the_reason_untouched(caplog, monkeypatch):
     assert summary is not None
     assert summary.startswith(poisoned)
     assert summary.endswith("[returncode=-15] stderr_tail: <none>")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected, level", [(False, "WARNING"), (True, "INFO")])
+async def test_the_windows_drain_amends_the_summary_too(expected, level, caplog, monkeypatch):
+    """``kill`` has TWO teardowns, and both owe the status they end up holding.
+
+    Windows runs the handle drain INSTEAD of the POSIX signal ladder and returns
+    from ``kill`` on its own, so an amendment wired only to the ladder leaves
+    every Windows death reporting ``<not reaped>`` about a process whose code it
+    had just confirmed. The drain returns only once every member's exit is
+    confirmed, which is precisely why the status is knowable on this path.
+
+    ``IS_WINDOWS`` is pinned rather than left to the host: the four tests above
+    exercise the ladder on Linux and macOS and would never reach this branch
+    there, which is the coverage gap that lets the two paths drift.
+    """
+    import logging
+
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    monkeypatch.setattr(rt_mod.platform_compat, "IS_WINDOWS", True)
+
+    async def _drain(process):
+        # What the real drain guarantees on return: the root is reaped, so its
+        # code is readable from the handle the caller still holds.
+        process.returncode = -15
+        return True
+
+    monkeypatch.setattr(rt_mod.platform_compat, "terminate_windows_asyncio_tree", _drain)
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(expected=expected, reason="warm mint teardown")
+
+    summary = rt.death_summary()
+    assert summary is not None
+    assert "[returncode=-15]" in summary
+    assert "<not reaped>" not in summary
+    assert "warm mint teardown" in summary
+    reaped = _reap_records(caplog)
+    assert [r.levelname for r in reaped] == [level]
+    assert "returncode=-15" in reaped[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_the_windows_drain_keeps_the_label_when_it_confirmed_no_status(caplog, monkeypatch):
+    """A drain that returns without a readable code claims nothing.
+
+    The same rule the POSIX path follows: ``<not reaped>`` is the honest answer
+    when no status was observed, and an amendment that invented one would be a
+    diagnostic asserting a code nobody saw.
+    """
+    import logging
+
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    monkeypatch.setattr(rt_mod.platform_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        rt_mod.platform_compat, "terminate_windows_asyncio_tree", AsyncMock(return_value=True)
+    )
+    proc.returncode = None
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(reason="warm mint teardown")
+
+    summary = rt.death_summary()
+    assert summary is not None
+    assert "[returncode=<not reaped>]" in summary
+    assert _reap_records(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_windows_drain_amends_nothing_and_keeps_the_process(caplog, monkeypatch):
+    """A drain that cannot confirm RAISES, keeping the pins for maintenance.
+
+    The amendment sits after that raise on purpose: a teardown that could not
+    finish has no confirmed status to report, and the handle must survive for the
+    retry rather than be dropped by a line that ran anyway.
+    """
+    import logging
+
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    monkeypatch.setattr(rt_mod.platform_compat, "IS_WINDOWS", True)
+
+    async def _drain_fails(process):
+        # The root WAS reaped -- so the code is readable -- but the members could
+        # not be confirmed, which is the case the real drain raises on. That
+        # makes this test load-bearing: an amendment placed before the raise, or
+        # in a finally, would publish this -15.
+        process.returncode = -15
+        raise OSError("handle drain incomplete")
+
+    monkeypatch.setattr(rt_mod.platform_compat, "terminate_windows_asyncio_tree", _drain_fails)
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        with pytest.raises(OSError):
+            await rt.kill(reason="warm mint teardown")
+
+    assert rt._process is proc, "a drain that cannot confirm keeps the handle"
+    summary = rt.death_summary()
+    assert summary is not None
+    assert "[returncode=<not reaped>]" in summary
+    assert _reap_records(caplog) == []
 
 
 @pytest.mark.asyncio
