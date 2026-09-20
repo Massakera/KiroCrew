@@ -2961,6 +2961,24 @@ class AcpRuntime:
                     exc_info=True,
                 )
                 raise
+            # Before the handle is dropped, as on the POSIX ladder below. The
+            # drain returns only once the root's exit is CONFIRMED and reaped
+            # (platform_compat awaits process.wait() on its success path), so
+            # the status the pre-signal death line could not read is knowable
+            # here. Omitting this left every Windows kill's retained summary
+            # reading returncode=<not reaped> for good -- and that summary
+            # outlives the log, riding AcpProcessDied into a turn's error and a
+            # cron's last_error, so the exit code was lost where an operator
+            # reads it.
+            #
+            # Only this path. The failure path above did not confirm
+            # retirement and keeps the process for maintenance to retry, and
+            # whether a root the loop happens to have reaped should be reported
+            # from a drain that FAILED is a separate question -- the status is
+            # usually unread there anyway (the executor raises before the wait,
+            # or the wait is what timed out), which _note_reaped_after_kill
+            # already treats as nothing owed.
+            self._note_reaped_after_kill(process.returncode)
             self._process = None
             self._process_instance = ""
             # Tracking was retired by the shared drain under the original pin.
