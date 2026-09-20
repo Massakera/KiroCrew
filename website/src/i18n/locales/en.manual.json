@@ -209,7 +209,9 @@
   "appSdk": {
     "chatEmbed": {
       "agent_is_working": "Agent is working...",
-      "message": "Message..."
+      "message": "Message...",
+      "stop": "Stop",
+      "stop_the_current_turn": "Stop the current turn"
     },
     "chatMessageList": {
       "copied": "Copied!",
@@ -3711,6 +3713,27 @@
       "failed_to_clear_context": "Failed to clear context"
     },
     "chat": {
+      "chatSurface": {
+        "cannot_reach": "Can’t reach {{label}}",
+        "commands_run_here": "Commands run on this machine",
+        "commands_run_on": "Commands run on {{label}}",
+        "connecting": "connecting…",
+        "create_failed": "Could not create a session.",
+        "create_no_key": "The gateway created a session but did not return its key.",
+        "gateway_no_answer": "The gateway did not answer.",
+        "live_updates_unavailable_title": "This crew’s event feed is not reachable through the proxy, so the session list will not update on its own. Sending still works.",
+        "loading_sessions": "Loading sessions…",
+        "never_falls_back": "This view always talks to the gateway it was pointed at — it never silently falls back to another one.",
+        "no_gateway_selected": "No gateway selected",
+        "no_sessions_yet": "No sessions yet — start one with {{action}}.",
+        "no_tool_activity": "No tool activity received yet.",
+        "pick_a_session": "Pick a session, or start a new one.",
+        "placeholder_message": "Message {{label}}…",
+        "reconnecting": "reconnecting…",
+        "stale_dropped": "Session list may be out of date — the event stream dropped. Messages still send.",
+        "stale_terminal": "Session list will not update on its own — this crew’s event feed is not reachable through the proxy. Messages still send.",
+        "working": "Working"
+      },
       "workflowRunCard": {
         "cancel": "Cancel",
         "save_help": "Keep the exact workflow from this completed run in your global library.",
@@ -4383,6 +4406,9 @@
       "configure_oauth_app": "Configure OAuth app",
       "prerequisite_github": "GitHub does not support dynamic client registration, so Connect uses the GitHub OAuth App registered under Settings → OAuth Apps. The GitHub consent page names that app; approve it to continue.",
       "prerequisite_asana": "Asana does not support dynamic client registration, so Connect uses the Asana MCP app registered under Settings → OAuth Apps. The Asana consent page names that app; approve it to continue."
+    },
+    "crewChatPage": {
+      "no_crew_named": "No crew was named in the URL."
     },
     "devFleetPage": {
       "applies_the_last_pull_build_the_dashboard_will_b": "Applies the last Pull+Build. The dashboard will briefly disconnect and reconnect on its own.",
@@ -5732,6 +5758,7 @@
       "remoteCrewPanel": {
         "auto_connect": "Auto-connect crews",
         "auto_connect_desc": "When on, opening the web app connects every crew automatically, and reconnects them when you come back to the tab. Turn off to connect a crew only when you switch to it.",
+        "chat": "Chat",
         "copy_failed": "Copy failed. Select the text and copy it manually.",
         "launch_status_unavailable": "Could not refresh the setup progress. The card below shows the last state received.",
         "copy_policy_failed": "Could not copy the policy JSON to the clipboard. Try again, or allow clipboard access for this site."

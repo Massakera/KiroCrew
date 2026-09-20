@@ -275,6 +275,8 @@
       "send": "Отправить",
       "send_message": "Отправить сообщение",
       "session_ready_type_a_message_to_start": "Сессия готова. Введите сообщение, чтобы начать.",
+      "stop": "Остановить",
+      "stop_the_current_turn": "Остановить текущий ход",
       "streaming": "потоковая передача"
     },
     "chatMessageList": {
@@ -9914,6 +9916,27 @@
         "resources": "Ресурсы",
         "start_chatting_to_see_sections": "Начните общение, чтобы увидеть разделы"
       },
+      "chatSurface": {
+        "cannot_reach": "Нет связи с «{{label}}»",
+        "commands_run_here": "Команды выполняются на этой машине",
+        "commands_run_on": "Команды выполняются на «{{label}}»",
+        "connecting": "подключение...",
+        "create_failed": "Не удалось создать сессию.",
+        "create_no_key": "Шлюз создал сессию, но не вернул её ключ.",
+        "gateway_no_answer": "Шлюз не ответил.",
+        "live_updates_unavailable_title": "Поток событий этого экземпляра недоступен через прокси, поэтому список сессий не будет обновляться сам. Отправка сообщений при этом работает.",
+        "loading_sessions": "Загрузка сессий...",
+        "never_falls_back": "Этот чат всегда обращается к тому шлюзу, на который был направлен, — и никогда молча не переключается на другой.",
+        "no_gateway_selected": "Шлюз не выбран",
+        "no_sessions_yet": "Сессий пока нет — создай первую через «{{action}}».",
+        "no_tool_activity": "Данных об активности инструментов пока не поступало.",
+        "pick_a_session": "Выбери сессию или начни новую.",
+        "placeholder_message": "Сообщение «{{label}}»...",
+        "reconnecting": "переподключение...",
+        "stale_dropped": "Список сессий может быть устаревшим — поток событий прервался. Сообщения по-прежнему отправляются.",
+        "stale_terminal": "Список сессий не будет обновляться сам — поток событий этого экземпляра недоступен через прокси. Сообщения по-прежнему отправляются.",
+        "working": "Работаю"
+      },
       "collapsibleToolGroup": {
         "approval_needed": "Требуется подтверждение",
         "approvals_pending": "ожидают подтверждения",
@@ -10995,6 +11018,9 @@
       "total_credits_title": "Кредиты за отслеженные ходы",
       "turn_credits_duration_title": "{{credits}} кредитов · {{duration}} за этот ход",
       "turn_credits_title": "{{credits}} кредитов за этот ход"
+    },
+    "crewChatPage": {
+      "no_crew_named": "В URL не указан экземпляр."
     },
     "devFleetPage": {
       "actions": "Действия",
@@ -14980,6 +15006,7 @@
         "groups_unavailable": "Не удалось загрузить группы, в которые входит этот аккаунт."
       },
       "remoteCrewPanel": {
+        "chat": "Чат",
         "your_crews": "Ваши экземпляры",
         "set_up_a_new_one": "Set up a new one",
         "auto_connect": "Автоподключение crew",

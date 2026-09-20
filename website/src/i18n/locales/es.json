@@ -271,6 +271,8 @@
       "send": "Enviar",
       "send_message": "Enviar mensaje",
       "session_ready_type_a_message_to_start": "Sesión lista. Escribe un mensaje para empezar.",
+      "stop": "Detener",
+      "stop_the_current_turn": "Detener el turno actual",
       "streaming": "en streaming"
     },
     "chatMessageList": {
@@ -9781,6 +9783,27 @@
         "resources": "Recursos",
         "start_chatting_to_see_sections": "Empieza a chatear para ver las secciones"
       },
+      "chatSurface": {
+        "cannot_reach": "No se puede conectar con {{label}}",
+        "commands_run_here": "Los comandos se ejecutan en esta máquina",
+        "commands_run_on": "Los comandos se ejecutan en {{label}}",
+        "connecting": "conectando…",
+        "create_failed": "No se pudo crear una sesión.",
+        "create_no_key": "El gateway creó una sesión, pero no devolvió su clave.",
+        "gateway_no_answer": "El gateway no respondió.",
+        "live_updates_unavailable_title": "El flujo de eventos de este crew no es accesible a través del proxy, así que la lista de sesiones no se actualizará por sí sola. El envío sigue funcionando.",
+        "loading_sessions": "Cargando sesiones…",
+        "never_falls_back": "Esta vista siempre habla con el gateway al que se apuntó — nunca recurre a otro en silencio.",
+        "no_gateway_selected": "Ningún gateway seleccionado",
+        "no_sessions_yet": "Aún no hay sesiones — inicia una con {{action}}.",
+        "no_tool_activity": "Aún no se ha recibido actividad de herramientas.",
+        "pick_a_session": "Elige una sesión o inicia una nueva.",
+        "placeholder_message": "Mensaje para {{label}}…",
+        "reconnecting": "reconectando…",
+        "stale_dropped": "La lista de sesiones puede estar desactualizada — el flujo de eventos se interrumpió. Los mensajes siguen enviándose.",
+        "stale_terminal": "La lista de sesiones no se actualizará por sí sola — el flujo de eventos de este crew no es accesible a través del proxy. Los mensajes siguen enviándose.",
+        "working": "Trabajando"
+      },
       "collapsibleToolGroup": {
         "approval_needed": "Se requiere aprobación",
         "approvals_pending": "aprobaciones pendientes",
@@ -10839,6 +10862,9 @@
       "total_credits_title": "Créditos en los turnos registrados",
       "turn_credits_duration_title": "{{credits}} créditos · {{duration}} en este turno",
       "turn_credits_title": "{{credits}} créditos en este turno"
+    },
+    "crewChatPage": {
+      "no_crew_named": "No se indicó ningún crew en la URL."
     },
     "devFleetPage": {
       "actions": "Acciones",
@@ -14797,6 +14823,7 @@
         "groups_unavailable": "No se pudieron cargar los grupos a los que se ha unido esta cuenta."
       },
       "remoteCrewPanel": {
+        "chat": "Chat",
         "your_crews": "Tus instancias",
         "set_up_a_new_one": "Set up a new one",
         "auto_connect": "Conectar Crews automáticamente",

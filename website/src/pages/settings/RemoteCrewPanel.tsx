@@ -421,7 +421,7 @@ function CrewRow({
                 gated) and Disconnect is the row's only connected-state control. */}
             {crewChatOn && (
               <Btn primary onClick={() => navigate(`/crew/${encodeURIComponent(inst.id)}/chat`)} disabled={!!busy || deleting}>
-                <MessageSquare className="lucide-inline" /> Chat
+                <MessageSquare className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.chat')}
               </Btn>
             )}
             <Btn onClick={() => onDisconnect(inst.id)} disabled={!!busy || deleting}>

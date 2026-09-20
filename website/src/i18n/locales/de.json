@@ -267,6 +267,8 @@
       "send": "Senden",
       "send_message": "Nachricht senden",
       "session_ready_type_a_message_to_start": "Sitzung bereit. Geben Sie eine Nachricht ein, um zu beginnen.",
+      "stop": "Stopp",
+      "stop_the_current_turn": "Aktuellen Zug stoppen",
       "streaming": "Streaming"
     },
     "chatMessageList": {
@@ -9648,6 +9650,27 @@
         "resources": "Ressourcen",
         "start_chatting_to_see_sections": "Beginnen Sie zu chatten, um Abschnitte zu sehen"
       },
+      "chatSurface": {
+        "cannot_reach": "{{label}} ist nicht erreichbar",
+        "commands_run_here": "Befehle laufen auf diesem Rechner",
+        "commands_run_on": "Befehle laufen auf {{label}}",
+        "connecting": "wird verbunden…",
+        "create_failed": "Es konnte keine Sitzung erstellt werden.",
+        "create_no_key": "Das Gateway hat eine Sitzung erstellt, aber ihren Schlüssel nicht zurückgegeben.",
+        "gateway_no_answer": "Das Gateway hat nicht geantwortet.",
+        "live_updates_unavailable_title": "Der Ereignis-Feed dieser Crew ist über den Proxy nicht erreichbar, daher aktualisiert sich die Sitzungsliste nicht von selbst. Senden funktioniert weiterhin.",
+        "loading_sessions": "Sitzungen werden geladen…",
+        "never_falls_back": "Diese Ansicht spricht immer mit dem Gateway, auf das sie verwiesen wurde — sie greift nie stillschweigend auf ein anderes zurück.",
+        "no_gateway_selected": "Kein Gateway ausgewählt",
+        "no_sessions_yet": "Noch keine Sitzungen — starte eine mit {{action}}.",
+        "no_tool_activity": "Noch keine Tool-Aktivität empfangen.",
+        "pick_a_session": "Wähle eine Sitzung aus oder starte eine neue.",
+        "placeholder_message": "Nachricht an {{label}}…",
+        "reconnecting": "wird neu verbunden…",
+        "stale_dropped": "Die Sitzungsliste ist möglicherweise veraltet — der Ereignisstrom ist abgebrochen. Nachrichten werden weiterhin gesendet.",
+        "stale_terminal": "Die Sitzungsliste aktualisiert sich nicht von selbst — der Ereignis-Feed dieser Crew ist über den Proxy nicht erreichbar. Nachrichten werden weiterhin gesendet.",
+        "working": "Arbeitet"
+      },
       "collapsibleToolGroup": {
         "approval_needed": "Genehmigung erforderlich",
         "approvals_pending": "Genehmigungen ausstehend",
@@ -10683,6 +10706,9 @@
       "total_credits_title": "Guthaben über die erfassten Züge",
       "turn_credits_duration_title": "{{credits}} Guthaben · {{duration}} in diesem Zug",
       "turn_credits_title": "{{credits}} Guthaben in diesem Zug"
+    },
+    "crewChatPage": {
+      "no_crew_named": "In der URL wurde keine Crew genannt."
     },
     "devFleetPage": {
       "actions": "Aktionen",
@@ -14613,6 +14639,7 @@
         "groups_unavailable": "Die Gruppen, denen dieses Konto beigetreten ist, konnten nicht geladen werden."
       },
       "remoteCrewPanel": {
+        "chat": "Chat",
         "your_crews": "Deine Instanzen",
         "set_up_a_new_one": "Set up a new one",
         "auto_connect": "Crews automatisch verbinden",

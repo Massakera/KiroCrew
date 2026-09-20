@@ -263,6 +263,8 @@
       "send": "发送",
       "send_message": "发送消息",
       "session_ready_type_a_message_to_start": "会话已就绪。输入消息即可开始。",
+      "stop": "停止",
+      "stop_the_current_turn": "停止当前轮次",
       "streaming": "流式输出中"
     },
     "chatMessageList": {
@@ -9515,6 +9517,27 @@
         "resources": "资源",
         "start_chatting_to_see_sections": "开始聊天即可看到章节"
       },
+      "chatSurface": {
+        "cannot_reach": "无法连接 {{label}}",
+        "commands_run_here": "命令在本机运行",
+        "commands_run_on": "命令在 {{label}} 上运行",
+        "connecting": "正在连接…",
+        "create_failed": "无法创建会话。",
+        "create_no_key": "网关已创建会话，但没有返回会话键。",
+        "gateway_no_answer": "网关没有响应。",
+        "live_updates_unavailable_title": "无法通过代理连接此 crew 的事件流，因此会话列表不会自行更新。仍可正常发送。",
+        "loading_sessions": "正在加载会话…",
+        "never_falls_back": "此视图始终与指定的网关通信 — 绝不会静默回退到其他网关。",
+        "no_gateway_selected": "未选择网关",
+        "no_sessions_yet": "还没有会话 — 点击“{{action}}”新建一个。",
+        "no_tool_activity": "尚未收到任何工具活动。",
+        "pick_a_session": "选一个会话，或新建一个。",
+        "placeholder_message": "发消息给 {{label}}…",
+        "reconnecting": "正在重连…",
+        "stale_dropped": "会话列表可能已过期 — 事件流已断开。消息仍可发送。",
+        "stale_terminal": "会话列表不会自行更新 — 无法通过代理连接此 crew 的事件流。消息仍可发送。",
+        "working": "工作中"
+      },
       "collapsibleToolGroup": {
         "approval_needed": "需要审批",
         "approvals_pending": "项待审批",
@@ -10527,6 +10550,9 @@
       "total_credits_title": "追踪到的轮次的额度总计",
       "turn_credits_duration_title": "本轮次消耗 {{credits}} 额度 · 用时 {{duration}}",
       "turn_credits_title": "本轮次消耗 {{credits}} 额度"
+    },
+    "crewChatPage": {
+      "no_crew_named": "URL 中未指定 crew。"
     },
     "devFleetPage": {
       "actions": "操作",
@@ -14430,6 +14456,7 @@
         "groups_unavailable": "无法加载此账号已加入的群组。"
       },
       "remoteCrewPanel": {
+        "chat": "聊天",
         "your_crews": "你的实例",
         "set_up_a_new_one": "Set up a new one",
         "auto_connect": "自动连接 crew",

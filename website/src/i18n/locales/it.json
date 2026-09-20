@@ -271,6 +271,8 @@
       "send": "Invia",
       "send_message": "Invia il messaggio",
       "session_ready_type_a_message_to_start": "Sessione pronta. Digita un messaggio per iniziare.",
+      "stop": "Arresta",
+      "stop_the_current_turn": "Arresta il turno corrente",
       "streaming": "streaming"
     },
     "chatMessageList": {
@@ -9781,6 +9783,27 @@
         "resources": "Risorse",
         "start_chatting_to_see_sections": "Inizia a chattare per vedere le sezioni"
       },
+      "chatSurface": {
+        "cannot_reach": "Impossibile raggiungere {{label}}",
+        "commands_run_here": "I comandi vengono eseguiti su questa macchina",
+        "commands_run_on": "I comandi vengono eseguiti su {{label}}",
+        "connecting": "connessione…",
+        "create_failed": "Impossibile creare una sessione.",
+        "create_no_key": "Il gateway ha creato una sessione ma non ne ha restituito la chiave.",
+        "gateway_no_answer": "Il gateway non ha risposto.",
+        "live_updates_unavailable_title": "Il feed degli eventi di questa crew non è raggiungibile attraverso il proxy, quindi l’elenco delle sessioni non si aggiornerà da solo. L’invio continua a funzionare.",
+        "loading_sessions": "Caricamento delle sessioni…",
+        "never_falls_back": "Questa vista comunica sempre con il gateway a cui è stata indirizzata — non ricade mai su un altro senza dirlo.",
+        "no_gateway_selected": "Nessun gateway selezionato",
+        "no_sessions_yet": "Ancora nessuna sessione — avviane una con {{action}}.",
+        "no_tool_activity": "Nessuna attività degli strumenti ricevuta finora.",
+        "pick_a_session": "Scegli una sessione, oppure avviane una nuova.",
+        "placeholder_message": "Messaggio per {{label}}…",
+        "reconnecting": "riconnessione…",
+        "stale_dropped": "L’elenco delle sessioni potrebbe non essere aggiornato — il flusso di eventi si è interrotto. I messaggi vengono comunque inviati.",
+        "stale_terminal": "L’elenco delle sessioni non si aggiornerà da solo — il feed degli eventi di questa crew non è raggiungibile attraverso il proxy. I messaggi vengono comunque inviati.",
+        "working": "Al lavoro"
+      },
       "collapsibleToolGroup": {
         "approval_needed": "Approvazione necessaria",
         "approvals_pending": "approvazioni in attesa",
@@ -10839,6 +10862,9 @@
       "total_credits_title": "Crediti sui turni tracciati",
       "turn_credits_duration_title": "{{credits}} crediti · {{duration}} in questo turno",
       "turn_credits_title": "{{credits}} crediti in questo turno"
+    },
+    "crewChatPage": {
+      "no_crew_named": "Nessuna crew è stata indicata nell’URL."
     },
     "devFleetPage": {
       "actions": "Azioni",
@@ -14796,6 +14822,7 @@
         "groups_unavailable": "Impossibile caricare i gruppi a cui questo account ha aderito."
       },
       "remoteCrewPanel": {
+        "chat": "Chat",
         "your_crews": "Le tue istanze",
         "set_up_a_new_one": "Set up a new one",
         "auto_connect": "Connetti i crew automaticamente",

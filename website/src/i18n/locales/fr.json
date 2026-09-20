@@ -271,6 +271,8 @@
       "send": "Envoyer",
       "send_message": "Envoyer le message",
       "session_ready_type_a_message_to_start": "Session prête. Saisissez un message pour commencer.",
+      "stop": "Arrêter",
+      "stop_the_current_turn": "Arrêter le tour en cours",
       "streaming": "diffusion en cours"
     },
     "chatMessageList": {
@@ -9781,6 +9783,27 @@
         "resources": "Ressources",
         "start_chatting_to_see_sections": "Commencez à discuter pour voir les sections"
       },
+      "chatSurface": {
+        "cannot_reach": "Impossible de joindre {{label}}",
+        "commands_run_here": "Les commandes s’exécutent sur cette machine",
+        "commands_run_on": "Les commandes s’exécutent sur {{label}}",
+        "connecting": "connexion…",
+        "create_failed": "Impossible de créer une session.",
+        "create_no_key": "La passerelle a créé une session mais n’a pas renvoyé sa clé.",
+        "gateway_no_answer": "La passerelle n’a pas répondu.",
+        "live_updates_unavailable_title": "Le flux d’événements de cette crew n’est pas joignable via le proxy, la liste des sessions ne se mettra donc pas à jour d’elle-même. L’envoi fonctionne toujours.",
+        "loading_sessions": "Chargement des sessions…",
+        "never_falls_back": "Cette vue s’adresse toujours à la passerelle vers laquelle elle a été pointée — elle ne bascule jamais silencieusement vers une autre.",
+        "no_gateway_selected": "Aucune passerelle sélectionnée",
+        "no_sessions_yet": "Aucune session pour le moment — démarres-en une avec {{action}}.",
+        "no_tool_activity": "Aucune activité d’outil reçue pour le moment.",
+        "pick_a_session": "Choisis une session, ou démarres-en une nouvelle.",
+        "placeholder_message": "Message à {{label}}…",
+        "reconnecting": "reconnexion…",
+        "stale_dropped": "La liste des sessions est peut-être obsolète — le flux d’événements s’est interrompu. Les messages sont toujours envoyés.",
+        "stale_terminal": "La liste des sessions ne se mettra pas à jour d’elle-même — le flux d’événements de cette crew n’est pas joignable via le proxy. Les messages sont toujours envoyés.",
+        "working": "En cours"
+      },
       "collapsibleToolGroup": {
         "approval_needed": "Approbation requise",
         "approvals_pending": "approbations en attente",
@@ -10839,6 +10862,9 @@
       "total_credits_title": "Crédits sur les tours tracés",
       "turn_credits_duration_title": "{{credits}} crédits · {{duration}} pour ce tour",
       "turn_credits_title": "{{credits}} crédits pour ce tour"
+    },
+    "crewChatPage": {
+      "no_crew_named": "Aucune crew n’a été nommée dans l’URL."
     },
     "devFleetPage": {
       "actions": "Actions",
@@ -14797,6 +14823,7 @@
         "groups_unavailable": "Impossible de charger les groupes rejoints par ce compte."
       },
       "remoteCrewPanel": {
+        "chat": "Conversation",
         "your_crews": "Tes instances",
         "set_up_a_new_one": "Set up a new one",
         "auto_connect": "Connecter les crews automatiquement",

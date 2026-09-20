@@ -267,6 +267,8 @@
       "send": "भेजें",
       "send_message": "संदेश भेजें",
       "session_ready_type_a_message_to_start": "सत्र तैयार है। शुरू करने के लिए संदेश टाइप करें।",
+      "stop": "रोकें",
+      "stop_the_current_turn": "वर्तमान टर्न रोकें",
       "streaming": "स्ट्रीमिंग"
     },
     "chatMessageList": {
@@ -9648,6 +9650,27 @@
         "resources": "संसाधन",
         "start_chatting_to_see_sections": "अनुभाग देखने के लिए चैट शुरू करें"
       },
+      "chatSurface": {
+        "cannot_reach": "{{label}} तक नहीं पहुँच पा रहे",
+        "commands_run_here": "कमांड इस मशीन पर चलते हैं",
+        "commands_run_on": "कमांड {{label}} पर चलते हैं",
+        "connecting": "कनेक्ट हो रहा है…",
+        "create_failed": "सत्र नहीं बनाया जा सका।",
+        "create_no_key": "गेटवे ने सत्र बना दिया, लेकिन उसकी कुंजी नहीं लौटाई।",
+        "gateway_no_answer": "गेटवे ने जवाब नहीं दिया।",
+        "live_updates_unavailable_title": "प्रॉक्सी के ज़रिये इस crew के इवेंट फ़ीड तक नहीं पहुँचा जा सकता, इसलिए सत्र सूची अपने आप अपडेट नहीं होगी। भेजना फिर भी काम करता है।",
+        "loading_sessions": "सत्र लोड हो रहे हैं…",
+        "never_falls_back": "यह दृश्य हमेशा उसी गेटवे से बात करता है जिस पर इसे लगाया गया था — यह चुपचाप किसी दूसरे पर नहीं चला जाता।",
+        "no_gateway_selected": "कोई गेटवे चुना नहीं गया",
+        "no_sessions_yet": "अभी कोई सत्र नहीं — “{{action}}” से एक शुरू करो।",
+        "no_tool_activity": "अभी तक कोई टूल गतिविधि नहीं मिली।",
+        "pick_a_session": "कोई सत्र चुनो, या नया शुरू करो।",
+        "placeholder_message": "{{label}} को संदेश…",
+        "reconnecting": "पुनः कनेक्ट हो रहा है…",
+        "stale_dropped": "सत्र सूची पुरानी हो सकती है — इवेंट स्ट्रीम टूट गई। संदेश फिर भी जाते हैं।",
+        "stale_terminal": "सत्र सूची अपने आप अपडेट नहीं होगी — प्रॉक्सी के ज़रिये इस crew के इवेंट फ़ीड तक नहीं पहुँचा जा सकता। संदेश फिर भी जाते हैं।",
+        "working": "काम चल रहा है"
+      },
       "collapsibleToolGroup": {
         "approval_needed": "स्वीकृति आवश्यक",
         "approvals_pending": "स्वीकृतियाँ लंबित",
@@ -10683,6 +10706,9 @@
       "total_credits_title": "ट्रेस किए गए टर्न का कुल क्रेडिट",
       "turn_credits_duration_title": "इस टर्न में {{credits}} क्रेडिट · {{duration}}",
       "turn_credits_title": "इस टर्न में {{credits}} क्रेडिट"
+    },
+    "crewChatPage": {
+      "no_crew_named": "URL में कोई crew नहीं बताया गया।"
     },
     "devFleetPage": {
       "actions": "कार्रवाइयां",
@@ -14614,6 +14640,7 @@
         "groups_unavailable": "इस अकाउंट ने जिन ग्रुप्स में शामिल हुआ है, वे लोड नहीं हो सके।"
       },
       "remoteCrewPanel": {
+        "chat": "चैट",
         "your_crews": "तुम्हारे इंस्टेंस",
         "set_up_a_new_one": "Set up a new one",
         "auto_connect": "crew स्वतः कनेक्ट करें",

@@ -263,6 +263,8 @@
       "send": "보내기",
       "send_message": "메시지 보내기",
       "session_ready_type_a_message_to_start": "세션이 준비되었습니다. 메시지를 입력해 시작하세요.",
+      "stop": "중지",
+      "stop_the_current_turn": "현재 턴 중지",
       "streaming": "스트리밍 중"
     },
     "chatMessageList": {
@@ -9515,6 +9517,27 @@
         "resources": "리소스",
         "start_chatting_to_see_sections": "대화를 시작하면 섹션이 표시됩니다"
       },
+      "chatSurface": {
+        "cannot_reach": "{{label}}에 연결할 수 없습니다",
+        "commands_run_here": "명령은 이 컴퓨터에서 실행됩니다",
+        "commands_run_on": "명령은 {{label}}에서 실행됩니다",
+        "connecting": "연결 중…",
+        "create_failed": "세션을 만들지 못했습니다.",
+        "create_no_key": "게이트웨이가 세션을 만들었지만 그 키를 반환하지 않았습니다.",
+        "gateway_no_answer": "게이트웨이가 응답하지 않았습니다.",
+        "live_updates_unavailable_title": "이 크루의 이벤트 피드에는 프록시를 통해 접근할 수 없으므로 세션 목록이 자동으로 갱신되지 않습니다. 전송은 계속 작동합니다.",
+        "loading_sessions": "세션을 불러오고 있습니다…",
+        "never_falls_back": "이 화면은 지정된 게이트웨이와 항상 통신합니다 — 다른 게이트웨이로 조용히 대체되지 않습니다.",
+        "no_gateway_selected": "선택된 게이트웨이 없음",
+        "no_sessions_yet": "아직 세션이 없습니다 — ‘{{action}}’을(를) 눌러 시작하세요.",
+        "no_tool_activity": "아직 도구 활동을 받지 못했습니다.",
+        "pick_a_session": "세션을 고르거나 새로 시작하세요.",
+        "placeholder_message": "{{label}}에게 메시지…",
+        "reconnecting": "재연결 중…",
+        "stale_dropped": "세션 목록이 오래되었을 수 있습니다 — 이벤트 스트림이 끊겼습니다. 메시지는 계속 전송됩니다.",
+        "stale_terminal": "세션 목록이 자동으로 갱신되지 않습니다 — 이 크루의 이벤트 피드에는 프록시를 통해 접근할 수 없습니다. 메시지는 계속 전송됩니다.",
+        "working": "처리 중"
+      },
       "collapsibleToolGroup": {
         "approval_needed": "승인 필요",
         "approvals_pending": "승인 대기 중",
@@ -10527,6 +10550,9 @@
       "total_credits_title": "추적된 턴 전체의 크레딧",
       "turn_credits_duration_title": "이 턴에서 {{credits}} 크레딧 · {{duration}}",
       "turn_credits_title": "이 턴에서 {{credits}} 크레딧"
+    },
+    "crewChatPage": {
+      "no_crew_named": "URL에 크루가 지정되지 않았습니다."
     },
     "devFleetPage": {
       "actions": "작업",
@@ -14430,6 +14456,7 @@
         "groups_unavailable": "이 계정이 참여한 그룹을 불러올 수 없습니다."
       },
       "remoteCrewPanel": {
+        "chat": "채팅",
         "your_crews": "내 인스턴스",
         "set_up_a_new_one": "Set up a new one",
         "auto_connect": "crew 자동 연결",

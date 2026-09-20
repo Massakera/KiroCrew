@@ -24,6 +24,7 @@ import { AppApiProvider } from '../app-sdk'
 import ChatSurface, { Unreachable } from './chat/ChatSurface'
 import { usePreviewFlag } from '../hooks/usePreviewFlag'
 import { PREVIEW_REMOTE_CREW_CHAT } from '../utils/previewFlags'
+import { i18nT } from '../i18n/t'
 
 export default function CrewChatPage() {
   const { crewId, sessionId } = useParams<{ crewId: string; sessionId?: string }>()
@@ -41,7 +42,7 @@ export default function CrewChatPage() {
   // silently address the LOCAL gateway — the one failure this design refuses to
   // make possible — so fail closed instead of proxying to ourselves.
   if (!crewId) {
-    return <Unreachable label="" detail="No crew was named in the URL." onRetry={null} />
+    return <Unreachable label="" detail={i18nT('pages.crewChatPage.no_crew_named')} onRetry={null} />
   }
   const basePath = `/api/instances/${encodeURIComponent(crewId)}/proxy`
   return (

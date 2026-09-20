@@ -263,6 +263,8 @@
       "send": "送信",
       "send_message": "メッセージを送信",
       "session_ready_type_a_message_to_start": "セッション準備完了。メッセージを入力して開始してください。",
+      "stop": "停止",
+      "stop_the_current_turn": "現在のターンを停止",
       "streaming": "ストリーミング中"
     },
     "chatMessageList": {
@@ -9515,6 +9517,27 @@
         "resources": "リソース",
         "start_chatting_to_see_sections": "セクションを表示するにはチャットを開始してください"
       },
+      "chatSurface": {
+        "cannot_reach": "{{label}} に到達できません",
+        "commands_run_here": "コマンドはこのマシンで実行",
+        "commands_run_on": "コマンドは {{label}} で実行",
+        "connecting": "接続中…",
+        "create_failed": "セッションを作成できませんでした。",
+        "create_no_key": "ゲートウェイはセッションを作成しましたが、そのキーを返しませんでした。",
+        "gateway_no_answer": "ゲートウェイが応答しませんでした。",
+        "live_updates_unavailable_title": "この crew のイベントフィードにはプロキシ経由で到達できないため、セッション一覧は自動では更新されません。送信は引き続き利用できます。",
+        "loading_sessions": "セッションを読み込んでいます…",
+        "never_falls_back": "このビューは指定されたゲートウェイと常に通信します — 別のゲートウェイに黙ってフォールバックすることはありません。",
+        "no_gateway_selected": "ゲートウェイが選択されていません",
+        "no_sessions_yet": "セッションはまだありません — 「{{action}}」から開始してください。",
+        "no_tool_activity": "ツールのアクティビティをまだ受信していません。",
+        "pick_a_session": "セッションを選ぶか、新しく開始してください。",
+        "placeholder_message": "{{label}} にメッセージ…",
+        "reconnecting": "再接続中…",
+        "stale_dropped": "セッション一覧は古い可能性があります — イベントストリームが切断されました。メッセージは引き続き送信できます。",
+        "stale_terminal": "セッション一覧は自動では更新されません — この crew のイベントフィードにはプロキシ経由で到達できません。メッセージは引き続き送信できます。",
+        "working": "処理中"
+      },
       "collapsibleToolGroup": {
         "approval_needed": "承認が必要です",
         "approvals_pending": "承認待ち",
@@ -10527,6 +10550,9 @@
       "total_credits_title": "トレースされたターン全体のクレジット",
       "turn_credits_duration_title": "このターンで {{credits}} クレジット · {{duration}}",
       "turn_credits_title": "このターンで {{credits}} クレジット"
+    },
+    "crewChatPage": {
+      "no_crew_named": "URL に crew が指定されていません。"
     },
     "devFleetPage": {
       "actions": "アクション",
@@ -14430,6 +14456,7 @@
         "groups_unavailable": "このアカウントが参加しているグループを読み込めませんでした。"
       },
       "remoteCrewPanel": {
+        "chat": "チャット",
         "your_crews": "あなたのインスタンス",
         "set_up_a_new_one": "Set up a new one",
         "auto_connect": "crew を自動接続",

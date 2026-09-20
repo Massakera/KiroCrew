@@ -23,6 +23,8 @@ import { useQuery } from '@tanstack/react-query'
 import { Bot, ChevronDown, FolderOpen, Loader2, Plus, Radio, RefreshCw, Server } from 'lucide-react'
 import { useAppApi } from '../../app-sdk'
 import ChatEmbed from '../../app-sdk/ChatEmbed'
+import { i18nT } from '../../i18n/t'
+import { fmtUnit } from '../../i18n/format'
 
 /** Cadence of the `dashboard` heartbeat on the gateway's `/api/stream`. */
 const HEARTBEAT_SECS = 5
@@ -202,11 +204,11 @@ export default function ChatSurface({ origin, streamBase, slotKey, onOpenSlot }:
       const created = await api.post<{ key?: string }>('/api/chat/slots', {})
       await seed.refetch()
       if (created?.key) onOpenSlot(created.key)
-      else setCreateError('The gateway created a session but did not return its key.')
+      else setCreateError(i18nT('pages.chat.chatSurface.create_no_key'))
     } catch (err) {
       // Surfaced inline rather than thrown: a failed create must not blank the
       // rail the user is still reading.
-      setCreateError(err instanceof Error ? err.message : 'Could not create a session.')
+      setCreateError(err instanceof Error ? err.message : i18nT('pages.chat.chatSurface.create_failed'))
     } finally {
       setCreating(false)
     }
@@ -224,7 +226,7 @@ export default function ChatSurface({ origin, streamBase, slotKey, onOpenSlot }:
     return (
       <Unreachable
         label={origin.label}
-        detail={seed.error instanceof Error ? seed.error.message : 'The gateway did not answer.'}
+        detail={seed.error instanceof Error ? seed.error.message : i18nT('pages.chat.chatSurface.gateway_no_answer')}
         onRetry={() => void seed.refetch()}
       />
     )
@@ -242,9 +244,9 @@ export default function ChatSurface({ origin, streamBase, slotKey, onOpenSlot }:
       </header>
 
       <div className="flex flex-1 min-h-0">
-        <aside className="w-[214px] shrink-0 border-r border-border flex flex-col min-h-0" aria-label="Sessions">
+        <aside className="w-[214px] shrink-0 border-r border-border flex flex-col min-h-0" aria-label={i18nT('pages.chatSidebar.sessions')}>
           <div className="flex items-center gap-2 px-3 py-2 border-b border-border text-[11px] uppercase tracking-wide text-muted">
-            Sessions
+            {i18nT('pages.chatSidebar.sessions')}
             <button
               type="button"
               data-testid="surface-new-session"
@@ -253,7 +255,7 @@ export default function ChatSurface({ origin, streamBase, slotKey, onOpenSlot }:
               style={{ background: 'var(--accent)', color: 'var(--accent-fg)' }}
               onClick={() => void createSession()}
             >
-              {creating ? <Loader2 className="lucide-inline animate-spin" /> : <Plus className="lucide-inline" />} New
+              {creating ? <Loader2 className="lucide-inline animate-spin" /> : <Plus className="lucide-inline" />} {i18nT('pages.chatSidebar.new')}
             </button>
           </div>
           {createError && (
@@ -262,9 +264,14 @@ export default function ChatSurface({ origin, streamBase, slotKey, onOpenSlot }:
             </div>
           )}
           <div className="flex-1 overflow-y-auto">
-            {seed.isLoading && <div className="px-3 py-2 text-xs text-muted">Loading sessions…</div>}
+            {seed.isLoading && <div className="px-3 py-2 text-xs text-muted">{i18nT('pages.chat.chatSurface.loading_sessions')}</div>}
             {!seed.isLoading && slots.length === 0 && (
-              <div className="px-3 py-2 text-xs text-muted">No sessions yet — start one with New.</div>
+              // The empty state names the button next to it, so it interpolates
+              // that button's OWN label rather than spelling it again — a second
+              // spelling is what drifts when the control is renamed or translated.
+              <div className="px-3 py-2 text-xs text-muted">
+                {i18nT('pages.chat.chatSurface.no_sessions_yet', { action: i18nT('pages.chatSidebar.new') })}
+              </div>
             )}
             {slots.map(s => (
               <button
@@ -303,7 +310,7 @@ export default function ChatSurface({ origin, streamBase, slotKey, onOpenSlot }:
               slotKey={openKey}
               frameless
               startAtBottom
-              placeholder={`Message ${origin.label}…`}
+              placeholder={i18nT('pages.chat.chatSurface.placeholder_message', { label: origin.label })}
               onStop={stopTurn}
               onRunningChange={onRunningChange}
               aboveComposer={
@@ -326,7 +333,7 @@ export default function ChatSurface({ origin, streamBase, slotKey, onOpenSlot }:
             />
           ) : (
             <div className="flex-1 grid place-items-center text-xs text-muted">
-              Pick a session, or start a new one.
+              {i18nT('pages.chat.chatSurface.pick_a_session')}
             </div>
           )}
         </section>
@@ -354,10 +361,10 @@ function ActivityLine({
         className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] font-mono text-muted text-left"
       >
         <Loader2 className="lucide-inline animate-spin" style={{ color: 'var(--accent)' }} />
-        <span className="text-text truncate">{current ? current.name : 'Working'}</span>
+        <span className="text-text truncate">{current ? current.name : i18nT('pages.chat.chatSurface.working')}</span>
         <span className="ml-auto flex items-center gap-2">
           {queued > 0 && <span>{queued} queued</span>}
-          <span>{elapsed}s</span>
+          <span>{fmtUnit(elapsed, 'second', { maximumFractionDigits: 0 })}</span>
           {tools.length > 0 && <span>· {tools.length} tools</span>}
           <ChevronDown className="lucide-inline" style={{ transform: open ? 'rotate(180deg)' : undefined }} />
         </span>
@@ -369,7 +376,7 @@ function ActivityLine({
             // stream, so "no rows" means no tool frames have arrived, which also
             // covers the case where the stream is not reachable at all.
             <div className="text-[11px] font-mono text-muted">
-              No tool activity received yet.
+              {i18nT('pages.chat.chatSurface.no_tool_activity')}
             </div>
           ) : (
             tools.map(t => (
@@ -413,13 +420,15 @@ function ContextShelf({ origin, slot, running }: { origin: SurfaceOrigin; slot?:
         className={chip}
         data-testid="surface-origin-chip"
         style={origin.kind === 'crew' ? { color: 'var(--accent)' } : undefined}
-        title={origin.kind === 'crew' ? `Commands run on ${origin.label}` : 'Commands run on this machine'}
+        title={origin.kind === 'crew'
+          ? i18nT('pages.chat.chatSurface.commands_run_on', { label: origin.label })
+          : i18nT('pages.chat.chatSurface.commands_run_here')}
       >
         <Server className="lucide-inline" />
         <span className="truncate max-w-[160px]">{origin.label}</span>
       </span>
       {slot?.agent && (
-        <span className={chip} style={runDim} title="Agent">
+        <span className={chip} style={runDim} title={i18nT('components.jobForm.agent')}>
           <Bot className="lucide-inline" />
           <span className="truncate max-w-[160px]">{slot.agent}</span>
         </span>
@@ -432,7 +441,7 @@ function ContextShelf({ origin, slot, running }: { origin: SurfaceOrigin; slot?:
       )}
       <span className="ml-auto flex items-center gap-0.5">
         {slot?.model && (
-          <span className={chip} style={runDim} title="Model">
+          <span className={chip} style={runDim} title={i18nT('components.chatInput.model')}>
             <span className="truncate max-w-[160px]">{slot.model}</span>
           </span>
         )}
@@ -455,7 +464,7 @@ function StreamChip({ state }: { state: StreamState }) {
   if (state === 'connecting') {
     return (
       <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] text-muted border border-border-strong">
-        <Loader2 className="lucide-inline animate-spin" /> connecting…
+        <Loader2 className="lucide-inline animate-spin" /> {i18nT('pages.chat.chatSurface.connecting')}
       </span>
     )
   }
@@ -464,7 +473,7 @@ function StreamChip({ state }: { state: StreamState }) {
       <span
         className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px]"
         style={{ color: 'var(--text-muted)', border: '1px solid var(--border-strong)' }}
-        title="This crew's event feed is not reachable through the proxy, so the session list will not update on its own. Sending still works."
+        title={i18nT('pages.chat.chatSurface.live_updates_unavailable_title')}
       >
         live updates unavailable
       </span>
@@ -475,7 +484,7 @@ function StreamChip({ state }: { state: StreamState }) {
       className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px]"
       style={{ color: 'var(--warn)', border: '1px solid var(--warn)' }}
     >
-      reconnecting…
+      {i18nT('pages.chat.chatSurface.reconnecting')}
     </span>
   )
 }
@@ -490,8 +499,8 @@ function StaleNotice({ terminal }: { terminal?: boolean }) {
   return (
     <div className="mx-3 mb-2 rounded px-2.5 py-1.5 text-[11px]" style={{ color: 'var(--warn)', border: '1px solid var(--warn)' }}>
       {terminal
-        ? 'Session list will not update on its own — this crew\u2019s event feed is not reachable through the proxy. Messages still send.'
-        : 'Session list may be out of date — the event stream dropped. Messages still send.'}
+        ? i18nT('pages.chat.chatSurface.stale_terminal')
+        : i18nT('pages.chat.chatSurface.stale_dropped')}
     </div>
   )
 }
@@ -500,10 +509,14 @@ export function Unreachable({ label, detail, onRetry }: { label: string; detail:
   return (
     <div className="h-full grid place-items-center p-6" data-testid="chat-surface-unreachable">
       <div className="max-w-md text-center">
-        <div className="text-sm text-text-strong">{label ? `Can't reach ${label}` : 'No gateway selected'}</div>
+        <div className="text-sm text-text-strong">
+          {label
+            ? i18nT('pages.chat.chatSurface.cannot_reach', { label })
+            : i18nT('pages.chat.chatSurface.no_gateway_selected')}
+        </div>
         <p className="mt-1 text-xs text-muted">{detail}</p>
         <p className="mt-2 text-xs text-muted">
-          This view always talks to the gateway it was pointed at — it never silently falls back to another one.
+          {i18nT('pages.chat.chatSurface.never_falls_back')}
         </p>
         {onRetry && (
           <button
@@ -511,7 +524,7 @@ export function Unreachable({ label, detail, onRetry }: { label: string; detail:
             onClick={onRetry}
             className="mt-3 inline-flex items-center gap-1.5 rounded border border-border-strong px-2.5 py-1 text-xs"
           >
-            <RefreshCw className="lucide-inline" /> Retry
+            <RefreshCw className="lucide-inline" /> {i18nT('components.chatPane.retry')}
           </button>
         )}
       </div>

@@ -416,8 +416,8 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
             className="p-2 rounded-md border transition-colors"
             style={{ borderColor: 'var(--danger)', color: 'var(--danger)', background: 'transparent' }}
             onClick={() => void onStop()}
-            title="Stop"
-            aria-label="Stop the current turn"
+            title={i18nT('appSdk.chatEmbed.stop')}
+            aria-label={i18nT('appSdk.chatEmbed.stop_the_current_turn')}
           >
             <Square size={16} />
           </button>

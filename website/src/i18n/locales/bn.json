@@ -267,6 +267,8 @@
       "send": "পাঠান",
       "send_message": "মেসেজ পাঠান",
       "session_ready_type_a_message_to_start": "সেশন প্রস্তুত। শুরু করতে একটি মেসেজ লিখুন।",
+      "stop": "থামাও",
+      "stop_the_current_turn": "বর্তমান টার্ন থামাও",
       "streaming": "স্ট্রিমিং হচ্ছে"
     },
     "chatMessageList": {
@@ -9648,6 +9650,27 @@
         "resources": "রিসোর্স",
         "start_chatting_to_see_sections": "সেকশন দেখতে চ্যাট শুরু করুন"
       },
+      "chatSurface": {
+        "cannot_reach": "{{label}}-এ পৌঁছানো যাচ্ছে না",
+        "commands_run_here": "কমান্ড এই মেশিনে চলে",
+        "commands_run_on": "কমান্ড {{label}}-এ চলে",
+        "connecting": "সংযুক্ত হচ্ছে…",
+        "create_failed": "সেশন তৈরি করা যায়নি।",
+        "create_no_key": "গেটওয়ে একটি সেশন তৈরি করেছে, কিন্তু তার কী ফেরত দেয়নি।",
+        "gateway_no_answer": "গেটওয়ে কোনো উত্তর দেয়নি।",
+        "live_updates_unavailable_title": "এই ক্রুর ইভেন্ট ফিড প্রক্সির মধ্য দিয়ে পাওয়া যাচ্ছে না, তাই সেশন তালিকা নিজে থেকে আপডেট হবে না। পাঠানো তবু কাজ করবে।",
+        "loading_sessions": "সেশন লোড হচ্ছে…",
+        "never_falls_back": "এই ভিউ সবসময় যে গেটওয়ের দিকে নির্দেশ করা হয়েছিল তার সঙ্গেই কথা বলে — এটি কখনও চুপচাপ অন্য কোনোটিতে সরে যায় না।",
+        "no_gateway_selected": "কোনো গেটওয়ে নির্বাচিত নয়",
+        "no_sessions_yet": "এখনও কোনো সেশন নেই — {{action}} দিয়ে একটি শুরু করো।",
+        "no_tool_activity": "এখনও কোনো টুল কার্যকলাপ আসেনি।",
+        "pick_a_session": "একটি সেশন বেছে নাও, বা নতুন একটি শুরু করো।",
+        "placeholder_message": "{{label}}-কে মেসেজ করো…",
+        "reconnecting": "আবার সংযুক্ত হচ্ছে…",
+        "stale_dropped": "সেশন তালিকা পুরোনো হতে পারে — ইভেন্ট স্ট্রিম বন্ধ হয়ে গেছে। মেসেজ তবু যাবে।",
+        "stale_terminal": "সেশন তালিকা নিজে থেকে আপডেট হবে না — এই ক্রুর ইভেন্ট ফিড প্রক্সির মধ্য দিয়ে পাওয়া যাচ্ছে না। মেসেজ তবু যাবে।",
+        "working": "কাজ চলছে"
+      },
       "collapsibleToolGroup": {
         "approval_needed": "অনুমোদন প্রয়োজন",
         "approvals_pending": "অনুমোদন বাকি",
@@ -10683,6 +10706,9 @@
       "total_credits_title": "ট্রেস করা টার্নগুলির মোট ক্রেডিট",
       "turn_credits_duration_title": "এই টার্নে {{credits}} ক্রেডিট · {{duration}}",
       "turn_credits_title": "এই টার্নে {{credits}} ক্রেডিট"
+    },
+    "crewChatPage": {
+      "no_crew_named": "URL-এ কোনো ক্রুর নাম দেওয়া হয়নি।"
     },
     "devFleetPage": {
       "actions": "অ্যাকশন",
@@ -14614,6 +14640,7 @@
         "groups_unavailable": "এই অ্যাকাউন্ট যে গ্রুপগুলোতে যোগ দিয়েছে, তা লোড করা যায়নি।"
       },
       "remoteCrewPanel": {
+        "chat": "চ্যাট",
         "your_crews": "আপনার ইনস্ট্যান্স",
         "set_up_a_new_one": "Set up a new one",
         "auto_connect": "crew স্বয়ংক্রিয়ভাবে সংযুক্ত করুন",
