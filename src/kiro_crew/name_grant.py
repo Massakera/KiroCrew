@@ -239,7 +239,6 @@ IDENTITY_CHANGED = "identity_changed"
 UNWITNESSED = "no_approval_identified_this_file"
 DISPATCHER = "program_dispatches_another"
 AMBIGUOUS_PATH = "search_path_has_a_relative_entry"
-WINDOWS_UNMODELLED = "windows_lookup_not_modelled"
 FILE_ASSOCIATION = "windows_file_association"
 BUILTIN_SHADOWS = "powershell_builtin_precedes_program"
 UNINSPECTABLE = "uninspectable"
@@ -258,7 +257,6 @@ _REFUSAL_LOG_TEXT = {
     UNWITNESSED: "a non-system program has no file identified by an approval",
     DISPATCHER: "a program runs another program named in its arguments",
     AMBIGUOUS_PATH: "the search path contains an empty or relative entry",
-    WINDOWS_UNMODELLED: "the Windows shell's lookup inputs could not be established",
     FILE_ASSOCIATION: "a program resolves to a file Windows runs through a registered "
     "file association",
     BUILTIN_SHADOWS: "PowerShell resolves the name to a built-in command before the search path",
@@ -278,14 +276,17 @@ class Refusal:
 
     ``dedupe_key`` is an optional fingerprint of the ENVIRONMENT STATE this
     refusal reads. When set, :func:`should_log_decline` collapses a repeated
-    line for the same session AND the same fingerprint down to one warning: a
-    profile that does not change between commands says the same thing about
-    every one of them, and burying real per-invocation refusals under that
-    repeated line is the noise :func:`should_log_decline` exists to prevent.
-    The fingerprint is part of the key, not the code, so a mid-session change
-    -- a profile is edited, or removed -- produces a fresh line rather than
-    silence. Never used by :func:`log_decline`: the SEL audit row is written
-    per invocation whatever the fingerprint says.
+    line for the same session AND the same fingerprint down to one warning: an
+    environment fingerprint that does not change between commands says the same
+    thing about every one of them, and burying real per-invocation refusals
+    under that repeated line is the noise :func:`should_log_decline` exists to
+    prevent. The fingerprint is part of the key, not the code, so a mid-session
+    change to that state produces a fresh line rather than silence. No shipped
+    refusal sets a ``dedupe_key`` today (the profile refusal that once did is
+    gone); the mechanism is kept as a generic seam for a future environment-
+    scope refusal, and the command-scope tests exercise it directly. Never used
+    by :func:`log_decline`: the SEL audit row is written per invocation whatever
+    the fingerprint says.
     """
 
     code: str
@@ -297,32 +298,14 @@ class Refusal:
         return _REFUSAL_LOG_TEXT.get(self.code, "a program name could not be vouched for")
 
 
-#: Refusal codes that describe the PLATFORM rather than the command. Every other
-#: code is a fact about the line that was run -- this name shadows a system
-#: program, that file is not the one an approval identified -- so it is worth
-#: saying every time it happens. A platform-scope code says the same thing about
-#: every command a session will ever run, so repeating it per invocation buries
-#: the per-command refusals it sits among and reads like a misconfiguration the
-#: user could fix.
-#:
-#: Only ``WINDOWS_UNMODELLED`` qualifies today, and only in the one state that
-#: still produces it: Windows could not say where the user's Documents folder
-#: is, so whether a PowerShell profile runs before the command cannot be
-#: established (:func:`windows_environment_refusal`). ``AMBIGUOUS_PATH`` and
-#: ``AMBIGUOUS_ENV`` -- the latter also covering a PowerShell profile that
-#: EXISTS -- are near-misses that are deliberately NOT here: both are
-#: environment state a user can change mid-session, so a later invocation can
-#: legitimately answer differently and each line is a fresh fact.
-_PLATFORM_SCOPE_CODES = frozenset({WINDOWS_UNMODELLED})
-
-#: ``(session bucket, code) -> None`` for platform-scope declines already logged.
-#: Bounded like :data:`_PINS` so a long-lived gateway cannot accumulate an entry
-#: per session it has ever served. An eviction costs one extra log line for a
-#: session that comes back after 512 others, which is the right way to be wrong.
-#: Every variable-length element of the key is held as its :func:`_notice_digest`
-#: rather than verbatim, so the retained SIZE is bounded as well as the entry
-#: count.
-_DECLINE_NOTICES: "OrderedDict[tuple[str, str], None]" = OrderedDict()
+#: ``(session bucket, code, fingerprint) -> None`` for fingerprinted command-scope
+#: declines already logged. Bounded like :data:`_PINS` so a long-lived gateway
+#: cannot accumulate an entry per session it has ever served. An eviction costs
+#: one extra log line for a session that comes back after 512 others, which is
+#: the right way to be wrong. Every variable-length element of the key is held as
+#: its :func:`_notice_digest` rather than verbatim, so the retained SIZE is
+#: bounded as well as the entry count.
+_DECLINE_NOTICES: "OrderedDict[tuple[str, str, str], None]" = OrderedDict()
 _DECLINE_NOTICE_LIMIT = 512
 
 #: Guards :data:`_DECLINE_NOTICES`. The tiers reach this from worker threads, so
@@ -342,12 +325,12 @@ def _notice_digest(value: str) -> str:
     chosen outside this module and neither has its length checked. The session
     key comes from the agent webhook, which takes ``sessionKey`` from the request
     body and validates its type and its PREFIX but caps no length, unlike the
-    ``message`` field beside it. The dedupe fingerprint is a filesystem path plus
-    an mtime, and a Documents folder redirected deep enough makes that path as
-    long as the filesystem allows. Bounding the ledger by entry COUNT alone
-    therefore bounds the wrong dimension: 512 entries of a caller's chosen size
-    is not a bound. A blank value still digests to its own stable value, so a
-    headless caller keeps the separate bucket it is documented to get.
+    ``message`` field beside it. The dedupe fingerprint is a description of the
+    environment state a refusal read, which a caller can make as long as the
+    filesystem allows. Bounding the ledger by entry COUNT alone therefore bounds
+    the wrong dimension: 512 entries of a caller's chosen size is not a bound. A
+    blank value still digests to its own stable value, so a headless caller keeps
+    the separate bucket it is documented to get.
     """
 
     digest = hashlib.blake2b(value.encode("utf-8", "surrogatepass"), digest_size=16)
@@ -360,25 +343,20 @@ def should_log_decline(session_key: str, refusal: Refusal) -> bool:
     Governs the human-facing ``logger.warning`` only. It never governs
     :func:`log_decline`, which writes the SEL audit row: declining is a security
     decision and every one of them is audited, per invocation, whatever this
-    returns. Nothing observable is lost by suppressing a repeat -- the text of a
-    platform-scope refusal is a constant read out of :data:`_REFUSAL_LOG_TEXT`
-    and carries nothing about the command that met it.
+    returns.
 
-    True for every command-scope code by default: those differ per invocation.
-    A command-scope refusal MAY opt in to session-deduplication by carrying a
-    :attr:`Refusal.dedupe_key` -- the fingerprint of the environment state it
-    reads -- and then the same session-plus-fingerprint pair collapses to one
-    line, with a changed fingerprint (a profile edited or removed mid-session)
-    producing a fresh one. True the first time a :data:`_PLATFORM_SCOPE_CODES`
-    member is met in a session, then False for that same session and code.
+    True for every decline by default: each is a fact about the line that ran, so
+    every occurrence is worth logging. A refusal MAY opt in to session-dedup by
+    carrying a :attr:`Refusal.dedupe_key` -- the fingerprint of the environment
+    state it reads -- and then the same session-plus-fingerprint pair collapses to
+    one line, with a changed fingerprint (the environment state changing
+    mid-session) producing a fresh one.
 
     A blank *session_key* is treated as its own bucket rather than shared, so a
     surface that has no session (a headless caller) still gets its first notice.
     """
 
-    if refusal.code in _PLATFORM_SCOPE_CODES:
-        key: tuple = (_notice_digest(session_key), refusal.code)
-    elif refusal.dedupe_key is not None:
+    if refusal.dedupe_key is not None:
         key = (_notice_digest(session_key), refusal.code, _notice_digest(refusal.dedupe_key))
     else:
         return True
@@ -389,84 +367,6 @@ def should_log_decline(session_key: str, refusal: Refusal) -> bool:
         while len(_DECLINE_NOTICES) > _DECLINE_NOTICE_LIMIT:
             _DECLINE_NOTICES.popitem(last=False)
     return True
-
-
-def platform_scope_notice() -> str | None:
-    """Name the platform-scope limitation in force here, or None.
-
-    One spelling for the surfaces that report it away from an invocation --
-    ``kirocrew doctor`` today -- so the CLI cannot describe a posture this module
-    does not actually hold. Derived from the same helper
-    :func:`name_grant_refusal` consults, so the two cannot drift: the notice is
-    the one Windows refusal that is a property of the host rather than of its
-    current configuration.
-    """
-
-    refusal = windows_environment_refusal()
-    if refusal is not None and refusal.code in _PLATFORM_SCOPE_CODES:
-        return refusal.code
-    return None
-
-
-def windows_environment_refusal() -> Refusal | None:
-    """Why NO name on this Windows host can be vouched for right now, else None.
-
-    ``None`` on every other platform. Two states refuse:
-
-    * Windows cannot say where the user's Documents folder is
-      (``SHGetKnownFolderPath`` failed), so whether a profile script runs before
-      the command cannot be established. Platform scope: a property of the host.
-    * A per-user PowerShell profile EXISTS. kiro-cli starts the shell without
-      ``-NoProfile``, so that script runs before every command, and a function
-      it defines resolves ahead of any program on ``PATH`` -- measured, and the
-      same threat ``BASH_ENV`` poses on POSIX. Whatever writes as the user
-      writes Documents, so the profile is not a file this check can trust by
-      location; nor is it pinned, because a pin records what a human approved,
-      and no approval card ever shows the profile. Command scope: the user can
-      remove the file and the next invocation answers differently.
-
-    The all-users profiles under ``$PSHOME`` are deliberately not checked: they
-    live beside the system binaries this module already trusts by location.
-
-    Like every other answer this module gives, this one describes the filesystem
-    as it is when the tier decides: a profile created after the check and before
-    the shell starts is the same residual window as the resolved file's own
-    contents changing there, and narrowing it is not something this check can do
-    from inside -- the shell is spawned by kiro-cli, which offers no
-    ``-NoProfile``. What closes it is that writing the file needs an approved
-    command of its own.
-
-    Public because ``kirocrew doctor`` prints the same answer, so a user reading
-    "why does every hook still prompt" sees the file that is doing it.
-    """
-
-    if not platform_compat.IS_WINDOWS:
-        return None
-    profiles = platform_compat.windows_powershell_profile_paths()
-    if profiles is None:
-        return Refusal(
-            WINDOWS_UNMODELLED,
-            "Windows could not report the user's Documents folder, so whether a "
-            "PowerShell profile runs before the command cannot be established",
-        )
-    for profile in profiles:
-        if os.path.isfile(profile):
-            # Fingerprint the profile's state -- path plus mtime -- so the
-            # log-line ledger deduplicates ONE line per session per state and
-            # writes a fresh one when the user edits or removes the file. The
-            # audit row is unchanged; every invocation is still recorded. See
-            # :attr:`Refusal.dedupe_key` and :func:`should_log_decline`.
-            try:
-                mtime = os.stat(profile).st_mtime_ns
-            except OSError:
-                mtime = 0
-            return Refusal(
-                AMBIGUOUS_ENV,
-                f"a PowerShell profile at {profile} runs before every command and "
-                "can define a function that replaces any program this check resolves",
-                dedupe_key=f"{profile}|{mtime}",
-            )
-    return None
 
 
 def environment_refusal() -> Refusal | None:
@@ -483,26 +383,21 @@ def environment_refusal() -> Refusal | None:
       holds.
     * :func:`pin_human_approval` DECLINES TO PIN while it holds. A pin records
       that a human saw a command and said yes to the file behind each of its
-      names -- but while a profile function or ``BASH_ENV`` can define that name
-      ahead of the file, the thing they approved may not be the file at all.
-      Pinning there would bank an identity the approval never established, and
-      the pin outlives the environment state: the user removes the profile and a
-      name grant then auto-approves an executable no human ever approved.
+      names -- but while ``BASH_ENV`` can define that name ahead of the file, the
+      thing they approved may not be the file at all. Pinning there would bank an
+      identity the approval never established, and the pin outlives the
+      environment state: the user clears the variable and a name grant then
+      auto-approves an executable no human ever approved.
 
     ``kirocrew doctor`` reports it too, so the row cannot claim grants are
     satisfiable on a host where every one of them is refused.
+
+    Windows adds nothing of its own here. kiro-cli spawns the shell profile-free
+    (see :data:`MODELLED_WINDOWS_SHELL`), so a ``$PROFILE`` never runs before the
+    command and cannot redefine a name; PowerShell does not read ``BASH_ENV``.
+    What remains is the platform-independent search-path check below.
     """
 
-    if platform_compat.IS_WINDOWS:
-        # PowerShell's lookup is modelled (see the module docstring), but only
-        # once the session that will run the command is known not to redefine
-        # names first: a per-user profile script runs ahead of the command and
-        # can define a function over any program name. Until Windows can say
-        # where that script would live, and while one exists, no name can be
-        # vouched for.
-        windows_refusal = windows_environment_refusal()
-        if windows_refusal is not None:
-            return windows_refusal
     if _path_is_ambiguous():
         return Refusal(
             AMBIGUOUS_PATH,
@@ -518,8 +413,9 @@ def environment_refusal() -> Refusal | None:
             # nothing about what will run. Refusing every name grant while that
             # is set is the honest answer; it costs auto-approve for a session
             # whose environment carries one of these, which is rare and already
-            # unusual. (Bash reads these; PowerShell does not, and its
-            # equivalent -- the profile -- is the Windows check above.)
+            # unusual. (Bash reads these; PowerShell does not, and the Windows
+            # shell is spawned with -NoProfile, so its nearest equivalent -- the
+            # profile -- does not run either.)
             return Refusal(
                 AMBIGUOUS_ENV,
                 f"{preload} is set in the inherited environment, so a shell function "
@@ -1098,34 +994,42 @@ _INERT_BUILTINS = frozenset(
 
 # ── Windows: PowerShell's resolution order ──
 #
-# The shell kiro-cli spawns on Windows is PowerShell (`powershell -Command`), and
-# PowerShell resolves a command word in a fixed order: alias, function, cmdlet,
-# then the executables on `PATH`. The first three come from the session itself,
-# so a name in one of those tables runs a BUILT-IN whatever `PATH` holds --
-# `sort` is Sort-Object with `sort.exe` sitting right there in System32, and
-# `curl` is Invoke-WebRequest. Resolving such a name from `PATH` would vouch for
-# a file the shell never runs. The tables below are the default alias and
-# function names of Windows PowerShell 5.1 (`Get-Alias`, plus the functions a
-# `-NoProfile` session defines), so a name in them is judged as the built-in it
-# is: allowed when the built-in is inert, refused otherwise. Module auto-loading
+# The shell kiro-cli spawns on Windows is Windows PowerShell 5.1, started
+# profile-free (`powershell -NoProfile -Command`), and PowerShell resolves a
+# command word in a fixed order: alias, function, cmdlet, then the executables on
+# `PATH`. The first three come from the session itself, so a name in one of those
+# tables runs a BUILT-IN whatever `PATH` holds -- `sort` is Sort-Object with
+# `sort.exe` sitting right there in System32, and `curl` is Invoke-WebRequest.
+# Resolving such a name from `PATH` would vouch for a file the shell never runs.
+# The tables below are the default alias and function names of Windows PowerShell
+# 5.1 (`Get-Alias`, plus the functions a `-NoProfile` session defines), so a name
+# in them is judged as the built-in it is: allowed when the built-in is inert,
+# refused otherwise. Because the session is profile-free, a user's `$PROFILE`
+# never runs before the command and so cannot redefine a name -- the tables are
+# the whole story, with no profile functions to layer on top. Module auto-loading
 # does not enter into this: measured, an application found on `PATH` wins over
 # an auto-loadable module function, and a name found nowhere is refused anyway.
 
-#: The Windows shell whose built-in set the tables below mirror, as the argv of a
-#: session equivalent to the one the command will run in. ONE spelling, because
-#: two places have to mean the same shell: these tables, and the derivation check
-#: that enumerates a live session to prove they are not stale.
+#: The Windows shell whose built-in set the tables below mirror, as the argv of
+#: the session the command actually runs in. ONE spelling, because two places
+#: have to mean the same shell: these tables, and the derivation check that
+#: enumerates a live session to prove they are not stale.
 #:
-#: ``-NoProfile`` is here and NOT in what kiro-cli spawns, deliberately. The
-#: tables record the shell's DEFAULT names, which is what a profile-free session
-#: reports; a profile's own functions are not table material because a profile
-#: existing refuses every grant outright (:func:`windows_environment_refusal`).
+#: This is the module's single stated guarantee about the shell kiro-cli spawns
+#: (kirodotdev/Kiro#9537): a profile-free Windows PowerShell 5.1 session,
+#: ``powershell -NoProfile -NonInteractive``. It is a guarantee a consumer PINS
+#: rather than an assumption it infers -- the shell is spawned exactly this way,
+#: so ``-NoProfile`` is BOTH what these tables model and what actually runs. That
+#: profile-free spawn is why there is no per-user-profile refusal in this module:
+#: a `$PROFILE` cannot inject an alias or function ahead of a program, so
+#: the tables record the session's DEFAULT names in full and nothing is layered
+#: on top of them at runtime.
 #:
-#: This is also the module's single point of exposure to kiro-cli's choice of
-#: shell (kirodotdev/Kiro#9537). If that ever becomes pwsh 7, changing it here
-#: re-points the derivation check at the new shell, and the check then fails on
-#: every name whose behaviour the tables get wrong -- which is the loud failure a
-#: hand-written mirror of another program's state needs.
+#: Pinning the shell here is also what keeps the model from silently drifting: if
+#: kiro-cli ever spawned pwsh 7 instead, changing this constant re-points the
+#: derivation check at the new shell, and the check then fails on every name
+#: whose behaviour the 5.1 tables get wrong -- the loud failure a hand-written
+#: mirror of another program's state needs.
 MODELLED_WINDOWS_SHELL: tuple[str, ...] = ("powershell", "-NoProfile", "-NonInteractive")
 
 #: PowerShell default aliases and session functions that are INERT in this

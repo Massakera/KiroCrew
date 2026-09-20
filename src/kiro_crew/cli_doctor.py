@@ -1872,46 +1872,32 @@ def _doctor_name_grant_platform_scope() -> None:
     A user reading decline lines in the log cannot tell a host-wide reason from
     their own misconfiguration; what they would have to read to find out is the
     source of :mod:`kiro_crew.name_grant`. This says it where they are already
-    looking for what their install can and cannot do. Three answers:
+    looking for what their install can and cannot do. Two answers:
 
-    * the platform-scope code (Windows could not report the Documents folder,
-      so the PowerShell profile check cannot run) -- a property of the host;
-    * a Windows environment refusal (a per-user PowerShell profile exists) --
-      the user can act on it, so the path is printed;
+    * an environment refusal (a relative ``PATH`` entry, or on POSIX an inherited
+      ``BASH_ENV``) -- the user can act on it, so the detail is printed;
     * or grants can be satisfied.
 
-    Not a failure, so it never joins *issues*: each fail-closed answer is the
-    intended posture. Imported locally to keep ``kirocrew doctor`` from pulling
-    a security module in on every invocation just to print one row.
+    There is no Windows-only branch: kiro-cli spawns the shell profile-free, so a
+    ``$PROFILE`` never runs before the command and Windows answers per command
+    exactly as POSIX does. Not a failure, so it never joins *issues*: each
+    fail-closed answer is the intended posture. Imported locally to keep
+    ``kirocrew doctor`` from pulling a security module in on every invocation just
+    to print one row.
     """
 
     from kiro_crew import name_grant
 
-    notice = name_grant.platform_scope_notice()
-    if notice is not None:
-        print(f"  hook auto-approve:  ⏹ declined on this host ({notice})")
-        _print_wrapped(
-            "This is the platform's scope, not your configuration. Windows could "
-            "not report where the user's Documents folder is, so this check cannot "
-            "tell whether a PowerShell profile runs before each command and "
-            "declines every name grant. Hooks that auto-approve on macOS and "
-            "Linux go to the approval card instead."
-        )
-        return
     refusal = name_grant.environment_refusal()
     if refusal is not None:
         print(f"  hook auto-approve:  ⚠ declined by this environment ({refusal.code})")
-        # The profile is the one state with a remedy a user can be told in a
-        # word. The others -- a relative `PATH` entry, an inherited `BASH_ENV`
-        # or exported shell functions -- are named in the detail, which says
-        # which one it is; a generic sentence there beats naming the wrong file.
-        if platform_compat.IS_WINDOWS and refusal.code == name_grant.AMBIGUOUS_ENV:
-            remedy = "remove or rename the profile to restore them."
-        else:
-            remedy = "clear the environment state named above to restore them."
+        # The detail names which state it is -- a relative `PATH` entry, an
+        # inherited `BASH_ENV` or exported shell functions -- so a generic
+        # sentence here beats naming the wrong one.
         _print_wrapped(
             refusal.detail + ". Hooks that would auto-approve go to the approval "
-            "card while this holds; " + remedy
+            "card while this holds; clear the environment state named above to "
+            "restore them."
         )
         return
     print("  hook auto-approve:  ✅ name grants can be satisfied on this platform")

@@ -3521,56 +3521,23 @@ class TestProjectSectionAndAuthRow:
 class TestNameGrantPlatformScopeRow:
     """`kirocrew doctor` says whether hook auto-approve works on this host.
 
-    A user who sees decline lines in `gateway.log` has no other way to tell a
-    host-wide reason from their own configuration.
+    A user who sees decline lines in `gateway.log` has no other way to tell an
+    environment reason from their own configuration. Windows answers per command
+    like POSIX now that kiro-cli spawns the shell profile-free, so there is no
+    Windows-only decline branch left to report.
     """
 
-    def test_unknown_documents_folder_names_the_code_and_says_it_is_not_your_config(
-        self, monkeypatch, capsys
-    ):
-        from kiro_crew import name_grant
-
-        monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(name_grant.platform_compat, "windows_powershell_profile_paths", lambda: None)
-        cli_doctor._doctor_name_grant_platform_scope()
-        out = capsys.readouterr().out
-        # The code is what a reader greps `gateway.log` for.
-        assert name_grant.WINDOWS_UNMODELLED in out
-        assert "not your configuration" in out
-        assert "approval card" in out
-
-    def test_an_existing_profile_is_named_so_the_user_can_act(self, monkeypatch, capsys, tmp_path):
-        from kiro_crew import name_grant
-
-        profile = tmp_path / "Microsoft.PowerShell_profile.ps1"
-        profile.write_text("function ls { evil }\n")
-        monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(
-            name_grant.platform_compat, "windows_powershell_profile_paths", lambda: (str(profile),)
-        )
-        cli_doctor._doctor_name_grant_platform_scope()
-        out = capsys.readouterr().out
-        assert name_grant.AMBIGUOUS_ENV in out
-        assert str(profile) in out
-        assert "approval card" in out
-        assert "✅" not in out
-
-    def test_windows_without_a_profile_reports_that_grants_can_be_satisfied(
-        self, monkeypatch, capsys, tmp_path
-    ):
+    def test_windows_reports_that_grants_can_be_satisfied(self, monkeypatch, capsys):
+        # kiro-cli spawns the shell profile-free, so a Windows host with no other
+        # environment refusal reports ✅ exactly like POSIX. There is no
+        # profile-carrying-host decline and no platform-scope code to grep for.
         from kiro_crew import name_grant
 
         monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", True)
         monkeypatch.setattr(name_grant, "_path_is_ambiguous", lambda: False)
-        monkeypatch.setattr(
-            name_grant.platform_compat,
-            "windows_powershell_profile_paths",
-            lambda: (str(tmp_path / "absent.ps1"),),
-        )
         cli_doctor._doctor_name_grant_platform_scope()
         out = capsys.readouterr().out
         assert "hook auto-approve:  ✅" in out
-        assert name_grant.WINDOWS_UNMODELLED not in out
 
     def test_posix_reports_that_grants_can_be_satisfied(self, monkeypatch, capsys):
         from kiro_crew import name_grant
@@ -3581,7 +3548,6 @@ class TestNameGrantPlatformScopeRow:
         cli_doctor._doctor_name_grant_platform_scope()
         out = capsys.readouterr().out
         assert "hook auto-approve:  ✅" in out
-        assert name_grant.WINDOWS_UNMODELLED not in out
 
     def test_an_inherited_preload_is_reported_rather_than_claimed_satisfiable(
         self, monkeypatch, capsys
@@ -3601,8 +3567,6 @@ class TestNameGrantPlatformScopeRow:
         assert name_grant.AMBIGUOUS_ENV in out
         assert "BASH_ENV" in out
         assert "approval card" in out
-        # Not the profile remedy -- there is no profile in this state.
-        assert "rename the profile" not in out
 
     def test_a_relative_search_path_entry_is_reported_rather_than_claimed_satisfiable(
         self, monkeypatch, capsys

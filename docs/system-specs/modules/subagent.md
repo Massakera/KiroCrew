@@ -336,12 +336,14 @@ is decided in strict priority order:
    matters most here: the subagent surface runs unattended, so an unverified
    shadowed name would be honoured with nobody watching. On Windows the check
    models the shell's lookup and returns per-command verdicts as it does on
-   POSIX, except in two host states that still decline every name grant:
-   `windows_lookup_not_modelled` when Windows cannot report where the user's
-   Documents folder is, and `ambiguous_env` when a per-user PowerShell profile
-   sits at one of the paths derived from it. In those two states a headless
-   subagent (no parent `auto` policy, no interactive approver) rejects shell
-   tools its allowlist would otherwise grant.
+   POSIX, with no profile-based blanket decline: kiro-cli spawns the shell
+   profile-free (Windows PowerShell 5.1, `-NoProfile`, see
+   `name_grant.MODELLED_WINDOWS_SHELL`), so a per-user `$PROFILE` never runs
+   before the command and cannot define a function ahead of a program on
+   `PATH`. What still declines on either platform is an ordinary environment
+   refusal — a relative `PATH` entry, or on POSIX an inherited `BASH_ENV` — in
+   which case a headless subagent (no parent `auto` policy, no interactive
+   approver) rejects shell tools its allowlist would otherwise grant.
 3. **Parent policy** — `parent_policy == "auto"` → auto-approve. Resolved once
    at `_run_inner` start (see the chain below); an active global YOLO folds
    into this snapshot rather than being re-read per event.

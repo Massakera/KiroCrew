@@ -759,7 +759,6 @@ class TestLogSafety:
             name_grant.UNWITNESSED,
             name_grant.DISPATCHER,
             name_grant.AMBIGUOUS_PATH,
-            name_grant.WINDOWS_UNMODELLED,
             name_grant.FILE_ASSOCIATION,
             name_grant.BUILTIN_SHADOWS,
             name_grant.UNINSPECTABLE,
@@ -1284,18 +1283,13 @@ class TestWindowsPaths:
     """
 
     def test_windows_answers_per_command(self, world, monkeypatch):
-        # WINDOWS_UNMODELLED is reserved for the one host state the model cannot
-        # run in (Documents unknown). A host that CAN say where its profile
-        # would be gets a per-command verdict: `find` is a system program here
-        # and is allowed; a relative path is refused for what it is.
+        # kiro-cli spawns the shell profile-free, so Windows carries no
+        # host-wide refusal of its own: it gets a per-command verdict like
+        # POSIX. `find` is a system program here and is allowed; a relative path
+        # is refused for what it is.
         system_dir, _ = world
         exe = _program(system_dir, "find.exe")
         monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(
-            name_grant.platform_compat,
-            "windows_powershell_profile_paths",
-            lambda: (str(system_dir / "no-such-profile.ps1"),),
-        )
         # The world's system stand-in knows no extensions; Windows' does.
         monkeypatch.setattr(
             name_grant.platform_compat,
@@ -1357,12 +1351,15 @@ class TestHookTierIsUntouched:
         assert result.action == TOOL_AUTO_APPROVE
 
 
-class TestPlatformScopeDeclineNotice:
-    """A platform-scope decline is stated once a session, not once a command.
+class TestUnfingerprintedDeclinesAlwaysLog:
+    """A decline with no fingerprint is a per-command fact and always logs.
 
-    On Windows every hook auto-approve is declined, so a per-invocation line
-    reaches roughly fifteen identical rows a session in ``gateway.log`` and reads
-    like a misconfiguration the user could fix.
+    There is no platform-scope code: kiro-cli spawns the shell profile-free,
+    so Windows produces no host-wide refusal that would repeat identically
+    every command. What remains are per-command refusals,
+    each a fact about the line that ran, so every occurrence is worth logging
+    unless the refusal explicitly opts in to fingerprint dedup (see
+    :class:`TestCommandScopeDedupeByEnvironmentFingerprint`).
     """
 
     @pytest.fixture(autouse=True)
@@ -1371,102 +1368,19 @@ class TestPlatformScopeDeclineNotice:
         yield
         name_grant._DECLINE_NOTICES.clear()
 
-    def test_platform_scope_is_stated_once_per_session(self):
-        refusal = name_grant.Refusal(name_grant.WINDOWS_UNMODELLED, "detail")
-        assert name_grant.should_log_decline("s1", refusal) is True
-        assert name_grant.should_log_decline("s1", refusal) is False
-        assert name_grant.should_log_decline("s1", refusal) is False
-
-    def test_a_second_session_gets_its_own_notice(self):
-        # The limitation is process-wide, but a reader needs to know WHICH
-        # session lost auto-approve, so the notice is per session.
-        refusal = name_grant.Refusal(name_grant.WINDOWS_UNMODELLED, "detail")
-        assert name_grant.should_log_decline("s1", refusal) is True
-        assert name_grant.should_log_decline("s2", refusal) is True
-
-    def test_a_blank_session_key_is_its_own_bucket(self):
-        # The headless surface passes no session; it must still get one notice.
-        refusal = name_grant.Refusal(name_grant.WINDOWS_UNMODELLED, "detail")
-        assert name_grant.should_log_decline("", refusal) is True
-        assert name_grant.should_log_decline("", refusal) is False
-        assert name_grant.should_log_decline("s1", refusal) is True
-
-    def test_no_command_scope_code_is_ever_suppressed(self):
-        # Derived from the code table rather than listed, so a code added later
-        # is covered here without anyone remembering to add it. Each of these is
-        # a fact about the line that ran, so every occurrence is worth logging.
-        command_scope = set(name_grant._REFUSAL_LOG_TEXT) - name_grant._PLATFORM_SCOPE_CODES
-        assert command_scope, "the table cannot be entirely platform scope"
-        for code in sorted(command_scope):
+    def test_no_code_is_ever_suppressed_without_a_fingerprint(self):
+        # Derived from the code table, so a code added later is covered here
+        # without anyone remembering to add it. Without a dedupe_key every
+        # occurrence logs.
+        for code in sorted(name_grant._REFUSAL_LOG_TEXT):
             refusal = name_grant.Refusal(code, "detail")
+            assert refusal.dedupe_key is None
             assert name_grant.should_log_decline("s1", refusal) is True, code
             assert name_grant.should_log_decline("s1", refusal) is True, code
-
-    def test_every_platform_scope_code_is_a_real_code(self):
-        # A retired or mistyped member would silently never match a refusal, so
-        # the gate would quietly stop suppressing anything.
-        assert name_grant._PLATFORM_SCOPE_CODES <= set(name_grant._REFUSAL_LOG_TEXT)
-
-    def test_the_notice_ledger_is_bounded(self):
-        # A gateway serves sessions for weeks; the ledger must not grow one
-        # entry per session forever.
-        refusal = name_grant.Refusal(name_grant.WINDOWS_UNMODELLED, "detail")
-        for n in range(name_grant._DECLINE_NOTICE_LIMIT + 50):
-            name_grant.should_log_decline(f"s{n}", refusal)
-        assert len(name_grant._DECLINE_NOTICES) <= name_grant._DECLINE_NOTICE_LIMIT
-
-    def test_the_retained_size_does_not_follow_the_session_key_length(self):
-        # Bounding the entry COUNT bounds the wrong dimension on its own: the
-        # session key is caller-supplied and nothing checks its length, so 512
-        # entries of a caller's chosen size is not a bound. What is retained is a
-        # digest, so a key a thousand times longer costs the same bytes.
-        refusal = name_grant.Refusal(name_grant.WINDOWS_UNMODELLED, "detail")
-        short = "hook:default:1"
-        huge = "hook:default:" + "x" * 262_144
-        assert name_grant.should_log_decline(short, refusal) is True
-        assert name_grant.should_log_decline(huge, refusal) is True
-        sizes = {len(bucket) for bucket, _code in name_grant._DECLINE_NOTICES}
-        assert len(sizes) == 1, name_grant._DECLINE_NOTICES.keys()
-        assert sizes.pop() < 128
-        # The oversized key must not be recoverable from what was kept.
-        assert not any("x" * 64 in bucket for bucket, _code in name_grant._DECLINE_NOTICES)
-
-    def test_two_distinct_keys_still_get_distinct_notices_after_digesting(self):
-        # The digest must not collapse different sessions into one bucket, which
-        # would silently suppress a second session's only notice.
-        refusal = name_grant.Refusal(name_grant.WINDOWS_UNMODELLED, "detail")
-        assert name_grant.should_log_decline("hook:default:a", refusal) is True
-        assert name_grant.should_log_decline("hook:default:b", refusal) is True
-        assert len(name_grant._DECLINE_NOTICES) == 2
-
-    def test_the_notice_follows_the_same_platform_branch_as_the_refusal(
-        self, monkeypatch, tmp_path
-    ):
-        # Derived from `windows_environment_refusal`, like `name_grant_refusal`,
-        # so `kirocrew doctor` cannot describe a posture this module does not
-        # hold. Off Windows there is no notice; on Windows there is one only
-        # when the profile check cannot run at all.
-        monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", False)
-        assert name_grant.platform_scope_notice() is None
-        monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(
-            name_grant.platform_compat,
-            "windows_powershell_profile_paths",
-            lambda: (str(tmp_path / "profile.ps1"),),
-        )
-        assert name_grant.platform_scope_notice() is None
-        (tmp_path / "profile.ps1").write_text("function ls { evil }\n")
-        # A profile that EXISTS is command scope: the user can remove it.
-        assert name_grant.platform_scope_notice() is None
-        assert name_grant.windows_environment_refusal().code == name_grant.AMBIGUOUS_ENV
-        monkeypatch.setattr(
-            name_grant.platform_compat, "windows_powershell_profile_paths", lambda: None
-        )
-        assert name_grant.platform_scope_notice() == name_grant.WINDOWS_UNMODELLED
 
     def test_the_audit_row_is_never_gated_by_the_notice(self):
-        # The security invariant here: the LINE is deduplicated, the audit row
-        # is not. Declining is a security decision, so every one of them is
+        # The security invariant here: the LINE may be deduplicated, the audit
+        # row is not. Declining is a security decision, so every one of them is
         # recorded per invocation. Asserted at `log_decline`, the one writer
         # every surface shares, rather than at any single surface.
         rows: list[dict] = []
@@ -1480,7 +1394,9 @@ class TestPlatformScopeDeclineNotice:
             tool_kind = "shell"
             request_id = "r1"
 
-        refusal = name_grant.Refusal(name_grant.WINDOWS_UNMODELLED, "detail")
+        # A fingerprinted refusal so the LINE is deduplicated to one, proving the
+        # audit row is written on every call regardless.
+        refusal = name_grant.Refusal(name_grant.AMBIGUOUS_ENV, "detail", dedupe_key="env|1")
         logged = 0
         for _ in range(3):
             # The exact order the call sites use: gate the line, always audit.
@@ -1494,30 +1410,24 @@ class TestPlatformScopeDeclineNotice:
                 tier="hook_auto_approve",
                 sel_factory=_Sel,
             )
-        assert logged == 1, "the platform-scope line should be stated once"
+        assert logged == 1, "the fingerprinted line should be stated once"
         assert len(rows) == 3, "every decline must still be audited"
         assert {r["outcome"] for r in rows} == {"auto_approve_declined"}
-        assert {r["metadata"]["code"] for r in rows} == {name_grant.WINDOWS_UNMODELLED}
-
-    def test_the_windows_refusal_is_the_code_the_notice_names(self, monkeypatch):
-        # Ties the two halves together: whatever `platform_scope_notice` reports
-        # is the code an actual refusal on this platform carries.
-        monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", True)
-        refusal = name_grant.name_grant_refusal("head file")
-        assert refusal is not None
-        assert refusal.code == name_grant.platform_scope_notice()
+        assert {r["metadata"]["code"] for r in rows} == {name_grant.AMBIGUOUS_ENV}
 
 
 class TestCommandScopeDedupeByEnvironmentFingerprint:
     """A command-scope decline whose fingerprint does not change is one line.
 
-    An oh-my-posh user whose profile is stable across a session sees the SAME
-    ``AMBIGUOUS_ENV`` line for every command in ``gateway.log`` -- the exact
-    per-invocation noise ``should_log_decline`` exists to prevent -- but the
-    code stays command-scope because a user CAN change the file, and every SEL
-    audit row is still written per invocation. The refusal opts in through
-    :attr:`Refusal.dedupe_key`; when the fingerprint changes (a profile edited
-    or removed mid-session) a fresh line is written.
+    A session whose environment state (an inherited ``BASH_ENV``, say) is stable
+    across a session would otherwise see the SAME ``AMBIGUOUS_ENV`` line for every
+    command in ``gateway.log`` -- the per-invocation noise ``should_log_decline``
+    exists to prevent -- but the code stays command-scope because a user CAN
+    change the state, and every SEL audit row is still written per invocation.
+    The refusal opts in through :attr:`Refusal.dedupe_key`; when the fingerprint
+    changes (the environment state edited or cleared mid-session) a fresh line is
+    written. The dedup mechanism itself is generic and does not depend on any
+    particular refusal producing a fingerprint today.
     """
 
     @pytest.fixture(autouse=True)
@@ -1583,14 +1493,6 @@ class TestCommandScopeDedupeByEnvironmentFingerprint:
             name_grant.should_log_decline("s1", r)
         assert len(name_grant._DECLINE_NOTICES) <= name_grant._DECLINE_NOTICE_LIMIT
 
-    def test_a_command_scope_code_is_still_not_in_the_platform_scope_set(self):
-        # The dedupe opt-in must not sneak `AMBIGUOUS_ENV` into the code set
-        # `should_log_decline` treats as platform scope. Env state a user can
-        # change is command scope, and a code in that set would ignore the
-        # fingerprint entirely -- an old state would silently suppress a fresh
-        # one on the same code.
-        assert name_grant.AMBIGUOUS_ENV not in name_grant._PLATFORM_SCOPE_CODES
-
     def test_the_audit_row_is_still_written_per_invocation(self):
         # The security invariant survives item 3: even when the LINE is
         # deduplicated by fingerprint, `log_decline` writes one SEL row per
@@ -1623,70 +1525,3 @@ class TestCommandScopeDedupeByEnvironmentFingerprint:
         assert len(rows) == 4, "every decline is still audited"
         assert {r["outcome"] for r in rows} == {"auto_approve_declined"}
         assert {r["metadata"]["code"] for r in rows} == {name_grant.AMBIGUOUS_ENV}
-
-
-class TestProfileRefusalFingerprint:
-    """Item 3, end to end -- the fingerprint tracks the profile's real state.
-
-    ``windows_environment_refusal`` populates the fingerprint from the profile
-    path and its mtime, so a stable profile logs once, an edited one logs
-    again. Off Windows there is no profile to fingerprint.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _clean_ledger(self):
-        name_grant._DECLINE_NOTICES.clear()
-        yield
-        name_grant._DECLINE_NOTICES.clear()
-
-    def test_a_stable_profile_writes_one_line_per_session(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", True)
-        profile = tmp_path / "profile.ps1"
-        profile.write_text("function evil {}\n")
-        monkeypatch.setattr(
-            name_grant.platform_compat,
-            "windows_powershell_profile_paths",
-            lambda: (str(profile),),
-        )
-        refusal_a = name_grant.windows_environment_refusal()
-        refusal_b = name_grant.windows_environment_refusal()
-        assert refusal_a is not None and refusal_b is not None
-        assert refusal_a.code == name_grant.AMBIGUOUS_ENV
-        assert refusal_a.dedupe_key is not None
-        assert refusal_a.dedupe_key == refusal_b.dedupe_key
-        assert str(profile) in refusal_a.dedupe_key
-        # Two commands under the same stable state -> one warning.
-        assert name_grant.should_log_decline("s1", refusal_a) is True
-        assert name_grant.should_log_decline("s1", refusal_b) is False
-
-    def test_an_edited_profile_writes_a_fresh_line(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", True)
-        profile = tmp_path / "profile.ps1"
-        profile.write_text("function evil {}\n")
-        os.utime(profile, ns=(100_000_000, 100_000_000))
-        monkeypatch.setattr(
-            name_grant.platform_compat,
-            "windows_powershell_profile_paths",
-            lambda: (str(profile),),
-        )
-        first = name_grant.windows_environment_refusal()
-        assert first is not None
-        assert name_grant.should_log_decline("s1", first) is True
-        assert name_grant.should_log_decline("s1", first) is False
-        # The user edits the profile; the mtime moves.
-        os.utime(profile, ns=(200_000_000, 200_000_000))
-        second = name_grant.windows_environment_refusal()
-        assert second is not None
-        assert second.dedupe_key != first.dedupe_key
-        assert name_grant.should_log_decline("s1", second) is True
-
-    def test_no_profile_produces_no_refusal(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", True)
-        profile = tmp_path / "profile.ps1"
-        # File does not exist.
-        monkeypatch.setattr(
-            name_grant.platform_compat,
-            "windows_powershell_profile_paths",
-            lambda: (str(profile),),
-        )
-        assert name_grant.windows_environment_refusal() is None

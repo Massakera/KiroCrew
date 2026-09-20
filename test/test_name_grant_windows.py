@@ -57,13 +57,6 @@ def win(tmp_path, monkeypatch):
 
     monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
     monkeypatch.setattr(
-        platform_compat,
-        "windows_powershell_profile_paths",
-        lambda: tuple(
-            str(documents / sub / name) for sub, name in platform_compat._POWERSHELL_USER_PROFILES
-        ),
-    )
-    monkeypatch.setattr(
         name_grant,
         "_agent_search_path",
         lambda: os.pathsep.join([str(user_dir), str(system_dir)]),
@@ -319,40 +312,61 @@ class TestPowerShellExpressionInvocation:
 
 
 class TestEnvironment:
-    """What must be true of the session before any name can be vouched for."""
+    """What must be true of the session before any name can be vouched for.
 
-    def test_no_profile_means_no_environment_refusal(self, win):
-        assert name_grant.windows_environment_refusal() is None
-        assert name_grant.platform_scope_notice() is None
+    kiro-cli spawns the shell profile-free (``powershell -NoProfile``, see
+    :data:`name_grant.MODELLED_WINDOWS_SHELL`), so a user's ``$PROFILE`` never
+    runs before the command and cannot redefine a name. There is therefore no
+    Windows-specific environment refusal left: Windows reaches the same
+    platform-independent checks POSIX does, and a clean command is satisfiable.
+    """
 
-    @pytest.mark.parametrize("subdir,filename", platform_compat._POWERSHELL_USER_PROFILES)
-    def test_any_per_user_profile_refuses_every_grant(self, win, subdir, filename):
-        # kiro-cli starts PowerShell without -NoProfile, so this script runs
-        # before the command, and a function it defines resolves ahead of any
-        # program -- measured. Same threat as BASH_ENV on POSIX, same answer.
-        system_dir, _, documents = win
-        _file(system_dir, "find.exe")
-        profile = _file(documents / subdir, filename, b"function find { evil }\n")
-        refusal = name_grant.name_grant_refusal("find /c x nul")
-        assert refusal is not None
-        assert refusal.code == name_grant.AMBIGUOUS_ENV
-        assert profile in refusal.detail
-        assert profile not in refusal.log_text
-        # Command scope, not platform scope: the user can remove the file.
-        assert name_grant.platform_scope_notice() is None
-
-    def test_unknown_documents_folder_is_platform_scope(self, win, monkeypatch):
-        # Without the folder the profile check cannot run, and a check that
-        # cannot run its own precondition declines. This is the ONE state that
-        # still produces the platform-scope code, so doctor reports it.
+    def test_a_clean_command_is_satisfiable(self, win):
+        # No profile is consulted at all now; a system program is allowed.
         system_dir, _, _ = win
         _file(system_dir, "find.exe")
-        monkeypatch.setattr(platform_compat, "windows_powershell_profile_paths", lambda: None)
-        refusal = name_grant.name_grant_refusal("find /c x nul")
-        assert refusal is not None
-        assert refusal.code == name_grant.WINDOWS_UNMODELLED
-        assert name_grant.platform_scope_notice() == name_grant.WINDOWS_UNMODELLED
-        assert refusal.code in name_grant._PLATFORM_SCOPE_CODES
+        assert name_grant.environment_refusal() is None
+        assert name_grant.name_grant_refusal("find /c x nul") is None
+
+    def test_a_currentuser_profile_present_still_satisfies_a_name_grant(self, win):
+        # THE REGRESSION TEST for kirodotdev/KiroCrew#12140. A CurrentUser
+        # PowerShell profile at the historical 5.1 profile location exists, yet
+        # the grant is still satisfiable: the shell is spawned with -NoProfile,
+        # so that script never runs before the command and cannot inject a
+        # function ahead of the program. This exercises the real
+        # `name_grant_refusal` path -- it returns None -- and would FAIL if the
+        # old profile-carrying-host refusal (`windows_environment_refusal`) were
+        # restored, because that refusal fired on exactly this file.
+        system_dir, _, documents = win
+        _file(system_dir, "find.exe")
+        profile = _file(
+            documents / "WindowsPowerShell",
+            "Microsoft.PowerShell_profile.ps1",
+            b"function find { evil }\n",
+        )
+        assert os.path.isfile(profile)  # the CurrentUser profile is present
+        assert name_grant.environment_refusal() is None
+        assert name_grant.name_grant_refusal("find /c x nul") is None
+
+    def test_a_present_profile_does_not_block_the_pin(self, win):
+        # A present profile leaves the approval pinnable: with -NoProfile the
+        # file behind the name IS what runs, so the approval identifies that
+        # file and pins it normally.
+        _, user_dir, documents = win
+        _file(user_dir, "gh.exe")
+        _file(
+            documents / "WindowsPowerShell",
+            "Microsoft.PowerShell_profile.ps1",
+            b"function gh { evil }\n",
+        )
+        # Non-system program: unwitnessed until a human approves it, but the
+        # profile is not what stands in the way.
+        first = name_grant.name_grant_refusal("gh pr list")
+        assert first is not None
+        assert first.code == name_grant.UNWITNESSED
+        name_grant.pin_human_approval("gh pr list")
+        assert name_grant._PINS  # the approval pinned despite the profile
+        assert name_grant.name_grant_refusal("gh pr list") is None
 
     def test_bash_preload_variables_do_not_apply(self, win, monkeypatch):
         # PowerShell never reads BASH_ENV; refusing on it here would describe a
@@ -368,66 +382,12 @@ class TestEnvironment:
         assert refusal is not None
         assert refusal.code == name_grant.AMBIGUOUS_PATH
 
-    def test_no_pin_is_recorded_while_a_profile_can_hide_the_program(self, win):
-        # An approval taken while a profile exists did NOT establish the file
-        # behind the name: the profile function is what ran, and the card showed
-        # the command, not the file. Pinning there banks an identity no human
-        # approved and OUTLIVES the profile, so removing the profile would turn
-        # it into an auto-approve. Nothing is pinned, so the name is still
-        # refused afterwards and the next approval -- the one that does identify
-        # the file -- is what pins it.
-        system_dir, user_dir, documents = win
-        _file(user_dir, "gh.exe")
-        profile = _file(
-            documents / "WindowsPowerShell",
-            "Microsoft.PowerShell_profile.ps1",
-            b"function gh { evil }\n",
-        )
-        assert name_grant.name_grant_refusal("gh pr list").code == name_grant.AMBIGUOUS_ENV
-        name_grant.pin_human_approval("gh pr list")
-        assert not name_grant._PINS
-
-        os.remove(profile)
-        after = name_grant.name_grant_refusal("gh pr list")
-        assert after is not None, "a pin taken behind a profile auto-approved once it was removed"
-        assert after.code == name_grant.UNWITNESSED
-        # And the approval that CAN identify the file still works.
-        name_grant.pin_human_approval("gh pr list")
-        assert name_grant.name_grant_refusal("gh pr list") is None
-
-    def test_the_profile_refusal_keeps_a_fixed_size_fingerprint(self, win, monkeypatch):
-        # The notice ledger is bounded by ENTRY COUNT, so anything variable-length
-        # it retains has to be digested or the bound bounds the wrong dimension:
-        # a Documents folder redirected deep enough makes the profile path as long
-        # as the filesystem allows, and each profile edit adds another entry.
-        _, _, documents = win
-        deep = documents / ("redirected" * 12) / "WindowsPowerShell"
-        profile = _file(deep, "Microsoft.PowerShell_profile.ps1", b"# long path\n")
-        monkeypatch.setattr(platform_compat, "windows_powershell_profile_paths", lambda: (profile,))
-        refusal = name_grant.windows_environment_refusal()
-        assert refusal is not None
-        assert profile in refusal.dedupe_key  # the producer keeps the readable value
-        assert len(profile) > 100, profile  # the length the ledger must not retain
-
-        name_grant._DECLINE_NOTICES.clear()
-        assert name_grant.should_log_decline("s", refusal) is True
-        assert name_grant.should_log_decline("s", refusal) is False
-        (key,) = name_grant._DECLINE_NOTICES
-        assert profile not in key[2]
-        assert len(key[2]) == 32, key  # blake2b(digest_size=16), whatever the path
-
-        # Still ONE line per distinct state: an edited profile is a fresh fact.
-        os.utime(profile, ns=(0, 1_234_567_891_000_000_000))
-        edited = name_grant.windows_environment_refusal()
-        assert edited.dedupe_key != refusal.dedupe_key
-        assert name_grant.should_log_decline("s", edited) is True
-        assert len(name_grant._DECLINE_NOTICES) == 2
-
     def test_the_derivation_check_spawns_the_shell_the_module_names(self):
         # The tables and the check that proves them fresh must mean the SAME
         # shell; a second spelling here is how they would drift apart while both
-        # look right. Also pins that the constant is what gets spawned, so
-        # re-pointing it at another shell re-points the check with it.
+        # look right. `-NoProfile` is now the stated guarantee of the shell
+        # kiro-cli spawns, so re-pointing the constant at another shell re-points
+        # the check with it.
         assert "-NoProfile" in name_grant.MODELLED_WINDOWS_SHELL
         source = inspect.getsource(
             TestBuiltinsPrecedeThePath.test_the_builtin_tables_cover_every_name_this_shell_resolves
@@ -435,21 +395,10 @@ class TestEnvironment:
         assert "name_grant.MODELLED_WINDOWS_SHELL" in source
         assert '"powershell"' not in source
 
-    def test_only_the_5_1_per_user_profiles_are_checked(self):
-        # The `("PowerShell", ...)` pairs cover pwsh 7's profile directory. kiro-cli
-        # spawns Windows PowerShell 5.1 (`powershell.exe`), whose profiles live under
-        # `Documents\WindowsPowerShell` -- pwsh 7's `Documents\PowerShell` file is
-        # never read by the shell that actually runs the command. Listing the pwsh 7
-        # paths refuses a grant on a file the running shell would not have read.
-        # If a maintainer re-adds them, this pin catches it.
-        assert platform_compat._POWERSHELL_USER_PROFILES == (
-            ("WindowsPowerShell", "profile.ps1"),
-            ("WindowsPowerShell", "Microsoft.PowerShell_profile.ps1"),
-        )
-
     def test_a_pwsh_7_profile_does_not_refuse(self, win):
-        # A file at pwsh 7's profile path exists but is never read by the shell
-        # kiro-cli spawns. The env refusal must not fire on it.
+        # No profile of any version is consulted now, but a pwsh 7 profile is a
+        # useful witness that the shell choice is irrelevant to the verdict: a
+        # file at pwsh 7's profile path exists and the grant is still satisfiable.
         system_dir, _, documents = win
         _file(system_dir, "find.exe")
         pwsh7_profile = _file(
@@ -458,8 +407,7 @@ class TestEnvironment:
             b"function find { evil }\n",
         )
         assert pwsh7_profile  # created
-        # The 5.1 profile dirs stay clear.
-        assert name_grant.windows_environment_refusal() is None
+        assert name_grant.environment_refusal() is None
         assert name_grant.name_grant_refusal("find /c x nul") is None
 
 
@@ -1014,16 +962,6 @@ class TestAbsolutePathsNative:
         assert refusal.code == name_grant.UNWITNESSED
         name_grant.pin_human_approval(f"{path} run")
         assert name_grant.name_grant_refusal(f"{path} run") is None
-
-    def test_the_real_documents_folder_resolves(self):
-        # The Known Folder API answers on a real Windows session; the profile
-        # paths PowerShell 5.1 reads are derived from it -- one all-hosts and
-        # one host-specific per profile directory, and only the 5.1 directory
-        # matters because that is the shell kiro-cli spawns.
-        paths = platform_compat.windows_powershell_profile_paths()
-        assert paths is not None
-        assert len(paths) == len(platform_compat._POWERSHELL_USER_PROFILES)
-        assert all(os.path.splitdrive(p)[0] for p in paths)
 
 
 class TestOffLoop:
