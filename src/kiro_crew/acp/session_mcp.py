@@ -90,6 +90,7 @@ from kiro_crew.agent import (
 from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
 from kiro_crew.agent_sdk.mcp_refs import parse_tools_refs
 from kiro_crew.env import sanitize_spec_env
+from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,49 @@ logger = logging.getLogger(__name__)
 # set the loop below REPLACES from the managed source: the element's command, args
 # and env are Crew's own by construction, not the spec's.
 CONTROL_PLANE_SERVERS = ("kirocrew-core", "kirocrew-cron")
+
+# Crew's own managed servers that are NOT the always-on control plane --
+# ``kirocrew-computer``, ``kirocrew-dashboard``, ``kirocrew-work``,
+# ``kirocrew-crew-log``, ``kirocrew-panel``. Every one of them imports identity
+# from ``mcp_shared`` and posts back to the gateway for the session it acts on
+# behalf of, so their DIRECT-launched processes need this session's identity -- and
+# on a shared ACP runtime, where the process carries no session-valued environment,
+# the only carrier is the element.
+#
+# DERIVED from the managed registry, never enumerated. It is exactly
+# ``KIROCREW_BIN_MCP_SERVERS`` (the ratchet-pinned mirror of
+# ``agent._MANAGED_MCP_SERVERS``) minus :data:`CONTROL_PLANE_SERVERS` -- the SAME
+# subtraction ``providers/mirrors/identity.identity_bound_crew_servers`` computes,
+# so the KIRO direct path and the codex/opencode withhold path cannot drift. A new
+# managed Crew server therefore gets its identity on the direct path for free,
+# rather than being forgotten by a hand-maintained name list until someone patches
+# this file per server (which is the whole point of deriving it).
+#
+# Kept SEPARATE from ``CONTROL_PLANE_SERVERS`` on purpose, because the two answer
+# different questions:
+#
+# * ``CONTROL_PLANE_SERVERS`` is the always-on set. It decides which servers EVERY
+#   session mounts, which survive a ``disabledTools`` entry, and -- through
+#   ``identity_bound_crew_servers`` (= ``KIROCREW_BIN_MCP_SERVERS`` minus this set)
+#   -- which of Crew's own servers the env-cleared codex/opencode transports
+#   WITHHOLD. Adding any of these here would mount them in every session (making an
+#   operator's tool-off unenforceable) AND hand them this session's credential on a
+#   codex/opencode element the spec describes -- a provenance hole the security
+#   review already closed twice (a borrowed name, then a spec-supplied
+#   ``PYTHONPATH`` beside a genuine command).
+# * This set is only ever consumed on the KIRO (native) direct path, where Crew
+#   launches its OWN binary and the element env is derived from the managed source,
+#   not the spec -- so the carriage is safe here for the same reason it is for the
+#   always-on control plane. It carries identity ONLY when the agent spec already
+#   declares the server and its ``tools`` allowlist grants it; it never auto-mounts.
+#
+# The gateway's stub path names the token recipients in
+# ``mcp_gateway.gatewayd.CONTROL_PLANE_BACKENDS`` (this set plus the always-on
+# core/cron -- i.e. every managed server), decided from the resolved command,
+# never from this tuple.
+IDENTITY_BOUND_OPT_IN_SERVERS = tuple(
+    name for name in KIROCREW_BIN_MCP_SERVERS if name not in CONTROL_PLANE_SERVERS
+)
 
 # kiro-cli's enterprise-governance discriminator, mirrored rather than imported
 # (``agent._MCP_REGISTRY_TYPE`` is private; a ratchet test pins the two equal).
@@ -853,6 +897,18 @@ def kiro_control_plane_servers(
     ACP shaping. Registry entries remain the enterprise catalog's responsibility.
     The element's ``env`` is owned by :func:`_managed_element_env`, which holds it to
     the rule the disk-writing consumer applies to this same population.
+
+    Covers the always-on control plane (:data:`CONTROL_PLANE_SERVERS`) AND the
+    opt-in identity-bound servers (:data:`IDENTITY_BOUND_OPT_IN_SERVERS`, every
+    managed Crew server outside :data:`CONTROL_PLANE_SERVERS` that the spec both
+    declares and grants). An opt-in server reaches an element ONLY when the agent
+    spec already declares it and its ``tools`` allowlist grants it -- a spec that
+    declares neither leaves ``entry`` as ``None`` and the server is skipped, so
+    nothing is ever auto-mounted. This is the DIRECT (non-stub) launch on the KIRO
+    backend, where Crew launches its own binary and the element env is re-derived
+    from the managed source, so handing an opt-in server identity here is as safe
+    as it is for the always-on control plane -- unlike the env-cleared
+    codex/opencode transports, where these servers stay withheld.
     """
     if not agent or _registry_mode():
         return []
@@ -869,11 +925,16 @@ def kiro_control_plane_servers(
         return []
     supported = {"command", "args", "env", "type", "autoApprove", "disabled", "disabledTools"}
     out = []
-    for name in CONTROL_PLANE_SERVERS:
+    opt_in_names = frozenset(IDENTITY_BOUND_OPT_IN_SERVERS)
+    for name in (*CONTROL_PLANE_SERVERS, *IDENTITY_BOUND_OPT_IN_SERVERS):
         if name in existing_names or not allow.grants(name):
             continue
         entry = spec["mcpServers"].get(name)
-        managed = managed_mcp_spec_entry(name)
+        # ``include_opt_in`` for the opt-in servers (``managed_mcp_spec_entry`` returns
+        # ``None`` for an opt_in server otherwise), so a spec that declares AND grants
+        # one gets its identity element -- never auto-mounted, since a spec that does
+        # not declare it leaves ``entry`` as ``None`` and is skipped just below.
+        managed = managed_mcp_spec_entry(name, include_opt_in=name in opt_in_names)
         if not isinstance(entry, dict) or not isinstance(managed, dict):
             continue
         sources = [entry]

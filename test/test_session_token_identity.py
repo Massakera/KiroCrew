@@ -406,7 +406,7 @@ async def test_kiro_unpooled_control_plane_receives_session_token(cfg, monkeypat
     monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
     monkeypatch.setattr(session_mcp, "_global_settings", lambda **kwargs: {})
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
-    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name: entry)
+    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name, **_kw: entry)
     monkeypatch.setattr(session_handle, "_MCP_DRAIN_NO_REPORT_CEILING", 0)
     runtime, _, _ = _make_runtime()
     runtime._can_load_session = True
@@ -441,7 +441,7 @@ async def test_projected_skill_search_receives_the_shared_sessions_identity(cfg,
     monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: {"tools": []})
     monkeypatch.setattr(session_mcp, "_global_settings", lambda **kw: {})
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
-    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name: entry)
+    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name, **_kw: entry)
     runtime, _, _ = _make_runtime()
     runtime._native_skill_projection = NativeSkillProjection(
         {"custom": "alias"}, {"custom": spec}, search_agents={"custom"}
@@ -485,7 +485,7 @@ def test_kiro_identity_projection_preserves_native_restrictions(tmp_path, monkey
     monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
     monkeypatch.setattr(session_mcp, "_global_settings", lambda **kwargs: settings)
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: restriction == "registry")
-    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name: managed)
+    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name, **_kw: managed)
     assert (
         session_mcp.kiro_control_plane_servers(
             "kirocrew",
@@ -531,7 +531,7 @@ def test_kiro_identity_projection_fails_closed_on_settings_errors(
     monkeypatch.setattr(agent, "_KIRO_MCP_JSON", global_path)
     monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
-    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name: managed)
+    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name, **_kw: managed)
     if failure == "refused":
         monkeypatch.setattr(hooks, "validate_file_path", lambda raw: None)
     elif failure == "oversized":
@@ -593,7 +593,7 @@ def test_the_control_plane_element_env_matches_the_spec_writing_consumer(tmp_pat
     monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
     monkeypatch.setattr(session_mcp, "_global_settings", lambda **kwargs: {})
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
-    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name: dict(managed))
+    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name, **_kw: dict(managed))
 
     elements = session_mcp.kiro_control_plane_servers("an-agent", work_dir=None)
 
@@ -619,6 +619,210 @@ def test_the_control_plane_element_env_matches_the_spec_writing_consumer(tmp_pat
     stamped = attach_stub_session_token(elements, TOKEN)
     assert stamped[0]["env"][-1] == {"name": STUB_SESSION_TOKEN_ENV, "value": TOKEN}
     assert {p["name"]: p["value"] for p in stamped[0]["env"][:-1]} == env
+
+
+class TestIdentityBoundOptInControlPlanes:
+    """The managed Crew servers beyond the always-on control plane
+    (``kirocrew-computer``, ``kirocrew-dashboard``, ``kirocrew-work``,
+    ``kirocrew-crew-log``, ``kirocrew-panel``) each post back to the gateway for
+    the session they act on behalf of, so on the DIRECT (non-stub) KIRO path their
+    launched element needs this session's identity -- but only when the agent spec
+    DECLARES them and its ``tools`` grants them, and never auto-mounted. The
+    regression: ``kiro_control_plane_servers`` iterated only the always-on
+    ``CONTROL_PLANE_SERVERS``, so a conductor's spec declaring these got no identity
+    element for them and every tool answered ``identity_unattested``. The set is now
+    DERIVED from the managed registry, so a new managed server is covered without a
+    per-server patch here.
+    """
+
+    def _patch(self, monkeypatch, *, work_command="test-crew"):
+        from kiro_crew.acp import session_mcp
+
+        managed = {
+            "kirocrew-core": {"command": "test-crew", "args": ["mcp-core"]},
+            "kirocrew-cron": {"command": "test-crew", "args": ["mcp-cron"]},
+            "kirocrew-dashboard": {"command": work_command, "args": ["mcp-dashboard"]},
+            "kirocrew-work": {"command": work_command, "args": ["mcp-work"]},
+        }
+        # ``include_opt_in`` is what makes the opt-in pair resolvable at all; a
+        # double that ignored it would resolve them like the emit path (``None``)
+        # and this test could never observe the fix.
+        monkeypatch.setattr(
+            session_mcp,
+            "managed_mcp_spec_entry",
+            lambda name, include_opt_in=False: (
+                dict(managed[name])
+                if name in managed
+                and (include_opt_in or name in ("kirocrew-core", "kirocrew-cron"))
+                else None
+            ),
+        )
+        monkeypatch.setattr(session_mcp, "_global_settings", lambda **kw: {})
+        monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
+        return session_mcp
+
+    @pytest.mark.parametrize("name", ["kirocrew-dashboard", "kirocrew-work"])
+    def test_a_declared_and_granted_opt_in_plane_is_projected_with_identity(
+        self, tmp_path, monkeypatch, name
+    ):
+        """The spec declares the server and ``tools`` grants it, so it reaches the
+        array carrying the managed command -- and the identity token stamps onto it
+        exactly as it does the always-on control plane."""
+        session_mcp = self._patch(monkeypatch)
+        sub = "mcp-dashboard" if name == "kirocrew-dashboard" else "mcp-work"
+        spec = {
+            "tools": ["@kirocrew-core", f"@{name}"],
+            "mcpServers": {
+                "kirocrew-core": {"command": "test-crew", "args": ["mcp-core"]},
+                name: {"command": "test-crew", "args": [sub]},
+            },
+        }
+        monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
+
+        elements = session_mcp.kiro_control_plane_servers("a-conductor", work_dir=tmp_path)
+        by_name = {e["name"]: e for e in elements}
+        assert name in by_name, f"{name} was declared and granted but not projected"
+        assert by_name[name]["command"] == "test-crew"
+        assert by_name[name]["args"] == [sub]
+
+        # And ``_own_stub_session``'s stamping lands the token on it, the same
+        # carrier the always-on control plane uses.
+        from kiro_crew.mcp_gateway.session_servers import attach_stub_session_token
+
+        stamped = attach_stub_session_token(elements, TOKEN)
+        env = {p["name"]: p["value"] for p in {e["name"]: e for e in stamped}[name]["env"]}
+        assert env[STUB_SESSION_TOKEN_ENV] == TOKEN
+
+    def test_a_spec_that_does_not_declare_them_gets_nothing_for_them(self, tmp_path, monkeypatch):
+        """The never-auto-mount half. A spec that declares neither opt-in server --
+        even one that names them in ``tools`` -- gets no element for them: identity
+        rides only a server the spec actually declared."""
+        session_mcp = self._patch(monkeypatch)
+        spec = {
+            # Grants everything, to prove the gate is the spec DECLARATION and not
+            # merely the allowlist.
+            "tools": ["*"],
+            "mcpServers": {"kirocrew-core": {"command": "test-crew", "args": ["mcp-core"]}},
+        }
+        monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
+
+        names = [e["name"] for e in session_mcp.kiro_control_plane_servers("a", work_dir=tmp_path)]
+        assert names == ["kirocrew-core"]
+        assert "kirocrew-dashboard" not in names
+        assert "kirocrew-work" not in names
+
+    def test_a_declared_opt_in_plane_the_tools_allowlist_omits_is_withheld(
+        self, tmp_path, monkeypatch
+    ):
+        """Declared but not granted: ``tools`` does not name it, so kiro-cli would
+        not mount it and neither does this -- the same allowlist rule the always-on
+        control plane obeys."""
+        session_mcp = self._patch(monkeypatch)
+        spec = {
+            "tools": ["@kirocrew-core"],
+            "mcpServers": {
+                "kirocrew-core": {"command": "test-crew", "args": ["mcp-core"]},
+                "kirocrew-work": {"command": "test-crew", "args": ["mcp-work"]},
+            },
+        }
+        monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
+
+        names = [e["name"] for e in session_mcp.kiro_control_plane_servers("a", work_dir=tmp_path)]
+        assert "kirocrew-work" not in names
+        assert "kirocrew-core" in names
+
+    def test_a_foreign_command_under_the_reserved_name_is_not_projected(
+        self, tmp_path, monkeypatch
+    ):
+        """Provenance, not the name. A spec spelling ``kirocrew-work`` with a command
+        that is not the managed one fails the exact command/args match the always-on
+        control plane is held to, so it never receives an identity element."""
+        session_mcp = self._patch(monkeypatch)
+        spec = {
+            "tools": ["@kirocrew-work"],
+            "mcpServers": {"kirocrew-work": {"command": "/tmp/evil", "args": ["mcp-work"]}},
+        }
+        monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
+
+        names = [e["name"] for e in session_mcp.kiro_control_plane_servers("a", work_dir=tmp_path)]
+        assert "kirocrew-work" not in names
+
+    def test_the_identity_bound_set_is_the_managed_registry_minus_the_control_plane(self):
+        """The set is DERIVED, not enumerated: every managed Crew server except the
+        always-on control plane, so a new managed server joins it for free. Adding
+        any of them to ``CONTROL_PLANE_SERVERS`` would mount them in every session
+        AND hand them identity on the env-cleared codex/opencode transports, the
+        provenance hole the security review closed. This pins the separation AND the
+        derivation so a later edit that merged them, or that re-hardcoded a name
+        list, fails here."""
+        from kiro_crew.acp.session_mcp import (
+            CONTROL_PLANE_SERVERS,
+            IDENTITY_BOUND_OPT_IN_SERVERS,
+        )
+        from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
+
+        assert not set(IDENTITY_BOUND_OPT_IN_SERVERS) & set(CONTROL_PLANE_SERVERS)
+        assert set(IDENTITY_BOUND_OPT_IN_SERVERS) == frozenset(
+            KIROCREW_BIN_MCP_SERVERS
+        ) - frozenset(CONTROL_PLANE_SERVERS)
+        # The derived set covers both the dashboard/work pair and every other
+        # managed Crew server a hardcoded per-server list would omit.
+        assert {"kirocrew-dashboard", "kirocrew-work"} <= set(IDENTITY_BOUND_OPT_IN_SERVERS)
+        assert "kirocrew-computer" in IDENTITY_BOUND_OPT_IN_SERVERS
+
+    def test_the_identity_bound_recipient_set_is_pinned_by_name(self):
+        """A NAME pin beside the derivation, so the runtime stays derived while any
+        change to WHICH managed servers receive this session's token requires a
+        same-commit, reviewed edit to this literal. The derivation test above proves
+        the runtime computes the set; this one proves the human-reviewed membership,
+        so a new managed server silently joining the recipients (or one dropping out)
+        cannot pass unremarked -- a managed server that posts back to the gateway
+        must be added here in the SAME commit that adds it to the registry."""
+        from kiro_crew.acp.session_mcp import IDENTITY_BOUND_OPT_IN_SERVERS
+
+        assert set(IDENTITY_BOUND_OPT_IN_SERVERS) == {
+            "kirocrew-computer",
+            "kirocrew-dashboard",
+            "kirocrew-work",
+            "kirocrew-crew-log",
+            "kirocrew-panel",
+        }, (
+            "A new managed Crew server that posts back to the gateway must be added "
+            "to this pin in the same commit that registers it; a server dropped from "
+            "the recipients must be removed here in that commit."
+        )
+
+    def test_the_stub_path_recipient_set_is_the_whole_managed_registry(self):
+        """The gateway stub path's token recipients (``CONTROL_PLANE_BACKENDS``) are
+        every managed Crew server, derived from the registry -- the KIRO direct
+        path's set plus the always-on core/cron. Pinned equal to the registry so the
+        two paths cannot drift: the direct path derives ``managed minus control
+        plane`` and the stub path derives ``managed``, from the ONE source."""
+        from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
+        from kiro_crew.mcp_gateway.gatewayd import CONTROL_PLANE_BACKENDS
+
+        assert CONTROL_PLANE_BACKENDS == frozenset(KIROCREW_BIN_MCP_SERVERS)
+
+    def test_the_set_stays_withheld_on_codex_and_opencode(self):
+        """The transports where identity carriage is NOT safe: every identity-bound
+        managed server is withheld from ``identity_bound_crew_servers`` so
+        codex/opencode drop them rather than mount them with a spec-described element
+        carrying this session's credential. The function reads its names from
+        ``IDENTITY_BOUND_OPT_IN_SERVERS``, the single site that computes ``managed set
+        minus control plane`` -- so the KIRO direct path and the codex/opencode
+        withhold path resolve to the same names by construction, not by a second
+        subtraction held equal to the first."""
+        import kiro_crew.providers.mirrors.identity as identity_mod
+        from kiro_crew.providers.mirrors.identity import identity_bound_crew_servers
+
+        withheld = identity_bound_crew_servers()
+        assert "kirocrew-dashboard" in withheld
+        assert "kirocrew-work" in withheld
+        # ONE computing site: the function returns the single source verbatim, so
+        # swapping in a sentinel there is the only value it can return.
+        sentinel = ("sentinel-server-a", "sentinel-server-b")
+        with patch.object(identity_mod, "IDENTITY_BOUND_OPT_IN_SERVERS", sentinel):
+            assert identity_bound_crew_servers() == frozenset(sentinel)
 
 
 class TestSweep:

@@ -65,6 +65,16 @@ OPT_IN_BIN_MCP_SERVERS = (
 # Every managed-binary server name, regardless of how it reaches a spec. This is
 # the cleanup view: Kiro Crew never legitimately writes any of them into the
 # user's global mcp.json, so a stray entry is purgeable either way.
+#
+# This tuple is also the token-recipient source both launch paths derive from:
+# the stub path's ``mcp_gateway.gatewayd.CONTROL_PLANE_BACKENDS`` and the direct
+# path's ``acp.session_mcp.IDENTITY_BOUND_OPT_IN_SERVERS`` (this set minus the
+# always-on control plane). Membership here is what hands a server the calling
+# session's per-session token on either path. The invariant that justifies that:
+# a managed Crew server posts back to the gateway for the session it acts for, so
+# it needs that session's identity. A server that does NOT post back must not be
+# listed here — adding one would grant it a bearer token it has no reason to
+# hold, and is a conscious exception, not a default.
 KIROCREW_BIN_MCP_SERVERS = ALWAYS_ON_BIN_MCP_SERVERS + OPT_IN_BIN_MCP_SERVERS
 
 # Every managed-binary server name KiroCrew is responsible for removing from

@@ -38,8 +38,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping
 
-from kiro_crew.acp.session_mcp import CONTROL_PLANE_SERVERS
-from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
+from kiro_crew.acp.session_mcp import IDENTITY_BOUND_OPT_IN_SERVERS
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 
 logger = logging.getLogger(__name__)
@@ -133,18 +132,14 @@ def identity_bound_crew_servers() -> frozenset[str]:
     defect this whole folder exists to kill, so those names are withheld and the
     absence is logged.
 
-    DERIVED, not enumerated. An earlier revision spelled the three names out with a
-    comment saying they were "``agent._MANAGED_MCP_SERVERS`` minus the control
-    plane" -- and a hand-copy of a subtraction drifts in the bad direction here: a
-    server added to the managed set later would miss this one, mount, and answer
-    ``not_bound``, reintroducing by omission the very defect above.
-
-    The managed set is read from :mod:`kiro_crew.mcp_cleanup`, which a ratchet test
-    already pins equal to ``agent._MANAGED_MCP_SERVERS`` and which imports nothing
-    heavier than ``config.paths`` -- so this leaf stays off ``agent``'s import graph
-    without spelling the names again, exactly as ``acp.kas_agents`` reads it.
+    The names come straight from :data:`~kiro_crew.acp.session_mcp.IDENTITY_BOUND_OPT_IN_SERVERS`,
+    the ONE site that computes ``managed registry minus control plane``. Returning
+    that set rather than recomputing the subtraction is what makes the KIRO direct
+    path (which carries identity to these servers) and the codex/opencode withhold
+    path (which drops them) the same answer by construction, so the two cannot
+    drift and a new managed Crew server joins both for free.
     """
-    return frozenset(KIROCREW_BIN_MCP_SERVERS) - frozenset(CONTROL_PLANE_SERVERS)
+    return frozenset(IDENTITY_BOUND_OPT_IN_SERVERS)
 
 
 def withheld_servers(restricted: frozenset[str]) -> frozenset[str]:

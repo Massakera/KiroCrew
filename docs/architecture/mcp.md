@@ -1896,20 +1896,27 @@ install that trips the check has more to read than every cron tool answering
 
 `CONTROL_PLANE_BACKENDS` is named in gatewayd itself (importing
 `acp.session_mcp` would put `kiro_crew.agent` on the daemon's boot path). It is
-a superset of `acp.session_mcp.CONTROL_PLANE_SERVERS`, not a mirror, because the
-two answer different questions: `CONTROL_PLANE_SERVERS` decides which servers
-every session mounts and which survive a `disabledTools` entry;
-`CONTROL_PLANE_BACKENDS` decides who is handed the token. Containment holds in
-one direction: a server mounted in every session posts back for that session,
-so it needs the token. `kirocrew-dashboard` is the reverse case -- it posts back
-for the CALLING session (`session_create`, `session_send`, the folder and tag
-tools), so it needs the token, but it is `opt_in`, so naming it in
-`CONTROL_PLANE_SERVERS` would mount it in every session and make an operator's
-decision to switch its tools off unenforceable. A ratchet test pins that
-relationship rather than equality: it asserts `CONTROL_PLANE_SERVERS` is
-contained in `CONTROL_PLANE_BACKENDS`, pins the token-only extras to exactly
-`kirocrew-dashboard`, and requires every extra to be a managed `opt_in` server,
-so a new recipient has to update the pin in the same commit. Because the
+the whole managed registry, `frozenset(KIROCREW_BIN_MCP_SERVERS)`, and a
+superset of `acp.session_mcp.CONTROL_PLANE_SERVERS`, because the two answer
+different questions: `CONTROL_PLANE_SERVERS` decides which servers every session
+mounts and which survive a `disabledTools` entry; `CONTROL_PLANE_BACKENDS`
+decides who is handed the token. Every managed server posts back to the gateway
+for the session it acts on behalf of, so every one of them needs the token --
+the always-on control plane and the managed servers beyond it
+(`kirocrew-computer`, `kirocrew-dashboard`, `kirocrew-work`, `kirocrew-crew-log`,
+`kirocrew-panel`) alike. `kirocrew-dashboard` posts back for the CALLING session
+(`session_create`, `session_send`, the folder and tag tools), so it needs the
+token, but it is `opt_in`, so naming it in `CONTROL_PLANE_SERVERS` would mount it
+in every session and make an operator's decision to switch its tools off
+unenforceable. The token recipients therefore derive from the managed registry
+rather than a hand-maintained list: on the stub path from `CONTROL_PLANE_BACKENDS`
+(the registry itself), and on the direct path from
+`session_mcp.IDENTITY_BOUND_OPT_IN_SERVERS` (the registry minus the always-on
+control plane), so the two paths cannot drift and a new managed Crew server joins
+both for free. A ratchet test pins that relationship rather than equality: it
+asserts `CONTROL_PLANE_SERVERS` is contained in `CONTROL_PLANE_BACKENDS` and that
+`CONTROL_PLANE_BACKENDS` equals the managed registry, so both `opt_in` and
+`spec_gate` servers are covered without any per-server bookkeeping. Because the
 dashboard is `opt_in`, `_spawns_own_control_plane` asks
 `agent.managed_mcp_spec_entry` for the invocation with `include_opt_in=True`,
 which skips only the `opt_in` emission disqualifier; a closed `spec_gate` still

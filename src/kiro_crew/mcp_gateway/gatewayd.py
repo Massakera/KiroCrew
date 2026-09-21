@@ -66,6 +66,7 @@ from kiro_crew.executors import (
 from kiro_crew.mcp_caller import CallerContext
 from kiro_crew.mcp_caller import _parent_pid as _ppid_fn
 from kiro_crew.mcp_caller import new_tenant_nonce
+from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.mcp_gateway import credwatch, hazards, socketsec, tool_surface, transport
 from kiro_crew.mcp_gateway.admission import (
     DEFAULT_CAPACITY,
@@ -151,22 +152,37 @@ logger = logging.getLogger(__name__)
 #: token, because only they post back to the gateway for the session they act on
 #: behalf of.
 #:
+#: DERIVED from the managed registry, not enumerated: it is exactly
+#: ``KIROCREW_BIN_MCP_SERVERS`` (the ratchet-pinned mirror of
+#: ``agent._MANAGED_MCP_SERVERS``, imported here because it is a leaf that pulls in
+#: nothing heavier than ``config.paths`` -- the daemon must NOT import
+#: ``kiro_crew.agent`` at boot). So a new managed Crew server becomes a token
+#: recipient the moment it joins the registry, rather than waiting for someone to
+#: extend a hand-maintained list here; the direct-path element identity
+#: (``acp.session_mcp.IDENTITY_BOUND_OPT_IN_SERVERS``) reads the same source, so
+#: the stub path and the direct path cannot drift apart.
+#:
 #: This is NOT a mirror of ``acp.session_mcp.CONTROL_PLANE_SERVERS`` -- the two
 #: answer different questions, and the ratchet pins CONTAINMENT rather than
 #: equality for that reason. That set decides which servers every session mounts
 #: and which survive a ``disabledTools`` entry (``session_mcp`` subtracts it from
-#: the disabled set); this one decides who is handed a bearer token.
-#: ``kirocrew-dashboard`` belongs in the second and NOT the first: it posts back
-#: to the gateway for the CALLING session (``session_create``, ``session_send``,
-#: the folder and tag tools), which is exactly what the token is for -- but it is
-#: ``opt_in``, so naming it there would mount it in every session and make an
-#: operator's decision to switch its tools off unenforceable.
+#: the disabled set); this one decides who is handed a bearer token. The managed
+#: servers beyond the always-on control plane (``kirocrew-computer``,
+#: ``kirocrew-dashboard``, ``kirocrew-work``, ``kirocrew-crew-log``,
+#: ``kirocrew-panel``) all post back to the gateway for the session they act on
+#: behalf of and so need the token -- but they are ``opt_in`` or gated, so naming
+#: them in ``CONTROL_PLANE_SERVERS`` would mount them in every session and make an
+#: operator's decision to switch their tools off unenforceable. They reach a DIRECT
+#: launch's element identity through ``IDENTITY_BOUND_OPT_IN_SERVERS`` and the stub
+#: path through this set.
 #:
 #: Membership is necessary and NOT sufficient. ``_spawns_own_control_plane`` still
 #: compares the spawned binary by realpath and the argv exactly against the
 #: managed spec for this name, and refuses a child carrying ``PYTHON*`` env or an
-#: import root that shadows ``kiro_crew``, so the name alone hands over nothing.
-CONTROL_PLANE_BACKENDS = frozenset({"kirocrew-core", "kirocrew-cron", "kirocrew-dashboard"})
+#: import root that shadows ``kiro_crew``, so the name alone hands over nothing --
+#: and a gated server (``kirocrew-computer``) whose ``spec_gate`` is shut resolves
+#: to no managed entry and is denied the token there.
+CONTROL_PLANE_BACKENDS = frozenset(KIROCREW_BIN_MCP_SERVERS)
 
 # Python treats its environment namespace as an extensible interpreter control
 # surface. A prefix rule fails closed when a later Python release adds another

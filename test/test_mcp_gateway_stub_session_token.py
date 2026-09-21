@@ -1376,10 +1376,10 @@ async def test_a_pooled_control_plane_is_handed_the_sessions_token(
     monkeypatch: pytest.MonkeyPatch, server_name: str
 ) -> None:
     """gatewayd spawns a pooled backend from its OWN environment, so the
-    per-session token is not in that backend's env. ``kirocrew-core`` and
-    ``kirocrew-cron`` post back to the gateway for the session they act for and
-    must prove it with ``X-Session-Token``; the caller block is the only channel
-    that can carry it to them."""
+    per-session token is not in that backend's env. Every managed control plane
+    posts back to the gateway for the session it acts for and must prove it with
+    ``X-Session-Token``; the caller block is the only channel that can carry it to
+    them."""
     _attest(monkeypatch, _ANCESTORS)
     await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A))
     backend, reader, task = await _live_conn_for_server(
@@ -1522,34 +1522,39 @@ def test_control_plane_backends_contain_session_mcp_and_justify_the_difference()
 
     ``CONTROL_PLANE_SERVERS`` decides which servers every session mounts and which
     survive a ``disabledTools`` entry; ``CONTROL_PLANE_BACKENDS`` decides who is
-    handed a bearer token. Containment holds in one direction only: a server
-    mounted in every session posts back for that session, so it needs the token.
-    The reverse does not, and ``kirocrew-dashboard`` is why -- it posts back for the
-    CALLING session, so it needs the token, but it is ``opt_in``, so naming it in
-    the first set would mount it everywhere and make an operator's decision to
-    switch its tools off unenforceable.
-
-    The extras are pinned BY NAME to exactly ``kirocrew-dashboard`` and each is
-    also checked BY PROPERTY. The name pin makes a new recipient an explicit,
-    reviewable change; the property check stops a typo'd or third-party name from
-    being handed a token even if someone edits the pin.
+    handed a bearer token. ``CONTROL_PLANE_BACKENDS`` is now DERIVED as the whole
+    managed registry (``KIROCREW_BIN_MCP_SERVERS``, pinned equal to
+    ``_MANAGED_MCP_SERVERS``): every managed Crew server posts back to the gateway
+    for the session it acts on behalf of, so every one needs the token. Containment
+    of ``CONTROL_PLANE_SERVERS`` holds by construction. The reverse does not, and
+    each token-only name is justified BY PROPERTY -- it is ``opt_in`` or gated, so
+    naming it in ``CONTROL_PLANE_SERVERS`` would mount it in every session and make
+    an operator's tool-off unenforceable. Deriving from one source is what stops a
+    new managed server being handed a token on the stub path while a per-server list
+    forgets it on the direct path.
     """
-    from kiro_crew.acp.session_mcp import CONTROL_PLANE_SERVERS
+    from kiro_crew.acp.session_mcp import (
+        CONTROL_PLANE_SERVERS,
+        IDENTITY_BOUND_OPT_IN_SERVERS,
+    )
     from kiro_crew.agent import _MANAGED_MCP_SERVERS
+    from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 
+    # DERIVED, not enumerated: the whole managed registry.
+    assert gw.CONTROL_PLANE_BACKENDS == frozenset(KIROCREW_BIN_MCP_SERVERS)
+    assert gw.CONTROL_PLANE_BACKENDS == frozenset(_MANAGED_MCP_SERVERS)
     assert frozenset(CONTROL_PLANE_SERVERS) <= gw.CONTROL_PLANE_BACKENDS
 
     token_only = gw.CONTROL_PLANE_BACKENDS - frozenset(CONTROL_PLANE_SERVERS)
-    assert token_only == frozenset({"kirocrew-dashboard"}), (
-        "a new token recipient must be added to this pin in the same commit that adds it "
-        "to CONTROL_PLANE_BACKENDS"
-    )
+    # The direct-path element-identity set is exactly the same subtraction, so the
+    # stub path and the direct path cannot hand a token to different servers.
+    assert token_only == frozenset(IDENTITY_BOUND_OPT_IN_SERVERS)
     for name in sorted(token_only):
         spec = _MANAGED_MCP_SERVERS.get(name)
         assert isinstance(spec, dict), f"{name!r} is handed a token but is not a managed server"
-        assert spec.get("opt_in"), (
-            f"{name!r} is token-only, which is only justified for an opt_in server; "
-            "one mounted in every session belongs in CONTROL_PLANE_SERVERS as well"
+        assert spec.get("opt_in") or "spec_gate" in spec, (
+            f"{name!r} is token-only, which is only justified for an opt_in or gated server; "
+            "one mounted unconditionally in every session belongs in CONTROL_PLANE_SERVERS as well"
         )
 
 
