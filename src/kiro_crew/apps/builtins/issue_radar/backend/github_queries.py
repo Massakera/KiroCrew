@@ -47,7 +47,7 @@ ROLLUP_CONTEXTS_JQ = (
 )
 PR_SUMMARY_SELECTION = (
     " number additions deletions changedFiles"
-    " mergeable state mergedAt"
+    " mergeable state mergedAt headRefName"
     " commits(last:1){nodes{commit{oid statusCheckRollup{state"
     f"  contexts(first:{ROLLUP_CONTEXT_PAGE}){{pageInfo{{hasNextPage}} nodes{{ __typename"
     "   ... on CheckRun{name conclusion status startedAt completedAt"
@@ -63,6 +63,7 @@ PR_SUMMARY_JQ_BODY = (
     "mergeable_raw: (.mergeable // null), "
     "pr_state: (.state // null), "
     "pr_merged_at: (.mergedAt // null), "
+    "head_ref: (.headRefName // null), "
     "head_sha: (.commits.nodes[0].commit.oid // null), "
     "rollup: (.commits.nodes[0].commit.statusCheckRollup.state // null), "
     "contexts_truncated: "

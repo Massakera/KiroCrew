@@ -72,6 +72,7 @@ from kiro_crew.apps.builtins.issue_radar.backend import (
     github_client,
     pipeline_routes,
     provider,
+    review_ready_url,
     store,
     watch,
 )
@@ -1332,6 +1333,164 @@ async def _handle_pulls_search(request: web.Request) -> web.Response:
             "limit": search_max,
         }
     )
+
+
+async def _resolve_review_ready_key() -> provider.RepoKey | None:
+    """The repo the review-ready row targets: the sole connected one.
+
+    The Command Bar is a GLOBAL launcher with no repo context, so its row sends no
+    ``owner``/``repo`` — resolution is the sole connected repo, and ONLY when
+    exactly one is connected. Zero or many is ambiguous, and the caller turns that
+    into a visible error rather than guessing a repo, because a URL built against
+    the wrong repo is exactly the silent-wrong-answer this feature must never
+    produce. Never hardcodes a repo: it is read from config.
+
+    There is deliberately no ``owner``/``repo`` query override: the only caller is
+    the context-less launcher, which cannot supply one, so a parameter for it would
+    be reachable from tests alone. A future repo-scoped caller adds it with a
+    consumer.
+    """
+    repos = [
+        r
+        for r in await asyncio.to_thread(store.list_connected_repos)
+        if r.get("owner") and r.get("repo")
+    ]
+    if len(repos) != 1:
+        return None
+    only = repos[0]
+    return provider.key_from_parts(
+        str(only["owner"]), str(only["repo"]), only.get("provider"), only.get("host")
+    )
+
+
+async def _handle_review_ready_search_url(request: web.Request) -> web.Response:
+    """GET /review-ready-search-url — the github.com search URL for the CONFIGURED
+    user's OPEN, ``readiness: passed`` PRs, merge-conflicted ones excluded. Backs
+    the Command Bar's copy row.
+
+    The browser cannot hold a GitHub token, so the whole query runs here and only
+    the finished string crosses back. Author is the authenticated ``gh`` login
+    (never client-supplied); repo is the sole connected repo. Every failure — no
+    repo (zero or many connected), a non-GitHub repo, no login, a ``gh`` error — is
+    answered with a non-2xx so the row's ``run()`` REJECTS and the bar shows it. It
+    never falls back to the unfiltered base URL: copying a link that still contains
+    conflicted PRs is the one wrong answer this feature can give.
+
+    The ≠1-connected-repo case is a visible error by design, not a bug: the
+    context-less launcher cannot name a repo, so anything but exactly one connected
+    repo is genuinely ambiguous and the row reports that rather than guessing.
+    """
+    key = await _resolve_review_ready_key()
+    if key is None:
+        return web.json_response(
+            {
+                "error": "no repo specified and not exactly one repo connected",
+                "code": "repo_ambiguous",
+            },
+            status=400,
+        )
+    # The copied URL is a github.com search URL, so it is only meaningful for a
+    # GitHub repo. A sole connected GitLab/Azure repo would otherwise reach the
+    # hardcoded github.com builder and copy a link to an unrelated GitHub repo —
+    # exactly the silent-wrong-answer this feature must never give. GitLab/Azure
+    # search-URL support is a deliberate follow-up.
+    if not key.is_github:
+        return web.json_response(
+            {
+                "error": "review-ready search URL is only supported for GitHub repos",
+                "code": "provider_unsupported",
+            },
+            status=400,
+        )
+    owner, repo = key.owner, key.repo
+    client = provider.client_for(key)
+    pkw = provider.call_kwargs(key)
+
+    if not await asyncio.to_thread(_connected, key):
+        return web.json_response(
+            {
+                "error": f"{owner}/{repo} is not connected — call /connect first",
+                "code": "repo_not_connected",
+            },
+            status=404,
+        )
+
+    # Author = the authenticated user, resolved server-side. A missing login must
+    # fail visibly here: an empty author would build a URL matching EVERY author's
+    # review-ready PRs, the opposite of what the row promises.
+    try:
+        author = await asyncio.to_thread(partial(client.get_current_login, **pkw))
+    except GhCliError as exc:
+        return web.json_response(
+            {"error": f"could not resolve GitHub identity: {exc}", "code": "identity_unresolved"},
+            status=502,
+        )
+    if not author:
+        return web.json_response(
+            {"error": "no authenticated GitHub identity", "code": "identity_missing"},
+            status=502,
+        )
+
+    # Search the author's open PRs. Request ONE past the client's own cap so a
+    # truncated result is a FACT, not a guess: if the author has more open PRs than
+    # the cap, a conflicted one could fall outside the window and never reach the
+    # `-head:` exclusion, yielding an over-broad URL. That is the one wrong answer
+    # this feature must never give, so a truncated search fails the route instead.
+    search_max = client.PR_SEARCH_MAX  # type: ignore[attr-defined]
+    try:
+        pulls = await asyncio.to_thread(
+            partial(client.search_pulls, owner, repo, **pkw),
+            state="open",
+            author=author,
+            assignee=None,
+            review_requested=None,
+            limit=search_max + 1,
+        )
+    except PrSearchError as exc:
+        return web.json_response({"error": str(exc), "code": "pr_search_invalid"}, status=400)
+    except GhCliError as exc:
+        return web.json_response({"error": str(exc), "code": "pr_search_failed"}, status=502)
+    if len(pulls) > search_max:
+        return web.json_response(
+            {
+                "error": (
+                    f"too many open PRs to build a complete list (over {search_max}); "
+                    "refusing to copy a possibly over-broad URL"
+                ),
+                "code": "pr_search_truncated",
+            },
+            status=502,
+        )
+
+    # Keep only the PRs carrying the readiness label. The search qualifies on
+    # author+state; the label filter is applied on the rows' own `labels` (which
+    # the search already returns) rather than as a query qualifier, so this reuses
+    # the existing search path unchanged.
+    label = review_ready_url.READINESS_PASSED_LABEL
+    passed = [p for p in pulls if label in (p.get("labels") or [])]
+
+    # Enrich by number to get each PR's `mergeable`. Without it every PR reports
+    # mergeable=None (unknown) and — since unknown is excluded — the URL would drop
+    # ALL of them, producing a base query that matches the label-passed set with no
+    # conflict exclusions applied. So a failed enrichment must fail the route, not
+    # silently return the wrong (over-broad) URL.
+    try:
+        enriched = await asyncio.to_thread(
+            partial(client.enrich_pulls_by_number, owner, repo, passed, **pkw)
+        )
+    except GhCliError as exc:
+        return web.json_response({"error": str(exc), "code": "pr_enrich_failed"}, status=502)
+
+    try:
+        url = review_ready_url.build_review_ready_search_url(owner, repo, author, enriched)
+    except ValueError as exc:
+        # A conflicted PR with no head branch name to exclude on: reporting it is
+        # correct — the alternative is a URL that silently includes it.
+        return web.json_response({"error": str(exc), "code": "head_branch_unknown"}, status=502)
+
+    # Only the URL is returned. The launcher copies it and reads nothing else; an
+    # owner/repo/author echo would be response surface with no consumer.
+    return web.json_response({"url": url})
 
 
 async def _handle_pull_detail(request: web.Request) -> web.Response:
@@ -5487,6 +5646,10 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/apps/issue-radar/issue", _require_enabled(_handle_issue_detail))
     app.router.add_get("/api/apps/issue-radar/pulls", _require_enabled(_handle_pulls))
     app.router.add_get("/api/apps/issue-radar/pulls/search", _require_enabled(_handle_pulls_search))
+    app.router.add_get(
+        "/api/apps/issue-radar/review-ready-search-url",
+        _require_enabled(_handle_review_ready_search_url),
+    )
     app.router.add_get("/api/apps/issue-radar/pull", _require_enabled(_handle_pull_detail))
     app.router.add_get("/api/apps/issue-radar/ref", _require_enabled(_handle_ref_summary))
     app.router.add_get("/api/apps/issue-radar/deps", _require_enabled(_handle_deps))

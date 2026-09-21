@@ -930,6 +930,14 @@ export interface RepoRef {
   host?: string
 }
 
+/** The `GET /api/apps/issue-radar/review-ready-search-url` payload: the finished
+ * github.com search URL for the configured user's open, `readiness: passed` PRs
+ * with the conflicted ones excluded. Only the URL — the launcher copies it and
+ * reads nothing else. */
+export interface ReviewReadySearchUrlResponse {
+  url: string
+}
+
 /** Which forge a repo lives on.
  *
  * `azure` is Azure DevOps on `dev.azure.com`, where `owner` carries
@@ -1349,6 +1357,21 @@ export const issueRadarApi = {
     if (opts.assignee) q.set('assignee', opts.assignee)
     if (opts.reviewRequested) q.set('review_requested', opts.reviewRequested)
     const r = await fetch(`${API}/pulls/search?${q.toString()}`, { credentials: 'same-origin' })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** The github.com search URL for the CONFIGURED user's open, `readiness: passed`
+   * PRs, with merge-conflicted ones excluded by head branch. The whole query runs
+   * server-side (the browser holds no GitHub token) and only the finished string
+   * comes back. Rejects on any failure — no repo, no identity, a `gh` error — so a
+   * caller MUST NOT fall back to a base URL: the server never returns the unfiltered
+   * URL, because copying a link that still contains conflicted PRs is the one wrong
+   * answer this feature can give. Repo is the sole connected repo, resolved
+   * server-side; there is no repo argument because the only caller (the launcher)
+   * has no repo context to pass. */
+  reviewReadySearchUrl: async (): Promise<ReviewReadySearchUrlResponse> => {
+    const r = await fetch(`${API}/review-ready-search-url`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },

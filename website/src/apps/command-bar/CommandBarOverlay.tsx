@@ -5,6 +5,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowRight,
   Check,
+  ClipboardCopy,
   Clock,
   Command,
   Cog,
@@ -24,6 +25,8 @@ import {
 } from 'lucide-react'
 
 import { api } from '../../api/client'
+import { issueRadarApi } from '../issue-radar/api'
+import { copyWithOutcome } from '../../utils/clipboard'
 import { commandFolderName, fileSessionInCommandFolder } from './sessionFolder'
 import type { ChatFolderRow } from './sessionFolder'
 import type { ChatFolder } from '../../types'
@@ -716,6 +719,64 @@ export default function CommandBarOverlay({
         },
       })
     }
+    // The one root row that stands on an APP rather than on the shell: it calls an
+    // Issue Radar endpoint, and Issue Radar ships `defaultEnabled: false` with every
+    // route behind `_require_enabled` (403 "issue-radar is disabled"). Offered
+    // unconditionally it would be a builtin row that, on any install which never
+    // enabled the app, can ONLY fail -- and fail into "Press Enter to try again", a
+    // retry that can never succeed and names no cause. `contributedCommands` already
+    // states the rule for contributed rows: a row that still ran from a disabled app
+    // would make the enable switch a lie. A builtin row resting on that app is the
+    // same lie, so it obeys the same rule. The app list is already read on this
+    // surface for `commandById`, so the check costs no request.
+    const issueRadarEnabled = (apps ?? []).some((a) => a.name === 'issue-radar' && a.enabled)
+
+    // Hoisted out of the `rows.push(...)` argument list only so the gate below reads as
+    // one line instead of wrapping forty; the spread keeps its original position, so the
+    // row still sits where it did among its siblings.
+    const copyReviewReadyRow: RootRow = {
+      id: 'command:copy-review-ready-prs',
+      title: i18nT('apps.commandBar.cmd_copy_review_ready_prs'),
+      // Names WHAT lands on the clipboard, because the value is invisible until
+      // the user pastes it: a github.com search URL, not the PRs themselves.
+      subtitle: i18nT('apps.commandBar.cmd_copy_review_ready_prs_sub'),
+      group: 'commands',
+      kind: 'invoke',
+      icon: <ClipboardCopy size={14} className="lucide-inline" />,
+      // The whole query runs server-side (the browser holds no GitHub token) and
+      // only the finished string comes back. Two ways this can fail, and BOTH must
+      // reach the bar rather than copy something wrong:
+      //   1. the fetch rejects (no repo, no identity, a `gh` error) — the server
+      //      never returns an unfiltered fallback URL, so a rejection here means
+      //      "no correct string exists right now", which is exactly what an `invoke`
+      //      row surfaces by letting the rejection propagate.
+      //   2. the clipboard write fails — copying is the entire point of the row, so
+      //      a silent failure would leave the user believing they hold a URL they do
+      //      not. `copyWithOutcome` reports whether the text ACTUALLY landed; on
+      //      false we throw, and the bar shows the failure instead of a false tick.
+      run: async () => {
+        // Capture the dialog generation BEFORE the fetch. The endpoint call is a
+        // network round-trip, and the bar can be dismissed (and a different thing
+        // copied) while it is in flight. If this activation no longer owns the
+        // dialog when it resolves, writing the clipboard would clobber whatever the
+        // user copied since — so skip the write entirely. `dialogRunRef` is bumped
+        // on every close and every argument-state exit.
+        const generation = dialogRunRef.current
+        const { url } = await issueRadarApi.reviewReadySearchUrl()
+        if (dialogRunRef.current !== generation) return
+        const outcome = await copyWithOutcome(url)
+        if (!outcome.ok) {
+          throw new Error(i18nT('apps.commandBar.copy_failed'))
+        }
+      },
+      keywords: ['clipboard', 'copy', 'pull', 'request', 'pr', 'review', 'ready', 'link', 'url'],
+      // A specialized action, not what the launcher should open on: demote it to
+      // the end of the Commands group while the query is empty so it neither takes
+      // the default first slot from New Session nor fills the group cap ahead of a
+      // contributed command. It ranks normally the moment the user types toward it.
+      idleDemote: true,
+    }
+
     rows.push(
       {
         id: 'command:new-session',
@@ -754,6 +815,8 @@ export default function CommandBarOverlay({
         run: async () => cycleTheme(),
         keywords: ['dark', 'light', 'appearance', 'colour', 'color'],
       },
+      // Gated on the backing app: see `issueRadarEnabled`.
+      ...(issueRadarEnabled ? [copyReviewReadyRow] : []),
       {
         id: 'command:search-sessions',
         title: i18nT('apps.commandBar.cmd_search_sessions'),
@@ -1171,15 +1234,25 @@ export default function CommandBarOverlay({
       // it succeeded -- a new session that was never created looks identical to a
       // created one once the bar is gone -- so the bar closes only after the work
       // resolves, and a rejection keeps it open carrying the error.
+      //
+      // Both outcomes are guarded on the dialog generation captured at activation:
+      // the work can be a network round-trip, and the bar can be dismissed (and
+      // re-opened) before it settles. A stale activation must drive neither
+      // `onClose` (which would close a freshly re-opened bar) nor `setActionError`
+      // (which would show a stale failure on it).
+      const invokeGeneration = dialogRunRef.current
+      const invokeOwned = () => dialogRunRef.current === invokeGeneration
       const pending = row.run?.()
       if (pending) {
         setPendingRow(row.id)
         void pending.then(
           () => {
+            if (!invokeOwned()) return
             setPendingRow(null)
             onClose()
           },
           () => {
+            if (!invokeOwned()) return
             setPendingRow(null)
             // Name the row and the way out: the bar deliberately stays open so Enter
             // retries, but that is invisible unless the copy says so.

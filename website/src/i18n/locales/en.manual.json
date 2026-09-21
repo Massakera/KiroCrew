@@ -1379,6 +1379,9 @@
     },
     "commandBar": {
       "cmd_new_session": "New Session",
+      "cmd_copy_review_ready_prs": "Copy Review-Ready PR Search",
+      "cmd_copy_review_ready_prs_sub": "Copies a GitHub search link for your open PRs labeled “readiness: passed”, skipping merge-conflicted ones.",
+      "copy_failed": "Could not copy to the clipboard. Try again.",
       "cmd_search_folders": "Search Folders",
       "cmd_search_sessions": "Search Sessions",
       "fallback_folders": "Search folders for “{{query}}”",

@@ -333,6 +333,7 @@ def parse_summary_rows(
             "deletions": row.get("deletions") or 0,
             "changed_files": row.get("changed_files") or 0,
             "head_sha": row.get("head_sha") or None,
+            "head_ref": row.get("head_ref") or None,
             "mergeable_state": None,
             "mergeable": mergeable_normalizer(row.get("mergeable_raw")),
             "pr_state": state_normalizer(row.get("pr_state")),
@@ -380,6 +381,11 @@ def apply_summaries(
         pull["changed_files"] = extra.get("changed_files", 0)
         if not pull.get("head_sha"):
             pull["head_sha"] = extra.get("head_sha")
+        # Search rows carry `head: null` (the search API is issue-shaped); the
+        # by-number summary resolves the head branch, so fill it when absent. A
+        # list row already carries its own `head` and is left untouched.
+        if not pull.get("head") and extra.get("head_ref"):
+            pull["head"] = extra.get("head_ref")
         pull["mergeable"] = extra.get("mergeable")
         live_state = extra.get("pr_state")
         if live_state:
