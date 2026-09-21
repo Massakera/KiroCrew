@@ -39,6 +39,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _hot_reload_helpers import change as _change
 
+from kiro_crew import skill_catalog
 from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig
 
@@ -789,13 +790,28 @@ class TestSkillsLoader:
         loader.reconfigure(cfg)
         assert loader._extra_paths == [configured.resolve(), edition.resolve()]
 
-    def test_the_discovery_cache_is_cleared_so_the_next_listing_walks_the_new_roots(
+    def test_new_roots_select_a_new_corpus_so_the_old_listing_cannot_serve_them(
         self, tmp_path: Path
     ) -> None:
+        """A root-set change must not be answerable from the previous listing.
+
+        The listing is keyed by the root set, so adding a root selects a
+        DIFFERENT corpus rather than re-filtering the old one -- a listing built
+        over the old roots can never name a skill in the new one.
+        """
+        added = tmp_path / "added-root"
+        added.mkdir()
         loader = _skills_loader(tmp_path)
-        loader._iter_cache["k"] = (0.0, [])
-        loader.reconfigure(KiroCrewConfig())
-        assert loader._iter_cache == {}
+        before = loader._corpus_key()
+
+        cfg = KiroCrewConfig()
+        cfg.skills.extra_paths = [str(added)]
+        loader.reconfigure(cfg)
+
+        after = loader._corpus_key()
+        assert after != before
+        assert str(added.resolve()) in after[1]
+        assert skill_catalog.corpus_state(after)["published"] is False
 
     @pytest.mark.asyncio
     async def test_a_max_triggered_write_does_not_reach_the_loader(self, tmp_path: Path) -> None:

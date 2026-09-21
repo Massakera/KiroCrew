@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -386,6 +387,32 @@ async def test_install_skips_a_traversal_entry_but_writes_the_rest(
     assert (skills_root / "covprov" / "cov-skill" / "SKILL.md").exists()
     assert not (skills_root / "escaped.md").exists()
     assert not (skills_root.parent / "escaped.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_bundle_install_rebuilds_catalog_off_the_event_loop(
+    state: MagicMock, registry: ProviderRegistry, sel_mock: MagicMock
+) -> None:
+    registry.register(_BundleProvider())
+    event_loop_thread = threading.current_thread()
+    rebuild_threads: list[threading.Thread] = []
+
+    def rebuild() -> None:
+        rebuild_threads.append(threading.current_thread())
+
+    state._standalone_skills._invalidate_iter_cache = rebuild
+    request = _mk(
+        "POST",
+        "/i",
+        state=state,
+        body={"provider": "covprov", "skill_id": "cov-skill"},
+    )
+
+    response = await h.api_skills_discover_install(request)
+
+    assert response.status == 200
+    assert len(rebuild_threads) == 1
+    assert rebuild_threads[0] is not event_loop_thread
 
 
 @pytest.mark.asyncio

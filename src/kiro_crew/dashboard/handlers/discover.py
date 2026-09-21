@@ -567,8 +567,9 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
             return written
 
         file_count = await asyncio.to_thread(_write_bundle)
-        # Invalidate the loader's cache so the skill is immediately discoverable.
-        skills._invalidate_iter_cache()
+        # Rebuilding walks every known corpus, so keep it off the event loop just
+        # like the bundle write above.
+        await asyncio.to_thread(skills._invalidate_iter_cache)
         kind = "updated" if already_exists else "created"
         logger.info("Installed skill bundle %s: %d files", key, file_count)
     elif already_exists:

@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from kiro_crew import platform_compat, skill_trust
+from kiro_crew import platform_compat, skill_catalog, skill_trust
 from kiro_crew.config.loader import KiroCrewConfig, SkillsConfig
 
 pytestmark = pytest.mark.skipif(
@@ -1306,9 +1306,25 @@ class TestConfinementMapSharesTheCacheLifetime:
 
         assert "legit" in {n for n, _, _ in loader._iter(project)}
 
+        # A second skill appears on disk, the way an in-app create writes one.
+        second = project / ".kiro" / "skills" / "fresh"
+        second.mkdir(parents=True)
+        (second / "SKILL.md").write_text(
+            "---\nname: fresh\ndescription: d\n---\n\nbody\n", encoding="utf-8"
+        )
+
         loader._invalidate_iter_cache()
-        assert loader._iter_cache == {}
         assert not loader._fm_cache
+        # Every corpus over this loader's roots is rebuilt here, the PROJECT one
+        # included. Rebuilding only the global corpus left a project session's very
+        # next listing missing the skill just written -- a required `always: true`
+        # one included -- and marking it dirty only would have put that listing on a
+        # synchronous walk.
+        key = loader._corpus_key(skill_trust.canonical_key(project) or "")
+        state = skill_catalog.corpus_state(key)
+        assert state["dirty"] is False
+        assert state["published"] is True
+        assert {n for n, _, _ in loader._iter(project)} >= {"legit", "fresh"}
 
 
 class TestEveryEnumeratedPathHasARecordedRoot:
@@ -1978,8 +1994,10 @@ class TestEnforcementIsAudited:
         loader = SkillsLoader(skills_path=tmp_path / "home-skills", install_builtins=False)
 
         for _ in range(5):
+            # Enforcement runs per call: `_iter` resolves the trusted project key
+            # before it reads the published listing, so five calls are five
+            # enforcement decisions and one record.
             loader._iter(project)
-            loader._iter_cache = {}  # force re-enforcement, not a cache hit
 
         governance = [c for c in calls if c.get("rule") == "project_skills_trust_enforced"]
         assert len(governance) == 1, (
@@ -2027,7 +2045,6 @@ class TestEnforcementIsAudited:
 
         for _ in range(3):
             loader._iter(project)
-            loader._iter_cache = {}
 
         assert attempts == 2, (
             "the failed write must retry on the next enforcement, while the "

@@ -189,20 +189,22 @@ def skill_search(name: str, args: dict[str, Any]) -> str:
             # No signed session (CLI, or an unidentified child): global-only.
             loader = mcp_core.SkillsLoader(install_builtins=False)
             try:
-                incomplete = False
                 if action == "read":
                     body = loader.read_scoped_skill(key)
                     matches = (
                         [{"key": key, "name": key, "content": body}] if body is not None else []
                     )
                     next_offset = None
+                    incomplete = not loader.catalog_complete()
                 else:
                     matches = loader.search_skills(
                         query, limit=limit + 1, offset=offset, browse=action == "list"
                     )
                     next_offset = offset + limit if len(matches) > limit else None
                     matches = matches[:limit]
-                    incomplete = bool(getattr(loader, "search_incomplete", False))
+                    incomplete = not loader.catalog_complete() or bool(
+                        getattr(loader, "search_incomplete", False)
+                    )
             finally:
                 loader.close()
     except Exception as exc:  # pragma: no cover — defensive
@@ -228,16 +230,26 @@ def skill_search(name: str, args: dict[str, Any]) -> str:
             "matches": len(matches),
         },
     )
+    if not matches and incomplete:
+        if action == "read":
+            return (
+                "Skill discovery is incomplete, so this exact key is UNKNOWN rather "
+                "than absent. Retry after the catalog refresh finishes."
+            )
+        if action == "list":
+            return (
+                "Skill discovery is incomplete, so this page cannot prove the list "
+                "has ended. Retry the same offset after the catalog refresh finishes."
+            )
+        return (
+            "Skill discovery is incomplete; absence is not conclusive. "
+            "Repeat the query, browse action='list', or load an exact key with "
+            "action='read'."
+        )
     if not matches and action == "read":
         return "Error: exact skill key is outside this scope, unreadable, or exceeds the 99,000-byte read capacity."
     if not matches and action == "list":
         return "End of this agent's available skill list."
-    if not matches and incomplete:
-        return (
-            "Body indexing is still in progress; absence is not conclusive. "
-            "Repeat the query to continue indexing, browse action='list', "
-            "or load an exact key with action='read'."
-        )
     if not matches:
         return (
             f"No skills matched '{query}'. Try broader keywords, browse action='list', "
@@ -257,7 +269,7 @@ def skill_search(name: str, args: dict[str, Any]) -> str:
     if incomplete:
         lines.insert(
             1,
-            "Body indexing is incomplete. Repeat the query to continue; list/read remain available.",
+            "Skill discovery is incomplete. Repeat the query to continue; list/read remain available.",
         )
     if next_offset is not None:
         lines.append(f"Next page: repeat this action/query with offset={next_offset}.")

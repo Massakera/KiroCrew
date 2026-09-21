@@ -2871,6 +2871,18 @@ Debug catalog logs separate snapshot loading, directory scanning, metadata
 assembly and index persistence. This reduces cold latency without promising a
 constant-time scan of an arbitrary filesystem.
 
+The process shares one immutable snapshot per corpus. A corpus retains at most
+20,000 rows, and every retained skill name, path and project key is capped at
+32,767 characters, the largest realistic supported filesystem path. The first
+row beyond either bound is refused and marks the snapshot incomplete. Search,
+paginated list and exact-read responses therefore report an incomplete corpus as
+unknown rather than claiming a missing skill or the end of the list. Corpus
+identity fields use the same path and project-key caps and are refused rather than
+truncated, because truncation could merge distinct projects. The one cold-start
+wait reads `COLD_BUILD_WAIT_SECS` directly; callers cannot supply a second bound.
+A mutation rebuild remains synchronous to its mutator so the next read sees the
+write, and async bundle installation sends that rebuild to a worker thread.
+
 **Source precedence** (project-level wins): `$KIROCREW_PROJECT_DIR/skills/` → `builtin_skills/` (bundled). Auto-copied to `~/.kiro/crew/skills/` on first run. Copies entire skill directories (scripts, assets, etc.).
 
 **Retired generated skill cleanup.** `skills.remove_retired_conductor_skill()`
@@ -2998,7 +3010,8 @@ capability check, not a best-effort `lstat` sequence; a pre-check followed by a 
 scan leaves the same swap window. Project skills remain available on macOS and Linux,
 where every traversed component stays pinned to a no-follow directory descriptor.
 
-**One enforcement point for every enumerated read.** Enumeration is TTL-cached, so a
+**One enforcement point for every enumerated read.** Enumeration is served from a
+published snapshot, so a
 path vetted while genuine can be replaced by a link out of the granted directory before
 anything reads it — and the root that made it acceptable is only known at enumeration
 time. So `_iter_uncached` records, per path, the root it was vetted against, and
@@ -3479,8 +3492,99 @@ entry cannot crowd the other candidates out of the response.
 every non-custom-agent message via the context builder, scoring word-overlap of
 the message against each skill's `triggers` (negative `!`-prefixed triggers
 exclude). To keep it off the per-message filesystem/config hot path:
-- the discovered skill-file list is TTL-cached (`_iter`, `_ITER_CACHE_TTL_SECS`),
-  invalidated by `create_auto_skill`;
+- the discovered skill-file list is served from a **process-wide published
+  snapshot** (`skill_catalog`), not from a per-loader deadline cache. `_iter`
+  reads whatever has been published and walks nothing on the calling thread; one
+  background worker (`skill-catalog`, a single thread for the whole process) does
+  the walking and publishes a newer snapshot when it finishes. The snapshot is
+  keyed by the corpus — this skills root, the extra roots, and the trusted
+  project key — so several loaders over one corpus share one walk, which a
+  gateway needs because it holds several long-lived loaders plus one per unsigned
+  MCP call;
+- `BACKGROUND_REVERIFY_SECS` decides when the worker is asked to walk AGAIN, and
+  is never consulted to decide whether a snapshot may be served. That is the
+  difference from the deadline it replaced: an unverified listing costs a late
+  discovery of an out-of-band edit, never a turn's latency. The deadline cache is
+  gone rather than relocated, so there is no second directory cache to reconcile
+  with this one;
+- the rows a corpus listing RETAINS are bounded by `MAX_CATALOG_SKILLS`, applied
+  where they are retained: the walker stops adding rows past it and the snapshot
+  store stops pulling past it, so a runaway tree is refused rather than
+  materialized and then trimmed. One constant is shared by both, a refused tail
+  is reported once per published snapshot (`CatalogSnapshot.truncated`, logged
+  only after the generation check accepts that snapshot), and
+  `CatalogSnapshot.complete` / `SkillsLoader.catalog_complete` let a caller say
+  "still discovering" instead of asserting a skill does not exist — a truncated or
+  unfinished listing must never read like a corpus that never held those skills;
+- the extra ROOTS retained in a corpus key are bounded by
+  `MAX_CATALOG_EXTRA_ROOTS` in count as well as in per-path length, because
+  `skills.extra_paths` is operator or edition config whose length is as writable
+  as its contents. `corpus_key` REFUSES an over-long list rather than truncating
+  it — a dropped root would make two different root sets hash to one key, and the
+  corpus would then serve a listing built over roots the caller never asked about
+  — so the bound is applied where the loader ADOPTS its roots
+  (`_install_extra_roots`, the one assignment site, fed by construction's
+  configured and edition loops and by a config reload alike). Reaching the
+  refusal would raise inside every listing, which would turn one config typo into
+  a broken turn; the adopted list is trimmed instead and the refused tail is named
+  in the log by count and position, never by value;
+- the CORPORA tracked at once are bounded by `MAX_TRACKED_CORPORA`, because
+  rows-per-corpus is only half the population: a gateway tracks one corpus per
+  trusted project it opens, each holding the global tree plus that project's
+  skills, and no read path drops one. Past the cap the least recently READ corpus
+  is forgotten, which costs it one listing when it is next asked for and nothing
+  else, since a snapshot is a cache. A corpus with a waiter is never the victim:
+  its waiters are parked on an event only this module sets, so dropping the record
+  would leave them waiting out their timeout for a listing nobody will publish,
+  and a waiter is therefore registered BEFORE its cold walk is scheduled;
+- two walks stay synchronous, and neither is on a chat turn. `rebuild_now` runs on
+  the mutator's own thread for `create_skill` / `update_skill` / `delete_skill` /
+  `create_auto_skill`, whose contract is that the write is visible to the very
+  next listing — a background rebuild cannot promise that, and before the
+  snapshot existed the next listing paid this same walk anyway. `cold_listing`
+  produces the FIRST listing of a corpus in a process: off the event loop it
+  joins the background walk (`wait_for_first`, bounded by
+  `COLD_BUILD_WAIT_SECS`), and on the loop it walks in place, which is parity
+  with what the old cache did on every miss and is now paid once instead of every
+  minute;
+- a mutation rebuilds every corpus over the mutating loader's roots — the global
+  one and one per trusted project that contributed its own skills root — because
+  rebuilding only the global corpus would leave a project session's next listing
+  missing the skill just written, a required `always: true` one included. A corpus
+  over a different root set is MARKED for rebuild instead of emptied, so its next
+  turn reads a listing one skill out of date rather than paying a walk. Each walk
+  reserves its generation when it starts, which is what stops a walk already in
+  flight from publishing over the edit: an uncommitted `generation + 1` hands the
+  same number to a background refresh and to the mutation's own rebuild, and the
+  publish guard then admits the loser;
+- `get_context` primes the listing before it renders. An `always: true` body is a
+  required startup instruction and which skills declare it is not knowable
+  without a listing, so a process that has never listed this corpus finishes one
+  first. Priming reports COMPLETE-or-not, never present-or-not: a listing
+  truncated at `MAX_CATALOG_SKILLS` is a lower bound on the corpus, so an
+  `always: true` skill past the refused row would be absent from a directory that
+  called itself ready — a silently dropped required instruction, which is the one
+  outcome this machinery exists to prevent. A refused tail therefore reports the
+  same shortfall an unfinished walk does, and the rows are still served; what is
+  refused is the claim that they are all of them. When priming does not finish,
+  the shortfall is STATED in the required parts rather than left to be inferred
+  from a short catalog. Priming never waits
+  on the event loop: a coroutine walks the first listing in place instead, because
+  reporting a shortfall it never measured would put an incomplete-discovery notice
+  in a process's first context and not in its second, and two builds of one
+  session would then differ byte for byte. A restarted process pays that one listing per corpus: the
+  persisted metadata rows already serve its per-file frontmatter reads, so what it
+  waits for is the traversal, and nothing waits again for the process's life. A
+  listing is NOT persisted, because a stored one cannot prove that no new
+  `always: true` skill appeared while the process was down, and injecting a
+  directory that silently lacks a required instruction is the one trade this path
+  refuses;
+- a snapshot holds a name, a path, and the project key the walker admitted it
+  under — never an authorization. Agent mapping, project trust, disabled apps,
+  `repo_scope` and the sensitive-path fence all run against a snapshot's rows at
+  every read, and withdrawing trust selects a DIFFERENT corpus rather than
+  re-filtering a retained one, so a revoke takes effect on the next read instead
+  of whenever a refresh happens to land;
 - the walk that rebuilds it (`_iter_skill_files`, on a worker thread) asks the
   sensitive-path fence through `is_sensitive_resolved_path` against the
   `realpath` it has already computed for loop detection and containment, with
@@ -3504,8 +3608,8 @@ exclude). To keep it off the per-message filesystem/config hot path:
   to `config.json` can no more reach a credential directory than one present at
   boot. Edition-contributed roots are preserved and stay LAST (lowest
   precedence): they come from the platform context, not config, so a config write
-  must not drop them. The discovery cache is cleared, so the next listing walks
-  the new roots instead of serving the old set for the rest of the TTL;
+  must not drop them. Changing the root set changes the corpus identity, so a
+  listing built over the old roots can never be served for the new ones;
 - exactly **one** SEL audit event is emitted for the matched set (skipped
   entirely when nothing matched, the common case), not one per skill scanned.
 

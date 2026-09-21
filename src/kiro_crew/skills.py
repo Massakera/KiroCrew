@@ -26,7 +26,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Iterable, Iterator, NamedTuple
 
 from kiro_crew import hooks as hooks_module
-from kiro_crew import pinned_fs, skill_trust
+from kiro_crew import pinned_fs, skill_catalog, skill_trust
 from kiro_crew.atomic_write import (
     atomic_write,
     open_access_control_source,
@@ -232,21 +232,16 @@ _DOLLAR_SKILL_PATTERN = re.compile(r"(?<![\w$])\$([a-z0-9][a-z0-9/_-]*)")
 # Cap how many distinct $skills one message may expand — bounds prompt growth and
 # matches the spirit of the per-message trigger cap.
 _MAX_DOLLAR_SKILLS = 5
-# Cache the discovered skill-file list for this long. get_triggered_skills runs
-# on EVERY message; without this it os.walk()s the skills dir + every extra
-# path per message.
+# Cache which apps are disabled for this long. The visibility filter runs on
+# EVERY message; without this it re-reads the app registry per message.
 #
-# This was 5.0s, which did not achieve that: a walk of a real skills tree (645
-# files across 21 roots on a dev desktop, incl. AIM-installed package roots)
-# takes ~0.7s, and chat messages arrive MINUTES apart — so every message missed
-# the cache and paid the full walk, and the 5s only ever deduped the several
-# _iter() calls WITHIN one message. At 60s the walk is amortized ~12x with a
-# worst-case staleness of one minute.
-#
-# Staleness only affects skills added OUT OF BAND (AIM sync, a manual cp):
-# the app's own create/update/delete/refresh all call _invalidate_iter_cache(),
-# so a skill written through the app is visible immediately regardless of TTL.
-_ITER_CACHE_TTL_SECS = 60.0
+# This is the ONLY deadline cache left on this path. The directory listing lives
+# in `skill_catalog`, which serves a published snapshot and walks on a background
+# worker, so no turn waits for a walk at all -- see that module's docstring for
+# why a deadline is the wrong shape for a walk. What is left here is a small
+# config read (which apps are disabled), which is cheap enough that a deadline is
+# the proportionate mechanism.
+_DISABLED_APPS_TTL_SECS = 60.0
 
 # A granted repository remains attacker-controlled after consent. Bound the
 # descriptor-relative walker well below Python's recursion limit so a malicious
@@ -803,6 +798,7 @@ def _iter_skill_files(
     *,
     confine_to: tuple[str, ...] | None = None,
     exclude_roots: tuple[str, ...] = (),
+    limit: int | None = None,
 ) -> list[tuple[str, Path]]:
     """Recursively find all SKILL.md files under *base*.
 
@@ -812,6 +808,11 @@ def _iter_skill_files(
     Unconfined provider trees follow links because apps register skills through
     them. Confined project trees never follow directory links or junctions: a
     link target can be a Windows UNC path, where descent would leak credentials.
+
+    *limit* bounds how many pairs are RETAINED, so a runaway tree is refused here
+    rather than materialized and trimmed by a caller. Retention stops mid-walk, so
+    which rows survive a truncation is not defined -- the caller reports the
+    listing as incomplete rather than describing the tail.
     """
     if confine_to is not None:
         if len(confine_to) != 1:
@@ -825,6 +826,8 @@ def _iter_skill_files(
             dirs[:] = [name for name in dirs if not name.startswith(".")]
             if "SKILL.md" not in files:
                 continue
+            if limit is not None and len(results) >= limit:
+                break
             skill_file = Path(dirpath) / "SKILL.md"
             rel = skill_file.parent.relative_to(base)
             results.append((str(rel).replace("\\", "/"), skill_file))
@@ -898,6 +901,8 @@ def _iter_skill_files(
             if discovered_file is not None:
                 name = str(directory.relative_to(base)).replace("\\", "/")
                 results.append((name, discovered_file))
+                if limit is not None and len(results) >= limit:
+                    break
             stack.extend(reversed(children))
     return sorted(results, key=lambda item: item[0])
 
@@ -2091,13 +2096,11 @@ class SkillsLoader:
                 )
         # Cache: path → (mtime or confined-content digest, parsed_frontmatter).
         self._fm_cache: dict[str, tuple[float | bytes, dict[str, str]]] = {}
-        # TTL cache of the discovered (name, path) list — avoids an os.walk per
-        # message in get_triggered_skills. Keyed by canonical project directory
-        # ("" when no project, or the project's skills are not trusted): a
-        # trusted project contributes its own skills root, so a single shared
-        # slot would serve one session's project skills to a session working in
-        # a different project for the whole TTL. (monotonic_deadline, results)
-        self._iter_cache: dict[str, tuple[float, list[tuple[str, Path, str | None]]]] = {}
+        # The discovered (name, path) list is NOT held here. It lives in
+        # `skill_catalog`, keyed by the corpus (this root, the extra roots, and
+        # the trusted project key) and shared by every loader in the process --
+        # a gateway holds several long-lived loaders plus one per unsigned MCP
+        # call, and an instance cache made each of them walk the same tree.
         self._disabled_apps_cache: tuple[float, frozenset[str]] | None = None
         # (canonical key, allowed) pairs already audited, so the enforcement
         # record is written on first use rather than once per message.
@@ -2149,6 +2152,7 @@ class SkillsLoader:
                 self._edition_extra_paths.append(resolved)
             else:
                 logger.debug("Edition skill path does not exist: %s", edition_path)
+        self._install_extra_roots(self._extra_paths)
 
         # Persistent usage ledger for hotness-ranked lazy skill injection.
         # Co-located with the skills root's parent (the KiroCrew home) so it
@@ -2234,16 +2238,47 @@ class SkillsLoader:
 
         Edition-contributed roots are preserved and stay LAST (lowest precedence);
         they come from the platform context, not config, so a config write must not
-        drop them. The discovery cache is cleared so the next listing walks the new
-        roots instead of serving the old set for the rest of the TTL.
+        drop them. Changing the root set changes the corpus identity, so every
+        published listing is marked for rebuild rather than reused: the new roots
+        cannot be filtered out of a listing built over the old ones.
         """
         self._configured_extra_paths = resolved_paths
         merged = list(resolved_paths)
         for edition_path in self._edition_extra_paths:
             if edition_path not in merged:
                 merged.append(edition_path)
+        self._install_extra_roots(merged)
+        skill_catalog.invalidate()
+
+    def _install_extra_roots(self, merged: list[Path]) -> None:
+        """Assign the extra-root list, bounded. The ONE assignment site.
+
+        Construction appends configured roots and then edition roots, and a config
+        reload rebuilds the list from scratch; all three feed this, so the bound
+        cannot be bypassed by whichever path grows next.
+
+        ``corpus_key`` REFUSES an over-long root list rather than truncating it,
+        because a dropped root would make two different root sets hash to one key
+        and a corpus would then serve a listing built over roots the caller never
+        asked about. That refusal is an invariant guard, not a path a turn may
+        take: reaching it would raise inside every listing, so one operator typo
+        in ``skills.extra_paths`` would break every message. The bound therefore
+        applies here, and the refused tail is named in the log rather than
+        silently absent.
+
+        Logged by count and position, never by value: a configured root can be any
+        path and a reloaded config is an untrusted document.
+        """
+        if len(merged) > skill_catalog.MAX_CATALOG_EXTRA_ROOTS:
+            logger.warning(
+                "skills.extra_paths: %d roots exceed the retention bound of %d; "
+                "roots at position %d and later are not searched",
+                len(merged),
+                skill_catalog.MAX_CATALOG_EXTRA_ROOTS,
+                skill_catalog.MAX_CATALOG_EXTRA_ROOTS,
+            )
+            merged = merged[: skill_catalog.MAX_CATALOG_EXTRA_ROOTS]
         self._extra_paths = merged
-        self._iter_cache.clear()
 
     def _max_triggered_now(self) -> int:
         """The per-message trigger cap, read live.
@@ -2333,29 +2368,131 @@ class SkillsLoader:
         except Exception:  # noqa: BLE001 — an unwritable log must not fail a turn
             logger.warning("could not audit project-skills enforcement", exc_info=True)
 
+    def _corpus_key(self, project_key: str = "") -> skill_catalog.CorpusKey:
+        """This loader's corpus identity for the snapshot store.
+
+        The project key is part of the identity, not a filter applied to a shared
+        listing: a trusted project contributes its own skills root, so one slot
+        would otherwise serve one session's project skills to a session working
+        somewhere else, and withdrawing trust would take effect only when a
+        refresh happened to land. Selecting a different corpus makes a revoke
+        take effect on the very next read.
+        """
+        return skill_catalog.corpus_key(self._dir, self._extra_paths, project_key)
+
+    @staticmethod
+    def _off_event_loop() -> bool:
+        """Whether this thread may be parked on a ``threading.Event``.
+
+        Same probe ``__init__`` uses for the builtin-skill sync. A coroutine must
+        never wait here; a worker thread (the embedding pool that builds context,
+        an MCP call, a CLI) may.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return True
+        return False
+
     def _iter(self, project_dir: str | Path | None = None) -> list[tuple[str, Path, str | None]]:
-        """Return all ``(name, skill_file)`` pairs, TTL-cached per project.
+        """Return all ``(name, skill_file, within)`` rows from the snapshot.
 
         Local skills take precedence over extra paths, and both take precedence
-        over a trusted project's own skills. The underlying os.walk is cached
-        for ``_ITER_CACHE_TTL_SECS`` because this runs on every message via
-        ``get_triggered_skills`` — re-walking the skills tree (plus every extra
-        path) per message was a per-message latency cost.
+        over a trusted project's own skills.
+
+        A published snapshot is served as-is and NOTHING is walked on this thread
+        -- not when it is a minute old, not when a mutation marked it for rebuild,
+        not when a dozen sessions ask at once. That is the whole change: the cache
+        this replaced was a deadline, so whichever turn found it expired paid the
+        entire walk, and chat messages arrive minutes apart.
+
+        The one exception is the first listing of a corpus in a process, which
+        cannot be served from nothing; see
+        :func:`skill_catalog.cold_listing`. Use :meth:`catalog_complete` to tell a
+        corpus that holds no skills apart from one still being discovered.
         """
         key = self._trusted_project_key(project_dir)
-        cached = self._iter_cache.get(key)
-        if cached is not None and time.monotonic() < cached[0]:
-            return cached[1]
-        results = self._iter_uncached(key or None)
-        self._iter_cache[key] = (time.monotonic() + _ITER_CACHE_TTL_SECS, results)
-        return results
+        corpus = self._corpus_key(key)
+
+        def build() -> Iterator[tuple[str, Path, str | None]]:
+            return self._iter_uncached(key or None)
+
+        snapshot = skill_catalog.read(corpus, build)
+        if snapshot is None:
+            snapshot = skill_catalog.cold_listing(corpus, build, may_wait=self._off_event_loop())
+        return list(snapshot.entries) if snapshot is not None else []
+
+    def catalog_complete(self, project_dir: str | Path | None = None) -> bool:
+        """Whether discovery for this corpus has finished and retained every row.
+
+        False means "still discovering, or a tail was refused past the cap", so a
+        caller reporting an absent skill must say so rather than assert the skill
+        does not exist. An empty result with this False is not an empty corpus.
+        """
+        key = self._trusted_project_key(project_dir)
+        snapshot = skill_catalog.read(
+            self._corpus_key(key), lambda: self._iter_uncached(key or None)
+        )
+        return snapshot is not None and snapshot.complete
+
+    def prime_catalog(self, project_dir: str | Path | None = None) -> bool:
+        """Wait, bounded, for the FIRST listing of this corpus.
+
+        The context build needs this: an ``always: true`` skill's body is a
+        REQUIRED startup instruction, and which skills declare it is not knowable
+        without a listing, so a process that has never listed this corpus must
+        finish one before it can claim it injected everything required. Dropping
+        a required instruction to save latency is not a trade this repo makes.
+
+        Never waits on the event loop. Its one caller is the context builder,
+        which every transport hands to an executor, so in production this parks a
+        worker thread. A coroutine that reaches it anyway cannot be parked on an
+        Event, so the first listing is walked IN PLACE there -- parity with what
+        the deadline cache did on every miss, and paid once per corpus instead of
+        every minute. What a coroutine must not get is the unfinished report
+        without an attempt: it would name a shortfall that does not exist, and the
+        next build on that corpus would then render a different directory.
+
+        Every other read goes through :meth:`_iter` and waits for nothing, so this
+        blocks at most once per process per corpus.
+
+        Returns whether a COMPLETE listing is now available. Complete, not merely
+        present: the walk stops retaining at
+        :data:`skill_catalog.MAX_CATALOG_SKILLS`, and a truncated listing is a
+        lower bound on the corpus, so an ``always: true`` skill past the refused
+        row would be absent from a listing that reported itself ready. Treating a
+        truncated snapshot as primed would drop a required instruction and say
+        nothing, which is the one outcome this method exists to prevent -- so a
+        refused tail reports the same shortfall an unfinished walk does.
+
+        The module-level :data:`skill_catalog.COLD_BUILD_WAIT_SECS` bounds the
+        wait and a timeout returns False rather than raising, so discovery is
+        reported as incomplete.
+        """
+        key = self._trusted_project_key(project_dir)
+        corpus = self._corpus_key(key)
+
+        def build() -> Iterator[tuple[str, Path, str | None]]:
+            return self._iter_uncached(key or None)
+
+        def ready(snapshot: "skill_catalog.CatalogSnapshot | None") -> bool:
+            return snapshot is not None and snapshot.complete
+
+        existing = skill_catalog.read(corpus, build)
+        if existing is not None:
+            return ready(existing)
+        if not self._off_event_loop():
+            return ready(skill_catalog.cold_listing(corpus, build, may_wait=False))
+        return ready(
+            skill_catalog.wait_for_first(corpus, build, skill_catalog.COLD_BUILD_WAIT_SECS)
+        )
 
     def _get_disabled_app_names(self) -> frozenset[str]:
         now = time.monotonic()
         if self._disabled_apps_cache is not None and now < self._disabled_apps_cache[0]:
             return self._disabled_apps_cache[1]
         disabled = _disabled_app_names()
-        self._disabled_apps_cache = (now + _ITER_CACHE_TTL_SECS, disabled)
+        self._disabled_apps_cache = (now + _DISABLED_APPS_TTL_SECS, disabled)
         return disabled
 
     def _iter_visible(
@@ -2418,20 +2555,34 @@ class SkillsLoader:
             )
         return skills
 
-    def _iter_uncached(self, project_key: str | None = None) -> list[tuple[str, Path, str | None]]:
+    def _iter_uncached(
+        self, project_key: str | None = None
+    ) -> Iterator[tuple[str, Path, str | None]]:
         """Walk the skills dir, extra paths, and an already-canonical project root.
+
+        Yields rather than returning a list, so the snapshot store's count bound
+        stops the walk instead of trimming a population already in memory. Each
+        root is asked to retain at most one row past that bound, which keeps peak
+        retention at one root's worth while still letting the consumer see that a
+        tail exists.
 
         This function performs no trust check of its own. The loading path passes
         a key confirmed by ``_trusted_project_key``; the catalog path uses it only
         to determine which confined names a later grant could admit. Callers must
         never pass a raw caller-supplied path.
         """
+        # One row past the cap per root: enough for the consumer to detect the
+        # tail, and never the whole tree. Not a per-root REMAINING budget, because
+        # a root's rows can be shadowed by an earlier root's names -- deducting
+        # them up front would refuse skills the corpus is nowhere near the cap to
+        # hold.
+        per_root = skill_catalog.MAX_CATALOG_SKILLS + 1
         # Unconfined (None): the global tree may legitimately hold app-registered
         # symlinks resolving into a provider root outside it.
-        results: list[tuple[str, Path, str | None]] = [
-            (name, path, None) for name, path in _iter_skill_files(self._dir)
-        ]
-        seen = {name for name, _, _ in results}
+        seen: set[str] = set()
+        for name, path in _iter_skill_files(self._dir, limit=per_root):
+            seen.add(name)
+            yield (name, path, None)
         # (root, confine_to): only the project root is confined — see
         # _iter_skill_files. Extra paths keep the provider-root allowance.
         roots: list[tuple[Path, tuple[str, ...] | None]] = [
@@ -2445,7 +2596,7 @@ class SkillsLoader:
             # directory handles; no path probe occurs before that confinement.
             roots.append((project_root, (project_key,)))
         for root, confine in roots:
-            for name, skill_file in _iter_skill_files(root, confine_to=confine):
+            for name, skill_file in _iter_skill_files(root, confine_to=confine, limit=per_root):
                 if name in seen:
                     continue
                 if confine is not None:
@@ -2453,8 +2604,8 @@ class SkillsLoader:
                     # lexical name. Resolving it here would reintroduce the
                     # link-swap/UNC probe the walk exists to prevent. Reads are
                     # re-confined at their own descriptor-pinned choke point.
-                    results.append((name, skill_file, confine[0]))
                     seen.add(name)
+                    yield (name, skill_file, confine[0])
                     continue
                 # Route through hooks validation (resolves symlinks + sensitive
                 # check) so files read later during trigger matching are vetted.
@@ -2466,23 +2617,40 @@ class SkillsLoader:
                 # going wrong: the key could disagree with the value handed out,
                 # and a miss read unconfined. Carried in the tuple, neither is
                 # expressible.
-                results.append((name, Path(resolved), None))
                 seen.add(name)
-        return results
+                yield (name, Path(resolved), None)
 
     def _invalidate_iter_cache(self) -> None:
         """Drop cached skill state so a just-written mutation is visible now.
 
-        Called by create/update/delete/refresh. Clears both the skill-file list
-        cache AND the mtime-keyed frontmatter cache: an in-place ``update_skill``
-        can overwrite a file within the same filesystem mtime tick as the prior
-        read, so keying the frontmatter cache on mtime alone would return the
-        stale parse. Dropping it here keeps the mutator's edit immediately
-        reflected in ``list_skills`` / ``get_triggered_skills``.
+        Called by create/update/delete/refresh. Marks the shared directory
+        snapshot for rebuild AND clears the mtime-keyed frontmatter cache: an
+        in-place ``update_skill`` can overwrite a file within the same filesystem
+        mtime tick as the prior read, so keying the frontmatter cache on mtime
+        alone would return the stale parse.
+
+        Marking, not clearing, is what a corpus over a DIFFERENT root set gets:
+        the generation bump stops a walk already in flight from publishing over
+        this edit, and keeping its previous listing means its next turn reads a
+        listing one skill out of date rather than paying a synchronous walk.
+
+        Every corpus over THIS loader's roots is rebuilt here and now -- the global
+        one and one per trusted project that contributed its own skills root --
+        because the mutator's contract is that its write is visible to the very
+        next listing, and a background rebuild cannot promise that. Rebuilding only
+        the global corpus would leave a project session's next listing missing the
+        skill just written, including a required ``always: true`` one. A mutation is
+        an explicit operator action, not a chat turn, and before the snapshot
+        existed the next listing paid this same walk anyway.
         """
         self._disabled_apps_cache = None
-        self._iter_cache = {}
         self._fm_cache.clear()
+        skill_catalog.invalidate()
+        keys = skill_catalog.known_keys(self._dir, self._extra_paths)
+        for key in keys or [self._corpus_key("")]:
+            skill_catalog.rebuild_now(
+                key, lambda pk=key[2]: self._iter_uncached(pk or None)  # type: ignore[misc]
+            )
 
     def _read_enumerated_skill_bytes(
         self,
@@ -5494,8 +5662,36 @@ class SkillsLoader:
         ``required_parts_out`` separates complete required bodies for the caller's
         protected-content admission. ``only=[]`` admits nothing. The explicit
         ``budget=None`` catalog reader retains its legacy unbudgeted rendering.
+
+        Runs OFF the event loop (its callers go through the embedding pool), which
+        is what lets it prime the directory snapshot first. Priming matters only on
+        a process that has never listed this corpus: an ``always: true`` body is a
+        required instruction, and which skills declare it is not knowable without a
+        listing, so returning early on an empty cold listing would drop required
+        instructions and say nothing. When priming does not finish, the shortfall
+        is STATED in the required parts rather than inferred from a short catalog.
         """
+        primed = self.prime_catalog(project_dir)
         all_skills = self.scoped_skills(project_dir=project_dir, only=only)
+        if not primed:
+            note = (
+                "[Skills] Skill discovery has not finished on this host, so this "
+                "directory is incomplete and may be missing required instructions. "
+                "Treat a skill you cannot find here as UNKNOWN rather than absent, "
+                "and retry skill_search before concluding it does not exist.\n"
+            )
+            logger.warning(
+                "skill-catalog: no complete directory for this corpus (a walk that "
+                "did not finish within %.0fs, or a listing that refused a tail past "
+                "%d rows); injected an incomplete-discovery notice instead of an "
+                "unqualified catalog",
+                skill_catalog.COLD_BUILD_WAIT_SECS,
+                skill_catalog.MAX_CATALOG_SKILLS,
+            )
+            if required_parts_out is not None:
+                required_parts_out.append(note)
+            elif not all_skills:
+                return note
         # Scope BEFORE anything is rendered. Dropping a repo-scoped skill only
         # from the injected body still leaves its summary line in the index, and
         # the index tells the agent to read the full file for anything related —

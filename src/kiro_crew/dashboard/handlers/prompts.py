@@ -2291,6 +2291,7 @@ async def api_skills(request: web.Request) -> web.Response:
                         else []
                     ),
                     "next_offset": None,
+                    "incomplete": not skills.catalog_complete(project_dir),
                 }
             matches = skills.search_skills(
                 query,
@@ -2319,7 +2320,8 @@ async def api_skills(request: web.Request) -> web.Response:
             return {
                 "matches": result,
                 "next_offset": next_offset,
-                "incomplete": bool(getattr(skills, "search_incomplete", False)),
+                "incomplete": not skills.catalog_complete(project_dir)
+                or bool(getattr(skills, "search_incomplete", False)),
             }
 
         try:

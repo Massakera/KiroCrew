@@ -1120,6 +1120,13 @@ class TestSkillSearch:
                 search_skills=lambda q, limit, **kwargs: [
                     {"name": "global-only", "key": "g/global-only", "description": q, "path": "/g"}
                 ],
+                # A double of SkillsLoader has to answer the whole contract the
+                # unsigned path calls, and the tool asks whether discovery
+                # finished before it can claim absence means anything. Omitted,
+                # the AttributeError is caught by the tool's own defensive
+                # handler and surfaces as "skill_search failed", which reads like
+                # a broken search rather than an incomplete double.
+                catalog_complete=lambda *_a, **_kw: True,
                 close=lambda: closed.append(True),
             ),
         )
@@ -1159,13 +1166,70 @@ class TestSkillSearch:
                 seen.append(limit)
                 return [{"name": "s", "key": "s", "description": "d", "path": "/p"}]
 
-            return SimpleNamespace(search_skills=_search, close=lambda: closed.append(True))
+            return SimpleNamespace(
+                search_skills=_search,
+                catalog_complete=lambda *_a, **_kw: True,
+                close=lambda: closed.append(True),
+            )
 
         monkeypatch.setattr(mcp_core, "SkillsLoader", _loader)
         out = _call_tool("skill_search", {"query": "x", "limit": 7})
         assert seen == [8]
         assert closed == [True]
         assert "Available skills (search, offset 0, 1 results)" in out
+
+    def test_an_unsigned_search_says_when_discovery_is_unfinished(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The unsigned path must not let an unfinished corpus read as complete.
+
+        The gateway path reports incompleteness from the route's own ``incomplete``
+        field; the unsigned path has no route to ask, so it asks the local loader
+        directly. Without that question a page of results looks like the whole
+        population and an empty one looks like "no such skill", which is the lie
+        the catalog's completeness flag exists to prevent. Pinned here rather than
+        only at the loader, because this is the consumer that renders the notice.
+        """
+        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        monkeypatch.setattr(
+            mcp_core, "_get", lambda *_a, **_kw: pytest.fail("no session: no gateway call")
+        )
+        monkeypatch.setattr(
+            mcp_core,
+            "SkillsLoader",
+            lambda **_kw: SimpleNamespace(
+                search_skills=lambda _q, limit, **kwargs: [
+                    {"name": "s", "key": "s", "description": "d", "path": "/p"}
+                ],
+                catalog_complete=lambda *_a, **_kw: False,
+                close=lambda: None,
+            ),
+        )
+        out = _call_tool("skill_search", {"query": "x"})
+        assert "Skill discovery is incomplete" in out
+
+    def test_an_unsigned_empty_result_is_not_reported_as_absence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Zero matches plus unfinished discovery is "unknown", never "none"."""
+        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        monkeypatch.setattr(
+            mcp_core, "_get", lambda *_a, **_kw: pytest.fail("no session: no gateway call")
+        )
+        monkeypatch.setattr(
+            mcp_core,
+            "SkillsLoader",
+            lambda **_kw: SimpleNamespace(
+                search_skills=lambda _q, limit, **kwargs: [],
+                catalog_complete=lambda *_a, **_kw: False,
+                close=lambda: None,
+            ),
+        )
+        out = _call_tool("skill_search", {"query": "zzz"})
+        assert "absence is not conclusive" in out
+        assert "No skills matched" not in out
 
     def test_loader_failure_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch):
         def _boom(**_kw: object) -> SimpleNamespace:
