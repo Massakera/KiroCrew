@@ -20,13 +20,26 @@ This prevents the catastrophic failure mode where a worktree branched from a
 local integration trunk (kiki-trunk) carries 100+ unshipped commits that get
 force-pushed to the remote feature branch, clobbering upstream work.
 
-Portable: stdlib only; shells out to git via argument lists.
+On a PASS it also records a RECEIPT naming this worktree and the commit it judged,
+so the publish floor can tell a gate that ran from one that was skipped -- a verdict
+printed and discarded leaves the two indistinguishable.  The receipt is written through
+``kiro_crew.security.push_receipt``, the ONE place that decides where a receipt
+lives and what it contains, so a reader and this writer cannot drift into two
+stores.  That import is the single non-stdlib dependency here and it is optional:
+when it fails the guard still reports its own verdict and warns that no receipt was
+recorded, which in an enrolled repository surfaces as a refused publish naming this
+gate rather than as a silent pass.
+
+Portable: stdlib only (plus the optional receipt import above); shells out to git
+via argument lists.
 
 Usage:  python3 push_guard.py [--base <branch>] [--max-ahead <N>]
 Exit:   0 SAFE | 40 REFUSED (stale base detected) | 2 environment error
 """
 
 import argparse
+import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -434,6 +447,163 @@ def _check_pre_squash(base, max_ahead):
     return 0
 
 
+#: Depth from this file to the package root that holds ``kiro_crew/`` --
+#: scripts/ -> prepare-pr/ -> kirocrew-dev/ -> builtin_skills/ -> kiro_crew/ -> root.
+_PACKAGE_ROOT_DEPTH = 5
+
+
+def _package_root():
+    """Directory holding the ``kiro_crew`` package this script ships inside."""
+    root = os.path.abspath(__file__)
+    for _ in range(_PACKAGE_ROOT_DEPTH + 1):
+        root = os.path.dirname(root)
+    return root
+
+
+def _receipt_module():
+    """Load the receipt writer that ships BESIDE this script, by file location.
+
+    The pairing is the point.  The agent runs this with a bare ``python3`` from inside
+    whatever repository it is working in, so ``kiro_crew`` may be absent from that
+    interpreter's path -- or, worse, present from a DIFFERENT checkout, in which case a
+    plain ``from kiro_crew.security import push_receipt`` resolves to a package that
+    does not carry this module (or carries an older one) and the receipt goes unwritten
+    for a reason that reads like a missing dependency.  An editable install registers a
+    meta-path finder that outranks ``sys.path``, so ordering the path alone does not fix
+    that; loading by location does.
+
+    The ``sys.path`` insert is still needed for the other half: the loaded module reaches
+    the data home through ``kiro_crew.config.paths``, the one resolver that decides where
+    a receipt lives, and that import needs SOME importable ``kiro_crew`` -- this tree's,
+    when the interpreter has none of its own.
+    """
+    root = _package_root()
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    location = os.path.join(root, "kiro_crew", "security", "push_receipt.py")
+    spec = importlib.util.spec_from_file_location("kirocrew_push_receipt", location)
+    if spec is None or spec.loader is None:
+        raise ImportError("no receipt writer beside this script: {}".format(location))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _worktree_root():
+    """Root of the worktree git resolves from here, or "" when there is none.
+
+    Every other check in this script runs git, which finds the repository from any
+    depth, so the guard passes when invoked from a subdirectory.  The receipt writer
+    needs the ROOT: handed a bare cwd it would look for a ``.git`` that a subdirectory
+    does not have and record nothing.
+    """
+    rc, toplevel, _ = run(["git", "rev-parse", "--show-toplevel"])
+    return toplevel if rc == 0 else ""
+
+
+def _clear_receipt():
+    """Drop any receipt this worktree already has; return a process exit code.
+
+    Returns non-zero only when the store is reachable and the receipt could not be
+    removed, because then a stale pass may still be sitting there and this run cannot
+    promise otherwise.  An unimportable receipt module is NOT that case: the store is
+    out of reach, so this script neither wrote nor can clear anything, and refusing
+    would turn an optional dependency into a required one.
+    """
+    root = _worktree_root()
+    if not root:
+        err("ERROR: not inside a git worktree.")
+        return 2
+    try:
+        module = _receipt_module()
+    except Exception as exc:  # noqa: BLE001 - optional dependency, see above
+        err(
+            "WARNING: push receipt store unreachable ({}: {}); no receipt was cleared "
+            "or will be recorded.".format(type(exc).__name__, exc)
+        )
+        return 0
+    try:
+        module.clear_receipt(root)
+    except Exception as exc:  # noqa: BLE001 - reported as a refusal, see above
+        err(
+            "ERROR: could not clear this worktree's previous push receipt ({}: {}). "
+            "Refusing, because a receipt from an earlier pass would otherwise keep "
+            "authorizing a publish this run has not judged.".format(type(exc).__name__, exc)
+        )
+        return 2
+    return 0
+
+
+def _revision_pair(base):
+    """The ``(HEAD, origin/<base>)`` commits this run is judging, or ``("", "")``.
+
+    Read from git rather than re-read later inside the receipt writer: the guard's
+    verdict is about ONE pair, and a receipt that names whatever the refs point at a
+    moment afterwards describes a state nothing checked.
+    """
+    rc_head, head, _ = run(["git", "rev-parse", "HEAD"])
+    rc_base, base_sha, _ = run(["git", "rev-parse", "refs/remotes/origin/" + base])
+    if rc_head != 0 or rc_base != 0 or not head or not base_sha:
+        return "", ""
+    return head, base_sha
+
+
+def _record_receipt(base, mode, head, base_sha):
+    """Record this PASS as a receipt for the current worktree's HEAD.
+
+    Called from exactly one place -- ``main()``, once the mode's own check has returned
+    0 -- so "a receipt exists" means "this guard passed", which is the whole property
+    the publish floor reads.  Writing it at each individual ``return 0`` inside the
+    checks would put the same claim behind five sites that can drift apart.
+
+    A failure here does NOT change the guard's verdict: this script answers whether the
+    base is fresh, and it either is or is not regardless of whether a receipt could be
+    stored.  It warns loudly instead, because in an enrolled repository the missing
+    receipt is what the publish floor will refuse on, and an operator reading that
+    refusal needs to know the write failed rather than that the gate was skipped.
+
+    The worktree is git's own ``--show-toplevel`` rather than the process cwd, resolved
+    by ``_worktree_root``.
+    """
+    root = _worktree_root()
+    if not root:
+        err(
+            "WARNING: push receipt not recorded (this directory is not inside a git "
+            "worktree). The verdict above still stands, but a repository enrolled in "
+            "the push-receipt check will refuse the publish until a receipt is stored."
+        )
+        return
+    try:
+        module = _receipt_module()
+        path = module.write_receipt(root, base=base, mode=mode, head=head, base_sha=base_sha)
+    except Exception as exc:  # noqa: BLE001 - a receipt is best-effort, see above
+        err(
+            "WARNING: push receipt not recorded ({}: {}). The verdict above still "
+            "stands, but a repository enrolled in the push-receipt check will refuse "
+            "the publish until a receipt is stored.".format(type(exc).__name__, exc)
+        )
+        return
+    print("receipt:         " + str(path))
+    # Read it back through the SAME function the publish floor calls.  Writing a receipt
+    # the reader cannot accept is silent otherwise: the publish is refused later with no
+    # trace of why the write did not help.  It catches a ref storage format the reader
+    # does not parse, a writer and reader resolving different data homes, and any drift
+    # between the two halves -- at gate time, where an operator is watching.
+    try:
+        verdict, detail = module.worktree_verdict(root)
+    except Exception as exc:  # noqa: BLE001 - a read-back is best-effort, see above
+        err(
+            "WARNING: the push receipt was written but could not be read back ({}: {}). "
+            "An enrolled repository may still refuse the publish.".format(type(exc).__name__, exc)
+        )
+        return
+    if verdict != "ok":
+        err(
+            "WARNING: the push receipt was written but the publish floor does not accept "
+            "it ({}: {}). An enrolled repository will refuse the publish.".format(verdict, detail)
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pre-push stale-base guard")
     parser.add_argument(
@@ -466,15 +636,40 @@ def main():
 
     base = _resolve_base(args.base)
 
+    # Invalidate first, judge second.  A receipt is evidence about the tree as it is
+    # NOW; leaving a previous pass in place while this run decides means a run that
+    # goes on to REFUSE still leaves the publish authorized by the verdict it just
+    # superseded.  Failing to clear is fatal rather than a warning, because the whole
+    # point is that no stale receipt survives this line.
+    clear_result = _clear_receipt()
+    if clear_result != 0:
+        return clear_result
+
     # Fetch origin/<base> — MUST succeed (fail closed) for both modes.
     fetch_result = _fetch_base(base)
     if fetch_result != 0:
         return fetch_result
 
+    # Capture the pair the check is about to judge, so the receipt can name exactly
+    # that and not whatever the refs point at once the check returns.
+    before = _revision_pair(base)
+
     if args.require_single_on_base:
-        return _check_single_on_base(base)
+        mode = "single-on-base"
+        result = _check_single_on_base(base)
     else:
-        return _check_pre_squash(base, args.max_ahead)
+        mode = "pre-squash"
+        result = _check_pre_squash(base, args.max_ahead)
+    if result == 0:
+        after = _revision_pair(base)
+        if not all(after) or after != before:
+            err(
+                "ERROR: HEAD or the base moved while this guard was checking, so its "
+                "verdict is about neither state. Nothing was recorded; re-run the guard."
+            )
+            return 2
+        _record_receipt(base, mode, after[0], after[1])
+    return result
 
 
 if __name__ == "__main__":

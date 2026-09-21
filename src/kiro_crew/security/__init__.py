@@ -609,6 +609,34 @@ def _emit_push_allow_event(command: str) -> None:
         )
 
 
+#: Label the push-receipt refusal reports. Deliberately not a catalog rule pattern:
+#: this gate has no ``BUILTIN_DENIED_RULES`` row and therefore no per-rule toggle,
+#: because its enable IS the operator's enrollment file -- a repository that has not
+#: opted in is not refused, so there is nothing for a toggle to switch off. Pinned
+#: equal to ``push_receipt.DENY_LABEL`` by ``test_push_receipt_gate.py`` rather than
+#: imported, which would put the module on this import path for a string.
+_PUSH_RECEIPT_DENY_LABEL = "prepare-pr push receipt"
+
+
+def _push_receipt_denial() -> str | None:
+    """Detail when an enrolled worktree carries no push receipt for its current HEAD.
+
+    A thin wrapper over ``security.push_receipt.denial_reason`` whose only job is the
+    LAZY import. The receipt module reads the data home through the config resolver, so
+    importing it at module scope would put a config import on the ``kiro_crew.security``
+    import path (a cycle risk on a module ~40 others import) and would charge every
+    caller for a check that only a publish ever reaches. An import failure is an
+    internal error, not an answer about a receipt, so it allows -- the same direction
+    the receipt check itself takes on everything it cannot judge.
+    """
+    try:
+        from kiro_crew.security import push_receipt
+    except Exception:
+        logger.warning("push receipt module unavailable; allowing the publish", exc_info=True)
+        return None
+    return push_receipt.denial_reason()
+
+
 # Longest path echoed back by ``sanitized_oauth_endpoint``. Real authorization
 # endpoint paths are short (the longest builtin is 31 chars); anything past this
 # bound is noise at best and smuggled payload at worst, so it is truncated with
@@ -1748,6 +1776,23 @@ def is_denied(
                 f"{note} (rule pattern: {gated_pattern})".strip(),
                 rule=tag,
                 component="git-publish-floor",
+            )
+        # Last question the publish floor asks, and only of a publish it would
+        # otherwise allow: does the work being published carry a prepare-pr push
+        # receipt? Asked HERE rather than at the allow exit below so it sits beside the
+        # other publish decisions and cannot be reached by a command that is not a
+        # publish. It answers ONLY for a worktree an operator enrolled; with nothing
+        # enrolled it returns None after one failed open, and a non-publish command
+        # never reaches this line at all -- which is what keeps a global floor's newest
+        # question free for every repository that did not ask for it.
+        receipt_detail = _push_receipt_denial()
+        if receipt_detail:
+            _emit_deny_event(tool_name, _PUSH_RECEIPT_DENY_LABEL, lower)
+            return _reason(
+                _PUSH_RECEIPT_DENY_LABEL,
+                receipt_detail,
+                rule="git-publish-push-receipt",
+                component="push-receipt-gate",
             )
         push_allow_pending = True
 

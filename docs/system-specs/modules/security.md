@@ -926,6 +926,88 @@ continue to apply.
   - **Git publish (verb-anchored regex):** `git push` is detected by `_is_git_publish()` (`_GIT_PUBLISH_RE` + `_GIT_PUBLISH_GLUE_RE`), **not** a substring glob. `push` must be the git *subcommand* (first non-flag token after `git`, allowing intervening `-x` / `-C path` / `-c k=v` options), so a commit message, branch name, grep pattern, or ssh remote payload that merely contains the word "push" is **not** blocked (e.g. `git commit -m '...push...'`, `git log --grep push`, `git switch -c fix/git-push`). Checked on the whole string first to catch command-substitution glue-evasion (`git$(echo ' ')push`, `git\`echo\`push`, `git_push`) and on segment-spanning chains (`git stash push && git push origin main`). Replaces the former broad `*git*push*` glob + ` stash push` exception, which over-blocked benign commands and surfaced as a silent `Tool use aborted` on the removed standalone provider.
   - **Protected-branch gate:** `_is_git_publish()` is a **pure, side-effect-free detector** — it only answers "is this a git push?". Whether the push is *allowed* (feature branch) or *denied* (protected/bare) is decided by `_git_publish_floor_tags()`, which returns the set of **rule-id tags** the command trips, at the single enforcement point in `is_denied` (via a deferred `push_allow_pending` flag), which is also where **both** SEL audits fire: `_emit_deny_event` on deny and `_schedule_push_allow_audit` (SEL `push_allowed`, operation `git_push`) on allow. `_is_push_to_protected_branch()` is retained only as a thin boolean view over the tag set for callers that need the yes/no answer. The `push_allowed` audit is deferred to the *final* allow exit, so a compound `<feature push> && <denied command>` chain that later trips a deny pass logs a **deny**, not an allow. The allow audit is handed the **raw** `tool_name`, not the lowercased matching view: nothing matched on an allow, so the fold buys the record nothing and costs it a case-sensitive branch name (`Feature-ABC` recorded as `feature-abc`) plus the pre-slice credential pass (see "Audit metadata goes through `redact_and_truncate`" above). Pinned by `test_push_branch_gate.py::TestGitPushEnforcement::test_allow_audit_records_the_raw_command_not_the_matching_view`.
     - **Opt-out, and the part of it that is NOT optional.** Each tag names a real git-publish catalog rule, and a tag fires only while its rule is in the enabled set — so an operator CAN disable protected-branch push blocking per rule (or wholesale with `disable_all`) through the keystone `denied_commands.json`. Three branches deliberately bypass that check and deny unconditionally, emitting the sentinel `_GIT_PUBLISH_UNGATED` instead of a rule id: an ambiguous refspec (`_AMBIGUOUS_REFSPEC_RE`), a brace-expansion refspec (`_AMBIGUOUS_EXPANSION_RE`), and the two "cannot parse" fallbacks (unparseable argv, or a push detected upstream with no clean segment). Those are anti-obfuscation, not policy: an operator opting out of a rule is choosing to allow a command shape they can *read*, which is not a licence to allow one nobody can. `git-publish-push-brace-expansion-refspec` is therefore the one git-publish rule that stays **locked** in the Settings panel (`_FLOOR_ENFORCED_RULE_IDS`), because its coverage is an ungated branch and a toggle for it would be a lie. A denial now reports the matched rule's own `pattern`, so it resolves to a `rule_id` in SEL rather than the opaque `git push` label.
+    - **Push receipt: a publish whose gate never ran is refused in an
+      ENROLLED worktree.** `push_guard.py` (the prepare-pr skill's pre-push stale-base
+      guard) prints a verdict, and a verdict alone persists nothing, so a publish whose
+      gate was skipped is byte-identical to one whose gate passed and nothing downstream
+      can tell them apart. On a PASS the guard writes a receipt
+      (`security/push_receipt.py`, `write_receipt`) naming the worktree's own git
+      directory, its `HEAD`, the base ref with the commit that ref carried, and the mode;
+      `is_denied` asks `_push_receipt_denial()` as the LAST publish question, of a publish
+      it would otherwise allow, and refuses when an enrolled worktree's current `HEAD`
+      carries no such receipt. Each property below is load-bearing, and each is what keeps
+      a defect in a GLOBAL floor from wedging every repository the agent touches:
+      - **Enrollment is the enable, and the refusal is gateway-wide.** The check
+        is reached only through the enrolled list in `push_receipts.json` under the data
+        home; with no such file a publish pays one failed `open`, and a command that is
+        not a publish pays nothing at all because the call sits inside this branch. There
+        is no catalog row and therefore no per-rule toggle -- a repository that did not
+        opt in is not refused, so a toggle would switch off nothing. Enrollment is
+        operator-owned by CONVENTION: an ordinary data-home file, deliberately not a new
+        keystone leaf. `is_denied` receives a command line and no working directory, so it
+        cannot tell which repository a push is for and asks its question of every enrolled
+        worktree: while ANY enrolled worktree is unreceipted -- the ordinary state between
+        guard runs, since a commit or a fetch invalidates -- EVERY publish from this
+        gateway is refused, including one in an unrelated repository. Over-refusal is the
+        chosen direction and `CROSS_REPO_NOTE` says so in the refusal text, because the
+        operator reading it is not necessarily standing in the worktree it names. Scoping
+        the question to the pushed repository needs the floor to learn the tool's working
+        directory, a change to the floor's own interface that belongs on its own.
+      - **The receipt binds a PAIR: this commit, against that base.** `worktree_verdict`
+        compares the recorded `HEAD` and re-reads the recorded base ref, refusing when
+        either has moved. `HEAD` alone would leave a pass valid after the base advanced,
+        which is exactly the window where the freshness verdict is wrong. Both revisions
+        are ARGUMENTS to `write_receipt`, captured by the guard around its own check and
+        re-read afterwards: if either moved while the check ran, the guard records nothing
+        and exits 2, because its verdict is then about neither state. And the guard CLEARS
+        any existing receipt before it runs its checks (`clear_receipt`), so a run that
+        goes on to refuse cannot leave the superseded pass behind. Failing to clear is
+        fatal to the guard rather than a warning, because the promise is that no stale
+        receipt survives that line.
+      - **The guard reads its own receipt back.** After writing, it calls the same
+        `worktree_verdict` the floor calls and warns when the answer is not OK. A receipt
+        the reader cannot accept -- a ref storage format the reader does not parse, a
+        writer and reader resolving different data homes, drift between the two halves --
+        is otherwise silent until a publish is refused with no trace of why the write did
+        not help.
+      - **Fail OPEN on an internal error, CLOSED only on a definite answer.** Absent,
+        stale (the receipt names another commit, so amending after the gate inherits
+        nothing), moved-base and untrusted (unknown version, wrong shape, a base ref that
+        is not a ref, or recorded against another git directory -- what a sibling
+        worktree's receipt copied into this name looks like) all refuse. An unresolvable
+        `HEAD`, a base ref that no longer resolves, an unreadable receipt, an unreadable
+        policy and an unimportable module all allow and log at WARNING: a stale
+        enrollment entry naming a worktree the operator has since deleted must not refuse
+        every publish on the host.
+      - **Identity is the git directory that holds `HEAD`, not the repository.** A linked
+        worktree has one of its own, so receipting one worktree leaves its sibling
+        refused -- correct, because the two sit on different commits. The guard resolves
+        that directory through git's own `--show-toplevel`, so a run from a subdirectory
+        receipts the worktree rather than failing to find a `.git`.
+      - **What a receipt does not prove.** The store and the enrollment file live in the
+        agent-writable data home, so a receipt is evidence against OMISSION -- a gate
+        skipped by accident, previously indistinguishable from one that passed -- and not
+        against an agent that sets out to forge one. Signing would not change that: the
+        SEL HMAC key is as readable as the file it would sign. Making a receipt
+        unforgeable needs it written by a process the agent cannot reach.
+      - **The override is explicit and audited.** A non-empty
+        `KIROCREW_PUSH_RECEIPT_OVERRIDE` allows the publish and emits one SEL
+        `push_receipt_override` event carrying its value, which is why the value is the
+        operator's REASON: it exists for the case where the receipt mechanism is itself
+        the broken part, and that case belongs in the audit trail.
+
+      Two limits stated rather than implied. The gate is not forgery-proof: the store is
+      a plain directory the agent's own shell can write, and signing would not change
+      that because the SEL HMAC key is itself agent-readable (keystone note in
+      `AGENTS.md`) -- what this closes is the SILENT skip, and the sanctioned bypass is
+      the audited override. And `is_denied` receives a command line with no working
+      directory (the gateway's cwd is not the tool's), so the check never guesses which
+      repository is being pushed: it requires a current receipt from EVERY enrolled
+      worktree, which in the ordinary single-enrollment case is exactly "the work being
+      published was gated", and otherwise over-refuses in the safe direction with a
+      refusal that names the worktree and the gate. A git `pre-push` hook is deliberately
+      not the mechanism: `core.hooksPath=/dev/null` stays. Pinned by
+      `test_push_receipt_gate.py`, whose mutation set covers each branch above.
     - `_PROTECTED_BRANCHES` covers `main`/`mainline` plus the legacy Git default-branch name (see `_PROTECTED_BRANCHES` in `security.py`), plus ambiguous runtime-resolved refs `_AMBIGUOUS_REFS` = {`head`, `@`, `fetch_head`}. A push to any of these (or a **bare** `git push` / `git push <remote>` with no explicit branch, since the current branch might be protected) is denied.
     - `_PUSH_ALL_BRANCHES_FLAGS` = {`--mirror`, `--all`} are denied **outright** (they push every local branch, so a per-branch target check cannot vouch for them), kept in lockstep with the `--(mirror|all)` regex in `config/defaults.json`.
     - `_is_push_to_protected_branch()` splits the command with `_split_segments()` and validates **every** `push` segment / refspec (closing the `push origin feat && push origin main` bypass), normalizing `refs/heads/…` paths and `local:remote` refspecs; refspecs with shell/revision syntax (`$`, `` ` ``, `@{…}` — `_AMBIGUOUS_REFSPEC_RE`) are treated as ambiguous and denied. If a push was detected upstream but **no** clean segment parses, it denies to be safe.
