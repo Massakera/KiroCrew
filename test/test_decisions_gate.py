@@ -583,6 +583,7 @@ class TestPointName:
             "message.steer",
             "model.route",
             "compaction.keep",
+            "task.split",
         )
 
     @pytest.mark.parametrize("unknown", ["skills.dedupe", "cron.novelty", "", "skills.Select"])

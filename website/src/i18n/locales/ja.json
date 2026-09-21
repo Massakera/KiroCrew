@@ -10259,7 +10259,16 @@
         "point_model_route": "モデル",
         "rate_right_model": "Jev は正しいモデルを選んだ",
         "rate_wrong_model": "Jev は誤ったモデルを選んだ",
-        "truncated_turns_label": "切り詰めた過去のやり取り"
+        "truncated_turns_label": "切り詰めた過去のやり取り",
+        "split_agreed_line": "Jev は {{shape}} を提案し、エージェントもそうした",
+        "split_agreed_line_spawned": "Jev は {{shape}} を提案し、エージェントもそうした（{{count}} 件起動）",
+        "split_differed_line": "Jev は {{suggested}} を提案したが、エージェントは代わりに {{actual}} を選んだ",
+        "split_rate_label": "この分割の助言を評価",
+        "split_rate_right": "Jev の提案は正しい",
+        "split_rate_wrong": "Jev の提案は誤り",
+        "split_shape_delegate": "サブエージェント 1 つ",
+        "split_shape_single": "単独で対応",
+        "split_shape_split": "並列のサブエージェント"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev がこの呼び出しを見て印を付けました。印を付けても、その呼び出しが許可されたかどうかは変わりません。それを決めるのはこのセッションの権限設定で、呼び出しは拒否されたこともあります。",

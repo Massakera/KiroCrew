@@ -4464,6 +4464,162 @@ async def _tool_risk_meta(
         return None
 
 
+def _is_owner_turn(
+    *,
+    user_origin: bool,
+    turn_actor: str,
+    self_wake: bool,
+    channel_origin: bool,
+) -> bool:
+    """Whether this turn is a message the dashboard's own owner typed.
+
+    Every argument is STRUCTURAL -- stamped by the dispatch that knows, never read
+    off the message text, which the user writes. ``user_origin`` is false for an
+    app-token send; ``turn_actor`` names any non-person dispatch (``app``,
+    ``cron``, ``subagent``, ``gateway``); ``self_wake`` is a nudge/monitor loop
+    waking the slot; ``channel_origin`` is a Slack or Discord relay. A turn is the
+    owner's only when all four say so, so a new dispatch that forgets to name
+    itself is the one case this reads wrong -- and it reads wrong towards asking on
+    a turn nobody typed, which is why ``task.split`` costs nothing but a hint.
+    """
+    return bool(user_origin) and not turn_actor and not self_wake and not channel_origin
+
+
+async def _task_split_suggestion(
+    state: DashboardState,
+    *,
+    session_key: str,
+    message: str,
+) -> dict | None:
+    """Jev's suggested shape for this request, or ``None`` to prepend nothing.
+
+    An ADVISORY. The caller's only use of the answer is
+    ``task_split.hint_line``'s string, prepended to the turn's context through the
+    same pure-prepend channel a regenerate hint travels, so nothing here spawns,
+    cancels or re-shapes anything: the agent reads the line and still decides.
+
+    ``None`` on every refusal -- the seam off, the session unsampled, a scrub, a
+    timeout, an answer outside the three shapes -- so an ordinary turn's prompt is
+    byte-identical to the one this build sends today.
+
+    The prior turns come from the session's own transcript tail, read off the loop
+    and only once the ceiling is above 0: at the shipped default the request goes
+    alone, so an enabled-but-unraised install pays no transcript read. The same
+    ``exclude_last_n=1`` every other reader here passes, because this turn's user
+    message is already flushed and sending it as history too would duplicate it.
+
+    Nothing raises: this sits before the turn's first token and an observation must
+    not cost the reply. The decisions package is imported INSIDE the function for
+    the reason every other caller does it.
+    """
+    try:
+        from kiro_crew.decisions.points import task_split
+
+        history: list[dict] = []
+        budget = await asyncio.to_thread(task_split.history_budget)
+        if budget > 0:
+            log = getattr(state, "conversation_log", None)
+            if log is not None:
+                from kiro_crew.decisions.points import (
+                    HISTORY_ROLES,
+                    MAX_HISTORY_MESSAGES,
+                )
+
+                history = await asyncio.to_thread(
+                    log.recent,
+                    session_key,
+                    max_messages=MAX_HISTORY_MESSAGES,
+                    roles=HISTORY_ROLES,
+                    exclude_last_n=1,
+                )
+        return await task_split.suggest(message, session_key=session_key, history=history)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pragma: no cover - an observation may not cost a turn
+        logger.debug("decisions: prepending no task.split hint", exc_info=True)
+        return None
+
+
+def _task_split_helpers(tool: str, result: object) -> int:
+    """How many sub-agents one spawn call actually STARTED, or 0. Never raises.
+
+    Read from the call's RESULT, which is the only place that says what RAN: the batch
+    tool starts one helper per entry, so a receipt says "3 spawned" for the one call
+    that started three, and a spawn the person DENIED started none while its call
+    frame looks identical to a successful one.
+
+    Reached only on a turn that already has a suggestion outstanding, so the import is
+    paid by a decided turn and by nothing else -- the reason every other caller here
+    imports the decisions package inside the function.
+    """
+    try:
+        from kiro_crew.decisions.points.task_split import helpers_started
+
+        return helpers_started(tool, result)
+    except Exception:  # pragma: no cover - an observation may not cost a turn
+        logger.debug("decisions: could not read a spawn result for task.split")
+        return 0
+
+
+def _task_split_spawn_tool(mcp_server_name: str, tool_name: str) -> str:
+    """Which sub-agent spawn tool a call is, or ``""``. Never raises.
+
+    The NAME rather than a boolean, because the two spawn tools mean different
+    shapes: ``spawn_sub_agents`` carries an ``agents`` list and is the parallel
+    path, so one such call is a split however many helpers it starts, while
+    ``spawn_run`` starts a single one. A count could not tell those apart.
+
+    Reached only on a turn that already has a suggestion outstanding, so the import
+    is paid by a decided turn and by nothing else -- the reason every other caller
+    here imports the decisions package inside the function.
+    """
+    try:
+        from kiro_crew.decisions.points.task_split import spawn_tool_named
+
+        return spawn_tool_named(mcp_server_name, tool_name)
+    except Exception:  # pragma: no cover - an observation may not cost a turn
+        logger.debug("decisions: could not read a tool identity for task.split")
+        return ""
+
+
+async def _task_split_record(
+    *,
+    session_key: str,
+    decided: dict | None,
+    spawn_tools: list[str],
+    spawn_helpers: int,
+) -> None:
+    """Write this turn's ``task.split`` outcome row, which publishes its receipt.
+
+    The BASELINE arm of this decision is what the agent actually did, so the row is
+    written here rather than where the question was asked: *spawn_tools* names the
+    ``spawn_run`` / ``spawn_sub_agents`` calls the turn made, which is only complete
+    once the turn stops making them.
+
+    The point publishes the row it wrote through ``decisions.outcomes``, so the
+    receipt reaches the reply the way every other point's does and this caller
+    holds nothing.
+
+    Nothing raises: this runs while a reply is being persisted, or inside the turn's
+    own ``finally``.
+    """
+    if not decided:
+        return
+    try:
+        from kiro_crew.decisions.points import task_split
+
+        await task_split.record_outcome(
+            session_key=session_key,
+            decided=decided,
+            spawn_tools=spawn_tools,
+            spawn_helpers=spawn_helpers,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pragma: no cover - an observation may not cost a reply
+        logger.debug("decisions: could not record the task.split outcome", exc_info=True)
+
+
 def _append_redaction_notice(slot: _ChatSlot, redacted: str) -> None:
     """Append the redaction notice for an already-persisted body.
 
@@ -8943,6 +9099,30 @@ async def _run_chat(
     # subtract them (see _answer_text_only) without re-parsing the prose.
     _compaction_notice_chunks: list[str] = []
     _turn_tool_calls = 0  # tool dispatches this turn (refusal diagnostic)
+    # Jev's `task.split` suggestion for this turn, and the arm it is scored
+    # against. The suggestion is advice prepended to the context below; the tool
+    # NAMES are the agent's own answer to the same question, taken from the trusted
+    # identity of each tool call, and the two meet on the row the final reply
+    # carries. All three stay empty for every turn the seam is off or unsampled for.
+    #
+    # `_split_recorded` makes the outcome row a once-per-turn write with TWO
+    # callers: the final reply's flush, which also stamps the receipt, and the
+    # turn's `finally`, which catches a turn that produced no assistant text at all
+    # -- a pure tool turn, an interrupt before the first token. Without the second
+    # caller exactly the turns most likely to spawn would lose the measurement the
+    # point exists for, and the log would over-represent turns that ended in prose.
+    _split_decision: dict | None = None
+    # Spawn calls awaiting their result, `tool_call_id -> tool name`. The arm is read
+    # at the RESULT rather than at the call, because only the result says what RAN: a
+    # batch call starts one helper per entry, and a spawn the person denied started
+    # none while its call frame is indistinguishable from a successful one.
+    _split_pending_spawns: dict[str, str] = {}
+    # The spawn tools of calls that actually STARTED something, and the sub-agents
+    # they started. A call that started nothing is in neither, so it moves neither the
+    # shape nor the printed count.
+    _split_spawn_tools: list[str] = []
+    _split_spawn_helpers = 0
+    _split_recorded = False
     # Snapshot of slot._stop_generation at turn start. `_stop_state` snaps back
     # to "idle" once a Stop resolves, so a Stop pressed AND resolved during the
     # turn is invisible to a point-in-time state check at completion. This
@@ -10472,6 +10652,48 @@ async def _run_chat(
         if regenerate_hint:
             full_message = f"[System: {regenerate_hint}]\n\n{full_message}"
 
+        # Jev (task.split): one advisory line about whether this request wants one
+        # worker, one sub-agent, or several in parallel. A pure PREPEND on the same
+        # channel the regenerate hint above uses, so it is scrubbed by the
+        # structural-marker pass below like every other dashboard-authored prefix,
+        # and the agent still chooses -- nothing here spawns or forbids anything.
+        # Asked only for a message the OWNER typed into this dashboard and only for
+        # a real turn: a slash command is dispatched to the harness rather than
+        # answered, so there is no work to shape.
+        #
+        # The text sent is `user_typed_message`, the snapshot taken above the
+        # expansion gate, and never `message`: an `@name` expansion REPLACES
+        # `message` with a local prompt file's contents in place at this depth, a
+        # `$skill` token appends a skill body to it, and the prepends between there
+        # and here add a cancelled-turn preamble, sub-agent failure text and drained
+        # app context. Sending `message` would forward local file contents to the
+        # provider on a turn whose person typed one word.
+        #
+        # `_prompt_depth == 0` is an EGRESS guard beside it, not a tidiness one: an
+        # expansion re-enters this function at depth 1 carrying the same
+        # `_directive_user_origin`, and at that depth the typed snapshot IS the
+        # expanded body, so the nested turn would ask about a file either way. Same
+        # guard shape the recovery paths and the model route already use.
+        if (
+            not is_slash
+            and _prompt_depth == 0
+            and _is_owner_turn(
+                user_origin=_directive_user_origin,
+                turn_actor=_turn_actor,
+                self_wake=_directive_self_wake,
+                channel_origin=_directive_channel_origin,
+            )
+        ):
+            _split_decision = await _task_split_suggestion(
+                state, session_key=session_key, message=user_typed_message
+            )
+            if _split_decision:
+                from kiro_crew.decisions.points.task_split import hint_line
+
+                _split_hint = hint_line(_split_decision)
+                if _split_hint:
+                    full_message = f"[System: {_split_hint}]\n\n{full_message}"
+
         # Enforce every structural boundary once more at provider egress.
         # ContextBuilder owns its trusted tail; everything added here is a pure
         # PREPEND. Scrub that complete dashboard-only prefix in one off-loop
@@ -11204,6 +11426,21 @@ async def _run_chat(
                 _turn_thought = True
             elif event.kind == EVENT_TOOL_CALL:
                 _turn_tool_calls += 1
+                # The agent's own answer to `task.split`, recorded only while a
+                # suggestion is outstanding. The tool NAME, read from the trusted
+                # `_meta.kiro` identity and never a title: this is the arm the
+                # suggestion is scored against, so a shell command or a third-party
+                # server exposing a same-named tool must not be able to move it.
+                #
+                # Only REMEMBERED here. What the call started is in its result, so the
+                # credit happens there: a batch call starts one helper per entry, and
+                # a denied call started none.
+                if _split_decision is not None and event.tool_call_id:
+                    _split_tool = _task_split_spawn_tool(
+                        event.mcp_server_name or "", event.tool_name or ""
+                    )
+                    if _split_tool:
+                        _split_pending_spawns[event.tool_call_id] = _split_tool
                 # Flush pre-tool text silently (no broadcast) so it persists,
                 # but keep the streaming message in place for correct tool ordering.
                 _flush_text_stream()
@@ -11611,6 +11848,20 @@ async def _run_chat(
                 # stream actually reported. `stop_reason` on this event describes
                 # the turn, not the tool, so it is not used here.
                 _tool_terminal = event.tool_final or (event.tool_status in TERMINAL_TOOL_STATUSES)
+                # `task.split`'s agent arm, credited from the RESULT of a spawn this
+                # turn made while a suggestion was outstanding. Popped on the first
+                # terminal frame so one call is counted once, and a call that started
+                # NOTHING -- denied, or failed -- is dropped rather than credited:
+                # this arm records what the turn did, not what it asked for. Read from
+                # the RAW `tool_output`, not the redacted display copy: the count must
+                # not be able to move because a redactor's coverage changed.
+                if _tool_terminal and _split_pending_spawns and event.tool_call_id:
+                    _split_done_tool = _split_pending_spawns.pop(event.tool_call_id, "")
+                    if _split_done_tool:
+                        _split_started = _task_split_helpers(_split_done_tool, event.tool_output)
+                        if _split_started > 0:
+                            _split_spawn_tools.append(_split_done_tool)
+                            _split_spawn_helpers += _split_started
                 if _tool_terminal:
                     # The backend's own word, unmapped, with the refusal this
                     # process decided taking precedence -- a refused call never
@@ -14733,6 +14984,24 @@ async def _run_chat(
                         _extract_and_redact_plan_metadata(assistant_text)
                     )
             _flush_text_stream()
+            # The turn's LAST assistant row, which is where the `task.split`
+            # receipt belongs: the record compares the suggestion with the shape
+            # the agent actually took, and that shape is only settled once the
+            # turn has stopped calling tools. Recorded BEFORE the flush, because
+            # the point publishes its row and the flush's own `_decisions_strip_meta`
+            # is what claims it onto the row it appends. The turn is claimed before
+            # the write and whether or not a row comes back, so the `finally`
+            # fallback cannot write a second one for this turn: the append runs in a
+            # worker thread a cancellation cannot stop, so a Stop delivered during it
+            # leaves the row on disk AND lets the `CancelledError` reach the
+            # `finally`, where an unclaimed turn is a second row for one turn.
+            _split_recorded = _split_decision is not None
+            await _task_split_record(
+                session_key=session_key,
+                decided=_split_decision,
+                spawn_tools=_split_spawn_tools,
+                spawn_helpers=_split_spawn_helpers,
+            )
             _flush_segment(state, slot, assistant_text, broadcast=False)
             if _stop_reason == STOP_REASON_REFUSAL:
                 # The Kiro service's content filter STREAMS its canned
@@ -17229,6 +17498,22 @@ async def _run_chat(
         if not (isinstance(exc, MemoryStartupUnavailable) and not _memory_preparation_admitted):
             await state.sessions.record_failure(session_key)
     finally:
+        # A `task.split` suggestion whose outcome row no reply claimed. A turn that
+        # produced no assistant text -- a pure tool turn, an interrupt before the
+        # first token -- has no row for the receipt to ride, but the MEASUREMENT is
+        # the point of the seam and those are exactly the turns most likely to have
+        # spawned. So the row is written here, which keeps the log honest about both
+        # arms without inventing a reply to draw on; the receipt it publishes is
+        # dropped by the next turn's `_discard_stale_decision` rather than shown on
+        # a reply it does not describe.
+        if _split_decision is not None and not _split_recorded:
+            _split_recorded = True
+            await _task_split_record(
+                session_key=session_key,
+                decided=_split_decision,
+                spawn_tools=_split_spawn_tools,
+                spawn_helpers=_split_spawn_helpers,
+            )
         # The turn's crew log closers, in the one order a reader can trust: every
         # `message/sent` for this turn has now been flushed, so the tool closer,
         # the last step's completion and the turn's own completion land after the

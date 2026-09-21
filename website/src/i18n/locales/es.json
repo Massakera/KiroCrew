@@ -10545,7 +10545,16 @@
         "point_model_route": "modelo",
         "rate_right_model": "Jev eligió el modelo correcto",
         "rate_wrong_model": "Jev eligió el modelo equivocado",
-        "truncated_turns_label": "Turnos anteriores recortados"
+        "truncated_turns_label": "Turnos anteriores recortados",
+        "split_agreed_line": "Jev sugirió {{shape}}, y el agente estuvo de acuerdo",
+        "split_agreed_line_spawned": "Jev sugirió {{shape}}, y el agente estuvo de acuerdo ({{count}} lanzados)",
+        "split_differed_line": "Jev sugirió {{suggested}}; el agente usó {{actual}} en su lugar",
+        "split_rate_label": "Valora este consejo de reparto",
+        "split_rate_right": "Jev sugirió la forma correcta",
+        "split_rate_wrong": "Jev sugirió la forma incorrecta",
+        "split_shape_delegate": "un subagente",
+        "split_shape_single": "un solo trabajador",
+        "split_shape_split": "subagentes en paralelo"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev miró esta llamada y la marcó. Eso no cambió nada sobre si la llamada estaba permitida: eso lo decidió el ajuste de permisos de esta sesión, y la llamada pudo haber sido rechazada igualmente.",

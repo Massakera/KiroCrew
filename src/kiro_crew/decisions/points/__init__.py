@@ -1,12 +1,15 @@
 """Business adapters for the Jev decision seam.
 
-Three adapters. ``skills.select`` picks the skill a message loads: an exact
-offered key selects one, an explicit no-skill answer selects none, and a refusal
-keeps trigger matching. ``message.steer`` decides whether a message sent into a
-RUNNING turn steers it or queues for the next one, and a refusal takes the steer
-path the composer has always defaulted to. ``model.route`` answers how hard a
-chat turn is and maps that tier to a model id, and a refusal keeps the model the
-session was already on. Each adapter's refusal is the shipped behaviour, never a
+``skills.select`` picks the skill a message loads: an exact offered key selects
+one, an explicit no-skill answer selects none, and a refusal keeps trigger
+matching. ``message.steer`` decides whether a message sent into a RUNNING turn
+steers it or queues for the next one, and a refusal takes the steer path the
+composer has always defaulted to. ``tool.risk`` annotates one tool call and
+decides nothing. ``model.route`` answers how hard a chat turn is and maps that
+tier to a model id, and a refusal keeps the model the session was already on.
+``task.split`` SUGGESTS whether a request should be done inline, delegated to one
+sub-agent or split across several, as one prepended line the agent is free to
+ignore. Each adapter's refusal is the shipped behaviour, never a
 third outcome.
 
 The core package owns transport, sampling and diagnostic logging.

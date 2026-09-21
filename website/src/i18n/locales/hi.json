@@ -10402,7 +10402,16 @@
         "point_model_route": "मॉडल",
         "rate_right_model": "Jev ने सही मॉडल चुना",
         "rate_wrong_model": "Jev ने गलत मॉडल चुना",
-        "truncated_turns_label": "काटे गए पिछले संदेश"
+        "truncated_turns_label": "काटे गए पिछले संदेश",
+        "split_agreed_line": "Jev ने {{shape}} सुझाया, और एजेंट ने वही किया",
+        "split_agreed_line_spawned": "Jev ने {{shape}} सुझाया, और एजेंट ने वही किया ({{count}} शुरू किए)",
+        "split_differed_line": "Jev ने {{suggested}} सुझाया; एजेंट ने बजाय {{actual}} लिया",
+        "split_rate_label": "इस बँटवारे की सलाह को आँको",
+        "split_rate_right": "Jev का सुझाव सही था",
+        "split_rate_wrong": "Jev का सुझाव गलत था",
+        "split_shape_delegate": "एक सब-एजेंट",
+        "split_shape_single": "एक ही कर्ता",
+        "split_shape_split": "समांतर सब-एजेंट"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev ने इस कॉल को देखा और इसे चिह्नित किया। इससे यह नहीं बदला कि कॉल की अनुमति थी या नहीं: वह इस सेशन की अपनी अनुमति सेटिंग ने तय किया, और कॉल फिर भी मना की जा सकती थी।",

@@ -66,6 +66,7 @@ DECISION_POINT_NAMES = (
     "message.steer",
     "model.route",
     "compaction.keep",
+    "task.split",
 )
 
 #: Points whose request carries TOOL-CALL ARGUMENTS, and which therefore need the

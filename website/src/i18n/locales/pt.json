@@ -10545,7 +10545,16 @@
         "point_model_route": "modelo",
         "rate_right_model": "Jev escolheu o modelo certo",
         "rate_wrong_model": "Jev escolheu o modelo errado",
-        "truncated_turns_label": "Turnos anteriores cortados"
+        "truncated_turns_label": "Turnos anteriores cortados",
+        "split_agreed_line": "O Jev sugeriu {{shape}}, e o agente concordou",
+        "split_agreed_line_spawned": "O Jev sugeriu {{shape}}, e o agente concordou ({{count}} iniciados)",
+        "split_differed_line": "O Jev sugeriu {{suggested}}; o agente usou {{actual}} em vez disso",
+        "split_rate_label": "Avalie este conselho de divisão",
+        "split_rate_right": "O Jev sugeriu a forma certa",
+        "split_rate_wrong": "O Jev sugeriu a forma errada",
+        "split_shape_delegate": "um subagente",
+        "split_shape_single": "um só executor",
+        "split_shape_split": "subagentes em paralelo"
       },
       "toolRiskBadge": {
         "annotation_title": "O Jev olhou esta chamada e sinalizou-a. Isso não mudou nada sobre a chamada ter sido permitida: isso foi decidido pela configuração de permissões desta sessão, e a chamada pode ter sido recusada mesmo assim.",

@@ -48,7 +48,13 @@
  */
 import type { DecisionFeedbackSide, DecisionVerdictValue } from '../../api/client'
 import type { ChatMessage } from '../../types'
-import { DECISIONS_COMPACTION_POINT, DECISIONS_LIVE_POINT, DECISIONS_MODEL_POINT, DECISIONS_STEER_POINT } from '../settings/decisionsPreview'
+import {
+  DECISIONS_COMPACTION_POINT,
+  DECISIONS_LIVE_POINT,
+  DECISIONS_MODEL_POINT,
+  DECISIONS_SPLIT_POINT,
+  DECISIONS_STEER_POINT,
+} from '../settings/decisionsPreview'
 
 /** Most records one reply may carry, mirroring the gateway's own per-session cap.
  *
@@ -147,11 +153,16 @@ export interface DecisionModelRecord {
 }
 
 /** Either decision, as the strip receives it. */
-export type DecisionRecord = DecisionStripRecord | DecisionModelRecord
+export type DecisionRecord = DecisionStripRecord | DecisionModelRecord | SplitDecisionRecord
 
 /** Whether *record* is a model-routing decision rather than a skill selection. */
 export function isModelRecord(record: DecisionRecord): record is DecisionModelRecord {
   return record.point === DECISIONS_MODEL_POINT
+}
+
+/** Whether a record is a task-shape suggestion, which draws its own one-line form. */
+export function isSplitRecord(record: DecisionRecord): record is SplitDecisionRecord {
+  return record.point === DECISIONS_SPLIT_POINT
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -480,6 +491,82 @@ export function readModelRecord(raw: unknown): DecisionModelRecord | null {
 }
 
 /**
+ * One task-shape suggestion, as the line on the assistant row prints it.
+ *
+ * `agree` is not read from the wire: see `readSplitRecord`. The two choices are
+ * the whole claim the line makes, so the flag that decides whether it reads as a
+ * match is derived from them.
+ */
+export interface SplitDecisionRecord {
+  /** Identifies the decision this line is about; the feedback POST's subject. */
+  turnId: string
+  /** Always `task.split`. */
+  point: typeof DECISIONS_SPLIT_POINT
+  /** The shape Jev suggested. */
+  jevChoice: SplitChoice
+  /** The shape the agent actually took, counted from its own spawn calls. */
+  agentChoice: SplitChoice
+  /**
+   * Sub-agents the turn started, which is what the line prints. NOT the number of
+   * spawn calls: one batch call fans out, so "1 spawned" over three working
+   * sub-agents would misreport the turn.
+   */
+  spawnHelpers: number
+  /** The two choices name the same shape. */
+  agree: boolean
+  /** Jev's own confidence, or `null` when the answer carried none. */
+  p: number | null
+  /**
+   * How long the suggestion took, in whole milliseconds. There is no `error` field,
+   * and that is the producer's contract rather than an omission here: a decision
+   * that FAILED prepends no hint and stamps no record.
+   */
+  latencyMs: number
+}
+
+/** The three shapes a `task.split` record may name, in increasing fan-out. */
+export const SPLIT_CHOICES = ['single', 'delegate', 'split'] as const
+
+export type SplitChoice = typeof SPLIT_CHOICES[number]
+
+/**
+ * Validate one raw task-shape record. `null` means "draw nothing".
+ *
+ * BOTH choices are required and each is held against the three shapes, for the
+ * reason the two name lists are in `readDecisionStrip`: the line's whole claim is
+ * who wanted what, and it cannot make that claim about a value it could not read.
+ * A fourth word would name a shape no code path produces.
+ *
+ * `agree` is recomputed from the two choices instead of being read from the wire.
+ * The line prints a match or a difference, so a flag that disagreed with the
+ * words beside it would hide a real divergence behind one of them.
+ */
+export function readSplitRecord(raw: unknown): SplitDecisionRecord | null {
+  const root = asRecord(raw)
+  if (!root) return null
+  if (typeof root.point === 'string' && root.point && root.point !== DECISIONS_SPLIT_POINT) return null
+  const turnId = typeof root.turn_id === 'string' ? root.turn_id : ''
+  if (!turnId) return null
+  const jevChoice = SPLIT_CHOICES.find(name => name === root.jev_choice)
+  const agentChoice = SPLIT_CHOICES.find(name => name === root.agent_choice)
+  if (!jevChoice || !agentChoice) return null
+  const rawP = root.p
+  const p = typeof rawP === 'number' && Number.isFinite(rawP) && rawP >= 0 && rawP <= 1 ? rawP : null
+  return {
+    turnId,
+    point: DECISIONS_SPLIT_POINT,
+    jevChoice,
+    agentChoice,
+    // `spawn_helpers` and never `spawn_calls`: the line is about what RAN, and one
+    // batch call can start several.
+    spawnHelpers: asCount(root.spawn_helpers),
+    agree: jevChoice === agentChoice,
+    p,
+    latencyMs: asCount(root.latency_ms),
+  }
+}
+
+/**
  * Validate one raw record of an assistant row's point. `null` means "draw nothing".
  *
  * Dispatched on the payload's own `point`. An absent point reads as
@@ -495,6 +582,7 @@ export function readDecisionRecord(raw: unknown): DecisionRecord | null {
   if (!root) return null
   const point = typeof root.point === 'string' && root.point ? root.point : DECISIONS_LIVE_POINT
   if (point === DECISIONS_MODEL_POINT) return readModelRecord(root)
+  if (point === DECISIONS_SPLIT_POINT) return readSplitRecord(root)
   if (point !== DECISIONS_LIVE_POINT) return null
   return readDecisionStrip(root)
 }

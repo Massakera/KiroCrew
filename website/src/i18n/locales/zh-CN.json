@@ -10259,7 +10259,16 @@
         "point_model_route": "模型",
         "rate_right_model": "Jev 选对了模型",
         "rate_wrong_model": "Jev 选错了模型",
-        "truncated_turns_label": "被截断的历史轮次"
+        "truncated_turns_label": "被截断的历史轮次",
+        "split_agreed_line": "Jev 建议{{shape}}，智能体也这样做了",
+        "split_agreed_line_spawned": "Jev 建议{{shape}}，智能体也这样做了（启动 {{count}} 个）",
+        "split_differed_line": "Jev 建议{{suggested}}；智能体改用{{actual}}",
+        "split_rate_label": "评价这条拆分建议",
+        "split_rate_right": "Jev 建议的形式正确",
+        "split_rate_wrong": "Jev 建议的形式错误",
+        "split_shape_delegate": "交给一个子智能体",
+        "split_shape_single": "自己完成",
+        "split_shape_split": "并行拆给多个子智能体"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev 看过这次调用并做了标记。标记不会影响这次调用是否被允许：那由本会话自己的权限设置决定，而且这次调用仍可能已被拒绝。",

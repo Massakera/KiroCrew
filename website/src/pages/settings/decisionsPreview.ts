@@ -51,12 +51,22 @@ export const DECISIONS_MODEL_POINT = 'model.route'
  * card's record dispatches on it and the Decisions card names it, so a second spelling
  * in either place would be a record nobody renders.
  *
- * The one SHADOW point in the list. The four above are asked so their answer can be
+ * The one SHADOW point in the list. The others are asked so their answer can be
  * used; this one is asked so the answer can be measured, and the compaction runs
  * identically whatever it says -- which is why it needs no arming choice anywhere, only
  * its own consent scope.
  */
 export const DECISIONS_COMPACTION_POINT = 'compaction.keep'
+
+/**
+ * The point that SUGGESTS how a request should be shaped -- one worker, one
+ * sub-agent, or several in parallel (`decisions/points/task_split.py`).
+ *
+ * An advisory: the suggestion is prepended to the turn's context as one line and
+ * the agent still decides, so the receipt on the reply compares the suggestion
+ * with what the agent actually spawned.
+ */
+export const DECISIONS_SPLIT_POINT = 'task.split'
 
 /** Config path of the sampling share; the only decisions value the config PATCH accepts. */
 export const DECISIONS_BUCKET_PATH = 'decisions.bucket'

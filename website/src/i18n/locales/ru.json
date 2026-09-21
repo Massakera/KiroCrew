@@ -10688,7 +10688,16 @@
         "point_model_route": "модель",
         "rate_right_model": "Jev выбрал верную модель",
         "rate_wrong_model": "Jev выбрал неверную модель",
-        "truncated_turns_label": "Обрезанные предыдущие сообщения"
+        "truncated_turns_label": "Обрезанные предыдущие сообщения",
+        "split_agreed_line": "Jev предложил {{shape}}, и агент так и сделал",
+        "split_agreed_line_spawned": "Jev предложил {{shape}}, и агент так и сделал (запущено {{count}})",
+        "split_differed_line": "Jev предложил {{suggested}}; агент выбрал вместо этого {{actual}}",
+        "split_rate_label": "Оцените этот совет о разделении",
+        "split_rate_right": "Jev предложил верную форму",
+        "split_rate_wrong": "Jev предложил неверную форму",
+        "split_shape_delegate": "один подагент",
+        "split_shape_single": "один исполнитель",
+        "split_shape_split": "подагенты параллельно"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev посмотрел на этот вызов и отметил его. Это никак не повлияло на то, был ли вызов разрешён: это решила настройка разрешений самой сессии, и вызов всё равно мог быть отклонён.",

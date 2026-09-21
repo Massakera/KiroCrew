@@ -189,22 +189,20 @@ export const CHUNK_BUDGETS = {
   // the merge result to 3,445,107 B (3364.4 KB). Preserve the documented margin
   // at that current measurement; a library-class regression still exceeds this
   // ceiling by hundreds of kilobytes.
-  // Re-measured 2026-09-21 against main @ 20261b7633, whose tip alone -- no PR
-  // code in the tree -- builds this chunk at 3,619,504 B and so exceeds the
-  // 3533 KB (3,617,792 B) ceiling by 1,712 B on its own. The margin the lines
-  // above describe is therefore already spent: the gate fails on the merge ref
-  // of every open PR, which is exactly the recurrence the `all` and `t` entries
-  // document, and attribution here was measured rather than assumed (pristine
-  // main built in its own worktree, then this branch on top of it).
-  // The compaction shadow-scoring surface (the keep line, its record reader and
-  // one settings switch) adds 2,761 B of first-party code on top of that, for a
-  // merge result of 3,622,265 B. The ceiling moves to cover both parts --
-  // main's 1,712 B of drift and this surface's 2,761 B -- rounded up to this
-  // table's whole-KB unit: 3538 KB, which leaves 647 B of headroom. It is NOT
-  // restored to the ~5% margin the lines above prescribe, because that is a
-  // re-measure of main's growth rather than a cost this surface incurs; at 647 B
-  // the next app-core addition trips this entry again.
-  App: 3538 * KB, // measured 3,622,265 B on this branch merged onto 20261b7633
+  // Re-measured 2026-09-21. Main's own tip -- no PR code in the tree -- already
+  // exceeds the 3533 KB (3,617,792 B) ceiling this entry shipped with, so the
+  // margin the lines above describe is spent and the gate fails on the merge ref
+  // of every open PR: the recurrence the `all` and `t` entries document.
+  // Attribution here is measured rather than assumed (pristine main built in its
+  // own worktree, then this branch on top of it). The compaction shadow-scoring
+  // surface carries 2,761 B of that, and the task-shape line with its record
+  // reader adds 2,430 B more, for a merge result of 3,624,695 B.
+  // The ceiling restores the ~5% margin the lines above prescribe at that
+  // measurement -- a whole-KB 3711 KB, 175,369 B of headroom -- rather than
+  // tracking each surface by a few hundred bytes, because an entry left with
+  // sub-KB slack is an entry the next app-core addition trips again while a
+  // library-class regression still exceeds this number by hundreds of KB.
+  App: 3711 * KB, // measured 3,624,695 B on this branch merged onto main
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)
   // -- one deliberate `codeSplitting` group, see vite.config.ts.

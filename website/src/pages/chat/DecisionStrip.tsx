@@ -8,11 +8,13 @@ import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import { DECISIONS_LIVE_POINT } from '../settings/decisionsPreview'
 import {
   isModelRecord,
+  isSplitRecord,
   type DecisionModelRecord,
   type DecisionRecord,
   type DecisionStripRecord,
 } from './decisionRecord'
 import VerdictThumbs from './DecisionVerdictThumbs'
+import SplitDecisionLine from './SplitDecisionLine'
 import { useRowDisclosure } from './rowDisclosure'
 
 /** Two decimals, so `0.81` reads as a score and not as a rounded `0.8`. */
@@ -238,6 +240,10 @@ const DecisionStrip = memo(function DecisionStrip({
   useLanguageGeneration()
   if (isModelRecord(record)) {
     return <ModelRouteStrip record={record} disclosureKey={disclosureKey} />
+  }
+  // No expanded body, so no `disclosureKey`: two words and a count, nothing to reveal.
+  if (isSplitRecord(record)) {
+    return <SplitDecisionLine record={record} />
   }
   return <SkillSelectStrip record={record} disclosureKey={disclosureKey} />
 })

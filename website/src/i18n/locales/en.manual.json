@@ -4312,7 +4312,16 @@
         "point_model_route": "model",
         "rate_right_model": "Jev picked the right model",
         "rate_wrong_model": "Jev picked the wrong model",
-        "truncated_turns_label": "Earlier turns cut short"
+        "truncated_turns_label": "Earlier turns cut short",
+        "split_agreed_line": "Jev suggested {{shape}}, and the agent agreed",
+        "split_agreed_line_spawned": "Jev suggested {{shape}}, and the agent agreed ({{count}} spawned)",
+        "split_differed_line": "Jev suggested {{suggested}}; the agent used {{actual}} instead",
+        "split_rate_label": "Rate this split advice",
+        "split_rate_right": "Jev suggested the right shape",
+        "split_rate_wrong": "Jev suggested the wrong shape",
+        "split_shape_delegate": "one sub-agent",
+        "split_shape_single": "one worker",
+        "split_shape_split": "parallel sub-agents"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev looked at this call and flagged it. That changed nothing about whether the call was allowed: this session's own permission setting decided that, and the call may still have been refused.",

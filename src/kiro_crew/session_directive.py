@@ -535,6 +535,62 @@ def _server_underscore_qualified(name: str) -> str:
     return candidate if candidate in DIRECTIVE_TOOLS else ""
 
 
+def core_tool_named(
+    mcp_server_name: str, tool_name: str, names: "frozenset[str] | set[str]"
+) -> str:
+    """The member of *names* a recorded tool CALL refers to, or ``""``.
+
+    THE identity predicate for "is this call one of OUR tools", generalised over
+    the tool set so a second consumer does not inline the two checks. A name is
+    honoured ONLY when the call's trusted ``_meta.kiro`` identity says it was
+    served by Kiro Crew's OWN core MCP server (:data:`CORE_MCP_SERVER`) AND its
+    CANONICAL tool name resolves into *names* under :func:`normalized_tool_name`.
+
+    Both arguments MUST come from the out-of-band ``_meta.kiro`` channel
+    (``mcpServerName`` / ``toolName``) — never the LLM-authored title. A shell tool
+    has no MCP server name and a canonical tool name like ``execute_bash``, so it
+    resolves to ``""``; so does a third-party MCP server that merely exposes a
+    same-named tool. Absent identity (empty server name) fails closed.
+
+    :func:`directive_tool_for` is this function bound to :data:`DIRECTIVE_TOOLS`,
+    and it stays a separate name because it is the one the forgery gate is
+    documented by. A caller with a DIFFERENT set (the decision seam's sub-agent
+    spawns) passes its own rather than re-deriving the server check.
+    """
+    if mcp_server_name != CORE_MCP_SERVER:
+        return ""
+    return normalized_tool_name(tool_name or "", names)
+
+
+def normalized_tool_name(raw: str, names: "frozenset[str] | set[str]") -> str:
+    """The member of *names* a recorded CANONICAL tool name refers to, or ``""``.
+
+    ``raw`` MUST be the trusted ``_meta.kiro.toolName`` (NOT the LLM-authored
+    title). For an MCP tool that name is the bare tool name (``"monitor_start"``);
+    some transports server-qualify it, and the separator is NOT one fixed
+    spelling: kiro-cli reports ``"<server>___<name>"`` while the canonical MCP
+    prefix form is ``"mcp__<server>__<name>"``. Split on the LAST run of two or
+    more underscores so BOTH qualified forms resolve — the same normalization
+    ``channel._blocked_tool_named`` already applies for the same reason, which
+    this deliberately mirrors rather than re-inventing.
+
+    Still nothing wider than that: the separator must be a run of >= 2
+    underscores, so a crafted path/namespace tail (``"a/b/monitor_start"``,
+    ``"do_monitor_start"``) cannot smuggle a name in. The tool half never
+    authenticates the SERVER either way — :func:`core_tool_named` checks
+    ``mcp_server_name`` independently, and that is the check a third-party server
+    fails.
+    """
+    if not raw:
+        return ""
+    if raw in names:
+        return raw
+    parts = _MCP_SEPARATOR_RE.split(raw)
+    if len(parts) > 1 and parts[-1] in names:
+        return parts[-1]
+    return ""
+
+
 def match_tool(raw: str) -> str:
     """Return the directive-tool name a recorded CANONICAL tool name refers to,
     or ``""``.
@@ -554,15 +610,12 @@ def match_tool(raw: str) -> str:
     never authenticates the SERVER either way — :func:`directive_tool_for`
     checks ``mcp_server_name`` independently, and that is the check a
     third-party server fails.
+
+    :data:`DIRECTIVE_TOOLS` bound into :func:`normalized_tool_name`, so the
+    separator rule above is written once and a second tool set cannot drift from
+    it.
     """
-    if not raw:
-        return ""
-    if raw in DIRECTIVE_TOOLS:
-        return raw
-    parts = _MCP_SEPARATOR_RE.split(raw)
-    if len(parts) > 1 and parts[-1] in DIRECTIVE_TOOLS:
-        return parts[-1]
-    return ""
+    return normalized_tool_name(raw, DIRECTIVE_TOOLS)
 
 
 def directive_tool_for(mcp_server_name: str, tool_name: str) -> str:
@@ -582,10 +635,13 @@ def directive_tool_for(mcp_server_name: str, tool_name: str) -> str:
     ``execute_bash``, so it resolves to ``""``; so does a third-party MCP
     server that merely exposes a tool named e.g. ``monitor_start``. Absent
     identity (empty server name) fails closed.
+
+    :data:`DIRECTIVE_TOOLS` bound into :func:`core_tool_named`, which is the same
+    two checks generalised over the tool set. Kept as its own name because this is
+    the predicate the forgery gate is documented by and the one both
+    ``EVENT_TOOL_CALL`` consumers are required to call.
     """
-    if mcp_server_name != CORE_MCP_SERVER:
-        return ""
-    return match_tool(tool_name or "")
+    return core_tool_named(mcp_server_name, tool_name, DIRECTIVE_TOOLS)
 
 
 def strip_marker(text: str) -> str:

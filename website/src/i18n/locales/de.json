@@ -10402,7 +10402,16 @@
         "point_model_route": "Modell",
         "rate_right_model": "Jev hat das richtige Modell gewählt",
         "rate_wrong_model": "Jev hat das falsche Modell gewählt",
-        "truncated_turns_label": "Gekürzte frühere Beiträge"
+        "truncated_turns_label": "Gekürzte frühere Beiträge",
+        "split_agreed_line": "Jev schlug {{shape}} vor, und der Agent stimmte zu",
+        "split_agreed_line_spawned": "Jev schlug {{shape}} vor, und der Agent stimmte zu ({{count}} gestartet)",
+        "split_differed_line": "Jev schlug {{suggested}} vor; der Agent nahm stattdessen {{actual}}",
+        "split_rate_label": "Diesen Aufteilungs-Vorschlag bewerten",
+        "split_rate_right": "Jev hat die richtige Form vorgeschlagen",
+        "split_rate_wrong": "Jev hat die falsche Form vorgeschlagen",
+        "split_shape_delegate": "ein Sub-Agent",
+        "split_shape_single": "ein Arbeiter",
+        "split_shape_split": "parallele Sub-Agenten"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev hat diesen Aufruf angesehen und markiert. Das hat nichts daran geändert, ob der Aufruf erlaubt war: darüber hat die Berechtigungseinstellung dieser Sitzung entschieden, und der Aufruf kann trotzdem abgelehnt worden sein.",

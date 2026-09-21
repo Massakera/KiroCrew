@@ -23,7 +23,7 @@
  */
 import { mkdirSync } from 'node:fs'
 
-import { json } from './lib/boot-api.mjs'
+import { CONSENTED, createChecks, stubDecisionsSeam } from './lib/decisions-capture.mjs'
 import { openTranscriptHarness } from './lib/transcript-harness.mjs'
 
 const OUT = process.argv[2] || '../temp-screenshots/decision-message-steer'
@@ -35,14 +35,6 @@ mkdirSync(OUT, { recursive: true })
 const LINE = '[data-testid="steer-decision-line"]'
 const QUEUED = `${LINE}[data-choice="queue"]`
 const STEERED = `${LINE}[data-choice="steer"]`
-
-/** Consent is on and pointed at the address it was given for. */
-const CONSENT = {
-  enabled: true,
-  endpoint: 'https://api.typesafe.ai/v1/systemone',
-  configured_endpoint: 'https://api.typesafe.ai/v1/systemone',
-  permits: true,
-}
 
 /** A separate later request: the work in progress finishes first. */
 const QUEUE_RECORD = {
@@ -112,11 +104,7 @@ const detail = {
   ],
 }
 
-const failures = []
-const check = (ok, msg) => {
-  if (!ok) failures.push(msg)
-  console.log(`${ok ? 'ok  ' : 'FAIL'} ${msg}`)
-}
+const { check, report } = createChecks()
 
 async function main() {
   const { page, load, close } = await openTranscriptHarness({
@@ -126,36 +114,15 @@ async function main() {
     detail,
   })
 
-  // The fleet answer and the keystone. Registered AFTER the harness's catch-all so
-  // they win: Playwright matches route handlers in reverse order.
-  let decisionsEnabled = true
-  await page.route('**/api/decisions/consent', route => json(route, CONSENT))
-  await page.route('**/api/dashboard/config', route =>
-    json(route, {
-      restore_sessions: false,
-      restore_window_minutes: 30,
-      merge_queued_messages: false,
-      widget_density: 'more',
-      decisions_enabled: decisionsEnabled,
-    }),
-  )
-
-  /**
-   * Pin the locale to English. The harness's init script CLEARS localStorage on
-   * every navigation, so the key is written by an init script registered AFTER the
-   * harness's first navigation, and a reload is what makes it stick.
-   */
-  let localePinned = false
-  async function loadInEnglish(theme) {
-    await load(theme, { selector: LINE })
-    if (!localePinned) {
-      await page.addInitScript(() => localStorage.setItem('mc-lang', 'en'))
-      localePinned = true
-    }
-    await page.reload({ waitUntil: 'domcontentloaded' })
-    await page.waitForSelector(LINE, { timeout: 20000 })
-    await page.waitForTimeout(800)
-  }
+  // Consent, the fleet answer and the English reload, shared with every other
+  // decision-point harness (`lib/decisions-capture.mjs`) so two stubs of one gate
+  // cannot diverge.
+  const { loadInEnglish, setDecisionsEnabled } = await stubDecisionsSeam({
+    page,
+    load,
+    selector: LINE,
+    consent: CONSENTED,
+  })
 
   /** Open the split button's picker with a draft in the composer. */
   async function openPicker() {
@@ -243,7 +210,7 @@ async function main() {
   }
 
   // ── The withheld pass: the fleet says no, so the mode is not offered ──
-  decisionsEnabled = false
+  setDecisionsEnabled(false)
   await loadInEnglish('dark')
   await openPicker()
   check(
@@ -272,12 +239,7 @@ async function main() {
 
   await close()
 
-  if (failures.length) {
-    console.error(`\n${failures.length} assertion(s) failed:`)
-    for (const f of failures) console.error(`  - ${f}`)
-    process.exit(1)
-  }
-  console.log('\nall assertions passed')
+  process.exitCode = report()
 }
 
 main().catch(err => {

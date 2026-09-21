@@ -10545,7 +10545,16 @@
         "point_model_route": "modello",
         "rate_right_model": "Jev ha scelto il modello giusto",
         "rate_wrong_model": "Jev ha scelto il modello sbagliato",
-        "truncated_turns_label": "Turni precedenti troncati"
+        "truncated_turns_label": "Turni precedenti troncati",
+        "split_agreed_line": "Jev ha suggerito {{shape}}, e l'agente ha seguito",
+        "split_agreed_line_spawned": "Jev ha suggerito {{shape}}, e l'agente ha seguito ({{count}} avviati)",
+        "split_differed_line": "Jev ha suggerito {{suggested}}; l'agente ha usato {{actual}} invece",
+        "split_rate_label": "Valuta questo consiglio di suddivisione",
+        "split_rate_right": "Jev ha suggerito la forma giusta",
+        "split_rate_wrong": "Jev ha suggerito la forma sbagliata",
+        "split_shape_delegate": "un sub-agente",
+        "split_shape_single": "un solo esecutore",
+        "split_shape_split": "sub-agenti in parallelo"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev ha guardato questa chiamata e l'ha segnalata. Questo non ha cambiato nulla sul fatto che la chiamata fosse permessa: lo ha deciso l'impostazione dei permessi di questa sessione, e la chiamata potrebbe essere stata rifiutata comunque.",
