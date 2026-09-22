@@ -66,7 +66,7 @@ This setting alone does not permit the transfer. Your consent record holds a **c
 
 `model_route` says which model answers a message at each difficulty level. **Every level starts empty, which means "leave it alone".** No model is named for you on purpose: accounts differ in which models they are offered, and a name you cannot use would fail on the first message rather than when you set it. The block above is the example to copy from — put in the ids your own model picker shows.
 
-An empty level does not turn the feature off. Jev is still asked, the answer is still recorded, and the reply still shows it — it reads `complex → (unpinned)`. The message just runs on the model the chat was already using. That is on purpose: you can watch which level your messages land in for a while, and then pin only the levels worth moving.
+An empty level does not turn the feature off. Jev is still asked, the answer is still recorded, and the reply still shows it — it reads `complex → (unpinned)`. The message runs on your own model: the one the chat was on before routing ever moved it, so an earlier message routed to a cheap level does not keep this one there. That is on purpose: you can watch which level your messages land in for a while, and then pin only the levels worth moving. Kiro Crew can only move a chat back to a model it can name, so a chat whose model your backend never reported stays where it is.
 
 The three keys above are the only ones read; anything else is ignored. `auto` means the same as empty. If you name a model your account cannot run, that message also stays put, and the log below says which of the two happened, so nothing is dropped silently.
 
