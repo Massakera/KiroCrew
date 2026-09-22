@@ -41,6 +41,7 @@ import { useAppDispatch, useAppSelector, useAppStore } from '../store'
 import { clearPaneReady, removeWarm, setActiveId, setPaneReady, setUnread, setWarm } from '../store/instancesSlice'
 import InstanceTabBar, { visibleInstanceTabs, useCrewPins, toggleCrewPin, useCrewSwitcherStableOrder, setStableOrder } from './InstanceTabBar'
 import { parseLoopbackOriginPort, resolveTunnelOrigin } from '../lib/tunnelOrigin'
+import { NATIVE_NOTIFY_TYPE, parseNativeNotifyEnvelope, postRelayedNativeNotification } from '../lib/nativeNotify'
 import { frameDocumentState, paneLog, safePaneUrl } from '../lib/paneLog'
 import { clearPaneHttpCache, paneOriginFor } from '../lib/paneCache'
 import { connectInstanceInto } from '../lib/connectInstance'
@@ -216,7 +217,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // recorded its readiness, so the pane can stop re-announcing without mistaking
   // an ordinary model broadcast for an ack — see EmbeddedHostBridge.
   const postAckToRef = useRef<(id: string) => void>(() => {})
-  const instancesRef = useRef<Array<{ id: string }>>([])
+  const instancesRef = useRef<Array<{ id: string; name?: string }>>([])
 
   // Whether `refreshToken` would actually mint for this id right now: no mint
   // already in flight, and outside the rate window. Split out of refreshToken so
@@ -355,6 +356,21 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
         const count = Number(data.count)
         if (!Number.isFinite(count) || count < 0) return
         dispatch(setUnread({ id, count }))
+      } else if (data.type === NATIVE_NOTIFY_TYPE) {
+        // A pane wants an OS banner it cannot post itself: `notifications` is a
+        // main-frame-only permission (permission-handler.js) and a browser tab
+        // denies it to a cross-origin iframe too. This frame holds the grant, so
+        // it posts on the pane's behalf. The SENDER is already trusted -- its
+        // origin resolved to a currently-warm tunnel port above -- and the pane
+        // has already applied its own mute / hidden / silent rules, so the only
+        // checks here are shape (every field the exact expected type, bounded)
+        // and this frame's own permission. The title is prefixed with the
+        // instance's name and the tag namespaced per instance id so several
+        // crews' notes stay distinguishable and never collapse onto one.
+        const note = parseNativeNotifyEnvelope(data)
+        if (!note) return
+        const name = instancesRef.current.find(i => i.id === id)?.name || id
+        postRelayedNativeNotification(name, id, note)
       } else if (data.type === 'mc-auth-expired') {
         // Reactive recovery: the embedded dashboard reported an expired session.
         // Force a fresh mint and reload its iframe rather than letting it show
