@@ -69,6 +69,9 @@ vi.mock('../api/client', () => ({
     status: vi.fn().mockResolvedValue({ uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0 }),
     sessionsUsage: vi.fn().mockResolvedValue({ usage: { credits_used: 3044, credits_covered: 3044, credits_overage: 0, credits_plan: 10000, resets: '2026-07-01', plan: 'KIRO POWER', cost_usd: 0, overage_rate: '0.04', bonus_credits: [{ name: 'Launch bonus', used: 250, total: 1000, days_left: 30 }], email: 'owner@example.com', account_type: 'Social' } }),
     listApps: vi.fn().mockResolvedValue([]),
+    // A NON-Kiro harness by default, so the credit pill's Kiro-only surfaces
+    // (the no-reading dash) stay off unless a test names the kiro backend.
+    kirocrewConfig: vi.fn().mockResolvedValue({ agent: { acp_backend: 'claude' } }),
     system: vi.fn().mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 }),
     chatSlotAgent: vi.fn().mockResolvedValue({}),
     chatSlotReasoningEffort: vi.fn().mockResolvedValue({}),
@@ -2102,8 +2105,44 @@ describe('Kiro credits pill — edge cases', () => {
     expect(screen.queryByTitle('Kiro credit usage')).not.toBeInTheDocument()
   })
 
-  it('auto-closes the modal if usage resolves to unavailable while it is open', async () => {
+  it('shows the no-reading dash for that same payload on the Kiro backend', async () => {
     const { api } = await import('../api/client')
+    // Same `available:false`, but the selected harness IS kiro-cli (`agent.acp_backend`
+    // is the kiro id, the empty string): kiro-cli holds no reading yet, and the
+    // modal this dash opens is where the user refreshes. Hiding it here would hide
+    // the one recovery path; on any other harness there is nothing to refresh.
+    vi.mocked(api.kirocrewConfig).mockResolvedValueOnce({ agent: { acp_backend: '' } } as never)
+    vi.mocked(api.sessionsUsage).mockResolvedValue({ usage: { available: false } } as never)
+    renderWithProviders(<App />, { route: '/chat' })
+    const pill = await screen.findByTitle('Kiro credit usage — no balance reading yet; open to refresh')
+    expect(pill).toHaveTextContent('—')
+    expect(screen.queryByTitle('Kiro credit usage')).not.toBeInTheDocument()
+  })
+
+  it('auto-closes the modal if usage resolves to unavailable while it is open (non-Kiro provider)', async () => {
+    // The pill hides for `none` on a non-Kiro harness (the mock's default
+    // backend is claude), so a modal opened during the warm-up would be left
+    // open behind a pill that no longer exists, with nothing to refresh.
+    const { api } = await import('../api/client')
+    let resolveUsage: (v: unknown) => void = () => {}
+    vi.mocked(api.sessionsUsage).mockReturnValue(new Promise(r => { resolveUsage = r }) as never)
+    renderWithProviders(<App />, { route: '/chat' })
+    const pill = await screen.findByTitle(/Kiro credit usage/)
+    fireEvent.click(pill)
+    expect(await screen.findByLabelText('Checking credit usage')).toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: 'Kiro Account' })).toBeInTheDocument()
+    await act(async () => { resolveUsage({ usage: { available: false } }); await Promise.resolve() })
+    await waitFor(() => expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Kiro Account' })).not.toBeInTheDocument())
+    expect(screen.queryByTitle(/Kiro credit usage/)).not.toBeInTheDocument()
+  })
+
+  it('keeps the modal open when usage resolves to no reading on the Kiro backend', async () => {
+    // Same payload, but the pill stays as the no-reading dash here, and the
+    // modal it opens is where Refresh lives -- closing it would take the one
+    // recovery path away at the moment it is needed.
+    const { api } = await import('../api/client')
+    vi.mocked(api.kirocrewConfig).mockResolvedValueOnce({ agent: { acp_backend: '' } } as never)
     let resolveUsage: (v: unknown) => void = () => {}
     vi.mocked(api.sessionsUsage).mockReturnValue(new Promise(r => { resolveUsage = r }) as never)
     renderWithProviders(<App />, { route: '/chat' })
@@ -2112,6 +2151,12 @@ describe('Kiro credits pill — edge cases', () => {
     expect(await screen.findByLabelText('Checking credit usage')).toBeInTheDocument()
     await act(async () => { resolveUsage({ usage: { available: false } }); await Promise.resolve() })
     await waitFor(() => expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument())
+    await screen.findByTitle('Kiro credit usage — no balance reading yet; open to refresh')
+    // Past any close (and its exit animation): still the same dialog, with Refresh.
+    await new Promise(resolve => setTimeout(resolve, 600))
+    const dialog = screen.getByRole('dialog', { name: 'Kiro Account' })
+    expect(within(dialog).getByText('No balance reading is available for this account yet.')).toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: /^Refresh$/ })).toBeEnabled()
   })
 
   it('never renders NaN when credit fields arrive non-finite', async () => {

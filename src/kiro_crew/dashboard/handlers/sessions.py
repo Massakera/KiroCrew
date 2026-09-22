@@ -192,7 +192,7 @@ _usage_cache: dict[str, object] = {}
 _usage_cache_ts: float = 0.0
 _USAGE_REFRESH_SECS = 600  # background refresh every 10 min
 # Ceiling on ONE whole refresh. Sized above the sum of the inner bounded steps
-# (whoami ≤30s + the billed scrape ≤60s, plus the unbounded API read between
+# (whoami ≤30s + the /usage scrape ≤60s, plus the unbounded API read between
 # them) so a healthy slow refresh still completes, while a wedged one is
 # guaranteed to release the in-flight guard instead of parking it forever.
 _USAGE_FETCH_DEADLINE_SECS = 180
@@ -208,77 +208,28 @@ _BONUS_COLON_RE = re.compile(
     re.IGNORECASE,
 )
 
-# --- Text-scrape gate ------------------------------------------------------
-# The `/usage` text scrape is a REAL billed kiro-cli chat turn, unlike the
-# GetUsageLimits API read the primary path uses. It runs on a timer for as long
-# as a dashboard tab is open, so an ungated fallback bills the user forever just
-# to render a credit meter. Hence: opt-in via config, logged once when it is
-# skipped, and backed off when it repeatedly fails.
+# --- Text-scrape back-off --------------------------------------------------
+# The `/usage` text scrape is a kiro-cli slash command handled locally: it calls
+# the same free GetUsageLimits API the primary path uses and prints the usage
+# table, so no prompt reaches a model and the read costs no credits. It is the
+# automatic fallback whenever the API path returns no plan. What it does cost is
+# a subprocess (whoami + the scrape, up to a minute and a half) on every refresh
+# interval, so a scrape that keeps producing unparseable output (kiro-cli format
+# change, wedged CLI, revoked auth) is parked instead of retried forever.
 
-#: True once the "scrape is disabled" notice has been logged. The refresh runs
-#: every _USAGE_REFRESH_SECS forever, so logging per cycle would fill the log
-#: with a message that never changes.
-_usage_scrape_disabled_logged = False
 #: Consecutive scrape attempts that produced no usable credit plan.
 _usage_scrape_failures = 0
 #: monotonic deadline before which no further scrape is attempted.
 _usage_scrape_backoff_until = 0.0
 #: Consecutive failures tolerated before the scrape is parked. Two refresh
 #: intervals of bad luck stay within normal retry; a third means the scrape is
-#: broken (kiro-cli format change, wedged CLI, revoked auth), and every further
-#: attempt spends credits for output that cannot be parsed.
+#: broken, and every further attempt is a subprocess spent on output that cannot
+#: be parsed.
 _USAGE_SCRAPE_FAILURE_THRESHOLD = 3
 #: How long a broken scrape is parked. Long relative to the 10-minute refresh so
-#: a persistent breakage costs a handful of turns per day, not one per interval.
+#: a persistent breakage costs a handful of attempts per day, not one per
+#: interval.
 _USAGE_SCRAPE_BACKOFF_SECS = 6 * 3600
-
-
-def _text_scrape_enabled() -> bool:
-    """True when the user has opted in to the credit-spending `/usage` scrape.
-
-    Fails CLOSED: any error reading config means the scrape does not run, so a
-    malformed config can never silently start billing chat turns. Blocking I/O
-    (stat + parse), so callers offload it.
-    """
-    try:
-        from kiro_crew.config.loader import KiroCrewConfig
-
-        return bool(KiroCrewConfig.load().dashboard.usage_text_scrape_enabled)
-    except Exception:
-        logger.debug("usage text-scrape gate unreadable; treating as disabled", exc_info=True)
-        return False
-
-
-def _log_scrape_disabled_once(signin_required: bool = False) -> None:
-    """Announce the skipped scrape exactly once per process.
-
-    ``signin_required`` swaps the message for the auth-class case, where the
-    default text ("the API returned no credit plan") names a cause that did not
-    happen and points at a knob that cannot help -- see
-    :func:`_unavailable_reason`. Without the swap, an operator reading only the log
-    is told to enable a billed scrape to fix an expired sign-in.
-    """
-    global _usage_scrape_disabled_logged
-    if _usage_scrape_disabled_logged:
-        return
-    _usage_scrape_disabled_logged = True
-    if signin_required:
-        logger.info(
-            "Kiro usage: no live Kiro credential could be read, so the credit "
-            "pill stays unavailable. Sign in to Kiro again (for example by "
-            "running kiro-cli login) to restore it. Enabling "
-            "dashboard.usage_text_scrape_enabled will NOT help here -- the "
-            "scrape is a billed kiro-cli chat turn that needs the same sign-in."
-        )
-        return
-    logger.info(
-        "Kiro usage: the API returned no credit plan and the /usage text scrape "
-        "is disabled, so the credit pill stays unavailable. The scrape is a "
-        "billed kiro-cli chat turn every %ds; enable it with "
-        "dashboard.usage_text_scrape_enabled = true in config.json if you want "
-        "to pay for the readout.",
-        _USAGE_REFRESH_SECS,
-    )
 
 
 def _scrape_in_backoff() -> bool:
@@ -289,9 +240,10 @@ def _scrape_in_backoff() -> bool:
 def _record_scrape_outcome(success: bool) -> None:
     """Track consecutive scrape failures and park the scrape once they pile up.
 
-    Every attempt costs credits, so a scrape that cannot produce a usable plan
-    must stop retrying on each TTL expiry. Any success clears the counter, so a
-    transient hiccup does not accumulate toward the ceiling.
+    A scrape that cannot produce a usable plan must stop retrying on each TTL
+    expiry: each attempt is a minute-scale subprocess for nothing. Any success
+    clears the counter, so a transient hiccup does not accumulate toward the
+    ceiling.
     """
     global _usage_scrape_failures, _usage_scrape_backoff_until
     if success:
@@ -303,7 +255,7 @@ def _record_scrape_outcome(success: bool) -> None:
         _usage_scrape_backoff_until = time.monotonic() + _USAGE_SCRAPE_BACKOFF_SECS
         logger.warning(
             "Kiro usage: %d consecutive /usage text scrapes yielded no credit "
-            "plan; pausing the scrape for %ds so it stops spending credits on "
+            "plan; pausing the scrape for %ds so it stops spawning kiro-cli for "
             "unusable output.",
             _usage_scrape_failures,
             _USAGE_SCRAPE_BACKOFF_SECS,
@@ -311,73 +263,67 @@ def _record_scrape_outcome(success: bool) -> None:
 
 
 #: Pill ``reason`` for an auth-class usage failure: no live credential could be
-#: read, or the API refuses the one that was. The remedy is a fresh sign-in, and
-#: unlike ``scrape_disabled`` it costs nothing to act on.
+#: read, or the API refuses the one that was. The remedy is a fresh sign-in.
 _REASON_SIGNIN_REQUIRED = "signin_required"
-#: Pill ``reason`` for the other case: the API answered about the account and
-#: reported no credit plan, and the billed scrape that could still find one is
-#: opted out.
-_REASON_SCRAPE_DISABLED = "scrape_disabled"
 
 
-def _unavailable_reason(api_result: kiro_usage_api.UsageResult) -> str:
-    """Pick the pill's ``reason`` for a failed read whose scrape will not run.
+def _unavailable_reason(api_result: kiro_usage_api.UsageResult) -> str | None:
+    """Pick the pill's ``reason`` for a refresh that ends without a reading.
 
-    ``scrape_disabled`` is only true when the API actually answered ABOUT the
-    account. When the read failed because no live credential was readable, or
-    because the credential was rejected, that message states a cause that did not
-    happen ("the free usage API returned no plan for this account") and prescribes
-    a remedy that spends credits without being able to work: the ``/usage`` scrape
-    is a billed kiro-cli chat turn needing the same sign-in, so every attempt is
-    paid for and fails until ``_record_scrape_outcome`` parks it.
+    An auth-class ``auth_state`` (no live credential was readable, or the API
+    rejected the one that was) reports ``signin_required``: the free API was
+    never answered about this account, and the ``/usage`` scrape needs the same
+    sign-in, so the one remedy is signing in again. Anything the API path could
+    not prove was an auth problem reports no reason -- a spurious "sign in again"
+    on a working sign-in would be the same class of defect in the other direction.
 
-    So an auth-class ``auth_state`` reports ``signin_required`` instead. Anything
-    the API path could not prove was an auth problem keeps the original message --
-    a spurious "sign in again" on a working sign-in would be the same class of
-    defect in the other direction.
-
-    This changes the message only. The scrape decision above is deliberately
-    untouched: an empty candidate list does NOT prove kiro-cli cannot
-    authenticate, because kiro-cli may authenticate from a store this module does
-    not enumerate (see :func:`_identity_matches_account`), so suppressing the
-    scrape here would break hosts where it works today.
+    This is a message only; the scrape decision does not consult it. An empty
+    candidate list does NOT prove kiro-cli cannot authenticate, because kiro-cli
+    may authenticate from a store this module does not enumerate (see
+    :func:`_identity_matches_account`), so the scrape still runs and its own
+    outcome decides what the pill shows.
     """
     if api_result.auth_state in (
         kiro_usage_api.AUTH_NO_CREDENTIAL,
         kiro_usage_api.AUTH_REJECTED,
     ):
         return _REASON_SIGNIN_REQUIRED
-    return _REASON_SCRAPE_DISABLED
+    return None
 
 
 def _cache_without_scrape(
-    api_usage: object, identity: dict[str, object], reason: str | None = None
+    api_usage: object, identity: dict[str, object] | None, reason: str | None = None
 ) -> None:
-    """Cache the best available value when the scrape is not going to run.
+    """Cache the best available value when the parked scrape is not going to run.
 
     Degrades rather than erroring: keep a previously-good value (dimmed
     ``stale``) so the pill does not blink out, otherwise surface whatever
     partial fields the API did return alongside ``available: False`` — the
-    frontend's existing signal to hide the pill instead of rendering blanks.
+    frontend's signal to show a no-reading dash (and the modal's Refresh) instead
+    of rendering blanks.
     ``reason`` (when given) rides that unavailable marker so the frontend can
-    explain WHY instead of hiding silently: the opt-in scrape being off is a
-    permanent, user-addressable state, unlike a cold-start failure, and hiding
-    it leaves users with no hint that a knob exists.
+    explain WHY instead of hiding silently.
 
-    Preserving is gated on ``_same_identity``: with the scrape disabled, a
-    plan-less API answer recurs every refresh forever, so an unguarded preserve
+    Preserving is gated on ``_same_identity``: while the scrape is parked, a
+    plan-less API answer recurs every refresh for hours, so an unguarded preserve
     would serve the PREVIOUS account's balance and email indefinitely after a
     switch A->B. An unproven identity (missing or mismatched email / start_url,
     including an account that never carried one) therefore reports unavailable
-    instead — hiding the pill is a cosmetic loss, attributing one account's
+    instead — a dash on the pill is a cosmetic loss, attributing one account's
     spend to another is not.
 
-    ``identity`` is this refresh's whoami, resolved before the API attempt, so a
-    switch landing inside that attempt is caught on the following refresh rather
-    than this one.
+    ``identity`` is a whoami resolved ADJACENTLY, right before this call, not the
+    one read at the top of the refresh: the API attempt sits between the two,
+    and a profile switch landing inside it must be judged against the account
+    that is signed in now. ``None`` (kiro-cli never resolved) proves nothing, so
+    nothing is preserved.
     """
     global _usage_cache, _usage_cache_ts
-    if _usage_cache.get("credits_plan") is not None and _same_identity(_usage_cache, identity):
+    if (
+        _usage_cache.get("credits_plan") is not None
+        and identity is not None
+        and _same_identity(_usage_cache, identity)
+    ):
         _usage_cache = {**_usage_cache, "stale": True}
     else:
         partial = (
@@ -654,24 +600,44 @@ def _publish_usage(payload: dict[str, object]) -> None:
     _usage_cache_ts = time.time()
 
 
-def _cache_transient_failure() -> None:
-    """Record a transient usage-fetch failure without blanking the pill.
+def _cache_transient_failure(identity: dict[str, object] | None, reason: str | None = None) -> None:
+    """Record a usage-fetch failure without blanking the pill for the same account.
 
     A timeout, an unexpected error, or a single unparseable scrape is transient.
     Overwriting a previously-good cache with ``{"available": False}`` on any of
     these hid the credit pill entirely for up to a full refresh interval — the
-    "disappearing pill" bug. Instead, when we already hold a good value, keep it
-    and flag it ``stale`` (the dashboard can dim it); only fall back to
-    ``available: False`` when there is no prior value to show (e.g. a cold-start
-    failure), preserving the original hide-on-no-data behavior. The definitive
-    "kiro-cli absent" case still sets ``available: False`` directly at its call
-    site — that is not transient.
+    "disappearing pill" bug. Instead, when we already hold a good value FOR THE
+    SAME ACCOUNT, keep it and flag it ``stale`` (the dashboard can dim it); fall
+    back to ``available: False`` when there is no prior value to show (e.g. a
+    cold-start failure). The definitive "kiro-cli absent" case still sets
+    ``available: False`` directly at its call site — that is not transient.
+
+    Preserving is gated on ``_same_identity``, exactly as :func:`_cache_without_scrape`
+    gates it: a plan-less refresh is what an account switch A->B looks like when
+    B's credential has lapsed (the API reports no plan, the scrape prints no
+    table), and that shape recurs on every interval until B signs in again. An
+    unguarded preserve would keep A's balance and email on screen under B's
+    session the whole time. ``identity`` is this refresh's whoami; ``None`` means
+    it was never resolved (the refresh failed before or during whoami), and an
+    unresolved or unproven identity reports unavailable rather than preserving —
+    a dash on the pill is a cosmetic loss, attributing one account's balance to
+    another is not.
+
+    ``reason`` rides the unavailable marker when the caller knows why the read
+    ended empty (the API's auth-class verdict, see :func:`_unavailable_reason`),
+    so the pill can name the remedy instead of hiding.
     """
     global _usage_cache, _usage_cache_ts
-    if _usage_cache.get("credits_plan") is not None:
+    if (
+        _usage_cache.get("credits_plan") is not None
+        and identity is not None
+        and _same_identity(_usage_cache, identity)
+    ):
         _usage_cache = {**_usage_cache, "stale": True}
     else:
         _usage_cache = {"available": False}
+        if reason is not None:
+            _usage_cache["reason"] = reason
     _usage_cache_ts = time.time()
 
 
@@ -842,30 +808,67 @@ def _identity_matches_account(api_arn: object, identity: dict[str, object]) -> b
     return isinstance(api_arn, str) and isinstance(whoami_arn, str) and api_arn == whoami_arn
 
 
-async def _fetch_usage_bg() -> None:
-    """Background task: fetch usage and update cache."""
+#: Outcome of a refresh whose API read returned no plan while the scrape was
+#: parked: no reading was fetched, and :func:`_cache_without_scrape` decided what
+#: the cache holds (a same-identity prior reading dimmed ``stale``, otherwise an
+#: unavailable marker).
+_SKIPPED_SCRAPE_PARKED = "scrape_parked"
+
+
+async def _fetch_usage_bg() -> str | None:
+    """Fetch usage and update the cache: the free API first, then the ``/usage``
+    scrape whenever the API returns no plan and the scrape is not parked.
+
+    Single-flight through ``_usage_fetching``: a refresh already in progress
+    makes this call return at once, so the timer and the account modal's
+    Refresh can never run two kiro-cli subprocesses for one reading.
+
+    Returns ``_SKIPPED_SCRAPE_PARKED`` when the API yielded no plan AND the
+    scrape is parked -- skipped for being parked already, OR attempted in this
+    very refresh and parked by that attempt's failure (the third miss). It is
+    the one outcome the refresh route reports differently, because no reading
+    was fetched and none will be until the park lifts: the cache then holds a
+    same-identity prior reading dimmed ``stale``, or an unavailable marker.
+    Every other outcome, including the early return above, returns ``None``.
+    """
     global _usage_cache, _usage_cache_ts, _usage_fetching
     if _usage_fetching:
-        return
+        return None
     _usage_fetching = True
     proc = None
     sandbox_cleanup = None
     kiro_bin: str | None = None
-    # Only a refresh that actually SPAWNED the billed scrape feeds the failure
+    # Only a refresh that actually SPAWNED the scrape feeds the failure
     # backoff — an API-path error or a missing kiro-cli says nothing about
     # whether the scrape works.
     scrape_attempted = False
 
-    async def _refresh() -> None:
+    async def _adjacent_identity() -> dict[str, object] | None:
+        """Re-resolve whoami right before a failure path decides what to keep.
+
+        The identity read at the top of the refresh can be a minute or more old
+        by the time the scrape has failed (the API attempt plus the scrape's own
+        timeout), and a profile switch can land inside that window. Judging
+        ``_same_identity`` against the top-of-refresh value would then match the
+        PREVIOUS account and keep its balance on screen under the new one. So the
+        failure paths judge against a whoami resolved adjacently, the same way
+        the parseable-plan branch does before it labels its reading. ``None``
+        when kiro-cli was never resolved: nothing can be proven, nothing is kept.
+        whoami costs no credits and is bounded, so this adds at most one more
+        short subprocess to a refresh that already ended without a reading.
+        """
+        return await _fetch_whoami(kiro_bin) if kiro_bin else None
+
+    async def _refresh() -> str | None:
         nonlocal proc, sandbox_cleanup, kiro_bin, scrape_attempted
         global _usage_cache, _usage_cache_ts
 
         kiro_bin = await _resolve_kiro_bin_for_spawn()
         if not kiro_bin:
             # kiro-cli absent (non-Kiro provider): cache an unavailable marker so
-            # the dashboard hides the credit pill instead of polling forever.
+            # the dashboard shows its no-reading dash instead of polling forever.
             _publish_usage({"available": False})
-            return
+            return None
         # Identity FIRST, because it is the anchor for credential selection.
         # ``whoami`` is kiro-cli's own account, and it costs no credits; passing
         # its profile ARN into fetch_usage_limits is what stops a still-valid
@@ -878,9 +881,9 @@ async def _fetch_usage_bg() -> None:
         # still fails fast instead of silently regressing to the slow path —
         # such accounts hold no SSO/OIDC bearer token, so ``fetch_usage_limits``
         # would spend its full timeout walking credential stores that cannot
-        # contain one, and the billed text scrape is no better a source. The
+        # contain one, and the text scrape is no better a source. The
         # ``reason`` rides the existing unavailable-marker shape so the
-        # frontend can say WHY instead of hiding the pill without explanation.
+        # frontend can say WHY, with a label specific to this auth type.
         account_type = identity.get("account_type")
         if (
             isinstance(account_type, str)
@@ -888,7 +891,7 @@ async def _fetch_usage_bg() -> None:
         ):
             _publish_usage({"available": False, "reason": "api_key_auth"})
             logger.info("Kiro usage: not available under API key auth; skipping fetch")
-            return
+            return None
         raw_arn = identity.get("_profile_arn")
         expected_arn = raw_arn if isinstance(raw_arn, str) and raw_arn else None
         # Primary source: the real GetUsageLimits API. It reads the live bearer
@@ -899,9 +902,8 @@ async def _fetch_usage_bg() -> None:
         # Both ARN values are safe to pass. An ARN anchors on identity; None
         # anchors on PROVENANCE (kiro-cli's own auth store only) — see
         # fetch_usage_limits. So an account with no profile ARN, and a whoami that
-        # could not be resolved at all, both still get the free API call instead of
-        # the credit-consuming text scrape, while an unprovable credential is still
-        # refused.
+        # could not be resolved at all, both still get the API call ahead of the
+        # slower text scrape, while an unprovable credential is still refused.
         #
         # Runs on the subprocess pool (not the default to_thread pool): the client
         # makes blocking urllib calls that can hang on DNS / a wedged TLS
@@ -935,32 +937,30 @@ async def _fetch_usage_bg() -> None:
                 api_usage.get("credits_used", "?"),
                 api_usage.get("credits_plan", "?"),
             )
-            return
-        # Fallback: scrape kiro-cli /usage stdout. Lossy for org-managed accounts
-        # on recent kiro-cli (no overage line), but the only source when the API
-        # path is unavailable (no token / non-Kiro build).
-        #
-        # This is a BILLED chat turn, not a free read, and this refresh runs on a
-        # timer whenever a dashboard tab is open — so it only happens when the
-        # user has explicitly opted in, and stops entirely once it has failed
-        # enough times to look broken. Both checks are before the spawn, so a
-        # disabled or parked scrape costs nothing at all.
-        if not await asyncio.to_thread(_text_scrape_enabled):
-            reason = _unavailable_reason(api_result)
-            _log_scrape_disabled_once(signin_required=reason == _REASON_SIGNIN_REQUIRED)
-            _cache_without_scrape(api_usage, identity, reason=reason)
-            return
+            return None
+        # Fallback: scrape kiro-cli /usage stdout. `/usage` is a slash command
+        # kiro-cli answers locally from the same free GetUsageLimits call, so
+        # this costs no credits; what it costs is a subprocess. Lossy for
+        # org-managed accounts on recent kiro-cli (no overage line), but the only
+        # source when the API path is unavailable (no readable token / non-Kiro
+        # build). It stops once it has failed enough times to look broken; that
+        # check is before the spawn, so a parked scrape costs nothing at all.
         if _scrape_in_backoff():
-            _cache_without_scrape(api_usage, identity)
-            return
+            # Judged against a whoami resolved HERE, not the top-of-refresh one:
+            # the API attempt sits between them and a profile switch can land
+            # inside it (see _adjacent_identity).
+            _cache_without_scrape(
+                api_usage, await _adjacent_identity(), reason=_unavailable_reason(api_result)
+            )
+            return _SKIPPED_SCRAPE_PARKED
         scrape_attempted = True
         # Route through the OS-level sandbox, consistent with how the main agent
         # kiro-cli process is spawned (AcpClient._spawn -> wrap_argv) — including
         # the TIER. This is a `kiro-cli chat` invocation, so a hardcoded
         # "standard" asks for stricter isolation than the very same chat binary
         # gets on the interactive path, and fail-closes wherever no backend
-        # exists. Doubly wasteful here: the scrape is a BILLED turn, so the
-        # refusal also fed the backoff counter that eventually parks it.
+        # exists. Doubly wasteful here: the refusal also feeds the backoff
+        # counter that eventually parks the scrape.
         #
         # OFF the loop, for two blocking reads: `configured_sandbox_mode()` stats
         # (and on a cache miss re-reads + revalidates) config.json, and
@@ -1017,7 +1017,7 @@ async def _fetch_usage_bg() -> None:
                     _usage_cache.get("credits_used", "?"),
                     parsed.get("credits_used", "?"),
                 )
-                return
+                return None
             parsed = {k: _redact_strings(v) for k, v in parsed.items()}
             # No ARN coupling check here: this scrape IS kiro-cli's own `/usage`
             # output, so it and `fresh_identity` describe the same account by
@@ -1035,12 +1035,26 @@ async def _fetch_usage_bg() -> None:
                 "Kiro usage refreshed (text): %s credits used",
                 parsed.get("credits_used", "?"),
             )
-        else:
-            # No parseable credit plan this cycle (unrecognized /usage output,
-            # or transient garbage). Keep the last good value (stale) rather than
-            # blanking the pill; only hide when we have nothing to show.
-            _record_scrape_outcome(False)
-            _cache_transient_failure()
+            return None
+        # No parseable credit plan this cycle (unrecognized /usage output, or
+        # transient garbage). Keep the last good value (stale) when it belongs to
+        # this same account rather than blanking the pill; hide when we have
+        # nothing provably ours to show. The account is judged against a whoami
+        # resolved HERE, not the top-of-refresh one (see _adjacent_identity).
+        # When the API had already classified the failure as auth-class, the
+        # scrape failing too is the expected shape of a lapsed sign-in, so the
+        # marker names that remedy.
+        _record_scrape_outcome(False)
+        _cache_transient_failure(await _adjacent_identity(), reason=_unavailable_reason(api_result))
+        return _parked_by_this_attempt()
+
+    def _parked_by_this_attempt() -> str | None:
+        # A failure that was the third miss has just parked the scrape. The
+        # caller pressed Refresh and got no reading; it must also learn that
+        # pressing again is pointless until the park lifts, exactly as it does
+        # when the scrape was parked before the press. The API yielded no plan
+        # whenever a scrape was attempted, so the park alone decides.
+        return _SKIPPED_SCRAPE_PARKED if _scrape_in_backoff() else None
 
     try:
         # ONE deadline over the whole refresh. Every await inside is either
@@ -1052,23 +1066,27 @@ async def _fetch_usage_bg() -> None:
         # credit pill shows "Checking usage..." forever with nothing logged.
         # A timeout here lands in the handler below, which keeps the last good
         # value or marks usage unavailable, so the pill always resolves.
-        await asyncio.wait_for(_refresh(), timeout=_USAGE_FETCH_DEADLINE_SECS)
+        return await asyncio.wait_for(_refresh(), timeout=_USAGE_FETCH_DEADLINE_SECS)
     except asyncio.TimeoutError:
-        # Transient hang — keep the last good value (stale) instead of blanking.
+        # Transient hang — keep the last good value (stale) for the same account
+        # instead of blanking. The account is re-resolved here too: the hang may
+        # have outlasted a profile switch.
         logger.debug("Background usage fetch timed out")
         if scrape_attempted:
             _record_scrape_outcome(False)
-        _cache_transient_failure()
+        _cache_transient_failure(await _adjacent_identity())
+        return _parked_by_this_attempt() if scrape_attempted else None
     except Exception:
         logger.debug("Background usage fetch failed", exc_info=True)
         if scrape_attempted:
             _record_scrape_outcome(False)
-        _cache_transient_failure()
+        _cache_transient_failure(await _adjacent_identity())
+        return _parked_by_this_attempt() if scrape_attempted else None
     finally:
         # Always reap the subprocess on any exit path (timeout, error, or task
         # cancellation, which is a BaseException the excepts above don't catch)
-        # so a leaked kiro-cli process can't hold the agent lock or keep burning
-        # credit quota. kill() is non-blocking; the OS reaps the zombie.
+        # so a leaked kiro-cli process can't hold the agent lock or keep a
+        # sandbox scope alive. kill() is non-blocking; the OS reaps the zombie.
         _usage_fetching = False
         if proc is not None and proc.returncode is None:
             try:
@@ -1102,12 +1120,62 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
         # `conversations`, `history` and `state` alongside `auth_kv`, so ordinary
         # chat traffic rewrites it roughly every 30 seconds; a disk-change trigger
         # would fire on nearly every poll, and each fire can reach the `/usage`
-        # text scrape, which spends credits. A faster readout is not worth billing
-        # the user for it; a profile switch is picked up on the next interval.
+        # text scrape, a minute-scale kiro-cli subprocess. A faster readout is
+        # not worth that churn; a profile switch is picked up on the next interval.
         state: DashboardState = request.app["state"]
         task = asyncio.create_task(_fetch_usage_bg())
         state._background_tasks.add(task)
         task.add_done_callback(state._background_tasks.discard)
+    return web.json_response({"usage": _usage_cache})
+
+
+async def api_sessions_usage_refresh(request: web.Request) -> web.Response:
+    """POST /api/sessions/usage/refresh — refresh the credit reading now.
+
+    The account modal's Refresh button. Runs one refresh (the same API-first,
+    scrape-second sequence the timer runs) and answers with the cache the GET
+    serves -- ``{"usage": <payload>}`` -- so the frontend parses both the same
+    way.
+
+    Guards, in order, and why each is here:
+
+    * :func:`reject_if_kiro_unverified` -- the scrape shells out to ``kiro-cli
+      chat``, which opens a browser login while signed out (same as the GET).
+    * Single flight -- while a refresh is in progress (the timer's or another
+      click's) a second POST is refused with 409 ``refresh_in_flight`` rather
+      than started: a refresh is a whoami + scrape subprocess pair that can
+      take up to :data:`_USAGE_FETCH_DEADLINE_SECS`, and two of them for one
+      reading is waste. Checked synchronously against ``_usage_fetching`` with
+      no await in between, and :func:`_fetch_usage_bg` sets the flag before
+      its first await, so two requests on the same loop cannot both pass.
+    * Back-off -- reported, not pre-checked. The refresh runs the free API
+      attempt regardless of the scrape's state; only when the API yields no
+      plan AND the scrape is parked -- parked before this refresh, or parked
+      BY this refresh's own failed attempt (the third miss) -- does the
+      response carry ``skipped: "scrape_parked"`` with ``retry_after``
+      (seconds until the park lifts), telling the UI no new reading was
+      fetched and none will be until then: the ``usage`` it received is a
+      same-identity prior reading dimmed ``stale``, or an unavailable marker
+      (see :func:`_cache_without_scrape` / :func:`_cache_transient_failure`).
+    """
+    blocked = await reject_if_kiro_unverified(request)
+    if blocked is not None:
+        return blocked
+    if _usage_fetching:
+        return web.json_response(
+            {"error": "A refresh is already running", "code": "refresh_in_flight"},
+            status=409,
+        )
+    outcome = await _fetch_usage_bg()
+    if outcome == _SKIPPED_SCRAPE_PARKED:
+        parked_for = max(1, int(_usage_scrape_backoff_until - time.monotonic() + 0.999))
+        return web.json_response(
+            {
+                "usage": _usage_cache,
+                "skipped": _SKIPPED_SCRAPE_PARKED,
+                "retry_after": parked_for,
+            }
+        )
     return web.json_response({"usage": _usage_cache})
 
 
