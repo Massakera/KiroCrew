@@ -155,6 +155,19 @@ class InstalledApp:
     # consent moment. Kept separate from ``enabled`` so a normal manual disable
     # never shows the re-consent warning.
     sessionApprovalConsentPending: bool = False  # noqa: N815
+    # Unit kinds this app may contribute to, snapshotted from its manifest at
+    # install and at every gateway-driven update.  AUTHORITY, not a copy kept for
+    # display: ``contributions.units`` names a kind like ``member`` that the app
+    # owns no namespace under, so the ``<app>/`` prefix rule that guards
+    # ``events`` and ``projections`` cannot guard it -- and a manifest is a file
+    # the app's own code can rewrite.  It lives HERE because this record is
+    # already what decides whether an app may act at all (``is_app_enabled``
+    # reads it) and because ``update_app`` keeps a source-owned
+    # ``installed.json`` out of the live tree, so nothing an app ships sets it.
+    # Empty denies every kind, which is also how a record written before this
+    # field existed reads -- see ``units_pending_approval`` for what the operator
+    # is shown in that case.
+    approvedUnits: tuple[str, ...] = ()  # noqa: N815
 
     def validate_fields(self) -> list[str]:
         """Validate classification field values. Returns error list (empty = valid)."""
@@ -192,6 +205,7 @@ class InstalledApp:
             sourceCommit=str(data.get("sourceCommit", "")),
             sourceSigner=str(data.get("sourceSigner", "")),
             sessionApprovalConsentPending=bool(data.get("sessionApprovalConsentPending", False)),
+            approvedUnits=_unit_kinds(data.get("approvedUnits")),
         )
         # Migrate old "managed" field to new classification fields
         if inst.schemaVersion < 2 and "origin" not in data:
@@ -260,6 +274,48 @@ def _credential_free_source_metadata(value: str) -> str:
     return _strip_git_target_userinfo(candidate)
 
 
+def _bump_grant_generation(name: str, when: str) -> None:
+    """Advance the grant generation for *name*, reporting rather than raising.
+
+    The scope caches key on this generation and have NO expiry, so nothing but a
+    change to it can dislodge a warm entry. That makes WHEN it moves a correctness
+    question, not a performance one, and an update has to move it three times:
+
+    * BEFORE the tree is touched, because from the first move the manifest on disk
+      differs from what any cached declaration describes, and a request that
+      read its grant earlier is fenced on the generation it read. Bumping only at
+      the end leaves that request able to pass both its check and its commit fence
+      inside the window and persist a contribution the narrowed manifest does not
+      authorize. The window spans a tree copy and an ``rmtree``, so it is real
+      duration rather than a nanosecond.
+    * after the replacement is durable, so anything cached DURING the window -- read
+      from a tree that was mid-replacement -- is dropped and the new manifest is what
+      gets cached.
+    * after a rollback, for the same reason: the tree went back, and a cache filled
+      mid-window may describe neither the old tree nor the new one.
+
+    The cost of the extra bumps is discarding warm entries that were still valid, so
+    the next request re-reads a manifest. That is a cache miss. The cost of not
+    bumping first is an unauthorized write that persists.
+
+    A cache that cannot be invalidated must not strand the operation, but it MUST be
+    loud: the process would be serving grants from a manifest that is gone, which is
+    security-relevant rather than a debug detail.
+    """
+    try:
+        from kiro_crew.eventlog import grants as _grants
+
+        _grants.invalidate(name)
+    except Exception:
+        logger.error(
+            "app %r: could not invalidate cached grants %s; removed permissions may "
+            "stay authorized until restart",
+            name,
+            when,
+            exc_info=True,
+        )
+
+
 def _write_installed(name: str, meta: InstalledApp) -> None:
     """Write credential-free installed.json metadata for an app.
 
@@ -298,6 +354,94 @@ def _pending_session_approval_after_manifest_change(
     if not requested_session_approval:
         return False
     return existing_pending
+
+
+def _unit_kinds(values: object) -> tuple[str, ...]:
+    """Normalise a unit-kind list into an ordered, de-duplicated tuple of strings.
+
+    Anything that is not a non-empty string contributes nothing, and a value that
+    is not a list at all reads as no kinds.  This parses AUTHORITY, so the only
+    safe reading of something it cannot parse is "none": raising would abort a
+    lifecycle operation over a hand-edited record, and coercing would invent a
+    grant out of whatever was in the file.
+    """
+    if not isinstance(values, (list, tuple)):
+        return ()
+    out: list[str] = []
+    for value in values:
+        if isinstance(value, str) and value and value not in out:
+            out.append(value)
+    return tuple(out)
+
+
+def declared_unit_kinds(manifest: AppManifest | None) -> tuple[str, ...]:
+    """The unit kinds *manifest* asks for, normalised. Empty when there is none."""
+    if manifest is None:
+        return ()
+    return _unit_kinds(list(manifest.contributions.units))
+
+
+def _declared_unit_kinds_in_data(manifest_data: dict[str, Any] | None) -> tuple[str, ...]:
+    """:func:`declared_unit_kinds` for a manifest still in dict form.
+
+    ``register_external_app`` is handed the manifest as JSON it is about to write
+    rather than as a parsed :class:`AppManifest`, and re-parsing it there just to
+    read one list would make the snapshot depend on a second parse succeeding.
+    """
+    if not isinstance(manifest_data, dict):
+        return ()
+    contributions = manifest_data.get("contributions")
+    if not isinstance(contributions, dict):
+        return ()
+    return _unit_kinds(contributions.get("units"))
+
+
+def _narrowed_unit_kinds(
+    *, approved: tuple[str, ...], declared: tuple[str, ...]
+) -> tuple[str, ...]:
+    """The approved kinds a new declaration still asks for -- never more.
+
+    ``register_external_app`` runs under the app's OWN token, so for an app that
+    is already installed it is the app's update path, not the operator's.
+    Dropping a kind there is the app narrowing itself and is always safe; ADDING
+    one is exactly the escalation ``approvedUnits`` exists to stop, so a
+    re-registration can only intersect.  Widening goes through ``install_app`` or
+    ``update_app``, and until it does :func:`units_pending_approval` names what is
+    waiting.
+    """
+    still_declared = set(declared)
+    return tuple(kind for kind in approved if kind in still_declared)
+
+
+def approved_unit_kinds(name: str) -> frozenset[str]:
+    """Unit kinds approved for *name*, read from the gateway-owned install record.
+
+    Read-only, and empty on every failure -- app absent, record unreadable, or a
+    record written before the field existed.  Callers INTERSECT a runtime
+    declaration with this, so empty denies rather than opening anything.
+    """
+    meta = _read_installed(name)
+    if meta is None:
+        return frozenset()
+    return frozenset(meta.approvedUnits)
+
+
+def units_pending_approval(
+    *, approved: tuple[str, ...], manifest: AppManifest | None
+) -> tuple[str, ...]:
+    """Declared unit kinds the approved snapshot does not cover.
+
+    What an operator has to act on.  An app whose declaration has grown since it
+    was installed -- including one installed before the snapshot existed -- keeps
+    running and keeps every other grant, but contributes to none of these kinds
+    until an install or update approves them.  Reported on the app's own record
+    rather than logged once, because from the app's side the denial is silent.
+
+    Takes the approved tuple rather than a name so a listing can answer for every
+    app without re-reading each record it already holds.
+    """
+    already = set(approved)
+    return tuple(kind for kind in declared_unit_kinds(manifest) if kind not in already)
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +958,10 @@ def install_app(
         displayName=manifest.displayName,
         enabled=False,  # installed but not enabled until explicitly enabled
         sessionApprovalConsentPending=bool(manifest.permissions.sessionApproval),
+        # The install IS the approval moment for the kinds this manifest declares:
+        # it is the operator putting these files in place, reading this manifest.
+        # Recorded now so a later rewrite of the app's own manifest cannot widen it.
+        approvedUnits=declared_unit_kinds(manifest),
         installedAt=_now_iso(),
         source=str(source),
         # Persist the server-resolved repository at the first durable metadata
@@ -957,6 +1105,12 @@ def update_app(
             requested_session_approval=requested_session_approval,
             widened_session_approval=widened_session_approval,
         ),
+        # An update re-approves, because an operator is installing this manifest the
+        # same way the first install did -- so an update may legitimately WIDEN the
+        # kinds. It is written into the same `meta` the file transaction below
+        # persists, so an update that fails restores `existing` and with it the
+        # previous authority; a failed update can never change what is approved.
+        approvedUnits=declared_unit_kinds(manifest),
         source=str(source),
         sourceUrl=source_repository.strip(),
         sourceRegistry="",
@@ -977,6 +1131,11 @@ def update_app(
         shutil.rmtree(str(tmp_data))
     if tmp_secret.is_file() and secret_file.is_file():
         tmp_secret.unlink()
+
+    # Close the window BEFORE anything moves. Past this point the tree on disk is
+    # mid-replacement and then new, so a declaration cached earlier describes
+    # authority this update may be removing. See _bump_grant_generation.
+    _bump_grant_generation(name, "before replacing its files")
 
     try:
         if data_dir.is_dir():
@@ -1025,6 +1184,9 @@ def update_app(
         except (OSError, shutil.Error, ValueError) as rollback_exc:
             rollback_error = f"; rollback failed: {rollback_exc}"
             logger.error("Failed to restore app %s after update error", name, exc_info=True)
+        # Whether the rollback succeeded or not, an entry cached during the window
+        # may describe neither tree.
+        _bump_grant_generation(name, "after rolling back a failed update")
         return AppResult(
             ok=False,
             name=name,
@@ -1035,6 +1197,11 @@ def update_app(
         _remove_any_shape(retired)
     except OSError:
         logger.warning("Could not remove retired app tree for %s", name, exc_info=True)
+
+    # Second bump, now that the replacement is durable: an entry filled during the
+    # window above describes a tree that was mid-replacement, so it is dropped here
+    # and the next read caches the manifest that actually shipped.
+    _bump_grant_generation(name, "after replacing its files")
 
     # Ensure data directory exists
     app_data_dir(name)
@@ -1998,9 +2165,11 @@ def list_apps() -> list[dict[str, Any]]:
         # Also load manifest for full info
         manifest_path = entry / APP_MANIFEST_FILENAME
         manifest_data: dict[str, Any] = {}
+        parsed_manifest: AppManifest | None = None
         if manifest_path.is_file():
             try:
                 manifest = AppManifest.from_json_file(manifest_path)
+                parsed_manifest = manifest
                 manifest_data = manifest.to_dict()
                 # For self-managed apps, the app may update its own
                 # app.json without going through update_app().  Reflect
@@ -2028,6 +2197,13 @@ def list_apps() -> list[dict[str, Any]]:
         # Include migratedTo if non-empty
         if meta.migratedTo:
             app_info["migratedTo"] = meta.migratedTo
+        # Unit kinds this app declares but has no approval for. Computed, never
+        # persisted: nothing here writes, because list_apps() must stay read-only.
+        pending_units = units_pending_approval(
+            approved=meta.approvedUnits, manifest=parsed_manifest
+        )
+        if pending_units:
+            app_info["unitsPendingApproval"] = list(pending_units)
         # Mark orphaned builtins
         if entry.name in orphaned_set:
             app_info["orphaned"] = True
@@ -2156,9 +2332,11 @@ def get_app(name: str) -> dict[str, Any] | None:
         return None
     manifest_path = app_dir(name) / APP_MANIFEST_FILENAME
     manifest_data: dict[str, Any] = {}
+    parsed_manifest: AppManifest | None = None
     if manifest_path.is_file():
         try:
             manifest = AppManifest.from_json_file(manifest_path)
+            parsed_manifest = manifest
             manifest_data = manifest.to_dict()
             # Sync version for self-managed apps (same as list_apps)
             if meta.lifecycle == "app" and manifest.version and manifest.version != meta.version:
@@ -2167,7 +2345,11 @@ def get_app(name: str) -> dict[str, Any] | None:
                 _write_installed(name, meta)
         except Exception:
             pass
-    return {**meta.to_dict(), "manifest": manifest_data}
+    info: dict[str, Any] = {**meta.to_dict(), "manifest": manifest_data}
+    pending_units = units_pending_approval(approved=meta.approvedUnits, manifest=parsed_manifest)
+    if pending_units:
+        info["unitsPendingApproval"] = list(pending_units)
+    return info
 
 
 def get_app_manifest(name: str) -> AppManifest | None:
@@ -2550,6 +2732,18 @@ def register_external_app(
                 if manifest_data
                 else existing.sessionApprovalConsentPending
             ),
+            # Intersect, never replace: this path runs under the app's own token,
+            # so letting it re-snapshot would let an app grant itself a kind by
+            # re-registering -- the same escalation as rewriting its manifest, one
+            # call further out. See `_narrowed_unit_kinds`.
+            approvedUnits=(
+                _narrowed_unit_kinds(
+                    approved=existing.approvedUnits,
+                    declared=_declared_unit_kinds_in_data(manifest_data),
+                )
+                if manifest_data
+                else existing.approvedUnits
+            ),
             resources=resources,
             lifecycle=lifecycle,
         )
@@ -2567,6 +2761,12 @@ def register_external_app(
             manifest_path.read_text(encoding="utf-8") if manifest_path.is_file() else None
         )
         manifest_text = json.dumps(manifest_data, indent=2) + "\n" if manifest_data else ""
+        # Same fence as update_app, and for the same reason: the manifest is about
+        # to be replaced, so a declaration cached from the old one has to stop being
+        # answerable BEFORE the write rather than after the handler returns. This
+        # path also narrows -- `approvedUnits` intersects just above -- so the window
+        # it would otherwise leave is a window on removed authority.
+        _bump_grant_generation(name, "before replacing its manifest")
         try:
             if manifest_data and widened_session_approval:
                 # Disable first when adding the grant so the new manifest is
@@ -2595,7 +2795,11 @@ def register_external_app(
             detail = f"failed to persist external registration: {exc}"
             if rollback_errors:
                 detail += f" ({'; '.join(rollback_errors)})"
+            _bump_grant_generation(name, "after rolling back a failed registration")
             return AppResult(ok=False, name=name, error=detail)
+
+        # Durable now, so drop anything cached while the write was in flight.
+        _bump_grant_generation(name, "after replacing its manifest")
     else:
         # New registration
         dest.mkdir(parents=True, exist_ok=True)
@@ -2608,6 +2812,12 @@ def register_external_app(
             # consent moment the self-registration path cannot provide.
             enabled=not widened_session_approval,
             sessionApprovalConsentPending=widened_session_approval,
+            # A FIRST registration is this app's install: it is choosing its own
+            # name and its own manifest either way, so recording what it declares
+            # grants nothing it could not have declared a moment earlier. What the
+            # snapshot exists to stop is a LATER widening, which the existing-app
+            # branch above intersects away.
+            approvedUnits=_declared_unit_kinds_in_data(manifest_data),
             installedAt=_now_iso(),
             source=source,
             sourceUrl=requested_repository,
