@@ -51,12 +51,67 @@ from kiro_crew.messaging.privacy_mode import is_temporary as is_thread_temporary
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.skill_trust import is_project_trusted as _is_project_trusted
 from kiro_crew.skills import _trusted_skill_roots, skills_dir
+from kiro_crew.terminal_safe import normalize_for_scanning
 
 if TYPE_CHECKING:
     from kiro_crew.execution_context import ExecutionContext
     from kiro_crew.platform.interfaces import CapabilityManager
 
 logger = logging.getLogger(__name__)
+
+
+def _scrub_text(val: str) -> str:
+    """Run both redactors, once on the text as given and once with invisibles removed."""
+    val, _ = redact_exfiltration_urls(val)
+    val, _ = redact_credentials(val)
+    val = normalize_for_scanning(val)
+    val, _ = redact_exfiltration_urls(val)
+    val, _ = redact_credentials(val)
+    return val
+
+
+def _scrub_decoded(val: object) -> object:
+    """Scrub every string inside an already-decoded JSON value, shape preserved."""
+    if isinstance(val, str):
+        return _scrub_text(val)
+    if isinstance(val, list):
+        return [_scrub_decoded(item) for item in val]
+    if isinstance(val, dict):
+        return {key: _scrub_decoded(item) for key, item in val.items()}
+    return val
+
+
+def _scrub_json_transport(val: str) -> str:
+    """Scrub the PAYLOAD of a field that carries a JSON document, not just its text.
+
+    A JSON document is a transport encoding, and encoding hides the very characters the
+    scan looks for: a control character inside the payload is written as the six printable
+    characters ``\\u0001``, so the control pattern finds nothing to remove and the token it
+    splits stays split for both redactor passes. The field then egresses carrying the
+    credential, and whatever decodes the document -- a browser calling ``JSON.parse`` --
+    gets the control character back, where it renders as nothing and the credential reads
+    as whole. A memory row carries the same value twice, as text and as JSON, so scanning
+    only the text redacts one copy of a credential and ships the other.
+
+    Scrubbing therefore descends into the decoded value. The field is replaced only when
+    that changed something, so a document holding nothing sensitive is passed through
+    byte for byte rather than re-serialised into a different spelling of itself.
+
+    Only a document decoding to a string, list or dict is considered: a bare JSON number
+    or boolean carries no text to scan, and a plain prose field does not parse at all.
+    """
+    if val.lstrip()[:1] not in ("{", "[", '"'):
+        return val
+    try:
+        decoded = json.loads(val)
+    except ValueError:
+        return val
+    if not isinstance(decoded, (str, list, dict)):
+        return val
+    cleaned = _scrub_decoded(decoded)
+    if cleaned == decoded:
+        return val
+    return json.dumps(cleaned)
 
 
 @overload
@@ -92,13 +147,35 @@ def _redact_memory_field(val: object) -> object:
     tool here: binary is dropped to ``None`` rather than redacted, since it is not
     text this chain can scan and returning it unread would put an unscanned blob on an
     egress path. That case falls to the ``object`` overload.
+
+    The redactors run TWICE, once on the text as stored and once after invisible
+    characters are removed, because each pass catches what the other cannot.
+
+    Both redactors decide by matching a pattern. An invisible character embedded
+    mid-token splits the token so no pattern matches it, and the field would leave on
+    an egress path carrying credential material any consumer that drops those
+    characters can reassemble. Removing them first rejoins the token, which is what the
+    second pass sees.
+
+    The first pass is not redundant, because removing a character can also DESTROY a
+    match. A pattern guarded by a negative lookbehind for a non-word character is
+    satisfied by the invisible character itself, so joining a word character onto the
+    token defeats it -- a credential the text as stored would have given up survives
+    normalisation. Scanning the original first keeps that verdict.
+
+    Normalising between the two passes rather than after both is what makes the order
+    safe. Normalising after the last pass would reassemble the very token that pass had
+    just failed to match, and the field would egress the whole secret.
+
+    Tab, newline and carriage return are content and survive, so a token split by one of
+    those three stays split; see
+    :func:`kiro_crew.terminal_safe.normalize_for_scanning` for what is removed and why
+    no visible content is lost.
     """
     if isinstance(val, (bytes, memoryview)):
         return None
     if isinstance(val, str):
-        val, _ = redact_exfiltration_urls(val)
-        val, _ = redact_credentials(val)
-        return val
+        return _scrub_json_transport(_scrub_text(val))
     if isinstance(val, list):
         return [_redact_memory_field(item) for item in val]
     if isinstance(val, dict):
