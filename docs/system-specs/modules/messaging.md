@@ -1637,8 +1637,17 @@ not one recomputed later from whichever transition happens to run.
 discarded the messages rather than answering them, which is the same reason a kept
 entry must not stay live. A terminal entry is never grown, never flipped, not
 counted as queued, and reported absent by `has_receipt`; the next thing that
-conversation does writes that record once and releases the key, so an edit that
-keeps failing cannot hold the key its next bubble needs. A bubble that already
+conversation does writes that record and releases the key. It releases it on the
+record being WRITTEN, never on the attempt: a bubble can refuse edits permanently
+rather than transiently -- past Webex's cap no edit on that id can ever land -- so
+letting go after one try leaves the bubble reading "Queued" with nothing able to
+rewrite it, which is the same destroyed-handle failure one rung down. So a refused
+retry posts the record as a NEW message instead. The frozen bubble above it still
+reads "Queued", and the two together state what happened where the frozen bubble
+alone claims the messages are still waiting. Only when that post is refused too is
+the entry kept for the next action, and while it is kept the key is not handed to a
+new bubble either -- that bubble would overwrite the record's only handle, so the
+new message is tracked as queued-with-no-bubble instead. A bubble that already
 owes a record is SKIPPED by `finish_cancelled` rather than relabelled: its
 messages left the queue when that earlier transition ran, not when this `/stop`
 did, so writing "Cancelled" over a flip's owed "Now answering" would state the
@@ -1659,17 +1668,31 @@ reconciliation matches on what each bubble DISPLAYS, a channel's drain must repo
 channel's placeholder, so passing its raw empty text matches nothing and the
 registry reads an answered receipt as unanswered, leaving it on "Queued" for its
 next message to grow. Every channel that substitutes a placeholder on create
-substitutes it on the flip as well. When the keyed
-receipt is not there at all -- its send failed, so it was never recorded -- the
-reconciliation does not run: without its texts there is no way to take its own
-share out of the tally first, and this conversation's messages would be credited to
-whoever shows the same words. A TERMINAL entry on that key is a different state and
+substitutes it on the flip as well. A conversation's CLAIM on a text is the copies
+its bubble displays plus the copies it has queued with no bubble at all, counted
+together under its own key. Both are demand: the caller enqueues before asking for
+a receipt, so a refused receipt post leaves the message queued while nothing in the
+registry displays it, and a tally read from bubbles alone therefore reads that
+conversation's demand low. The surplus then looks unclaimed and a co-tenant showing
+the same words is finalized over a message still sitting in the queue -- one
+conversation's bubble closed on another's message, which is the disclosure the
+per-conversation key exists to prevent. Those texts are accounting only: no bubble
+exists to display them in. Nothing is retained that the queue does not already
+hold, one entry per queued message, and the claim is released by the same two
+events that release the message -- the turn that answers it, or the `clear_queue`
+that discards it. When the keyed
+receipt is not there at all -- its post failed, so no bubble was ever recorded --
+the reconciliation does not run: this conversation's own bubble-less messages are
+released, because the turn answered them, but attributing copies to OTHER
+conversations is not done from a state the registry cannot explain. A TERMINAL entry
+on that key is a different state and
 is not that case: its messages left the queue in an earlier transition, and a later
 one would have replaced it with a live bubble, so the conversation is known to hold
 nothing and contributes nothing to the tally. There is no unseen share to net out,
-so the record it owes is retried, its key released, and the co-tenants this turn
+so the record it owes is retried and the co-tenants this turn
 did answer are still reconciled -- stopping at the retry would leave a consumed
-co-tenant reading "Queued" for no reason the registry can state. The
+co-tenant reading "Queued" for no reason the registry can state; an entry still
+owing a record after that retry keeps its key and simply stays out of the tally. The
 `deferred` count the caller passes -- entries the drain re-enqueued -- counts only
 THIS conversation's, so it is recorded in the flipped body as-is while that
 conversation is alone on the session key. Once

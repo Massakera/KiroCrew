@@ -37,7 +37,10 @@ class _Surface:
         edit_returns_false: bool = False,
         receipt_key: str = "conv-1",
     ) -> None:
-        self._send_id = send_id
+        #: What the channel answers a send with. ``None`` is how every client
+        #: reports a send that did not land, and tests flip it mid-run to make the
+        #: platform start or stop accepting posts.
+        self.send_id = send_id
         self.edit_raises = edit_raises
         #: A real client answers a non-2xx with False rather than raising -- a rate
         #: limit, or Webex's cap of ten edits per message. The registry must treat
@@ -49,7 +52,7 @@ class _Surface:
 
     async def send_receipt(self, body: str) -> Any | None:
         self.sent.append(body)
-        return self._send_id
+        return self.send_id
 
     async def edit_receipt(self, msg_id: Any, body: str) -> bool:
         self.edits.append((msg_id, body))
@@ -608,6 +611,176 @@ class TestConversationIdentity:
             "B's bubble was shrunk over a copy that was not provably its own: " f"{b.edits[-1][1]}"
         )
 
+    def test_a_queued_message_with_no_bubble_keeps_its_copy_from_a_co_tenant(self) -> None:
+        """A failed receipt send does not make that message's copy free for others.
+
+        A's "ok" is queued but its receipt send failed, so no bubble displays it.
+        A's own bubble shows only "hi". When A's turn answers both messages the
+        copy of "ok" is A's, and B -- which displays "ok" and is still waiting --
+        must not be told its message was answered.
+        """
+        a = _Surface(send_id="mid-a", receipt_key="chat-A")
+        b = _Surface(send_id="mid-b", receipt_key="chat-B")
+        q = ReceiptQueue()
+
+        async def go() -> None:
+            async with q.lock:
+                a.send_id = None  # the platform refuses the receipt post
+                await q.create_or_grow_locked(self.SESSION, a, "ok")
+                a.send_id = "mid-a"
+                await q.create_or_grow_locked(self.SESSION, a, "hi")
+                await q.create_or_grow_locked(self.SESSION, b, "ok")
+                await q.flip_answering_locked(self.SESSION, a, ["hi", "ok"])
+
+        asyncio.run(go())
+        assert q.has_receipt(self.SESSION, "chat-B"), (
+            "B's bubble was retired over a copy belonging to A's message, which has "
+            "no bubble of its own to account for it"
+        )
+        assert not any("Now answering" in body for _, body in b.edits), (
+            "B was told its message was answered while it was still queued: " f"{b.edits}"
+        )
+
+    def test_identical_words_survive_a_failed_receipt_send(self) -> None:
+        """The same words from two people stay apart when one send failed.
+
+        A sends "ok" twice; the first receipt post fails, so A's bubble displays
+        one copy while A holds two queued messages. A's turn answers both. The
+        second copy is A's, not B's.
+        """
+        a = _Surface(send_id=None, receipt_key="chat-A")
+        b = _Surface(send_id="mid-b", receipt_key="chat-B")
+        q = ReceiptQueue()
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked(self.SESSION, a, "ok")
+                a.send_id = "mid-a"
+                await q.create_or_grow_locked(self.SESSION, a, "ok")
+                await q.create_or_grow_locked(self.SESSION, b, "ok")
+                await q.flip_answering_locked(self.SESSION, a, ["ok", "ok"])
+
+        asyncio.run(go())
+        assert q.has_receipt(
+            self.SESSION, "chat-B"
+        ), "B's queued message was finalized over A's second copy"
+
+    def test_a_bubble_less_claim_is_released_once_its_message_is_answered(self) -> None:
+        """The claim goes when the message does, or it over-blocks for ever.
+
+        A's first message never got a bubble and is answered by A's own turn. Held
+        past that, its claim reads as demand A does not have, and the next turn
+        that would have resolved B exactly declines to -- permanently, since the
+        claim has nothing left to release it.
+        """
+        a = _Surface(send_id=None, receipt_key="chat-A")
+        b = _Surface(send_id="mid-b", receipt_key="chat-B")
+        q = ReceiptQueue()
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked(self.SESSION, a, "ok")  # post refused
+                await q.flip_answering_locked(self.SESSION, a, ["ok"])  # answered anyway
+                a.send_id = "mid-a"
+                await q.create_or_grow_locked(self.SESSION, a, "ok")
+                await q.create_or_grow_locked(self.SESSION, b, "ok")
+                # Two copies answered, two copies displayed: the accounting is exact
+                # and each conversation takes its own.
+                await q.flip_answering_locked(self.SESSION, a, ["ok", "ok"])
+
+        asyncio.run(go())
+        assert not q.has_receipt(self.SESSION, "chat-B"), (
+            "B was left waiting although every displayed copy was answered: the claim "
+            "of A's long-answered message is still being counted as demand"
+        )
+        assert any(
+            "Now answering" in body for _, body in b.edits
+        ), f"B's bubble never got its record: {b.edits}"
+
+    def test_a_co_tenants_bubble_less_message_protects_another_co_tenant(self) -> None:
+        """The tally, not the spending, is what covers a claim that is not the keyed one.
+
+        A's own bubble-less messages are covered because A's turn spends their
+        copies. C's are not: C is not draining, so nothing of C's is spent here and
+        only the tally can speak for it. Two copies are answered and three
+        conversations hold that word, so one of them is still waiting and no text
+        says which -- B must not be picked.
+        """
+        a = _Surface(send_id="mid-a", receipt_key="chat-A")
+        b = _Surface(send_id="mid-b", receipt_key="chat-B")
+        c = _Surface(send_id=None, receipt_key="chat-C")
+        q = ReceiptQueue()
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked(self.SESSION, a, "ok")
+                await q.create_or_grow_locked(self.SESSION, b, "ok")
+                await q.create_or_grow_locked(self.SESSION, c, "ok")  # post refused
+                # A's channel reports two copies while A's bubble displays one.
+                await q.flip_answering_locked(self.SESSION, a, ["ok", "ok"])
+
+        asyncio.run(go())
+        assert q.has_receipt(self.SESSION, "chat-B"), (
+            "B was finalized on a copy that C's bubble-less queued message may "
+            "account for: a claim with no bubble was left out of the tally"
+        )
+        assert not any(
+            "Now answering" in body for _, body in b.edits
+        ), f"B was told its message was answered while it was still queued: {b.edits}"
+
+    def test_the_keyed_turn_releases_its_own_bubble_less_claim(self) -> None:
+        """A turn that answers a bubble-less message releases its claim as it goes.
+
+        Distinct from the case above, where the conversation had no bubble at all:
+        here it has one, so the release happens beside the bubble's own split. Left
+        behind, the claim survives the message and the next turn that should have
+        resolved B declines to.
+        """
+        a = _Surface(send_id=None, receipt_key="chat-A")
+        b = _Surface(send_id="mid-b", receipt_key="chat-B")
+        q = ReceiptQueue()
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked(self.SESSION, a, "ok")  # post refused
+                a.send_id = "mid-a"
+                await q.create_or_grow_locked(self.SESSION, a, "hi")  # bubble shows "hi"
+                await q.flip_answering_locked(self.SESSION, a, ["hi", "ok"])
+                await q.create_or_grow_locked(self.SESSION, a, "ok")
+                await q.create_or_grow_locked(self.SESSION, b, "ok")
+                await q.flip_answering_locked(self.SESSION, a, ["ok", "ok"])
+
+        asyncio.run(go())
+        assert not q.has_receipt(self.SESSION, "chat-B"), (
+            "B was left waiting although every displayed copy was answered: the claim "
+            "the keyed turn answered is still being counted as demand"
+        )
+
+    def test_a_stop_drops_a_claim_it_discarded_the_message_for(self) -> None:
+        """``clear_queue`` took the bubble-less messages too, so their claim goes.
+
+        Kept, it outlives the message it stands for, and the accounting it distorts
+        leaves a later co-tenant waiting over copies that were all answered.
+        """
+        a = _Surface(send_id=None, receipt_key="chat-A")
+        b = _Surface(send_id="mid-b", receipt_key="chat-B")
+        q = ReceiptQueue()
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked(self.SESSION, a, "ok")  # post refused
+                await q.finish_cancelled_locked(self.SESSION, a)  # /stop discards it
+                a.send_id = "mid-a"
+                await q.create_or_grow_locked(self.SESSION, a, "ok")
+                await q.create_or_grow_locked(self.SESSION, b, "ok")
+                await q.flip_answering_locked(self.SESSION, a, ["ok", "ok"])
+
+        asyncio.run(go())
+        assert not q.has_receipt(self.SESSION, "chat-B"), (
+            "B was left waiting although every displayed copy was answered: a claim "
+            "for a message /stop discarded is still being counted as demand"
+        )
+
     def test_the_answering_conversation_attributes_its_own_duplicate(self) -> None:
         """A shared word does not stop a conversation attributing ITS OWN copy.
 
@@ -941,8 +1114,9 @@ class TestConversationIdentity:
     def test_a_cancelled_record_is_retried_once_then_yields_its_key(self) -> None:
         """The next thing the conversation does is the first chance to recover.
 
-        The retry is one attempt, not a loop: an edit that keeps failing must not
-        keep the key, because this conversation's new bubble needs it.
+        Here the platform has recovered, so the edit lands and the key goes to the
+        new bubble. A record still unwritten keeps the key instead -- see the two
+        cases below.
         """
         s = _Surface(edit_raises=True)
         q = ReceiptQueue()
@@ -962,6 +1136,111 @@ class TestConversationIdentity:
         assert len(s.sent) == 2, "the new message did not get its own bubble"
         assert "a" not in s.sent[1], "the fresh bubble inherited the cancelled text"
         assert q.has_receipt("s", s.receipt_key)
+
+    def test_a_record_the_bubble_will_not_take_is_posted_as_a_new_message(self) -> None:
+        """A bubble can stop accepting edits for good, so the record goes elsewhere.
+
+        Webex refuses edits on a message past a fixed count, and no retry on that
+        id can ever land. Retrying for ever would leave the bubble reading
+        "⏳ Queued" over messages that are gone, so the record is posted as its own
+        message and the key is released then.
+        """
+        s = _Surface(edit_raises=True)
+        q = ReceiptQueue()
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.finish_cancelled_locked("s", s)  # edit fails
+                await q.create_or_grow_locked("s", s, "b")  # retry fails, post instead
+
+        asyncio.run(go())
+        posted = [body for body in s.sent if "Cancelled" in body]
+        assert len(posted) == 1, (
+            "the record the bubble refused was never posted anywhere the reader can "
+            f"see it: {s.sent}"
+        )
+        assert "a" in posted[0], f"the posted record lost the text it stands for: {posted[0]}"
+        assert q.has_receipt("s", s.receipt_key), "the new message did not get its own bubble"
+
+    def test_a_record_that_cannot_be_written_at_all_keeps_its_handle(self) -> None:
+        """Nothing is released while the record is still unwritten.
+
+        Both routes failed, so the only thing that could ever state what happened
+        is this entry. Dropping it here is what stranded the bubble on "⏳ Queued"
+        with nothing able to rewrite it.
+        """
+        s = _Surface(edit_raises=True)
+        q = ReceiptQueue()
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.finish_cancelled_locked("s", s)  # edit fails
+                s.send_id = None  # and the platform refuses posts too
+                await q.create_or_grow_locked("s", s, "b")
+                # The platform recovers. The owed record must still be writable.
+                s.edit_raises = False
+                s.send_id = "mid-2"
+                await q.create_or_grow_locked("s", s, "c")
+
+        asyncio.run(go())
+        cancels = [body for _, body in s.edits if "Cancelled" in body]
+        assert len(cancels) == 3, (
+            "the handle was released while the record was unwritten, so recovery "
+            f"could not write it: attempts={len(cancels)} edits={s.edits}"
+        )
+
+    def test_a_new_message_does_not_take_a_key_that_still_owes_a_record(self) -> None:
+        """A fresh bubble must not overwrite the only handle an owed record has.
+
+        The platform refuses one post and then recovers, which is what separates
+        the two things that would be posted through that key: the record it owes,
+        and a bubble for the new message. Taking the key for the bubble loses the
+        record for good -- nothing else refers to that message. Tracked as
+        queued-without-a-bubble instead, the new message keeps its claim and the
+        record is still written on the next action.
+        """
+
+        class _RefusesOnePost(_Surface):
+            """Refuses exactly one post, then accepts. Only landed posts are recorded."""
+
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(**kwargs)
+                self.refuse_next = False
+                self.refused: list[str] = []
+
+            async def send_receipt(self, body: str) -> Any | None:
+                if self.refuse_next:
+                    self.refuse_next = False
+                    self.refused.append(body)
+                    return None
+                return await super().send_receipt(body)
+
+        s = _RefusesOnePost(edit_raises=True)
+        other = _Surface(send_id="mid-b", receipt_key="chat-B")
+        q = ReceiptQueue()
+
+        async def go() -> None:
+            async with q.lock:
+                await q.create_or_grow_locked("s", s, "a")
+                await q.finish_cancelled_locked("s", s)  # edit fails, record owed
+                s.refuse_next = True
+                # The retry's edit fails and its replacement post is refused, so the
+                # record is still owed. The platform accepts posts again after this.
+                await q.create_or_grow_locked("s", s, "ok")
+                await q.create_or_grow_locked("s", other, "ok")
+                await q.flip_answering_locked("s", s, ["ok"])
+
+        asyncio.run(go())
+        assert any("Cancelled" in body for body in s.sent), (
+            "the owed record was never written: a new bubble took the key and "
+            f"destroyed its only handle (landed posts: {s.sent}, refused: {s.refused})"
+        )
+        assert q.has_receipt("s", "chat-B"), (
+            "B was finalized over the copy belonging to the message that got no "
+            "bubble because the key still owed a record"
+        )
 
     def test_a_discarded_message_cannot_make_a_live_conversations_text_ambiguous(self) -> None:
         """A terminal entry is not a co-tenant holding a queued message.

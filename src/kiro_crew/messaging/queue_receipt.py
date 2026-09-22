@@ -117,8 +117,11 @@ class QueueReceipt:
     #: :meth:`has_receipt` reports it as absent. The entry is kept only because it
     #: is the bubble's only handle, and the body is kept with it because the retry
     #: has to write the record that was intended, not one recomputed later from a
-    #: different transition. The next thing that conversation does retries it once
-    #: and then lets go, so an edit that keeps failing cannot hold the key.
+    #: different transition. The next thing that conversation does writes that
+    #: record and releases the key -- by editing the bubble, or, when the bubble
+    #: has stopped accepting edits, by posting the record as a new message. The key
+    #: is never released on an attempt alone: that is what left a bubble reading
+    #: "⏳ Queued" with nothing able to rewrite it.
     final_body: str | None = None
 
 
@@ -198,6 +201,17 @@ class ReceiptQueue:
 
     def __init__(self) -> None:
         self._receipts: dict[tuple[str, str], QueueReceipt] = {}
+        #: Display texts of messages a conversation has QUEUED but has no bubble
+        #: for, because the receipt send itself failed. They are tracked because
+        #: reconciliation attributes answered copies by text, and a copy belonging
+        #: to one of these is otherwise invisible: the conversation's demand reads
+        #: low, the surplus looks unclaimed, and a co-tenant displaying the same
+        #: words is finalized over a message still sitting in the queue. Nothing
+        #: is retained here that the queue does not already hold -- one entry per
+        #: queued message, dropped when that message is answered or when
+        #: ``clear_queue`` discards it -- and it is accounting only, never
+        #: displayed: no bubble exists to display it in.
+        self._unreceipted: dict[tuple[str, str], list[str]] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -225,18 +239,41 @@ class ReceiptQueue:
         ]
 
     async def _retry_terminal(self, key: tuple[str, str], receipt: QueueReceipt) -> None:
-        """Give a stranded terminal record one more attempt, then release the key.
+        """Write the record a terminal receipt owes, and release its key once written.
 
         Writes the body that transition MEANT to show, carried on the receipt, so a
         cancel is retried as a cancel and a flip as a flip. Called when the
         conversation acts again, which is the first moment the platform may have
-        recovered. One attempt, not a loop: the entry exists to rescue a transient
-        failure, and an edit that keeps failing must not keep this conversation's
-        key -- its next bubble needs it.
+        recovered.
+
+        The key is released only when the record is somewhere the reader can see
+        it. Releasing it on an attempt is the same mistake as retiring a live
+        receipt on one: the entry goes, and the bubble keeps reading
+        "⏳ Queued" over messages that have left the queue, with nothing left that
+        could ever rewrite it.
+
+        A refused edit is not always transient, which is why a second failure does
+        not simply wait for a third attempt: Webex stops accepting edits for a
+        message after a fixed number of them, and past that cap no retry on that id
+        can ever land. So the record is posted as a NEW message instead. The frozen
+        bubble above it still reads "⏳ Queued", and together the two tell the truth
+        -- it was queued, and here is what became of it -- where the frozen bubble
+        alone says it is still waiting, forever. Only if that post fails too is the
+        entry kept, for the next thing this conversation does.
         """
-        if receipt.final_body is not None:
-            await self._edit(receipt, receipt.final_body, "record-retry")
-        del self._receipts[key]
+        body = receipt.final_body
+        if body is None or await self._edit(receipt, body, "record-retry"):
+            del self._receipts[key]
+            return
+        try:
+            posted = await receipt.surface.send_receipt(body)
+        except Exception:
+            logger.debug(
+                "%s: queue receipt record-replace failed", receipt.surface.label, exc_info=True
+            )
+            return
+        if posted is not None:
+            del self._receipts[key]
 
     def _warn_unresolved(self, session_key: str, surface: ReceiptSurface, transition: str) -> None:
         """Report a transition that found no receipt for the conversation it names.
@@ -326,12 +363,27 @@ class ReceiptQueue:
         gone, so appending to it would put already-answered text back under
         "⏳ Queued" beside the new message -- but this is the first evidence the
         platform may be answering again, so its record is retried once here before
-        the key is handed to the new bubble.
+        the key is handed to the new bubble. While that record is STILL unwritten
+        the key is not handed over at all: it is the record's only handle.
+
+        A send that fails leaves no bubble, and the message is nonetheless queued
+        -- the caller enqueued it before calling. Its text is recorded against
+        this conversation so reconciliation can still see the claim, because a
+        copy of it will be answered and a tally built from bubbles alone would
+        credit that copy to whichever co-tenant displays the same words.
         """
         entry = (session_key, surface.receipt_key)
         receipt = self._receipts.get(entry)
         if receipt is not None and receipt.final_body is not None:
             await self._retry_terminal(entry, receipt)
+            if entry in self._receipts:
+                # The record this key owes is still unwritten, and posting it is
+                # what was just tried and refused. A new bubble here would take the
+                # key and destroy the only handle that record has, so this message
+                # is tracked as queued-without-a-bubble instead; the next thing
+                # this conversation does retries both.
+                self._unreceipted.setdefault(entry, []).append(display_text)
+                return
             receipt = None
         if receipt is None:
             msg_id = await surface.send_receipt(receipt_text([display_text]))
@@ -339,6 +391,13 @@ class ReceiptQueue:
                 self._receipts[entry] = QueueReceipt(
                     msg_id=msg_id, surface=surface, texts=[display_text]
                 )
+            else:
+                # No bubble, but the message IS queued: the caller enqueued it
+                # before calling. Recording the text keeps this conversation's
+                # demand visible to reconciliation, which would otherwise see a
+                # copy of it answered with nothing accounting for it and hand the
+                # surplus to whichever co-tenant shows the same words.
+                self._unreceipted.setdefault(entry, []).append(display_text)
             return
         receipt.texts.append(display_text)
         await self._edit(receipt, receipt_text(receipt.texts), "grow")
@@ -427,7 +486,8 @@ class ReceiptQueue:
         whatever transition happened to run then rather than the one that failed.
         So it is never grown, never flipped, not counted as queued, and reported
         absent by :meth:`has_receipt`; the next thing that conversation does writes
-        that record once and releases the key.
+        that record and releases the key, editing the bubble or, once the bubble has
+        stopped accepting edits, posting the record as a new message.
         :meth:`finish_cancelled_locked` keeps its entry the same way, and there the
         messages are gone rather than answered -- ``clear_queue`` discarded them --
         which is the same reason a kept entry must not stay live.
@@ -438,15 +498,28 @@ class ReceiptQueue:
         own share out of the tally first, and this conversation's messages would be
         credited to whoever shows the same words. That state is already unexplained
         and logged; acting on it is how one conversation's record ends up closed
-        over another's message.
+        over another's message. Its own bubble-less messages are still released,
+        because this turn answered them; what is held back is attributing copies to
+        OTHER conversations.
+
+        A conversation's claim on a text is the copies its bubble DISPLAYS plus the
+        copies it has queued with no bubble at all, counted together under its own
+        key. Both are demand: a receipt send that failed leaves the message queued,
+        so a copy of it gets answered while nothing in the registry displays it. A
+        tally read from bubbles alone therefore undercounts that conversation and
+        the surplus looks free, which is how a co-tenant showing the same words is
+        finalized over a message still sitting in the queue. A conversation holding
+        only such messages appears in no bubble at all and is counted the same way.
 
         A TERMINAL entry on that key is a different state and is not that case. Its
         messages left the queue in an earlier transition, and a later one would have
         replaced it with a live bubble, so the conversation is known to hold nothing
         and contributes nothing to the tally -- there is no unseen share to net out.
-        Its owed record is retried, its key released, and the co-tenants this turn
-        did answer are still reconciled; stopping there would leave a consumed
-        co-tenant reading "⏳ Queued" for no reason the registry can state.
+        Its owed record is retried, and the co-tenants this turn did answer are
+        still reconciled; stopping there would leave a consumed co-tenant reading
+        "⏳ Queued" for no reason the registry can state. Its key is released only
+        when that record is written, so an entry still owing one is left in place
+        and simply stays out of the tally.
 
         Caller MUST hold :attr:`lock` across dequeue + this call.
         """
@@ -466,6 +539,24 @@ class ReceiptQueue:
                     waiting.append(text)
             return taken, waiting
 
+        def spend_unreceipted(key: tuple[str, str]) -> None:
+            """Credit answered copies to this conversation's bubble-less messages.
+
+            Those messages have left the queue now, so their claim must go with
+            them: held, it would read as demand forever and make every co-tenant
+            sharing those words permanently unresolvable. Spending the copies here
+            also keeps them away from the co-tenants below, which is where they
+            belong -- this conversation's own messages account for them.
+            """
+            queued = self._unreceipted.get(key)
+            if queued is None:
+                return
+            _, still_queued = split(queued)
+            if still_queued:
+                self._unreceipted[key] = still_queued
+            else:
+                del self._unreceipted[key]
+
         entry = (session_key, surface.receipt_key)
         receipt = self._receipts.get(entry)
         if receipt is None:
@@ -475,6 +566,11 @@ class ReceiptQueue:
             # without spending copies those unseen messages may account for.
             # Leave every bubble alone and let each conversation's own turn
             # resolve it; the warning below names the tracking issue.
+            #
+            # Its bubble-less messages are still released, because this turn
+            # answered them: what is deferred here is attributing copies to OTHER
+            # conversations, not noticing that this one's messages are gone.
+            spend_unreceipted(entry)
             self._warn_unresolved(session_key, surface, "flip")
             return
         if receipt.final_body is not None:
@@ -491,7 +587,6 @@ class ReceiptQueue:
         else:
             del self._receipts[entry]
         others = self._live_keys(session_key)
-        keyed_texts = receipt.texts if receipt is not None else []
         # One tally over the CO-TENANTS, against what this turn answered. A text is
         # ambiguous only when the session wants MORE copies of it than the turn
         # answered: with enough to go round, the multiset accounting is exact and
@@ -502,9 +597,24 @@ class ReceiptQueue:
         # ambiguous with itself, and this conversation's own texts are counted for
         # the same reason: a co-tenant must not claim a copy this conversation is
         # displaying. The tally is taken before any split spends a copy.
+        #
+        # A conversation's claim is the copies its bubble displays PLUS the copies
+        # it has queued with no bubble, combined under its own key. Both are real
+        # demand, and a conversation whose receipt send failed has only the second
+        # kind -- it holds queued messages and appears nowhere in ``others``, so a
+        # tally built from bubbles alone reads its demand as zero and lets a
+        # co-tenant showing the same words take a copy that message accounts for.
+        claims: dict[tuple[str, str], list[str]] = {}
+        if receipt is not None:
+            claims[entry] = list(receipt.texts)
+        for key in others:
+            claims[key] = list(self._receipts[key].texts)
+        for key, queued in self._unreceipted.items():
+            if key[0] == session_key:
+                claims.setdefault(key, []).extend(queued)
         demand: Counter[str] = Counter()
         holders: Counter[str] = Counter()
-        for texts in [keyed_texts, *(self._receipts[k].texts for k in others)]:
+        for texts in claims.values():
             demand.update(texts)
             holders.update(set(texts))
         ambiguous = frozenset(
@@ -522,6 +632,10 @@ class ReceiptQueue:
             # same two receipts and declined again, so the stale read the branch
             # below treats as self-correcting never corrected.
             mine, left = split(receipt.texts)
+            # After the bubble's own display, because that is what this record will
+            # name; before the co-tenants below, because a copy one of these
+            # messages accounts for is not theirs to take.
+            spend_unreceipted(entry)
             # Nothing of this conversation's was attributable. The body below would
             # then fall back to the WHOLE bubble and call it answered, which is true
             # only when the queue is provably empty: the drain re-enqueued nothing of
@@ -600,7 +714,9 @@ class ReceiptQueue:
         ``final_body``: those messages are gone, so it is never grown, never
         flipped, and never counted as queued, and the retry writes the cancel that
         was intended rather than whatever a later transition would compute. The
-        next thing this conversation does writes it once and releases the key.
+        next thing this conversation does writes it and releases the key, editing
+        the bubble or posting the cancel as a new message once the bubble has
+        stopped accepting edits.
 
         A bubble that ALREADY owes a record from an earlier transition is skipped
         rather than relabelled. Its messages left the queue when that transition
@@ -610,6 +726,14 @@ class ReceiptQueue:
 
         Caller MUST hold :attr:`lock` across clear_queue + this call.
         """
+        # ``clear_queue`` discarded this session's held messages, the bubble-less
+        # ones included. They can never be answered now, so their claim goes with
+        # them -- kept, it would read as demand against every later turn and leave
+        # co-tenants sharing those words permanently unresolvable. There is no
+        # bubble to write a "🛑 Cancelled" record on, which is why they are dropped
+        # rather than finalized.
+        for key in [key for key in self._unreceipted if key[0] == session_key]:
+            del self._unreceipted[key]
         for key in list(self._receipts):
             if key[0] != session_key:
                 continue
