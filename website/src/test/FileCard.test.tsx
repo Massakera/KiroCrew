@@ -29,7 +29,10 @@ describe('FileCard', () => {
     // whitespace-insensitive matcher rather than a literal: `fmtUnit` asks CLDR for
     // the `narrow` form and promotes any plain space to U+00A0, and the separator
     // CLDR chooses differs per locale and can change across ICU versions.
-    expect(screen.getByText((_, el) => el?.textContent?.replace(/\s/g, '') === '2kB')).toBeInTheDocument()
+    // The meta line joins type · size · description, so match the size as a
+    // segment of that line rather than as the whole element text.
+    expect(screen.getByText((content) => /^PDF\s*·\s*2\s*kB$/.test(content.replace(/\u00a0/g, ' ')))).toBeInTheDocument()
+    expect(screen.getByTestId('file-card-glyph').dataset.family).toBe('document')
     const link = document.querySelector('a[download]')
     expect(link).toBeInTheDocument()
     expect(link?.getAttribute('href')).toContain('/api/outbox/report.pdf')
@@ -38,9 +41,16 @@ describe('FileCard', () => {
   it('renders download link when no content_type', () => {
     render(<FileCard file={{ filename: 'data.bin' }} />)
     expect(screen.getByText('data.bin')).toBeInTheDocument()
+    expect(screen.getByTestId('file-card-glyph').dataset.family).toBe('unknown')
     expect(document.querySelector('a[download]')).toBeInTheDocument()
     expect(document.querySelector('audio')).not.toBeInTheDocument()
     expect(document.querySelector('video')).not.toBeInTheDocument()
+  })
+
+  it('picks the family from the extension when the MIME is opaque', () => {
+    render(<FileCard file={{ filename: 'deploy-key.pem', content_type: 'application/octet-stream' }} />)
+    expect(screen.getByTestId('file-card-glyph').dataset.family).toBe('key')
+    expect(document.querySelector('a[download]')).toBeInTheDocument()
   })
 
   it('renders audio player for audio/ogg', () => {
