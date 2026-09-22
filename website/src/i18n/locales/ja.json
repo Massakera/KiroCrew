@@ -14161,6 +14161,7 @@
         "system_notifications_allowed": "許可済み",
         "allow_system_notifications": "システム通知を許可",
         "system_notifications_blocked": "ブラウザーでブロックされています。サイトの権限設定で再度オンにしてください。",
+        "system_notifications_host_managed": "このリモートクルーの通知はメインの {{productName}} ウィンドウが表示します。許可またはブロックは、そちらの設定 → 通知で行ってください。",
         "show_banner_for_new_notifications": "新しい通知をバナーで表示",
         "show_banner_for_new_notifications_description": "通知が届くとカードがトップバーの下にスライドして表示され、その後ベルに収まります。"
       },

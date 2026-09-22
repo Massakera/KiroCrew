@@ -250,25 +250,34 @@ function ChannelsSection() {
 }
 
 /**
- * The OS-notification permission as one settings row. Three states, one
- * action: `default` offers the button (the click is the browser's required
- * user gesture), `granted` confirms, `denied` says where the browser keeps the
- * switch — this page cannot flip it, so it offers no button that would fail.
- * Unmounted entirely where the platform has no `Notification` at all.
+ * The OS-notification permission as one settings row. `default` offers the
+ * button (the click is the browser's required user gesture), `granted`
+ * confirms, `denied` says where the browser keeps the switch — this page cannot
+ * flip it, so it offers no button that would fail. In an embedded pane
+ * (`host-managed`) it points at the main Kiro Crew window's Settings › Notifications —
+ * the frame that does own the switch — and makes no claim either way, because
+ * the pane is not told the parent's grant. Unmounted entirely where the
+ * platform has no `Notification` at all.
+ *
+ * Exported for `capture/system-notifications-row.tsx`, which photographs all
+ * four states for PR evidence. Mounting the real row is the point: a fixture
+ * that re-composed this markup could drift from which state shows which copy,
+ * and that mapping is exactly what the frames are evidence of.
  */
-function SystemNotificationsRow() {
+export function SystemNotificationsRow() {
   const { permission, request } = useNotificationPermission()
   if (permission === 'unsupported') return null
   const label = i18nT('pages.settings.notificationsPanel.system_notifications')
+  const description = permission === 'denied'
+    ? i18nT('pages.settings.notificationsPanel.system_notifications_blocked')
+    : permission === 'host-managed'
+      ? i18nT('pages.settings.notificationsPanel.system_notifications_host_managed')
+      : i18nT('pages.settings.notificationsPanel.system_notifications_description')
   return (
     <div data-setting-label={label} data-testid="system-notifications-row" className="flex items-center justify-between gap-4 py-1.5">
       <div className="flex-1 min-w-0">
         <div className="text-[13px] font-semibold text-text">{label}</div>
-        <div className="text-[12px] text-muted mt-0.5">
-          {permission === 'denied'
-            ? i18nT('pages.settings.notificationsPanel.system_notifications_blocked')
-            : i18nT('pages.settings.notificationsPanel.system_notifications_description')}
-        </div>
+        <div className="text-[12px] text-muted mt-0.5">{description}</div>
       </div>
       {permission === 'granted' && (
         <span className="flex items-center gap-1 text-[12px] text-muted shrink-0"><Check className="lucide-inline text-ok" /> {i18nT('pages.settings.notificationsPanel.system_notifications_allowed')}</span>

@@ -13,10 +13,26 @@
  * by most browsers and by all of them once the user has dismissed the prompt.
  */
 import { useCallback, useEffect, useState } from 'react'
+import { isEmbeddedPane } from '../lib/embedded'
 
-export type NotificationPermissionState = 'unsupported' | 'default' | 'granted' | 'denied'
+export type NotificationPermissionState =
+  | 'unsupported'
+  | 'default'
+  | 'granted'
+  | 'denied'
+  /** An embedded remote-instance pane, where this permission is not ours to
+   *  report. Chromium pins the pane's own value to `denied` (Electron grants
+   *  `notifications` to the main frame only) while toasts still reach the user
+   *  via the parent relay in `lib/nativeNotify.ts` — but whether one LANDS
+   *  depends on the parent dashboard's grant, which the pane is never told. So
+   *  neither `denied` nor `granted` is true here: both are a guess, and a wrong
+   *  guess in either direction is the bug (a pane that says "blocked" while
+   *  banners arrive, or "Allowed" while they silently vanish). This state
+   *  claims nothing and names the owner instead. */
+  | 'host-managed'
 
 export function readNotificationPermission(): NotificationPermissionState {
+  if (isEmbeddedPane()) return 'host-managed'
   if (typeof Notification === 'undefined') return 'unsupported'
   const p = Notification.permission
   return p === 'granted' || p === 'denied' ? p : 'default'

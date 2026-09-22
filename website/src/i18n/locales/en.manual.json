@@ -6229,6 +6229,7 @@
         "system_notifications_allowed": "Allowed",
         "allow_system_notifications": "Allow system notifications",
         "system_notifications_blocked": "Blocked in your browser. Turn it back on in the site's permission settings.",
+        "system_notifications_host_managed": "This remote crew's notifications are shown by the main {{productName}} window — allow or block them in its Settings → Notifications.",
         "show_banner_for_new_notifications": "Show a banner for new notifications",
         "show_banner_for_new_notifications_description": "A card slides in under the top bar when a notification arrives, then tucks into the bell."
       },

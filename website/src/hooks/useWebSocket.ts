@@ -17,6 +17,7 @@ import { bindSlotReadSender, emitSlotRead, flushSlotRead } from '../lib/slotRead
 import { getViewedThreadSlot } from '../lib/viewedThread'
 import { VoicePcmPlayer, voiceBoundary, createVoiceRequestId } from '../lib/voicePlayback'
 import { reportVoiceFailure } from '../lib/voiceFailure'
+import { showNativeNotification } from '../lib/nativeNotify'
 import {
   fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setAutomations, sseAutomation, removeAutomation, sseSideQueue, reconcileWorkflowRuns,
 } from '../store/chatSlice'
@@ -1676,15 +1677,16 @@ export function useWebSocket() {
               dispatchMcNotification(APPROVAL_KIND)
             }
             // Browser notification when tab not focused (permission must be granted via UI interaction elsewhere)
-            if (typeof Notification !== 'undefined' && document.hidden && Notification.permission === 'granted') {
-              // Android Chrome throws "Illegal constructor" for page-context
-              // Notification; an uncaught throw here kills the whole message
-              // handler, so the native toast is best-effort.
-              try {
-                new Notification(i18nT('hooks.useWebSocket.approval_required'), { body: data.tool || i18nT('hooks.useWebSocket.a_task_needs_your_decision'), silent: true, tag: 'kirocrew-approval' })
-              } catch {
-                /* unsupported platform */
-              }
+            if (document.hidden) {
+              // The permission check, the throwing-constructor guard and the
+              // embedded-pane relay all live in showNativeNotification: in a
+              // remote-instance pane the page-context constructor is refused by
+              // Electron's main-frame-only gate, so the parent has to post it.
+              showNativeNotification({
+                title: i18nT('hooks.useWebSocket.approval_required'),
+                body: data.tool || i18nT('hooks.useWebSocket.a_task_needs_your_decision'),
+                tag: 'kirocrew-approval',
+              })
             }
             dispatch(addNotification({
               kind: 'approval',
@@ -2405,14 +2407,16 @@ export function useWebSocket() {
               const doneBody = completionNeedsInput
                 ? i18nT('hooks.useWebSocket.waiting_for_input')
                 : i18nT('hooks.useWebSocket.response_ready')
-              // Android Chrome throws "Illegal constructor" for page-context
-              // Notification; an uncaught throw here kills the whole message
-              // handler, so the native toast is best-effort (same as approval).
-              try {
-                new Notification(doneTitle, { body: doneBody, tag: `kirocrew-chat-done:${doneSlot}`, silent: questionPending })
-              } catch {
-                /* unsupported platform */
-              }
+              // Same seam as the approval toast above: it owns the
+              // throwing-constructor guard and the embedded-pane relay.
+              // `silent` stays tied to questionPending — a pending question
+              // already chimed, anything else earns the OS sound.
+              showNativeNotification({
+                title: doneTitle,
+                body: doneBody,
+                tag: `kirocrew-chat-done:${doneSlot}`,
+                silent: questionPending,
+              })
             }
             if (data.slot && !isSlotOnScreen(data.slot) && !reconnectingRef.current) {
               dispatch(markSlotUnread({ slot: data.slot, ts: (data as { ts?: string }).ts || undefined }))

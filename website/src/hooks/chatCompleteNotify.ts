@@ -13,6 +13,7 @@
  * Settings > Notifications.
  */
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
+import { canShowNativeNotification, requestNativeNotificationPermission } from '../lib/nativeNotify'
 
 /** localStorage key holding the opt-in. Absent — or anything but `'1'` —
  *  means off, so a corrupt or half-written value degrades to the default
@@ -38,13 +39,8 @@ export function loadChatCompleteNotify(): boolean {
  */
 export function saveChatCompleteNotify(on: boolean): void {
   safeSetItem(CHAT_COMPLETE_NOTIFY_KEY, on ? '1' : '0')
-  if (!on || typeof Notification === 'undefined') return
-  if (Notification.permission !== 'default') return
-  try {
-    void Notification.requestPermission()
-  } catch {
-    /* unsupported platform (a callback-only implementation returns nothing) */
-  }
+  if (!on) return
+  requestNativeNotificationPermission()
 }
 
 /**
@@ -65,7 +61,13 @@ export function shouldNotifyOnChatComplete(opts: {
 }): boolean {
   if (!opts.slot || opts.reconnecting) return false
   if (!loadChatCompleteNotify()) return false
-  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false
+  // Not a raw `Notification.permission` read: inside an embedded
+  // remote-instance pane that value is pinned to 'denied' by Electron's
+  // main-frame-only permission gate, so reading it there would switch the
+  // feature off for exactly the crews whose completions the user cannot see.
+  // `canShowNativeNotification` answers "can this frame get a toast delivered",
+  // which in a pane means "the parent can post it for us".
+  if (!canShowNativeNotification()) return false
   // "Away" needs both axes: `hidden` covers minimized / another virtual desktop
   // / a background tab, while `hasFocus()` covers a window that is fully
   // visible but sitting behind another application.

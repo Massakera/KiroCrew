@@ -712,6 +712,69 @@ Requires a paid Apple Developer account ($99/yr) for the Developer ID cert and
 notary access. Without one, distribute via Homebrew cask or instruct users to
 clear the quarantine flag.
 
+### Signing a LOCAL build (`make resign-desktop`)
+
+The block above is the distribution lane. For everyday development the build
+deliberately does **not** search your keychain (`_eb_invoke` in
+`packaging/build-desktop.sh` sets `CSC_IDENTITY_AUTO_DISCOVERY=false`), so every
+plain `make desktop` app is ad-hoc signed. That is usually fine — and is a trap
+for two features:
+
+- **Notifications never appear.** macOS silently drops every notification posted
+  by an ad-hoc bundle: no banner, nothing in Notification Center, no Dock badge.
+  Chromium still reports `Notification.permission === "granted"` and
+  `new Notification(...)` still returns an object, so there is no error anywhere
+  to diagnose from, and System Settings → Notifications shows the app present
+  and allowed.
+- **TCC grants reset every rebuild.** Microphone and accessibility consent is
+  keyed to the signing identity, so an ad-hoc build re-prompts (or silently
+  fails) after each `make desktop` — see the TCC section below.
+
+Fix it by re-signing the **installed** bundle. An **Apple Development** identity
+is enough; notarization is not needed for an app you install yourself.
+
+```bash
+security find-identity -v -p codesigning     # copy the quoted name
+export KIROCREW_SIGN_IDENTITY="Apple Development: you@example.com (XXXXXXXXXX)"
+make desktop                                 # install the DMG as usual, then:
+make resign-desktop                          # /Applications/KiroCrew.app
+```
+
+`make resign-desktop APP=/path/to/KiroCrew.app` signs a bundle elsewhere;
+`KIROCREW_SIGN_ENTITLEMENTS` overrides the entitlements file. The script quits
+early rather than half-signing: it refuses on a non-Darwin host, a missing
+identity, a missing bundle or entitlements file, and a bundle that is still
+running. It clears extended attributes first, because a quarantine flag or Finder
+metadata anywhere in the tree makes `codesign` refuse with *"resource fork,
+Finder information, or similar detritus not allowed"* and the signature is then
+**not written** — the bundle silently stays ad-hoc. A path that refuses to give
+its attributes up is reported and does **not** abort the run: `xattr -cr` exits
+nonzero if any single path refuses even though the rest of the tree was cleared,
+and `codesign` is the authority on whether it mattered — it fails loudly.
+
+One path does get deleted rather than stripped: a top-level `Icon\r`, Finder's
+custom-icon marker. It carries a resource fork `codesign` refuses and it is not
+the app's icon (that lives in `Contents/Resources/*.icns`), so it is cruft. A
+DMG copy can land it owned by someone else, in which case the script stops with
+the one `sudo rm` that clears it.
+
+It prints the resulting `Authority` / `TeamIdentifier`; you want
+`Authority=Apple Development: …` and a real team id, not `Signature=adhoc`.
+Expect macOS to re-ask for microphone and accessibility on the next launch —
+those grants belonged to the old signature.
+
+**Why this is not done inside the build.** electron-builder accepts an identity,
+but it signs every file it walks individually and with `--timestamp`, which is
+one network round trip to Apple's timestamp authority *per file*. The bundled
+CPython's `site-packages` is thousands of files (it reaches `__pycache__/*.pyc`,
+which are not even Mach-O) and a universal build pays all of it twice — measured
+at 20+ minutes without finishing. A single `codesign --deep` over the finished
+bundle walks nested *bundles* instead and carries no timestamp, which is the
+difference between seconds and abandoning the build. A timestamp *is* required
+for distribution (a signature without one stops validating when the certificate
+expires), and that lane is untouched: releases are signed and notarized by
+`packaging/signing/`.
+
 ## macOS folder-access (TCC) prompts
 
 macOS gates `~/Downloads`, `~/Documents`, `~/Desktop`, `~/Pictures`, `~/Movies`

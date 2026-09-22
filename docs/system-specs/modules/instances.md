@@ -565,11 +565,32 @@ what its own edit invalidated, and never reopens anything on the user's behalf.
 - **postMessage relay.** The parent validates every embedded-frame
   `event.origin` against an exact loopback http origin (`127.0.0.1`, `localhost`,
   or a single-label `*.localhost`) **and** requires the port to belong to a
-  currently-warm tunnel before trusting any message. Only four message kinds
-  cross the boundary: an unread count, an auth-expired signal, a switch-pane
-  request (whose target is re-validated against the known instance list), and a
-  readiness ping. The parent's outbound `postMessage` is addressed to the pane's
-  exact origin, never `*`.
+  currently-warm tunnel before trusting any message. Every kind that crosses the
+  boundary is an explicitly handled `data.type` in `InstancesViewport`'s single
+  listener — an unread count, an auth-expired signal, a switch-pane request
+  (whose target is re-validated against the known instance list), a readiness
+  ping, chrome/focus reports, and the native-notification relay below; anything
+  unrecognised is dropped. The parent's outbound `postMessage` is addressed to
+  the pane's exact origin, never `*`.
+- **Native notifications are relayed, not granted.** A pane cannot post an OS
+  notification itself: Electron's permission handler puts `notifications` in
+  `MAIN_FRAME_ONLY_PERMISSIONS`, so an embedded page cannot forge a toast wearing
+  this app's identity. That rule catches a first-party crew pane too, and the
+  effect was that a remote crew finishing a background turn — or asking for a
+  tool approval — could never reach the user: `Notification.permission` reads
+  `'denied'` in the frame and every toast no-opped silently. So the pane relays
+  `mc-native-notify` `{title, body, tag, silent}` (`lib/nativeNotify.ts`) and the
+  PARENT posts it, because the parent is the main frame and holds the grant. No
+  permission is widened. The parent re-clamps title and body to the sender's own
+  caps (a cap enforced only by the sender is not a cap), leads the title with the
+  crew's name on the same line behind a middle dot (`Nimbus · Turn finished`) so
+  the banner says which machine is asking while still reading as one line like an
+  unprefixed one, and namespaces the OS
+  `tag` as `mc-instance:<id>:<tag>` so a pane cannot collapse the local
+  dashboard's banner of the same kind. The child addresses `'*'` because it does
+  not know the parent's origin; who may frame it at all is bounded by the CSP
+  `frame-ancestors` claim below, and the parent's origin+warm-port check is what
+  decides whose voice a message is.
 - **CSP.** `frame-ancestors` is `'self'` plus the exact parent origin carried in
   the minted token's signed `embed_parent_port` claim, never a wildcard and never
   a hardcoded port, so a local page with no validly-signed token can never frame

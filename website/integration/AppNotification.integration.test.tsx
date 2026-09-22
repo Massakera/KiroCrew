@@ -101,8 +101,11 @@ describe('useNativeNotification', () => {
       icon: AVATAR,
       tag: 'appr-123',
     })
-    // The regression we are preventing: the old generic string.
-    expect(opts.body).not.toMatch(/\d+ new notification/)
+    // The regression we are preventing: the generic count fallback replacing a
+    // note that has its own body. Matched against the CURRENT fallback shape --
+    // app.notification_count renders "<n> notification(s)" -- because a pattern
+    // naming retired copy would pass whatever the fallback did.
+    expect(opts.body).not.toMatch(/\d+ notification/)
   })
 
   it('falls back to botName + generic body when the notification lacks content', () => {
@@ -120,14 +123,14 @@ describe('useNativeNotification', () => {
     expect(notificationCtor).toHaveBeenCalledTimes(1)
     const [title, opts] = notificationCtor.mock.calls[0]
     expect(title).toBe(BOT_NAME)
-    expect(opts.body).toBe('New notification')
+    expect(opts.body).toBe('1 notification')
     expect(opts.tag).toBe('job-xyz')
   })
 
   it('uses the delta (not total) when body falls back on a later burst', () => {
     // Seed the store with 3 already-unacked, body-less notifications so the
     // hook's `prev` ref reaches 3. Then drop a single new body-less one —
-    // the fallback should say "1 new notification", not "4 new notifications".
+    // the fallback counts the DELTA, so "1 notification", not "4 notifications".
     const store = createTestStore({ notifications: { items: [] } as any })
     mount(store)
 
@@ -162,9 +165,11 @@ describe('useNativeNotification', () => {
 
     expect(notificationCtor).toHaveBeenCalledTimes(1)
     const [, opts] = notificationCtor.mock.calls[0]
-    // Regression: old code used notifCount (4), new code uses delta (1).
-    expect(opts.body).toBe('New notification')
-    expect(opts.body).not.toMatch(/4 new/)
+    // Regression: old code used notifCount (4), current code uses delta (1).
+    // The copy comes from the pluralized app.notification_count catalog key,
+    // so the count is what this asserts, not a hand-built plural.
+    expect(opts.body).toBe('1 notification')
+    expect(opts.body).not.toMatch(/\b4\b/)
   })
 
   it('flattens the markdown body -- an OS toast renders plain text only', () => {
@@ -232,7 +237,7 @@ describe('useNativeNotification', () => {
 
     expect(notificationCtor).toHaveBeenCalledTimes(1)
     const [, opts] = notificationCtor.mock.calls[0]
-    expect(opts.body).toBe('New notification')
+    expect(opts.body).toBe('1 notification')
   })
 
   it('falls back to the generic body when a persisted body is not a string', () => {
@@ -251,7 +256,7 @@ describe('useNativeNotification', () => {
 
     expect(notificationCtor).toHaveBeenCalledTimes(1)
     const [, opts] = notificationCtor.mock.calls[0]
-    expect(opts.body).toBe('New notification')
+    expect(opts.body).toBe('1 notification')
   })
 
   it('uses a per-event tag so rapid updates replace instead of stack', () => {

@@ -301,14 +301,34 @@ a mounted banner honours it immediately.
 ### System-notification permission surfaces
 
 `hooks/useNotificationPermission.ts` exposes `Notification.permission` as state
-(`unsupported | default | granted | denied`), re-read on window focus and after
-its own `request()` settles. Two user-gesture surfaces call `request()`:
+(`unsupported | default | granted | denied | host-managed`), re-read on window
+focus and after its own `request()` settles. Two user-gesture surfaces call
+`request()`:
 
 - **Settings › Notifications › Desktop alerts › System notifications**
   (`SystemNotificationsRow`): `granted` shows "Allowed" with a check and no
   button; `default` offers "Allow system notifications"; `denied` states in
   plain language that the browser blocked it and where to turn it back on.
   Absent entirely when `Notification` is undefined.
+
+  `host-managed` is the embedded remote-instance pane, and it is the one state
+  that asserts NOTHING about delivery: it points at the main Kiro Crew window's
+  own Settings › Notifications as the place the switch lives, and offers no
+  button, because that switch is not in this frame. Naming a destination the
+  reader can actually find is the load-bearing half — "the host owns this
+  permission" is not actionable for someone who does not know they are looking at
+  a pane, and neither is a bare "dashboard", which names no window. The copy also
+  says "notifications" rather than "banners", because the adjacent row in the
+  same Desktop alerts section uses "banner" for the in-app card. The pane's own
+  `Notification.permission` is pinned to `denied`
+  (Electron grants `notifications` to the main frame only) while the relay in
+  `lib/nativeNotify.ts` delivers anyway, so `denied` would tell a working pane
+  it was blocked — but the parent's grant is never sent to the pane, so
+  `granted` would equally be a guess, and a pane claiming "Allowed" while the
+  parent drops every relay is the same bug mirrored. Reporting either verdict
+  from a frame that cannot know one is what this state exists to prevent; a
+  pane that should report the parent's real grant needs the parent to send it
+  first.
 - **Bell popover hint** (`NotificationPermissionHint`, in the mac controls
   card): one row — bell-ring icon, "Get alerted when you're away", "Allow",
   "Not now" — shown only while permission is `default`, the store holds at

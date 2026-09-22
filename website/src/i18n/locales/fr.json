@@ -14551,6 +14551,7 @@
         "system_notifications_allowed": "Autorisées",
         "allow_system_notifications": "Autoriser les notifications système",
         "system_notifications_blocked": "Bloquées par votre navigateur. Réactivez-les dans les autorisations du site.",
+        "system_notifications_host_managed": "Les notifications de cette crew distante sont affichées par la fenêtre principale de {{productName}} — autorisez-les ou bloquez-les dans ses Paramètres → Notifications.",
         "show_banner_for_new_notifications": "Afficher une bannière pour les nouvelles notifications",
         "show_banner_for_new_notifications_description": "À l’arrivée d’une notification, une carte glisse sous la barre supérieure puis se range dans la cloche."
       },

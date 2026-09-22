@@ -14356,6 +14356,7 @@
         "system_notifications_allowed": "অনুমতি দেওয়া আছে",
         "allow_system_notifications": "সিস্টেম বিজ্ঞপ্তির অনুমতি দাও",
         "system_notifications_blocked": "তোমার ব্রাউজার এটি আটকে দিয়েছে। সাইটের অনুমতি সেটিংসে আবার চালু করো।",
+        "system_notifications_host_managed": "এই রিমোট ক্রুর নোটিফিকেশন দেখায় মূল {{productName}} উইন্ডো — ওটার সেটিংস → নোটিফিকেশন-এ অনুমতি দাও বা বন্ধ করো।",
         "show_banner_for_new_notifications": "নতুন বিজ্ঞপ্তির জন্য ব্যানার দেখাও",
         "show_banner_for_new_notifications_description": "বিজ্ঞপ্তি এলে একটি কার্ড উপরের বারের নিচ থেকে ঢুকে আসে, তারপর ঘণ্টায় গুটিয়ে যায়।"
       },

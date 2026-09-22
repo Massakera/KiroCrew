@@ -489,6 +489,7 @@ Linux, `.\make.ps1 <target>` on Windows.
 | `make wheel` | Self-contained pip wheel with the dashboard bundled, into `dist/` |
 | `make backend-bin` | Frozen standalone backend binary (host arch only) |
 | `make desktop` | Full desktop app: DMG on macOS, AppImage on Linux, NSIS installer on Windows |
+| `make resign-desktop` | macOS only: re-sign an installed `.app` with `KIROCREW_SIGN_IDENTITY`, so OS notifications are delivered and TCC grants stick. A plain `make desktop` build is ad-hoc signed, and macOS silently drops notifications from one |
 | `make test` | Build, then run the `pytest` suite |
 | `make clean` | Remove build artifacts, dists, and caches |
 

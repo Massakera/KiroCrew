@@ -46,6 +46,13 @@ import { clearPaneHttpCache, paneOriginFor } from '../lib/paneCache'
 import { connectInstanceInto } from '../lib/connectInstance'
 import { LINUX_CAPTION_CONTROLS_WIDTH, TRAFFIC_LIGHT_INSET_PX, WIN_CAPTION_OVERLAY_WIDTH, WIN_CAPTION_RESERVE_PX } from '../lib/electron'
 import { isEmbeddedPane } from '../lib/embedded'
+import {
+  NATIVE_NOTIFY_BODY_MAX,
+  NATIVE_NOTIFY_MESSAGE,
+  NATIVE_NOTIFY_TITLE_MAX,
+  clampNotifyText,
+  showNativeNotification,
+} from '../lib/nativeNotify'
 import ErrorNotice from './ErrorNotice'
 import { errMessage } from '../utils/thunkError'
 import { reportInstanceFailure } from '../utils/instanceFailureReport'
@@ -216,7 +223,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // recorded its readiness, so the pane can stop re-announcing without mistaking
   // an ordinary model broadcast for an ack — see EmbeddedHostBridge.
   const postAckToRef = useRef<(id: string) => void>(() => {})
-  const instancesRef = useRef<Array<{ id: string }>>([])
+  const instancesRef = useRef<Array<{ id: string; name?: string }>>([])
 
   // Whether `refreshToken` would actually mint for this id right now: no mint
   // already in flight, and outside the rate window. Split out of refreshToken so
@@ -355,6 +362,39 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
         const count = Number(data.count)
         if (!Number.isFinite(count) || count < 0) return
         dispatch(setUnread({ id, count }))
+      } else if (data.type === NATIVE_NOTIFY_MESSAGE) {
+        // A pane cannot post an OS notification itself: Electron's permission
+        // handler grants `notifications` to the MAIN frame only, so that an
+        // embedded page cannot forge a toast wearing this app's identity. A
+        // first-party remote-crew pane is caught by that rule too, and the
+        // effect is that a remote crew finishing a background turn could never
+        // reach the user. So the pane relays its intent and the parent — which
+        // holds the grant — posts it. See lib/nativeNotify.ts.
+        //
+        // Re-clamped here rather than trusted: a cap enforced only by the
+        // sender is not a cap, and this crosses a frame boundary.
+        const relayTitle = clampNotifyText(data.title, NATIVE_NOTIFY_TITLE_MAX)
+        if (!relayTitle) return
+        // The crew's name leads the title because the banner is the user's only
+        // clue about WHICH machine is asking; without it two crews producing the
+        // same session title are indistinguishable in Notification Center.
+        // Middle dot rather than an em dash: a title is free text that often
+        // contains a dash of its own, so `A — B — C` gives no clue which span is
+        // the crew, and the dot reads as one line like an unprefixed banner.
+        // `name` is optional, so it falls back to the instance id rather than to
+        // nothing: an id is not pretty, but it still says which machine, and
+        // dropping the prefix would silently make a remote banner look local --
+        // the one thing this prefix exists to prevent.
+        const instance = instancesRef.current.find(i => i.id === id)
+        const crew = instance?.name || id
+        showNativeNotification({
+          title: `${crew} · ${relayTitle}`,
+          body: clampNotifyText(data.body, NATIVE_NOTIFY_BODY_MAX),
+          // Namespaced per instance so a pane's tag cannot collapse the local
+          // dashboard's banner of the same kind (or another crew's).
+          tag: `mc-instance:${id}:${clampNotifyText(data.tag, 64)}`,
+          silent: data.silent !== false,
+        })
       } else if (data.type === 'mc-auth-expired') {
         // Reactive recovery: the embedded dashboard reported an expired session.
         // Force a fresh mint and reload its iframe rather than letting it show

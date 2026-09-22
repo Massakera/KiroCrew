@@ -14356,6 +14356,7 @@
         "system_notifications_allowed": "Erlaubt",
         "allow_system_notifications": "Systembenachrichtigungen erlauben",
         "system_notifications_blocked": "Im Browser blockiert. Schalte sie in den Berechtigungen der Website wieder ein.",
+        "system_notifications_host_managed": "Die Benachrichtigungen dieser Remote-Crew zeigt das Hauptfenster von {{productName}} – erlaube oder blockiere sie in dessen Einstellungen → Benachrichtigungen.",
         "show_banner_for_new_notifications": "Banner für neue Benachrichtigungen anzeigen",
         "show_banner_for_new_notifications_description": "Bei einer neuen Benachrichtigung gleitet eine Karte unter der oberen Leiste ein und verschwindet dann in der Glocke."
       },

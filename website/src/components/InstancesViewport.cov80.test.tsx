@@ -180,3 +180,120 @@ describe('InstancesViewport relay listener', () => {
     expect(api.refreshInstanceToken).toHaveBeenCalledTimes(1)
   })
 })
+
+/**
+ * The parent posts OS notifications on an embedded pane's behalf, because a
+ * pane's own page-context constructor is refused by Electron's main-frame-only
+ * permission gate. Without this relay a remote crew's completions and approvals
+ * reach the user on no surface at all.
+ */
+describe('InstancesViewport native notification relay', () => {
+  let constructed: Array<{ title: string; options: NotificationOptions }>
+  const realNotification = (globalThis as { Notification?: unknown }).Notification
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(isEmbeddedPane).mockReturnValue(false)
+    constructed = []
+    class FakeNotification {
+      static permission = 'granted'
+      constructor(title: string, options: NotificationOptions = {}) {
+        constructed.push({ title, options })
+      }
+    }
+    Object.defineProperty(globalThis, 'Notification', {
+      value: FakeNotification,
+      configurable: true,
+      writable: true,
+    })
+  })
+
+  afterEach(() => {
+    // Restore rather than delete: jsdom has no Notification, so an unconditional
+    // delete is right here, but a future jsdom that ships one must not lose it.
+    if (realNotification === undefined) {
+      delete (globalThis as { Notification?: unknown }).Notification
+    } else {
+      Object.defineProperty(globalThis, 'Notification', {
+        value: realNotification,
+        configurable: true,
+        writable: true,
+      })
+    }
+  })
+
+  /**
+   * Render and wait until the instances query has actually reached the
+   * component, not merely until an iframe exists: the pane is rendered straight
+   * from the warm store, so the iframe appears BEFORE the crew list resolves,
+   * and a relay arriving in that window legitimately gets no crew name. Waiting
+   * on the rendered name is an observable signal for "the data landed" — never a
+   * sleep standing in for it.
+   */
+  async function renderWithCrewLoaded() {
+    renderWithProviders(<InstancesViewport />, { store: warmStore() })
+    await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+    await waitFor(() => expect(document.body.textContent).toContain('Zzq One'))
+  }
+
+  it('posts a relayed notification, led by the crew name and tagged per instance', async () => {
+    await renderWithCrewLoaded()
+
+    post({ type: 'mc-native-notify', v: 1, title: 'Refactor done', body: 'Response ready', tag: 'kirocrew-chat-done:s1' })
+
+    await waitFor(() => expect(constructed).toHaveLength(1))
+    // The crew name leads: without it two crews showing the same session title
+    // are indistinguishable in Notification Center.
+    expect(constructed[0].title).toBe('Zzq One · Refactor done')
+    expect(constructed[0].options.body).toBe('Response ready')
+    // Namespaced so a pane cannot collapse the local dashboard's own banner.
+    expect(constructed[0].options.tag).toBe('mc-instance:cd-1:kirocrew-chat-done:s1')
+  })
+
+  it('falls back to the instance id when the crew has no name', async () => {
+    // `name` is optional. Dropping the prefix when it is absent would make a
+    // remote crew's banner look exactly like a local one -- the confusion the
+    // prefix exists to prevent -- so an id stands in rather than nothing.
+    vi.mocked(api.listInstances).mockResolvedValueOnce({
+      instances: [{
+        id: 'cd-1', ssh_host: 'cd-1-alias', remote_port: 7777, local_port: 7778,
+        ttl: '20h', remote_bin: '',
+        status: { instance_id: 'cd-1', state: 'connected', local_port: 7778, remote_port: 7777 },
+      }],
+      warm_set_cap: 5,
+    } as unknown as Awaited<ReturnType<typeof api.listInstances>>)
+    renderWithProviders(<InstancesViewport />, { store: warmStore() })
+    await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+
+    post({ type: 'mc-native-notify', v: 1, title: 'Turn finished' })
+
+    await waitFor(() => expect(constructed).toHaveLength(1))
+    expect(constructed[0].title).toBe('cd-1 · Turn finished')
+  })
+
+  it('re-clamps an oversized relayed payload instead of trusting the sender', async () => {
+    await renderWithCrewLoaded()
+
+    post({ type: 'mc-native-notify', v: 1, title: 'T'.repeat(5000), body: 'B'.repeat(5000) })
+
+    await waitFor(() => expect(constructed).toHaveLength(1))
+    // Clamped twice — once on the relayed title, then again on the composed
+    // string — so the cap holds whatever the crew name costs. Clamping keeps a
+    // PREFIX and the crew name leads, so the name is never what gets dropped.
+    expect(constructed[0].title).toHaveLength(200)
+    expect(constructed[0].title.startsWith('Zzq One · ')).toBe(true)
+    expect(constructed[0].options.body).toHaveLength(500)
+  })
+
+  it('drops a relay with no usable title, and one from an untrusted origin', async () => {
+    await renderWithCrewLoaded()
+
+    post({ type: 'mc-native-notify', v: 1, title: '' })
+    post({ type: 'mc-native-notify', v: 1, title: 42 })
+    post({ type: 'mc-native-notify', v: 1, title: 'From nowhere' }, 'http://127.0.0.1:9999')
+    post({ type: 'mc-native-notify', v: 1, title: 'From evil' }, 'https://evil.example')
+
+    // Nothing to wait for — assert the absence after the synchronous dispatches.
+    expect(constructed).toHaveLength(0)
+  })
+})

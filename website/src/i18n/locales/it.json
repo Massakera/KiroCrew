@@ -14551,6 +14551,7 @@
         "system_notifications_allowed": "Consentite",
         "allow_system_notifications": "Consenti le notifiche di sistema",
         "system_notifications_blocked": "Bloccate nel browser. Riattivale nelle autorizzazioni del sito.",
+        "system_notifications_host_managed": "Le notifiche di questa crew remota sono mostrate dalla finestra principale di {{productName}}: consentile o bloccale nelle sue Impostazioni → Notifiche.",
         "show_banner_for_new_notifications": "Mostra un banner per le nuove notifiche",
         "show_banner_for_new_notifications_description": "Quando arriva una notifica, una scheda scivola sotto la barra superiore e poi si ritira nella campanella."
       },

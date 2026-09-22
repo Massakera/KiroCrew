@@ -435,6 +435,16 @@ function Invoke-Desktop {
     Write-Host "  so SmartScreen shows an 'unrecognized app' interstitial." -ForegroundColor Yellow
 }
 
+# Present so a Windows contributor following the documented target table gets a
+# reason instead of "unknown target". There is nothing to implement here:
+# notification delivery and TCC consent are keyed to a macOS code signature, and
+# `codesign` exists only there. Windows installer signing is CI's own lane.
+function Invoke-ResignDesktop {
+    Write-Err "resign-desktop is macOS-only: it re-signs an installed .app with codesign."
+    Write-Host "  On Windows the desktop app needs no re-signing -- installer signing is CI's lane."
+    exit 2
+}
+
 # Remove a file, directory, or directory link. Plain Remove-Item -Recurse
 # follows a junction and deletes the TARGET's contents, so a staged dist that is
 # a junction (how the dev-mode dist link is created on Windows -- os.symlink
@@ -480,10 +490,11 @@ try {
         "wheel"       { Invoke-Wheel }
         "backend-bin" { Invoke-BackendBin }
         "desktop"     { Invoke-Desktop }
+        "resign-desktop" { Invoke-ResignDesktop }
         "clean"       { Invoke-Clean }
         default {
             Write-Err "unknown target '$Target'"
-            Write-Host "  Targets: build frontend backend test wheel backend-bin desktop clean"
+            Write-Host "  Targets: build frontend backend test wheel backend-bin desktop resign-desktop clean"
             exit 2
         }
     }

@@ -14746,6 +14746,7 @@
         "system_notifications_allowed": "Разрешены",
         "allow_system_notifications": "Разрешить системные уведомления",
         "system_notifications_blocked": "Заблокированы в браузере. Включите их снова в разрешениях сайта.",
+        "system_notifications_host_managed": "Уведомления этой удалённой команды показывает главное окно {{productName}} — разрешите или заблокируйте их в его разделе Настройки → Уведомления.",
         "show_banner_for_new_notifications": "Показывать баннер для новых уведомлений",
         "show_banner_for_new_notifications_description": "Когда приходит уведомление, карточка выезжает под верхней панелью, а затем убирается в колокольчик."
       },

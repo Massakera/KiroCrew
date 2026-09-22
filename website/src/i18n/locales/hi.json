@@ -14356,6 +14356,7 @@
         "system_notifications_allowed": "अनुमति मिली",
         "allow_system_notifications": "सिस्टम सूचनाओं की अनुमति दो",
         "system_notifications_blocked": "तुम्हारे ब्राउज़र ने इसे रोक दिया है। साइट की अनुमति सेटिंग में इसे फिर से चालू करो।",
+        "system_notifications_host_managed": "इस रिमोट क्रू की सूचनाएँ मुख्य {{productName}} विंडो दिखाती है — उसकी सेटिंग्स → सूचनाएँ में इन्हें अनुमति दो या बंद करो।",
         "show_banner_for_new_notifications": "नई सूचनाओं के लिए बैनर दिखाओ",
         "show_banner_for_new_notifications_description": "सूचना आने पर एक कार्ड टॉप बार के नीचे से आता है, फिर घंटी में समा जाता है।"
       },

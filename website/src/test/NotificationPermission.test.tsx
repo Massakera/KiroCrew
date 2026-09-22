@@ -9,6 +9,9 @@ import { NotificationsPanel } from '../pages/settings/NotificationsPanel'
 import NotificationPermissionHint from '../components/notifications/NotificationPermissionHint'
 import { PERMISSION_HINT_DISMISSED_KEY } from '../hooks/notificationBanner'
 
+vi.mock('../lib/embedded', () => ({ isEmbeddedPane: vi.fn(() => false) }))
+import { isEmbeddedPane } from '../lib/embedded'
+
 vi.mock('../hooks/useNotificationSound', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../hooks/useNotificationSound')>()
   return { ...actual, playPreset: vi.fn() }
@@ -36,6 +39,8 @@ function installNotification(initial: NotificationPermission, verdict: Notificat
 
 beforeEach(() => {
   localStorage.clear()
+  // Default every case to the top frame; the pane case opts in explicitly.
+  vi.mocked(isEmbeddedPane).mockReturnValue(false)
   ;(window as unknown as { AudioContext: unknown }).AudioContext = vi.fn(() => ({
     state: 'running', currentTime: 0, destination: {}, resume: vi.fn(() => Promise.resolve()),
     createOscillator: vi.fn(() => ({ connect: vi.fn(), disconnect: vi.fn(), start: vi.fn(), stop: vi.fn(), type: '', frequency: { value: 0 }, onended: null })),
@@ -71,6 +76,29 @@ describe('Settings › Notifications › System notifications row', () => {
     render(<NotificationsPanel />)
     const row = screen.getByTestId('system-notifications-row')
     expect(row.textContent).toContain("Blocked in your browser. Turn it back on in the site's permission settings.")
+    expect(row.querySelector('button')).toBeNull()
+  })
+
+  it('inside a pane: points at the dashboard that owns the switch, claims no verdict', () => {
+    // The regression this pins, from both directions. Chromium pins a pane's own
+    // value to 'denied' while the relay delivers, so "blocked in your browser"
+    // is wrong; but the parent's grant is never sent to the pane, so "Allowed"
+    // is equally a guess — and the version of this row that claimed it was
+    // BLOCKED in review. The row must therefore assert neither.
+    //
+    // It must also name somewhere the reader can GO: a user who does not know
+    // they are looking at a pane cannot act on "the host owns this". The
+    // Settings path is the actionable half, so it is pinned alongside.
+    vi.mocked(isEmbeddedPane).mockReturnValue(true)
+    installNotification('denied')
+    render(<NotificationsPanel />)
+
+    const row = screen.getByTestId('system-notifications-row')
+    expect(row).toHaveTextContent(/main Kiro Crew window/i)
+    expect(row).toHaveTextContent(/Settings → Notifications/i)
+    expect(row).not.toHaveTextContent(/blocked in your browser/i)
+    expect(row).not.toHaveTextContent(/^Allowed$/i)
+    // No action either: the switch it would flip does not live in this frame.
     expect(row.querySelector('button')).toBeNull()
   })
 

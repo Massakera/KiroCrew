@@ -5,7 +5,11 @@
 #   make wheel     — self-contained pip wheel (dashboard bundled)
 #   make backend-bin — standalone backend tree (bundled interpreter, no system Python)
 #   make desktop   — double-clickable desktop app (universal DMG on macOS / AppImage on Linux)
-.PHONY: all build frontend backend test clean wheel backend-bin desktop
+#   make resign-desktop — macOS: re-sign an INSTALLED KiroCrew.app with your own
+#                    identity, so OS notifications and TCC grants work (a plain
+#                    `make desktop` build is ad-hoc signed, and macOS silently
+#                    drops notifications from one). Needs KIROCREW_SIGN_IDENTITY.
+.PHONY: all build frontend backend test clean wheel backend-bin desktop resign-desktop
 
 PY ?= python3
 VENV := .venv
@@ -122,6 +126,16 @@ desktop:
 	NBD="$$(cat "$${KIROCREW_HOME:-$$HOME/.kiro/crew}/node-bin-dir" 2>/dev/null || true)"; \
 	  { [ -z "$$NBD" ] || export PATH="$$NBD:$$PATH"; }; \
 	  bash packaging/build-desktop.sh
+
+# Re-sign the installed app with a local identity. Separate from `desktop`
+# because signing inside electron-builder timestamps every file of the bundled
+# CPython over the network and takes tens of minutes; this takes seconds. Pass an
+# app path to override the default /Applications/KiroCrew.app:
+#   make resign-desktop APP=/path/to/KiroCrew.app
+# Quoted: an unquoted $(APP) word-splits, and a spaced path whose first word is
+# a real directory would send `xattr -cr` recursively over THAT directory.
+resign-desktop:
+	bash packaging/resign-desktop.sh "$(APP)"
 
 clean:
 	rm -rf build dist *.egg-info src/*.egg-info \
