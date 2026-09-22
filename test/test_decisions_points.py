@@ -613,17 +613,17 @@ def test_the_budget_stops_the_walk_and_clips_the_last_turn_admitted():
     assert trace == {"history_chars": 60, "truncated": 1}, "one clip, and the budget spent exactly"
 
 
-def test_the_shipped_default_sends_no_prior_turns_at_all(monkeypatch):
-    """Consent was given for the message and the menu, so that is what ships.
+def test_an_install_with_no_consented_ceiling_sends_no_prior_turns(monkeypatch):
+    """The shipped config asks for a few turns; the keystone decides whether any go.
 
-    An owner who wants the conversation sent raises
-    ``decisions.history_budget_chars`` themselves; an upgrade does not raise it
-    for them.
+    An owner who reviewed only the message excerpt and the candidate descriptions
+    has a ceiling of 0, and the gate takes the smaller of the two, so this install
+    sends the current message alone.
     """
     from kiro_crew.config.sections import DECISION_HISTORY_BUDGET_DEFAULT, DecisionsConfig
 
-    assert DECISION_HISTORY_BUDGET_DEFAULT == 0
-    assert DecisionsConfig().history_budget_chars == 0
+    assert DECISION_HISTORY_BUDGET_DEFAULT == 2000
+    assert DecisionsConfig().history_budget_chars == 2000
     monkeypatch.setattr(core, "history_budget_chars", lambda *a, **k: 0)
     trace = {}
     assert sel.build_history(_turns(("user", "prior")), "now", trace=trace) == []

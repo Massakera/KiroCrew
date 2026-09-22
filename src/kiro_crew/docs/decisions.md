@@ -37,7 +37,7 @@ The configuration shape is:
 {
   "decisions": {
     "bucket": 10,
-    "history_budget_chars": 0,
+    "history_budget_chars": 2000,
     "model_route": {
       "simple": "claude-haiku-4.5",
       "medium": "claude-opus-4.8",
@@ -58,7 +58,7 @@ Create the API-key secret through the existing [secrets vault](secrets-vault.md)
 
 `bucket` chooses a percentage of sessions. It is a fixed sample, not a random draw per message. A session stays selected or unselected while its key and bucket remain unchanged. `0` samples none and `100` samples all otherwise eligible sessions. Its default is `100`, so with the switch on and no `bucket` set, every otherwise-eligible session is sampled. A value that is not a whole number reads as `0`, so a typo never widens the sample.
 
-`history_budget_chars` bounds how much of the conversation so far is sent with one decision, in characters, on top of the current message. **Its default is `0`: no earlier turns are sent.** Raise it and earlier user and assistant turns are added newest first until the budget is spent, with the last one admitted clipped to fit. At most the 20 most recent turns are read, so a budget far above a few thousand characters stops adding turns. Tool output is never sent, by any of the features on this page. A value that does not parse reads as `0`, so a typo never widens what leaves the machine.
+`history_budget_chars` bounds how much of the conversation so far is sent with one decision, in characters, on top of the current message. **Its default is `2000`, about the last two or three turns.** It is only what the decision ASKS for: your consent records a ceiling of its own, the smaller of the two is what goes, and that ceiling is `0` until you set one, so a fresh install still sends your new message alone. Inside the ceiling, earlier user and assistant turns are added newest first until the budget is spent, with the last one admitted clipped to fit. At most the 20 most recent turns are read, so a budget far above a few thousand characters stops adding turns. Tool output is never sent, by any of the features on this page. A value that does not parse reads as the default, and your consented ceiling clamps that too, so a typo never sends more than you reviewed.
 
 This ceiling does not govern compaction scoring, which is a separate switch and sends a whole transcript when you turn it on — see [Measuring what a compaction should keep](#measuring-what-a-compaction-should-keep) below.
 
@@ -90,7 +90,7 @@ A few things worth knowing. The choice belongs to one chat, not to the whole app
 
 ## Data and waiting time
 
-Enabling Jev allows the message excerpt to leave the machine -- with the candidate skill descriptions for a skill choice, and on its own for a model choice. It does not send your earlier turns unless you both raise `history_budget_chars` and consent to a ceiling for it, after which that many characters of earlier user and assistant turns from the same conversation leave the machine as well. Credential and suspicious-URL checks refuse matching requests, but they are not a guarantee that all private content is detected. Do not enable the feature for content that must stay local.
+Enabling Jev allows the message excerpt to leave the machine -- with the candidate skill descriptions for a skill choice, and on its own for a model choice. It does not send your earlier turns unless you consent to a ceiling for them, after which that many characters of earlier user and assistant turns from the same conversation leave the machine as well. Credential and suspicious-URL checks refuse matching requests, but they are not a guarantee that all private content is detected. Do not enable the feature for content that must stay local.
 
 A sampled selection waits for a bounded answer. `timeout_ms` controls the provider budget; its default is 1000 milliseconds, a value at or below zero is floored to 1 millisecond rather than disabling the timeout, and the wait is capped at ten seconds whatever that value says. A missing key, unavailable provider or short budget can make the feature fall back without changing the selected skills. There is no automatic retry.
 
@@ -145,7 +145,7 @@ The mode only appears while the switch is on, your fleet permits the feature, an
 | Auto (Jev), valid answer | Jev's choice of the two |
 | Auto (Jev), timeout, refusal or invalid answer | Steer, the button's own default |
 
-Auto applies only while a turn is actually running, and only to messages you send yourself: an app, an integration or a scheduled job is never decided for. Its request carries the message you just typed. It also carries a short extract of the turn in progress -- what you asked it and the newest thing it printed -- but only as far as the same `history_budget_chars` ceiling above allows, so at the default of `0` your new message is all that leaves the machine. Anything that looks like a credential or a data-collecting URL is removed from that extract first.
+Auto applies only while a turn is actually running, and only to messages you send yourself: an app, an integration or a scheduled job is never decided for. Its request carries the message you just typed. It also carries a short extract of the turn in progress -- what you asked it and the newest thing it printed -- but only as far as the same `history_budget_chars` ceiling above allows, so with no consented ceiling your new message is all that leaves the machine. Anything that looks like a credential or a data-collecting URL is removed from that extract first.
 
 The decision appears on your own message in the transcript: one line saying what Jev chose, how sure it was and how long it took, with the same thumbs you can use on a skill decision. It says the CHOICE rather than what then happened, because the two can differ — a chosen interruption cannot always be delivered, and the message then runs after the work in progress like a queued one. A message nobody decided for shows nothing.
 
