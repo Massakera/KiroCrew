@@ -352,15 +352,23 @@ export default function AgentTemplatesTab() {
   }, [dirty])
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['agent-templates'] })
-  const writeErrorText = (e: unknown): string => {
+  const writeErrorText = (e: unknown, name = ''): string => {
     const code = e instanceof ApiError ? parseErrorCode(e.body) : undefined
     return code === 'template_read_only'
       ? i18nT('pages.overview.agentTemplatesTab.err_read_only')
       : code === 'name_taken' || code === 'name_bound'
         ? i18nT('pages.overview.agentTemplatesTab.err_name_taken')
-        : code === 'invalid_template_name'
-          ? i18nT('pages.overview.agentTemplatesTab.name_rule')
-          : errMessage(e) || i18nT('pages.overview.agentTemplatesTab.err_generic')
+        : code === 'template_name_reserved_by_engine'
+          // The agent engine keeps a few ids for itself; the server refuses
+          // them so a template under one never silently runs as something
+          // else. Its own code, so the runtime-owned stems' plain
+          // `template_name_reserved` keeps its server text and is not blamed
+          // on the engine. Named with the typed name so the user knows which
+          // word to change.
+          ? i18nT('pages.overview.agentTemplatesTab.err_name_reserved', { name })
+          : code === 'invalid_template_name'
+            ? i18nT('pages.overview.agentTemplatesTab.name_rule')
+            : errMessage(e) || i18nT('pages.overview.agentTemplatesTab.err_generic')
   }
   const writeError = (e: unknown) => setNotice({ kind: 'err', text: writeErrorText(e) })
   // A refused save is reported IN the save bar, beside the button that was
@@ -407,7 +415,7 @@ export default function AgentTemplatesTab() {
       setSelectedName(r.name)
       openDetail()
     },
-    onError: writeError,
+    onError: (e: unknown, f) => setNotice({ kind: 'err', text: writeErrorText(e, f.name.trim()) }),
   })
   const remove = useMutation({
     mutationFn: (name: string) => api.agentTemplateDelete(name),
