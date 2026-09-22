@@ -57,6 +57,7 @@ from kiro_crew.agent_spec_format import (
     agent_spec_candidates,
     is_markdown_spec,
     iter_agent_spec_files,
+    spec_relname,
 )
 from kiro_crew.apps.bridges import _mcp_lock as _agent_file_lock
 from kiro_crew.apps.bridges import _registration_source
@@ -2605,19 +2606,20 @@ def _load_template_specs(
     taken: set[str] = set()
     matches: list[Path] = []
     for f in iter_agent_spec_files(agents_dir):
-        # An unreadable spec still occupies its filename.
-        taken.add(f.stem.lower())
+        spec_id = spec_relname(agents_dir, f)
+        # An unreadable spec still occupies its id.
+        taken.add(spec_id.lower())
         spec = _read_agent_spec(f, operation=operation, source="dashboard")
         if spec is None:
             continue
         declared = spec_str(spec, "name")
         if declared:
             taken.add(declared.lower())
-        if declared == name or f.stem == name:
+        if declared == name or spec_id == name:
             matches.append(f)
             if source is None:
                 source = spec
-                source_name = declared or f.stem
+                source_name = declared or spec_id
                 source_path = f
     if len(matches) > 1:
         raise _AmbiguousTemplateName(name)
@@ -3440,7 +3442,7 @@ def _agent_detail_candidates(name: str) -> list[tuple[Path, dict[str, Any]]]:
         )
         if spec is None:
             continue
-        if spec.get("name") == name or f.stem == name:
+        if spec.get("name") == name or spec_relname(kiro_agents_dir_path(), f) == name:
             matches.append((f, spec))
     return matches
 
@@ -3514,7 +3516,8 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                 try:
                     # Either lookup spelling can resolve this same file; a
                     # hand-edited name cannot hide its enrolled stem.
-                    for identity in dict.fromkeys((f.stem, spec_str(data, "name") or f.stem)):
+                    spec_id = spec_relname(kiro_agents_dir_path(), f)
+                    for identity in dict.fromkeys((spec_id, spec_str(data, "name") or spec_id)):
                         await asyncio.to_thread(require_unmanaged_template, identity)
                 except CapabilityError as exc:
                     return web.json_response(

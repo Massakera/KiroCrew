@@ -387,8 +387,13 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
         # so a project spec that declares this agent under some other filename is
         # still found. Matching on `<bound>.json` alone would miss exactly that
         # and under-report the shadow.
+        proj_scope = project_agents_dir(project_dir)
         proj_spec = next(
-            (p for p in project_agent_files(project_dir) if project_agent_name(p) == bound),
+            (
+                p
+                for p in project_agent_files(project_dir)
+                if project_agent_name(p, proj_scope) == bound
+            ),
             None,
         )
         if proj_spec is not None:

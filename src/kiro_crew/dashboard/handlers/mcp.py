@@ -22,7 +22,7 @@ from kiro_crew.agent import (
     rebuild_agent_config,
 )
 from kiro_crew.agent_discovery import _read_agent_spec
-from kiro_crew.agent_spec_format import iter_agent_spec_files
+from kiro_crew.agent_spec_format import iter_agent_spec_files, spec_relname
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     FORWARD_DECLARED_ENV_DEFAULT,
@@ -3076,7 +3076,7 @@ def _collect_server_rows() -> dict[str, dict[str, Any]]:
         )
         if spec is None:
             continue
-        agent_name = spec.get("name") or path.stem
+        agent_name = spec.get("name") or spec_relname(agents_dir, path)
         mcp_servers = spec.get("mcpServers")
         if not isinstance(mcp_servers, dict):
             continue

@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
-from kiro_crew.agent_spec_format import is_markdown_spec, iter_agent_spec_files
+from kiro_crew.agent_spec_format import is_markdown_spec, iter_agent_spec_files, spec_relname
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.terminal_safe import _TERMINAL_CTRL_RE
 
@@ -426,7 +426,14 @@ def check_dead_paths(*, agents_dir: Path | None = None, repair=_default_repair) 
     for spec_path in iter_agent_spec_files(agents_dir):
         managed = spec_path.name in managed_names
         dead, unreadable = _walk_spec(spec_path)
-        result = SpecResult(spec=spec_path.name, managed=managed, dead=dead, unreadable=unreadable)
+        # Reported by id, so two same-named specs in different subdirectories are
+        # two rows a reader can tell apart and act on.
+        result = SpecResult(
+            spec=spec_relname(agents_dir, spec_path) + spec_path.suffix,
+            managed=managed,
+            dead=dead,
+            unreadable=unreadable,
+        )
         report.results.append(result)
         if managed and dead:
             managed_needs_repair = True

@@ -174,6 +174,40 @@ ALLOWED_HOOK_EVENTS = frozenset(
 # Valid agent name pattern (alphanumeric, hyphens, underscores)
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]$|^[a-zA-Z0-9]$")
 
+# One segment of an agent id: the same grammar as _AGENT_NAME_RE, unanchored so
+# it can be joined.
+_AGENT_ID_SEGMENT = r"[a-zA-Z0-9](?:[a-zA-Z0-9_-]{0,62}[a-zA-Z0-9])?"
+
+# Imported for the bound below, not re-exported: ``agent_spec_format`` is a leaf
+# module (it imports nothing from this package), so this edge cannot cycle.
+from kiro_crew.agent_spec_format import MAX_AGENT_SPEC_DEPTH  # noqa: E402
+
+# Valid agent ID pattern — an agent id is a path RELATIVE to an agents directory
+# with the spec suffix removed, so it may name a subdirectory: a spec at
+# ``<agents>/team/planner.md`` is the agent ``team/planner`` (see
+# :mod:`kiro_crew.agent_spec_format`). A single segment is the flat case and is
+# accepted on exactly the terms _AGENT_NAME_RE accepts it, so no name that
+# validated before stops validating.
+#
+# Use this wherever an agent is SELECTED and _AGENT_NAME_RE wherever a name is
+# MINTED as a filename or a directory (a workspace name, a new template): the two
+# are separate because a value that becomes one path component must not carry a
+# separator, and WORKSPACE_NAME_RE below is that case.
+#
+# Every id this accepts is safe to join onto an agents directory
+# (``agent_spec_format.is_safe_agent_relname``): a segment begins and ends
+# alphanumeric, so no segment can be ``.`` or ``..`` or empty, and neither a
+# backslash nor a drive letter nor a leading ``/`` can appear.
+#
+# The depth comes from the WALK's own bound (``MAX_AGENT_SPEC_DEPTH``) rather
+# than a number chosen here, so the two can never disagree: a spec found one
+# level below where this grammar stopped would be listed under a name every
+# selection surface rejects. A file at the deepest directory the walk reaches has
+# that many separators in its id, hence this many repetitions.
+AGENT_ID_RE = re.compile(
+    rf"^{_AGENT_ID_SEGMENT}(?:/{_AGENT_ID_SEGMENT}){{0,{MAX_AGENT_SPEC_DEPTH}}}$"
+)
+
 # Artifact slug grammar — mirrors kiro_crew.artifacts._SLUG_RE (kept here so
 # consumers outside the store module share one public definition). Used to
 # validate the companion-chat `artifact` slot binding at EVERY
@@ -1072,13 +1106,13 @@ SPAWN_RUN_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("task", str, max_len=MAX_MEDIUM_STRING),
         FieldSpec("tasks", list, item_type=str, item_max_len=MAX_MEDIUM_STRING),
-        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=AGENT_ID_RE),
         FieldSpec(
             "agents",
             list,
             item_type=str,
             item_max_len=MAX_SHORT_STRING,
-            item_pattern=_AGENT_NAME_RE,
+            item_pattern=AGENT_ID_RE,
         ),
         # 0 = "not set" → falls through to config default via `0 or config_value`.
         # Bounded by the same ceiling the config loader clamps
@@ -1138,7 +1172,7 @@ SPAWN_CONTINUE_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("conversation", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("task", str, required=True, max_len=MAX_MEDIUM_STRING),
-        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=AGENT_ID_RE),
         FieldSpec("max_turns", int, min_val=0, max_val=SUBAGENT_MAX_TURNS_CEILING),
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
     ],
@@ -2606,7 +2640,7 @@ CRON_ADD_SCHEMA = ToolSchema(
         FieldSpec("at", (int, float), min_val=0, max_val=4102444800),  # up to 2100
         FieldSpec("delay", (int, float), min_val=1, max_val=86400 * 30),  # 1s to 30 days
         FieldSpec("at_time", str, max_len=100),
-        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=AGENT_ID_RE),
         FieldSpec("member_id", str, max_len=MAX_SHORT_STRING),
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
         FieldSpec("silent", bool),
@@ -3279,7 +3313,7 @@ MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
             FieldSpec("message", str, max_len=MAX_CRON_MESSAGE),
             FieldSpec("cron_expr", str, max_len=100),
             FieldSpec("every", int, min_val=60, max_val=86400 * 30),
-            FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+            FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=AGENT_ID_RE),
             FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
             FieldSpec("channel", str, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
             FieldSpec("thread_ts", str, max_len=30, pattern=re.compile(r"^\d+\.\d+$")),

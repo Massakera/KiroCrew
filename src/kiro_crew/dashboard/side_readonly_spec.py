@@ -249,10 +249,12 @@ def _read_base_spec(base_name: str, project_dir: str | None) -> tuple[dict[str, 
     """
     from kiro_crew.agent import agent_spec_path
     from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
+    from kiro_crew.config.paths import project_agents_dir
 
     if project_dir:
+        scope = project_agents_dir(project_dir)
         for spec_file in project_agent_files(project_dir):
-            if project_agent_name(spec_file) == base_name:
+            if project_agent_name(spec_file, scope) == base_name:
                 data = _read_agent_spec(
                     spec_file, operation="side_readonly_spec", source="dashboard"
                 )
@@ -286,10 +288,16 @@ def _refuse_if_shadowed(derived_name: str, target: Path, project_dir: str | None
     """
     from kiro_crew.agent import agent_spec_path
     from kiro_crew.agent_discovery import project_agent_files, project_agent_name
+    from kiro_crew.agent_spec_format import spec_relname
+    from kiro_crew.config.paths import project_agents_dir
 
     if project_dir:
+        scope = project_agents_dir(project_dir)
         for spec_file in project_agent_files(project_dir):
-            if spec_file.stem == derived_name or project_agent_name(spec_file) == derived_name:
+            if (
+                spec_relname(scope, spec_file) == derived_name
+                or project_agent_name(spec_file, scope) == derived_name
+            ):
                 raise ReadOnlySpecError(
                     "derived_name_shadowed",
                     f"project spec {spec_file} declares {derived_name!r}; kiro-cli would load it "

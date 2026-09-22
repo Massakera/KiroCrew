@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from kiro_crew.agent_spec_format import iter_agent_spec_files
+from kiro_crew.agent_spec_format import iter_agent_spec_files, spec_relname
 from kiro_crew.metrics.sessions import (
     END_REASON_EVICTED,
     discard_session_start,
@@ -1176,7 +1176,7 @@ class SessionAllocationService:
                 )
                 if data is None:
                     continue
-                if data.get("name") == agent or agent_file.stem == agent:
+                if data.get("name") == agent or spec_relname(agents_dir, agent_file) == agent:
                     model = self._deps.spec_model(data)
                     break
         except Exception:

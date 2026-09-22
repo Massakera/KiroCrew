@@ -144,12 +144,15 @@ def test_chat_restore_keeps_a_model_less_spec_unpinned(tmp_path, monkeypatch):
     assert model_map == {"bot": "", "bot-file": ""}
 
 
-def test_session_resolver_stops_at_first_match_and_preserves_glob_order(tmp_path, monkeypatch):
+def test_session_resolver_stops_at_first_match_in_the_walk_order(tmp_path, monkeypatch):
+    """The resolver reads until it matches and then stops, so the file it picks
+    among two specs claiming one name is decided by the scan order -- which is
+    the walk's own: each directory's entries by name."""
     from kiro_crew import session
 
-    first = tmp_path / "z-first.json"
+    first = tmp_path / "a-first.json"
     first.write_text(json.dumps({"name": "bot", "model": "m1"}), encoding="utf-8")
-    later = tmp_path / "a-later.json"
+    later = tmp_path / "z-later.json"
     later.write_text(json.dumps({"name": "bot", "model": "m2"}), encoding="utf-8")
     real_reader = session._read_agent_spec
     reads = []
@@ -160,7 +163,6 @@ def test_session_resolver_stops_at_first_match_and_preserves_glob_order(tmp_path
 
     monkeypatch.setattr(session, "kiro_agents_dir_path", lambda: tmp_path)
     monkeypatch.setattr(session, "_read_agent_spec", _reader)
-    monkeypatch.setattr(type(tmp_path), "glob", lambda self, pattern: iter((first, later)))
     session.SessionManager._agent_model_cache = {}
 
     assert session.SessionManager._resolve_agent_model("bot") == "m1"

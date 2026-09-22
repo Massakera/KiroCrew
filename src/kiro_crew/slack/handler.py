@@ -48,7 +48,11 @@ from kiro_crew.agent_discovery import (
     project_agent_name,
     read_agent_spec_strict,
 )
-from kiro_crew.agent_spec_format import is_markdown_spec, iter_agent_spec_files
+from kiro_crew.agent_spec_format import (
+    is_markdown_spec,
+    iter_agent_spec_files,
+    spec_relname,
+)
 from kiro_crew.config.loader import (
     ACTIVATION_REVIEW,
     ConfigReadError,
@@ -56,7 +60,7 @@ from kiro_crew.config.loader import (
     config_path,
     update_config_locked,
 )
-from kiro_crew.config.paths import kiro_agents_dir, peek_data_home
+from kiro_crew.config.paths import kiro_agents_dir, peek_data_home, project_agents_dir
 from kiro_crew.constants import is_control_tag_tail, strip_control_comments
 from kiro_crew.context import (
     ContextBuilder,
@@ -1101,16 +1105,17 @@ def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None
         stem = spec.stem.removesuffix(".agent-spec")
         if stem != name and spec.stem != name:
             continue
-        return project_agent_name(spec)
+        return project_agent_name(spec, project_agents_dir(project_dir or ""))
 
     agents_dir = kiro_agents_dir()
-    specs = (
-        sorted(iter_agent_spec_files(agents_dir), key=lambda f: (len(f.stem), f.stem))
+    ids: dict[Path, str] = (
+        {f: spec_relname(agents_dir, f) for f in iter_agent_spec_files(agents_dir)}
         if agents_dir.is_dir()
-        else []
+        else {}
     )
+    specs = sorted(ids, key=lambda f: (len(ids[f]), ids[f]))
     match = next(
-        (f for f in specs if f.stem == name or f.stem.endswith(f"-{name}")),
+        (f for f in specs if ids[f] == name or ids[f].endswith(f"-{name}")),
         None,
     )
     if not match:
@@ -1131,11 +1136,14 @@ def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None
         # broken JSON spec still occupies its name, as it always has; a
         # markdown file that does not parse is not a spec at all (a README,
         # notes), the same rule the listing applies, so it does not resolve.
-        return None if is_markdown_spec(match) else match.stem
+        return None if is_markdown_spec(match) else ids[match]
     if not isinstance(data, dict):
-        return None if is_markdown_spec(match) else match.stem
+        return None if is_markdown_spec(match) else ids[match]
     declared = data.get("name")
-    return declared if isinstance(declared, str) and declared else match.stem
+    # ``ids[match]``, never ``match.stem``: the match was FOUND by id, so
+    # reporting the bare filename hands back a different agent -- for
+    # ``team/planner`` with no declared name, the flat ``planner``.
+    return declared if isinstance(declared, str) and declared else ids[match]
 
 
 # Frontmatter ``name:`` matcher for cc-plugins agent specs. Pre-compiled at

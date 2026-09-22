@@ -2658,7 +2658,7 @@ class TestEffectiveModelSection:
         self._install_spec(None)
         real_reader = cli_doctor._read_agent_spec
         monkeypatch.setattr(cli_doctor, "project_agent_files", lambda d: [hostile])
-        monkeypatch.setattr(cli_doctor, "project_agent_name", lambda p: "kirocrew")
+        monkeypatch.setattr(cli_doctor, "project_agent_name", lambda p, root: "kirocrew")
         # Only the injected path is faked; the user-level spec still goes through
         # the real reader so the report's own self-check is not disturbed. The
         # stub forwards **kw because the reader takes keyword-only SEL

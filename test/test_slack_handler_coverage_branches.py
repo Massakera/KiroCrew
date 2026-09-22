@@ -346,7 +346,7 @@ class TestResolveAgentName:
         spec = tmp_path / "reviewer.agent-spec.json"
         spec.write_text("{}", encoding="utf-8", newline="\n")
         monkeypatch.setattr(h, "_discover_project_agents", lambda _d: [spec])
-        monkeypatch.setattr(h, "project_agent_name", lambda p: "project-reviewer")
+        monkeypatch.setattr(h, "project_agent_name", lambda p, root: "project-reviewer")
         assert h._resolve_agent_name("reviewer", str(tmp_path)) == "project-reviewer"
 
     def test_unsafe_agent_path_resolves_to_none(self, monkeypatch, tmp_path):
@@ -369,6 +369,34 @@ class TestResolveAgentName:
         monkeypatch.setattr(h, "_discover_project_agents", lambda _d: [])
         monkeypatch.setattr(h, "kiro_agents_dir", lambda: agents)
         assert h._resolve_agent_name("helper") == "helper"
+
+    def test_a_nested_spec_does_not_resolve_onto_the_flat_agent_of_the_same_stem(
+        self, monkeypatch, tmp_path
+    ):
+        """Trap: the match is found by ID and was reported by FILENAME, so
+        ``team/planner`` with no declared name answered ``planner`` -- a
+        different, broader agent that the caller never asked for."""
+        agents = tmp_path / "agents"
+        (agents / "team").mkdir(parents=True)
+        (agents / "team" / "planner.json").write_text("{}", encoding="utf-8", newline="\n")
+        (agents / "planner.json").write_text(
+            '{"name": "planner"}', encoding="utf-8", newline="\n"
+        )
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d: [])
+        monkeypatch.setattr(h, "kiro_agents_dir", lambda: agents)
+
+        assert h._resolve_agent_name("team/planner") == "team/planner"
+        assert h._resolve_agent_name("planner") == "planner"
+
+    def test_a_nested_unparseable_spec_falls_back_to_its_id(self, monkeypatch, tmp_path):
+        agents = tmp_path / "agents"
+        (agents / "team").mkdir(parents=True)
+        (agents / "team" / "planner.json").write_text(
+            "{not json", encoding="utf-8", newline="\n"
+        )
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d: [])
+        monkeypatch.setattr(h, "kiro_agents_dir", lambda: agents)
+        assert h._resolve_agent_name("team/planner") == "team/planner"
 
 
 class TestIterCcAgentNames:

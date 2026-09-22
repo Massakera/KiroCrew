@@ -67,7 +67,7 @@ from kiro_crew.agent_discovery import (
     list_agents,
 )
 from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
-from kiro_crew.agent_spec_format import is_markdown_spec
+from kiro_crew.agent_spec_format import is_markdown_spec, spec_relname
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_local_path,
@@ -398,8 +398,8 @@ def _find_infos(name: str) -> list[AgentInfo]:
         spec = _read_agent_spec(f, operation="api_agent_template_delete", source="dashboard")
         if spec is None:
             continue
-        info = _global_agent_info(f, spec)
-        if info.name != name and f.stem != name:
+        info = _global_agent_info(f, spec, agents_dir)
+        if info.name != name and spec_relname(agents_dir, f) != name:
             continue
         fork = forks.get(info.name)
         if fork:
@@ -802,8 +802,8 @@ async def api_agent_template_delete(request: web.Request) -> web.Response:
                         )
                         if not isinstance(fresh, dict):
                             raise FileNotFoundError(found.filename)
-                        on_disk = _global_agent_info(spec_path, fresh)
-                        if name not in (on_disk.name, spec_path.stem):
+                        on_disk = _global_agent_info(spec_path, fresh, agents_dir)
+                        if name not in (on_disk.name, spec_relname(agents_dir, spec_path)):
                             raise FileNotFoundError(found.filename)
                         # The pre-lock ambiguity check is re-run HERE, where it
                         # decides: a package install landing a second file that
@@ -1034,7 +1034,7 @@ def read_only_reason_for_path(path: Path) -> str | None:
     if is_markdown_spec(path):
         return _READ_ONLY_MARKDOWN
     spec = _read_agent_spec(path, operation="api_agent_detail", source="dashboard")
-    info = _global_agent_info(path, spec if isinstance(spec, dict) else {})
+    info = _global_agent_info(path, spec if isinstance(spec, dict) else {}, kiro_agents_dir_path())
     fork = agent_state.all_fork_info().get(info.name)
     if fork:
         info.private_to = str(fork.get("private_to", ""))

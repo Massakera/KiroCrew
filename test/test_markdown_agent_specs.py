@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,17 +50,28 @@ from kiro_crew.agent_discovery import (
     spec_by_declared_name,
 )
 from kiro_crew.agent_spec_format import (
+    MAX_AGENT_SPEC_DEPTH,
     agent_spec_candidates,
     is_agent_spec_name,
     is_markdown_spec,
+    is_safe_agent_relname,
     iter_agent_spec_files,
     parse_agent_spec_text,
     parse_markdown_spec,
     shadowed_markdown_specs,
+    spec_relname,
     spec_stem,
     spec_suffix,
     split_markdown_spec,
 )
+from kiro_crew.validation import _AGENT_NAME_RE, AGENT_ID_RE
+
+# A spec that declares no ``name``, so its name is the one its LOCATION gives it.
+UNNAMED_MD = """---
+description: grouped in a folder
+---
+Be helpful.
+"""
 
 # The reporter's own probe file, verbatim: it loads under ``kiro-cli --v3`` and
 # was invisible to Kiro Crew.
@@ -280,6 +292,142 @@ class TestParser:
         assert sorted(p.name for p in iter_agent_spec_files(folding)) == ["Foo.json", "bar.md"]
         assert [p.name for p in shadowed_markdown_specs(folding)] == ["foo.md"]
 
+    def test_the_walk_descends_and_names_an_agent_by_its_path(self, tmp_path: Path) -> None:
+        """The v3 engine walks the agents directory and names an agent by its
+        path relative to the root, so a spec an author grouped in a folder is the
+        agent ``team/planner`` on both hosts -- not an agent the roster omits."""
+        (tmp_path / "flat.md").write_text(PROBE, encoding="utf-8")
+        (tmp_path / "team").mkdir()
+        (tmp_path / "team" / "planner.md").write_text(PROBE, encoding="utf-8")
+        (tmp_path / "team" / "sub").mkdir()
+        (tmp_path / "team" / "sub" / "deep.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "empty").mkdir()
+
+        assert [spec_relname(tmp_path, p) for p in iter_agent_spec_files(tmp_path)] == [
+            "flat",
+            "team/planner",
+            "team/sub/deep",
+        ]
+        assert spec_relname(tmp_path, tmp_path / "flat.md") == "flat"
+        # A path from somewhere else keeps the name it had rather than raising
+        # inside a scan.
+        assert spec_relname(tmp_path, Path("/elsewhere/other.json")) == "other"
+
+    def test_the_twin_rule_is_per_directory(self, tmp_path: Path) -> None:
+        """Trap: a twin is ONE agent authored twice. ``team/twin.json`` hides
+        ``team/twin.md`` beside it, and hides nothing from ``twin.md`` at the top
+        level -- those are the two agents ``team/twin`` and ``twin``."""
+        (tmp_path / "twin.md").write_text(PROBE, encoding="utf-8")
+        (tmp_path / "team").mkdir()
+        (tmp_path / "team" / "twin.md").write_text(PROBE, encoding="utf-8")
+        (tmp_path / "team" / "twin.json").write_text("{}", encoding="utf-8")
+
+        assert [spec_relname(tmp_path, p) for p in iter_agent_spec_files(tmp_path)] == [
+            "team/twin",
+            "twin",
+        ]
+        assert [spec_relname(tmp_path, p) for p in shadowed_markdown_specs(tmp_path)] == [
+            "team/twin"
+        ]
+
+    def test_a_symlinked_file_is_read_and_a_symlinked_directory_is_not_walked(
+        self, tmp_path: Path
+    ) -> None:
+        """A linked spec FILE is the case authors use, and the hardened reader
+        checks its resolved target. A linked DIRECTORY is not walked: a spec
+        inside one resolves outside the agents directory, which
+        ``agent._spec_path_is_safe`` refuses -- so following the link would list
+        an agent the resolver every writer goes through then declines to find,
+        and the surfaces would disagree about whether it exists. A broken link is
+        neither a file nor a directory and is skipped.
+
+        The directory links go through ``make_dir_link``, so on Windows this
+        exercises a JUNCTION -- which needs no privilege, answers ``True`` to
+        ``is_dir(follow_symlinks=False)`` and ``False`` to ``is_symlink()``, and
+        would therefore be walked there and nowhere else if the rule tested for a
+        symlink alone."""
+        from conftest import make_dir_link
+
+        elsewhere = tmp_path / "checkout"
+        elsewhere.mkdir()
+        (elsewhere / "linked.md").write_text(PROBE, encoding="utf-8")
+        (elsewhere / "target.json").write_text("{}", encoding="utf-8")
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "own.json").write_text("{}", encoding="utf-8")
+        make_dir_link(agents / "repo", elsewhere)
+        make_dir_link(agents / "loop", agents)
+        try:
+            (agents / "linked-file.json").symlink_to(elsewhere / "target.json")
+            (agents / "gone.md").symlink_to(agents / "nowhere.md")
+        except (OSError, NotImplementedError):
+            pytest.skip("file symlinks unavailable on this platform/filesystem")
+
+        assert [spec_relname(agents, p) for p in iter_agent_spec_files(agents)] == [
+            "linked-file",
+            "own",
+        ]
+
+    def test_a_hidden_directory_holds_state_and_is_not_walked(self, tmp_path: Path) -> None:
+        """Kiro Crew keeps the skill-projection leases in a dotted directory
+        right inside the agents directory, and every file in it is JSON -- walked,
+        each would be listed as an agent."""
+        (tmp_path / ".kirocrew-skill-projection-leases").mkdir()
+        (tmp_path / ".kirocrew-skill-projection-leases" / "1-abc.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (tmp_path / "real.json").write_text("{}", encoding="utf-8")
+
+        assert [spec_relname(tmp_path, p) for p in iter_agent_spec_files(tmp_path)] == ["real"]
+
+    def test_the_walk_stops_where_the_id_grammar_stops(self, tmp_path: Path) -> None:
+        """Every roster read walks this tree, so it is bounded -- and the bound is
+        the SAME one the wire grammar is built from. A spec found one level
+        deeper would be listed under a name every selection surface rejects,
+        which is this PR's own defect one level down."""
+        deep = tmp_path
+        for level in range(MAX_AGENT_SPEC_DEPTH + 2):
+            deep = deep / f"d{level}"
+            deep.mkdir()
+            (deep / "a.json").write_text("{}", encoding="utf-8")
+
+        found = [spec_relname(tmp_path, p) for p in iter_agent_spec_files(tmp_path)]
+        assert len(found) == MAX_AGENT_SPEC_DEPTH
+        assert found[0] == "d0/a"
+        # The deepest id the walk can produce is one the grammar still accepts,
+        # and one level further is neither produced nor accepted.
+        assert AGENT_ID_RE.match(found[-1]), found[-1]
+        too_deep = "/".join(f"d{i}" for i in range(MAX_AGENT_SPEC_DEPTH + 1)) + "/a"
+        assert too_deep not in found
+        assert not AGENT_ID_RE.match(too_deep)
+        for name in found:
+            assert AGENT_ID_RE.match(name) and is_safe_agent_relname(name), name
+
+    def test_an_id_that_escapes_the_agents_directory_has_no_candidate(self, tmp_path: Path) -> None:
+        """An id is joined onto the agents directory, so the join is the guard."""
+        assert [p.name for p in agent_spec_candidates(tmp_path, "z")] == ["z.json", "z.md"]
+        assert agent_spec_candidates(tmp_path, "team/planner") == [
+            tmp_path / "team" / "planner.json",
+            tmp_path / "team" / "planner.md",
+        ]
+        for refused in ("../../.aws/credentials", "a/../../b", "/etc/passwd", "", ".", "a/"):
+            assert agent_spec_candidates(tmp_path, refused) == [], refused
+        assert agent_spec_candidates(tmp_path, "C:/x") == []
+        assert agent_spec_candidates(tmp_path, "a\\b") == []
+
+    def test_every_id_the_wire_accepts_is_safe_to_join(self) -> None:
+        """The two rules are separate code and must not drift: a name the wire
+        admits and the join refuses would be an agent that validates and then
+        resolves to nothing."""
+        for name in ("a", "kirocrew", "team/planner", "a/b/c/d", "my_team-1/planner-2"):
+            assert AGENT_ID_RE.match(name), name
+            assert is_safe_agent_relname(name), name
+        for name in ("../x", "a/../b", "/a", "a/", "a//b", ".", "a/.", "C:/x", "a\\b"):
+            assert not AGENT_ID_RE.match(name), name
+        # Nothing that validated before stops validating.
+        for name in ("a", "ab", "a-b_c", "x" * 64):
+            assert bool(_AGENT_NAME_RE.match(name)) <= bool(AGENT_ID_RE.match(name)), name
+
     def test_twins_differing_only_by_case_are_distinct_agents_on_a_case_sensitive_filesystem(
         self, tmp_path: Path
     ) -> None:
@@ -307,6 +455,164 @@ class TestRoster:
         assert probe.filename == "kas-md-probe.md"
         assert probe.description.startswith("A minimal markdown-format probe agent")
         assert probe.scope == "global"
+
+    def test_a_nested_agent_is_listed_under_its_path_and_is_reopenable(
+        self, agents_dir: Path
+    ) -> None:
+        """The roster is the surface the report was filed against: a markdown
+        agent in a subfolder did not appear at all. Its ``filename`` stays
+        relative to the scope because that is what the roster's own readers
+        reopen it as."""
+        (agents_dir / "team").mkdir()
+        (agents_dir / "team" / "planner.md").write_text(UNNAMED_MD, encoding="utf-8")
+        (agents_dir / "plain.json").write_text(json.dumps({"name": "plain"}), encoding="utf-8")
+
+        rows = {a.name: a for a in list_agents(agents_dir=agents_dir)}
+
+        assert set(rows) == {"team/planner", "plain"}
+        nested = rows["team/planner"]
+        assert nested.filename == "team/planner.md"
+        assert (agents_dir / nested.filename).is_file()
+        assert nested.description == "grouped in a folder"
+        assert sorted(agent_spec_stems(agents_dir, operation="t", source="unknown")) == [
+            "plain",
+            "team/planner",
+        ]
+
+    def test_a_spec_linked_into_a_fenced_target_is_not_listed(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The walk follows a symlinked FILE, so the refusal for one whose target
+        the fence withholds is the hardened reader's -- and it must still hold now
+        that the walk reaches files in subdirectories too."""
+        outside = agents_dir.parent / "fenced"
+        outside.mkdir()
+        (outside / "payload.json").write_text(
+            json.dumps({"name": "payload", "model": "stolen"}), encoding="utf-8"
+        )
+        (agents_dir / "team").mkdir()
+        (agents_dir / "plain.json").write_text(json.dumps({"name": "plain"}), encoding="utf-8")
+        try:
+            (agents_dir / "top.json").symlink_to(outside / "payload.json")
+            (agents_dir / "team" / "nested.json").symlink_to(outside / "payload.json")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable on this platform/filesystem")
+        monkeypatch.setattr(
+            agent_discovery,
+            "_fence_refuses",
+            lambda real: "fenced" in str(real),
+        )
+
+        assert [a.name for a in list_agents(agents_dir=agents_dir)] == ["plain"]
+
+    def test_a_nested_spec_is_read_only_to_the_model_pin_writer(self, agents_dir: Path) -> None:
+        """Mutating a nested spec is not offered, and refusing is what keeps an
+        intermediate directory off a check-then-reopen write path."""
+        (agents_dir / "team").mkdir()
+        (agents_dir / "team" / "planner.json").write_text(
+            json.dumps({"model": "pinned"}), encoding="utf-8"
+        )
+
+        with pytest.raises(ValueError, match="defined in a subdirectory"):
+            agent_mod.reset_agent_model("team/planner")
+
+        # Unchanged on disk: the refusal is before the write, not after it.
+        assert json.loads((agents_dir / "team" / "planner.json").read_text(encoding="utf-8")) == {
+            "model": "pinned"
+        }
+
+    def test_a_symlinked_ancestor_is_refused_by_the_spec_write_gate(
+        self, agents_dir: Path, tmp_path: Path
+    ) -> None:
+        """The gate checked the final component only, and a nested id put
+        intermediate components on this path for the first time.
+
+        The link here points back INSIDE the tree on purpose. An outward-pointing
+        one is already refused by the resolved-containment test, so it proves
+        nothing about this check; an inward-pointing one resolves to a contained
+        path and is invisible to that test. It is also the shape the swap needs:
+        a link that reads as legitimate at check time and is repointed before the
+        writer reopens the path by name."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "evil.json").write_text("{}", encoding="utf-8")
+        (agents_dir / "real").mkdir()
+        (agents_dir / "real" / "spec.json").write_text("{}", encoding="utf-8")
+        (agents_dir / "flat.json").write_text("{}", encoding="utf-8")
+        try:
+            (agents_dir / "team").symlink_to(agents_dir / "real", target_is_directory=True)
+            (agents_dir / "outward").symlink_to(outside, target_is_directory=True)
+            (agents_dir / "linkfile.json").symlink_to(outside / "evil.json")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable on this platform/filesystem")
+
+        assert agent_mod._spec_path_is_safe(agents_dir / "flat.json", agents_dir)
+        assert agent_mod._spec_path_is_safe(agents_dir / "real" / "spec.json", agents_dir)
+        # Same file, reached through a linked ancestor: contained, and refused.
+        assert not agent_mod._spec_path_is_safe(agents_dir / "team" / "spec.json", agents_dir)
+        assert not agent_mod._spec_path_is_safe(agents_dir / "outward" / "evil.json", agents_dir)
+        assert not agent_mod._spec_path_is_safe(agents_dir / "linkfile.json", agents_dir)
+        assert not agent_mod._spec_path_is_safe(outside / "evil.json", agents_dir)
+
+    def test_the_tool_policy_endpoint_admits_a_nested_id(self) -> None:
+        """Trap: the endpoint sanitized with a character denylist written when no
+        legitimate name carried a ``/``. Rejecting one returns 400, ``mcp_shared``
+        maps 400 to ``policy_forbidden``, and that value is NOT in
+        ``_UNRESOLVED_REFUSES_CALL`` -- so a refusal to ANSWER read as "excludes
+        nothing" and the excluded tool ran. The grammar admits the id and still
+        forbids every traversal shape."""
+        from kiro_crew.mcp_shared import _UNRESOLVED_REFUSES_CALL
+
+        for good in ("planner", "team/planner", "a/b/c/d"):
+            assert AGENT_ID_RE.fullmatch(good), good
+        for bad in ("../x", "a/../b", "a\\b", "/a", "a/", "."):
+            assert not AGENT_ID_RE.fullmatch(bad), bad
+        # Pin the reason this matters: the 400 path does not refuse the call, so
+        # admitting the id is what applies the policy rather than dropping it.
+        assert "policy_forbidden" not in _UNRESOLVED_REFUSES_CALL
+
+    def test_the_slack_agent_listing_names_a_nested_spec_by_its_path(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The sibling the First Principles lane enumerated: this listing still
+        fell back to the bare filename, so the channel modal offered ``planner``
+        for a spec that is the agent ``team/planner``."""
+        from kiro_crew.slack import events as slack_events
+
+        monkeypatch.setattr(slack_events, "kiro_agents_dir", lambda: agents_dir)
+        (agents_dir / "team").mkdir()
+        (agents_dir / "team" / "planner.json").write_text("{}", encoding="utf-8")
+        (agents_dir / "named.json").write_text(json.dumps({"name": "declared"}), encoding="utf-8")
+
+        assert slack_events._get_agent_names() == ["declared", "team/planner"]
+
+    def test_a_declared_name_still_outranks_the_path(self, agents_dir: Path) -> None:
+        """The path is the FALLBACK name, as the stem was: a spec that declares
+        its own name keeps it wherever the file sits."""
+        (agents_dir / "team").mkdir()
+        (agents_dir / "team" / "planner.json").write_text(
+            json.dumps({"name": "chosen"}), encoding="utf-8"
+        )
+
+        assert [a.name for a in list_agents(agents_dir=agents_dir)] == ["chosen"]
+
+    def test_an_edit_below_the_top_level_invalidates_the_roster_cache(
+        self, agents_dir: Path
+    ) -> None:
+        """Trap: a signature taken from the top level alone would serve the
+        pre-edit roster until something at the top level happened to change."""
+        (agents_dir / "team").mkdir()
+        nested = agents_dir / "team" / "planner.json"
+        nested.write_text(json.dumps({"description": "first"}), encoding="utf-8")
+        first = {a.name: a.description for a in list_agents(agents_dir=agents_dir)}
+        assert first == {"team/planner": "first"}
+
+        nested.write_text(json.dumps({"description": "second"}), encoding="utf-8")
+        os.utime(nested, (time.time() + 10, time.time() + 10))
+
+        assert {a.name: a.description for a in list_agents(agents_dir=agents_dir)} == {
+            "team/planner": "second"
+        }
 
     def test_a_readme_in_the_agents_dir_is_not_an_agent(self, agents_dir: Path) -> None:
         (agents_dir / "README.md").write_text("# not an agent\n", encoding="utf-8")
@@ -600,6 +906,59 @@ class TestRewriter:
             overlay_dir / "foo.json", overlay_dir / "Foo.json"
         )
         assert any("foo.md" in r.message and "Foo.json" in r.message for r in caplog.records)
+
+    def test_a_nested_source_takes_no_overlay_and_never_the_flat_agent_s(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The defect, with no mocking: the overlay filename is `<stem>.json`, so
+        `a/planner` and a flat `planner` both name `planner.json`. The walk sorts
+        `a/planner` FIRST, so the nested source claimed the overlay and the flat
+        one was skipped -- and `session_servers` looks that overlay up by the bare
+        id, handing the FLAT session the nested agent's brokered servers. A nested
+        source now takes no overlay at all."""
+        from kiro_crew.mcp_gateway import rewriter
+
+        src = tmp_path / "agents"
+        (src / "a").mkdir(parents=True)
+        # Both declare the stubbable ``srv`` (the fixture's only stub target)
+        # plus one key that says whose spec an overlay was built from, so the
+        # assertion below names an agent rather than counting files.
+        (src / "a" / "planner.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "srv": {"command": sys.executable, "args": ["-x"]},
+                        "nested-only": {"command": sys.executable, "args": ["-x"]},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "planner.json").write_text(
+            json.dumps(
+                {
+                    "name": "planner",
+                    "mcpServers": {
+                        "srv": {"command": sys.executable, "args": ["-x"]},
+                        "flat-only": {"command": sys.executable, "args": ["-x"]},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level("DEBUG", logger=rewriter.logger.name):
+            results, _env = _rewrite(tmp_path)
+
+        overlay_dir = tmp_path / "mcp-gateway" / "agents"
+        overlay = json.loads((overlay_dir / "planner.json").read_text(encoding="utf-8"))
+        assert "flat-only" in overlay["mcpServers"], "planner.json is the FLAT agent's overlay"
+        assert (
+            "nested-only" not in overlay["mcpServers"]
+        ), "the flat agent's session must never be handed the nested agent's servers"
+        assert results == {"planner.json": 1}
+        assert not (overlay_dir / "a").exists()
+        assert any("below the agents directory" in r.message for r in caplog.records)
 
     def test_a_skipped_twin_does_not_claim_its_valid_sibling_s_overlay(
         self,

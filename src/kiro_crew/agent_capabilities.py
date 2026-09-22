@@ -23,6 +23,7 @@ from kiro_crew.agent_spec_format import (
     agent_spec_candidates,
     iter_agent_spec_files,
     parse_agent_spec_bytes,
+    spec_relname,
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
@@ -93,7 +94,7 @@ def _source(name: str, project: str, *, allow_private: bool = False) -> tuple[Pa
         if _conflicting_spec_for(name, path, root) is not None:
             raise CapabilityError("ambiguous_template_name")
         spec = _read_spec(path)
-        if spec.get("name", path.stem) != name:
+        if spec.get("name", spec_relname(root, path)) != name:
             raise CapabilityError("source_identity_changed")
         if path is not None:
             if not allow_private and agent_state.get_fork_info(name, strict=True):
@@ -104,7 +105,7 @@ def _source(name: str, project: str, *, allow_private: bool = False) -> tuple[Pa
                 source = "project"
             elif path.name in OWNED_KIRO_AGENT_FILES:
                 source = "builtin"
-            elif _global_agent_info(path, spec).source == "package":
+            elif _global_agent_info(path, spec, root).source == "package":
                 source = "package"
             else:
                 source = "custom"
@@ -1318,7 +1319,9 @@ class CapabilityService:
                 if snap["project"]:
                     roots.append(project_agents_dir(snap["project"]))
                 occupied = {
-                    p.stem.lower() for directory in roots for p in iter_agent_spec_files(directory)
+                    spec_relname(directory, p).lower()
+                    for directory in roots
+                    for p in iter_agent_spec_files(directory)
                 }
                 from kiro_crew.agent_discovery import _read_agent_spec
 
@@ -1328,7 +1331,9 @@ class CapabilityService:
                             path, operation="capability_publish", source="dashboard"
                         )
                         if declared is not None:
-                            occupied.add(str(declared.get("name", path.stem)).lower())
+                            occupied.add(
+                                str(declared.get("name", spec_relname(directory, path))).lower()
+                            )
                 occupied.update(
                     str(v.get("kiro_agent", "")).lower()
                     for v in document.get("agents", {}).values()

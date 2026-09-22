@@ -128,7 +128,7 @@ from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.backends import model_registry_namespace
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
-from kiro_crew.agent_spec_format import iter_agent_spec_files
+from kiro_crew.agent_spec_format import iter_agent_spec_files, spec_relname
 from kiro_crew.config import KiroCrewConfig, live
 from kiro_crew.config.live import ConfigChange
 from kiro_crew.config.loader import (
@@ -2294,7 +2294,7 @@ class SessionManager:
                 )
                 if data is None:
                     continue
-                if data.get("name") == agent or agent_file.stem == agent:
+                if data.get("name") == agent or spec_relname(agents_dir, agent_file) == agent:
                     model = spec_model(data)
                     break
         except Exception:

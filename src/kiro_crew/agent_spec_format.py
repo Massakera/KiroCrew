@@ -13,10 +13,36 @@ config loader, the MCP gateway rewriter and the discovery cache can all reach it
 without an import cycle. It parses bytes it is handed and never opens a file --
 the hardened read (size cap, sensitive-symlink refusal) stays with the caller.
 
+An agents directory is a TREE, not a flat list: the v3 engine walks it and
+names an agent by its path relative to the directory with the suffix removed and
+``/`` as the separator, so ``~/.kiro/agents/team/planner.md`` is the agent
+``team/planner``. :func:`iter_agent_spec_files` walks the same way and
+:func:`spec_relname` derives the same id, so a spec in a subdirectory is one
+agent everywhere rather than an agent the roster omits and a session cannot
+select. A file directly in the directory keeps its plain stem, so nothing about
+a flat install changes. The walk is bounded by :data:`MAX_AGENT_SPEC_DEPTH`,
+which is also the bound ``validation.AGENT_ID_RE`` is built from so a spec can
+never be found under a name the selection surfaces reject. A directory whose name
+begins with ``.`` is not descended into: that is where this directory's tools keep
+state (Kiro Crew's own skill-projection leases live in one, and every file in it
+is JSON), never where an author puts an agent. A symlinked DIRECTORY is not
+descended into either, because a spec inside one resolves outside the agents
+directory and ``agent._spec_path_is_safe`` refuses it -- discovering an agent no
+resolver will find is worse than not discovering it. A symlinked FILE is still
+read, which is the case authors use and the hardened reader already covers.
+
+Because an id can now carry ``/``, an id turned back into a filename is a path
+join on caller-supplied text: :func:`is_safe_agent_relname` is the one rule for
+what may be joined, and :func:`agent_spec_candidates` yields nothing for a name
+that escapes the directory.
+
 ``<name>.json`` beside ``<name>.md`` is one agent authored twice -- the JSON twin
 is the workaround users kept while only JSON was read -- and the JSON wins:
 the iterator drops the shadowed markdown file, so every consumer sees one
-agent, and the roster warns so the author knows which file is live. Two
+agent, and the roster warns so the author knows which file is live. Twins are
+per DIRECTORY, which is what a twin is -- one agent authored twice:
+``team/planner.json`` and ``planner.md`` are the two agents ``team/planner`` and
+``planner``, and neither shadows the other. Two
 files of the SAME form declaring one name stay an ambiguity for the callers
 that already refuse it.
 
@@ -34,6 +60,8 @@ from __future__ import annotations
 
 import json
 import math
+import ntpath
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -46,6 +74,24 @@ JSON_SUFFIX = ".json"
 MARKDOWN_SUFFIX = ".md"
 AGENT_SPEC_SUFFIXES: tuple[str, ...] = (JSON_SUFFIX, MARKDOWN_SUFFIX)
 NATIVE_SKILL_ALIAS_PREFIX = "kirocrew-skill-view-"
+
+#: How many directories below an agents directory the scan descends. The v3
+#: engine applies no depth limit -- but every roster read, every per-turn model
+#: resolution and every gateway fingerprint walks this tree, so the cost of a
+#: pathological one is paid on a user's keystroke. Agent ids are typed by hand;
+#: nesting is for grouping a handful of agents, not for mirroring a source tree.
+#:
+#: This is ALSO the bound the wire grammar is built from
+#: (``validation.AGENT_ID_RE``), so the two cannot disagree. They must not: a
+#: spec the walk finds one level below where the grammar stops would be listed
+#: under a name every selection surface rejects, which is the original defect
+#: (an agent that exists and cannot be run) one level deeper.
+MAX_AGENT_SPEC_DEPTH = 4
+
+#: Path segments an agent id may not contain. ``..`` is the one that matters --
+#: an id is joined onto an agents directory -- and ``.``/empty are refused with
+#: it so one rule covers every spelling that does not name a child.
+_UNSAFE_ID_SEGMENTS = frozenset({"", ".", ".."})
 
 _FRONTMATTER_CLOSE_RE = re.compile(r"^---[ \t]*\r?$", re.MULTILINE)
 
@@ -177,28 +223,164 @@ def _has_json_twin(directory: Path, md: Path, json_stems: set[str]) -> bool:
     return (directory / f"{md.stem}{JSON_SUFFIX}").exists()
 
 
+def _scan_spec_dirs(root: Path) -> list[tuple[Path, list[Path]]]:
+    """``(directory, its spec files)`` for *root* and every directory under it.
+
+    Breadth-first from *root*, each directory's entries sorted by name, so the
+    order is the same on every platform and every run. Bounded by
+    :data:`MAX_AGENT_SPEC_DEPTH`, and a directory whose name begins with ``.``
+    is skipped: that is where a tool keeps state, never where an author puts an
+    agent.
+
+    A symlinked DIRECTORY is not descended into, and neither is a Windows
+    JUNCTION -- which needs no privilege to create, answers ``True`` to
+    ``is_dir(follow_symlinks=False)`` and ``False`` to ``is_symlink()``, so the
+    symlink rule alone would let the walk through it on Windows and nowhere else.
+    A spec reached through either resolves outside the agents directory, and
+    ``agent._spec_path_is_safe`` refuses exactly that -- so following the link would list an agent that the
+    resolver every writer and the capability layer go through then declines to
+    find. An agent that is discovered and unresolvable is worse than one that is
+    neither, because the surfaces disagree about whether it exists. A symlinked
+    FILE is still followed, which is the case authors actually use (a spec linked
+    to a checked-in copy) and the case the hardened reader already covers by
+    checking the resolved target.
+
+    Every ``OSError`` is swallowed and the directory contributes nothing, which
+    is what ``Path.glob`` does for an unreadable or missing directory on every
+    supported version -- so a caller's existing ``except OSError`` stays correct
+    and a caller without one is no more exposed than before. A broken symlink is
+    neither a file nor a directory here and is skipped by the same rule. The
+    resolved-directory set remains the guard against a repeat from any other
+    cause (a bind mount inside the tree), so no directory is ever read twice.
+    """
+    found: list[tuple[Path, list[Path]]] = []
+    visited: set[str] = set()
+    queue: list[tuple[Path, int]] = [(root, 0)]
+    while queue:
+        directory, depth = queue.pop(0)
+        try:
+            resolved = os.path.realpath(directory, strict=True)
+        except OSError:
+            continue
+        if resolved in visited:
+            continue
+        visited.add(resolved)
+        files: list[Path] = []
+        subdirs: list[Path] = []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in sorted(entries, key=lambda e: e.name):
+                    try:
+                        # A real directory entry only: ``follow_symlinks=False``
+                        # excludes a symlink and ``is_junction`` the Windows
+                        # reparse point that answers True to it anyway. ``is_file``
+                        # DOES follow the link, so a symlinked spec still loads,
+                        # and a broken link answers False to both.
+                        if entry.is_dir(follow_symlinks=False) and not entry.is_junction():
+                            # A DOTTED directory holds state, not authored
+                            # agents: Kiro Crew keeps the skill-projection
+                            # leases in ``.kirocrew-skill-projection-leases``
+                            # right here, and every one of those files is JSON --
+                            # walked, they would each be listed as an agent. The
+                            # v3 engine has no such directory to skip, so this is
+                            # a divergence the shared directory forces, and the
+                            # rule is the conventional one rather than a list of
+                            # Kiro Crew's own names: an author grouping agents
+                            # names the folder, and a tool hiding state dots it.
+                            if not entry.name.startswith("."):
+                                subdirs.append(directory / entry.name)
+                        elif entry.is_file() and is_agent_spec_name(entry.name):
+                            files.append(directory / entry.name)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+        found.append((directory, files))
+        if depth >= MAX_AGENT_SPEC_DEPTH:
+            continue
+        for subdir in subdirs:
+            queue.append((subdir, depth + 1))
+    return found
+
+
+def spec_relname(directory: Path, path: Path) -> str:
+    """The agent id *path* carries by where it sits under *directory*.
+
+    The path relative to the scan root, spec suffix removed, ``/`` as the
+    separator -- the id the v3 engine derives for the same file, so one spec is
+    one agent on both hosts. ``<agents>/team/planner.md`` is ``team/planner``
+    and ``<agents>/planner.md`` is ``planner``, so a flat install reads exactly
+    as it did.
+
+    Falls back to the plain stem when *path* is not under *directory*: a caller
+    holding a path from elsewhere gets the name it got before rather than a
+    ``ValueError`` raised in the middle of a roster scan.
+    """
+    try:
+        relative = path.relative_to(directory)
+    except ValueError:
+        return spec_stem(path.name)
+    return spec_stem(relative.as_posix())
+
+
+def is_safe_agent_relname(name: str) -> bool:
+    """Whether *name* may be joined onto an agents directory as a relative path.
+
+    An id is a path relative to the scan root, so turning one back into a
+    filename joins caller-supplied text onto a directory a caller then reads or
+    writes. Refused: an empty name, a NUL, a backslash (ids spell the separator
+    ``/``; a Windows separator would resolve as one there and not here, so the
+    same id would name two different files), an absolute or drive-qualified
+    path, and any segment in :data:`_UNSAFE_ID_SEGMENTS` -- which is what makes
+    ``../../.aws/credentials`` unusable as an agent name.
+
+    A name the walk derived always passes: it is built from real path segments
+    under the root. The rule is for the other direction -- a name off the wire,
+    a ``--agent`` argument, a URL path segment.
+    """
+    if not name or "\x00" in name or "\\" in name:
+        return False
+    if name.startswith("/") or ntpath.splitdrive(name)[0]:
+        return False
+    return not any(segment in _UNSAFE_ID_SEGMENTS for segment in name.split("/"))
+
+
 def _split_spec_files(directory: Path) -> tuple[list[Path], list[Path]]:
-    """``(live, shadowed)``: every spec file, with ``<stem>.md`` beside ``<stem>.json`` set aside."""
-    json_files = list(directory.glob(f"*{JSON_SUFFIX}"))
-    json_stems = {p.stem for p in json_files}
-    live = list(json_files)
+    """``(live, shadowed)``: every spec file at or under *directory*, with
+    ``<stem>.md`` beside ``<stem>.json`` set aside.
+
+    The twin rule is applied per directory, because that is the pair it is
+    about: ``<stem>.json`` and ``<stem>.md`` in ONE directory are one agent
+    authored twice, while the same stem in two directories is two agents with
+    two ids.
+    """
+    live: list[Path] = []
     shadowed: list[Path] = []
-    for path in directory.glob(f"*{MARKDOWN_SUFFIX}"):
-        (shadowed if _has_json_twin(directory, path, json_stems) else live).append(path)
+    for folder, files in _scan_spec_dirs(directory):
+        json_files = [p for p in files if spec_suffix(p.name) == JSON_SUFFIX]
+        json_stems = {p.stem for p in json_files}
+        live.extend(json_files)
+        for path in files:
+            if spec_suffix(path.name) != MARKDOWN_SUFFIX:
+                continue
+            (shadowed if _has_json_twin(folder, path, json_stems) else live).append(path)
     return live, shadowed
 
 
 def iter_agent_spec_files(directory: Path, *, ordered: bool = True) -> list[Path]:
-    """Every live spec file in *directory*, both forms.
+    """Every live spec file at or under *directory*, both forms.
 
-    A ``<stem>.md`` whose ``<stem>.json`` twin exists is NOT returned: the JSON
-    wins (see the module docstring), and :func:`shadowed_markdown_specs` names
-    the files this dropped. Propagates ``OSError`` from the directory walk
-    exactly as ``Path.glob`` does, so a caller that already handles the
-    JSON-only glob's failure handles this one unchanged. *ordered* sorts by full
-    name so the order is stable across platforms; ``ordered=False`` keeps the
-    directory's native order, JSON entries first, for the first-match resolvers
-    that scan on the event loop and stop at the first hit.
+    The walk descends into subdirectories, so a spec grouped in a folder is
+    returned too; :func:`spec_relname` turns each path into the agent's id. A
+    ``<stem>.md`` whose ``<stem>.json`` twin sits in the SAME directory is not
+    returned: the JSON wins (see the module docstring), and
+    :func:`shadowed_markdown_specs` names the files this dropped. An unreadable,
+    missing or looping directory contributes nothing rather than raising,
+    exactly as ``Path.glob`` behaves, so a caller that handled the JSON-only
+    glob handles this unchanged. *ordered* sorts by full path so the order is
+    stable across platforms; ``ordered=False`` keeps the walk's own order --
+    each directory's entries by name, JSON before markdown within a directory --
+    for the first-match resolvers that stop at the first hit.
     """
     live, _shadowed = _split_spec_files(directory)
     live = [path for path in live if not path.stem.startswith(NATIVE_SKILL_ALIAS_PREFIX)]
@@ -206,7 +388,7 @@ def iter_agent_spec_files(directory: Path, *, ordered: bool = True) -> list[Path
 
 
 def shadowed_markdown_specs(directory: Path) -> list[Path]:
-    """The ``<stem>.md`` files a ``<stem>.json`` twin hides, sorted; ``[]`` on a walk error."""
+    """The ``<stem>.md`` files a same-directory ``<stem>.json`` twin hides, sorted."""
     try:
         _live, shadowed = _split_spec_files(directory)
     except OSError:
@@ -215,11 +397,22 @@ def shadowed_markdown_specs(directory: Path) -> list[Path]:
 
 
 def agent_spec_candidates(directory: Path, name: str) -> list[Path]:
-    """The direct-filename paths ``<name>.json`` and ``<name>.md``, existing or not.
+    """The paths ``<name>.json`` and ``<name>.md`` under *directory*, existing or not.
 
     JSON first, so a caller that takes the first existing candidate applies the
     JSON-wins rule for a twin without restating it.
+
+    *name* may be a nested id: ``team/planner`` names
+    ``<directory>/team/planner.json`` and ``.md``, which is what makes an agent
+    the walk found in a subdirectory resolvable by the id the walk gave it.
+
+    ``[]`` for a name :func:`is_safe_agent_relname` refuses. Every candidate is
+    a path a caller goes on to read or write, so a name that escapes the agents
+    directory yields no candidate at all rather than a path outside the tree
+    that happens not to exist yet.
     """
+    if not is_safe_agent_relname(name):
+        return []
     return [directory / f"{name}{suffix}" for suffix in AGENT_SPEC_SUFFIXES]
 
 

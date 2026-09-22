@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Collection, Mapping
 
 from kiro_crew import __version__, platform_compat
-from kiro_crew.agent_spec_format import iter_agent_spec_files
+from kiro_crew.agent_spec_format import iter_agent_spec_files, spec_relname
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.env import mcp_search_path, spec_path_key
@@ -1483,8 +1483,13 @@ def _rewrite_inputs_fingerprint(
       forward, so the feature would silently not work.
     * ``schema`` / ``package`` — invalidate on rewriter logic changes.
     """
+    # Keyed by the agent's id, not the bare filename: with the scan walking
+    # subdirectories two specs can share a filename, and one key for both would
+    # drop a source from the fingerprint — an edit to it would then leave the
+    # stale overlay in place, which is the one thing this value exists to stop.
     sources: dict[str, list[Any] | None] = {
-        p.name: _source_sig(p) for p in iter_agent_spec_files(source_dir)
+        spec_relname(source_dir, p) + p.suffix: _source_sig(p)
+        for p in iter_agent_spec_files(source_dir)
     }
     return {
         "schema": _FINGERPRINT_SCHEMA,
@@ -2111,6 +2116,29 @@ def rewrite_agents(
     # the overlay (and the pruning of the twin's stale one) below.
     overlay_keys_claimed: dict[str, str] = {}
     for path in iter_agent_spec_files(source_dir):
+        if "/" in spec_relname(source_dir, path):
+            # A spec in a SUBDIRECTORY takes no overlay. Its id carries a ``/``
+            # and this filename cannot: ``path.stem`` would drop the prefix, so
+            # ``a/planner.md`` and a flat ``planner.md`` both name
+            # ``planner.json``. The claim guard below then skips whichever came
+            # second -- and the walk sorts ``a/planner`` FIRST, so the nested
+            # source took the overlay and the flat agent lost it, while
+            # ``session_servers`` looks that overlay up by the bare id and
+            # handed the FLAT session the nested agent's brokered servers.
+            #
+            # Skipping is the honest outcome, not a workaround: encoding a
+            # nested id into a flat filename is one change (with the spec's own
+            # ``name`` field as the authority, which ``session_servers`` already
+            # treats it as) and it is not this one. Until it lands, a nested
+            # agent's session launches its declared servers unpooled -- already
+            # the posture for a project-scoped agent, whose overlay is likewise
+            # not written.
+            logger.debug(
+                "agent %s is below the agents directory; no broker overlay is written for "
+                "it and its session runs its own servers unpooled",
+                path.name,
+            )
+            continue
         # The overlay is JSON whatever the source: ``session_servers`` resolves
         # ``<agent>.json``. The fingerprint's ``sources`` stays keyed by the
         # SOURCE name, so a markdown edit invalidates its overlay.

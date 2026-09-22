@@ -192,36 +192,31 @@ class TestAgentSpecReadsAreHardened:
         )
         assert KiroCrewConfig._resolve_named_agent_model("huge", agents_dir=tmp_path) == ""
 
-    def test_named_resolver_refuses_a_link_into_a_sensitive_path(
-        self, tmp_path, monkeypatch
-    ):
+    def test_named_resolver_does_not_read_through_a_directory_link(self, tmp_path):
         # A directory junction needs no privilege on Windows and resolves
-        # through pathlib exactly like a symlink, so the guard is exercised
-        # here rather than skipped. The sensitive-path verdict is scoped to
-        # the junction's TARGET so the test proves resolution follows the
-        # link: a same-named spec OUTSIDE the link must still read fine.
+        # through pathlib exactly like a symlink, so the rule is exercised here
+        # rather than skipped. The payload lives OUTSIDE the agents directory and
+        # the junction is the only route to it, which is what makes the
+        # assertion about the link: the scan walks subdirectories now
+        # (``agent_spec_format``) and does not follow a symlinked one, so a spec
+        # reachable only through the link donates nothing -- while a spec sitting
+        # in the directory itself still reads fine.
         from conftest import make_dir_link
-        from kiro_crew import agent_discovery
 
+        agents = tmp_path / "agents"
+        agents.mkdir()
         outside = tmp_path / "sensitive-outside"
         outside.mkdir()
         (outside / "link.json").write_text(json.dumps({"name": "link", "model": "stolen"}))
-        (tmp_path / "direct.json").write_text(json.dumps({"name": "direct", "model": "fine"}))
-        make_dir_link(tmp_path / "link", outside)
-        monkeypatch.setattr(
-            agent_discovery,
-            "is_sensitive_path",
-            lambda p: "sensitive-outside" in str(p),
-        )
-        assert KiroCrewConfig._resolve_named_agent_model("link", agents_dir=tmp_path) == ""
+        (agents / "direct.json").write_text(json.dumps({"name": "direct", "model": "fine"}))
+        make_dir_link(agents / "link", outside)
+        assert KiroCrewConfig._resolve_named_agent_model("link", agents_dir=agents) == ""
         assert (
-            KiroCrewConfig._resolve_named_agent_model("direct", agents_dir=tmp_path)
+            KiroCrewConfig._resolve_named_agent_model("direct", agents_dir=agents)
             == "fine"
         )
 
-    def test_installed_spec_resolver_reads_through_the_hardened_reader(
-        self, tmp_path, monkeypatch
-    ):
+    def test_installed_spec_resolver_reads_through_the_hardened_reader(self, tmp_path, monkeypatch):
         # The installed kirocrew.json path goes through the same reader: a
         # spec the reader refuses yields no model, and the resolver falls
         # through to the bundled default instead of trusting the file.

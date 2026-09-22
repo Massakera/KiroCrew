@@ -33,7 +33,7 @@ from kiro_crew.agent_spec_format import (
     iter_agent_spec_files,
     parse_agent_spec_bytes,
     shadowed_markdown_specs,
-    spec_stem,
+    spec_relname,
 )
 from kiro_crew.config.paths import kiro_agents_dir, project_agents_dir, project_kiro_dir
 from kiro_crew.executors import discovery_executor
@@ -569,7 +569,12 @@ def spec_by_declared_name(
 
 
 def agent_spec_stems(agents_dir: Path, *, operation: str, source: str) -> list[str]:
-    """Filename stems of the specs in *agents_dir*, sorted by filename, deduplicated.
+    """Agent ids of the specs in *agents_dir*, sorted by filename, deduplicated.
+
+    An id is the path relative to *agents_dir* without the suffix
+    (:func:`~kiro_crew.agent_spec_format.spec_relname`), so a spec in a
+    subdirectory is listed as ``team/planner`` -- the name the backend resolves
+    it by -- and a spec sitting directly in the directory is its plain stem.
 
     The cheap listing the Slack surfaces show: every ``*.json`` stem as before,
     unparseable ones included (a broken JSON spec still occupies its name), plus
@@ -585,7 +590,7 @@ def agent_spec_stems(agents_dir: Path, *, operation: str, source: str) -> list[s
             _read_agent_spec(path, operation=operation, source=source) is None
         ):
             continue
-        stems.setdefault(path.stem)
+        stems.setdefault(spec_relname(agents_dir, path))
     return list(stems)
 
 
@@ -661,15 +666,29 @@ def project_agent_files(
     return sorted(specs, key=lambda f: f.stem)
 
 
-def _project_agent_fallback_name(spec: Path) -> str:
-    """The filename-derived name for *spec*, with the spec suffixes stripped."""
+def _project_agent_fallback_name(spec: Path, root: Path) -> str:
+    """The location-derived name for *spec*, with the spec suffixes stripped.
+
+    *root* is the agents directory *spec* was scanned from, and it is REQUIRED:
+    the name is the path relative to it, so a project spec in a subdirectory is
+    ``team/planner`` exactly as a user-level one is. It was briefly optional, and
+    that was a defect rather than a convenience -- a lookup that omitted it got
+    the bare filename, so a restricted spec in a subdirectory answered to a name
+    no caller was asking about and the restriction it carries was not applied.
+    Required means the type checker, not a reader, is what proves no lookup is
+    left on the old answer.
+
+    The legacy ``<project>/.kiro/*.agent-spec.json`` scope returns before *root*
+    is consulted: that scope is one flat directory and is not walked, so its
+    filename IS its name.
+    """
     fallback = spec.name
     if fallback.endswith(AGENT_SPEC_SUFFIX):
         return fallback[: -len(AGENT_SPEC_SUFFIX)]
-    return spec_stem(fallback)
+    return spec_relname(root, spec)
 
 
-def _declared_project_agent_name(spec: Path) -> str | None:
+def _declared_project_agent_name(spec: Path, root: Path) -> str | None:
     """The dispatchable name *spec* declares, or ``None`` when it does not parse.
 
     ``None`` (malformed JSON, unreadable file, sensitive symlink target) means the
@@ -680,18 +699,21 @@ def _declared_project_agent_name(spec: Path) -> str | None:
     data = _read_agent_spec(spec, operation="resolve_project_agent_name", source="unknown")
     if data is None:
         return None
-    return spec_str(data, "name", _project_agent_fallback_name(spec))
+    return spec_str(data, "name", _project_agent_fallback_name(spec, root))
 
 
-def project_agent_name(spec: Path) -> str:
+def project_agent_name(spec: Path, root: Path) -> str:
     """The dispatchable name a project agent file declares.
 
     The declared ``name`` wins over the filename, matching what kiro-cli lists and
-    accepts for ``--agent``. The stem is the fallback, with
+    accepts for ``--agent``. The location is the fallback, with
     :data:`AGENT_SPEC_SUFFIX` stripped — a raw ``<name>.agent-spec`` stem is not a
     name anything downstream resolves.
+
+    *root* is the agents directory *spec* was scanned from and is required; see
+    :func:`_project_agent_fallback_name` for why it is not optional.
     """
-    return _declared_project_agent_name(spec) or _project_agent_fallback_name(spec)
+    return _declared_project_agent_name(spec, root) or _project_agent_fallback_name(spec, root)
 
 
 def _project_signature(project_dir: str | Path) -> tuple[_ListAgentsSig, ...]:
@@ -769,7 +791,7 @@ def project_agent_names(
         # Only a spec that parses contributes: a malformed or unreadable file can
         # never become a kiro-cli mode, and admitting its filename fallback here
         # would have dispatch accept a name whose session/set_mode then fails.
-        if (name := _declared_project_agent_name(f)) is not None:
+        if (name := _declared_project_agent_name(f, project_agents_dir(project_dir))) is not None:
             declared.append(name)
     _warn_on_systematic_scan_failure(project_agents_dir(project_dir), candidates, len(declared))
     names = frozenset(declared)
@@ -934,7 +956,7 @@ def agent_model_map(
         declared_name = spec_str(data, "name")
         if declared_name:
             result[declared_name] = model
-        result[spec_file.stem] = model
+        result[spec_relname(directory, spec_file)] = model
         parsed += 1
     _warn_on_systematic_scan_failure(directory, candidates, parsed)
     return result
@@ -1199,8 +1221,9 @@ def agent_skill_globs(
     # ``f`` is the ORIGINAL path: ``f.stem`` and ``expand_skill_uri`` below
     # must see it so a symlinked spec's relative globs stay anchored where
     # the symlink lives.
+    scope = agents_dir if agents_dir is not None else _kiro_agents_dir()
     for data, f in parsed_agent_specs(agents_dir, operation="agent_skill_globs", source="unknown"):
-        if data.get("name") != agent and f.stem != agent:
+        if data.get("name") != agent and spec_relname(scope, f) != agent:
             continue
         return [g for uri in skill_resource_uris(data) if (g := expand_skill_uri(uri, f))]
     if strict and agent != "kirocrew":
@@ -1329,22 +1352,24 @@ def _dir_signature(d: Path) -> _ListAgentsSig:
     and parsed-specs caches.
     """
     entries: list[tuple[str, int]] = []
-    try:
-        with os.scandir(d) as it:
-            for entry in it:
-                # Case-insensitive: a case-insensitive filesystem serves
-                # ``Foo.JSON`` to ``glob("*.json")`` consumers, so a
-                # case-sensitive suffix here would omit from the signature a
-                # file the scans include — its edits would never invalidate.
-                if not is_agent_spec_name(entry.name):
-                    continue
-                try:
-                    m = entry.stat().st_mtime_ns
-                except OSError:
-                    m = 0
-                entries.append((entry.name, m))
-    except OSError:
-        pass
+    # The same walk the scans use, so a spec in a subdirectory is fingerprinted
+    # too: signed off the top level alone, an edit to ``team/planner.md`` would
+    # leave every cache keyed on this value serving the pre-edit roster until
+    # something at the top level happened to change.
+    for spec_path in iter_agent_spec_files(d):
+        # Case-insensitive: a case-insensitive filesystem serves ``Foo.JSON`` to
+        # a ``glob("*.json")`` consumer, so a case-sensitive suffix here would
+        # omit from the signature a file the scans include — its edits would
+        # never invalidate.
+        if not is_agent_spec_name(spec_path.name):
+            continue
+        try:
+            m = spec_path.stat().st_mtime_ns
+        except OSError:
+            m = 0
+        # Name AND suffix: the id alone would make ``a.json`` and ``a.md``
+        # one entry, so swapping a spec's form would not invalidate anything.
+        entries.append((spec_relname(d, spec_path) + spec_path.suffix, m))
     return tuple(sorted(entries))
 
 
@@ -1420,14 +1445,21 @@ def _with_edition_agents(disk_agents: list[AgentInfo]) -> list[AgentInfo]:
     return list(by_name.values())
 
 
-def _global_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
-    """Build an :class:`AgentInfo` for a user-level (``~/.kiro/agents``) config."""
+def _global_agent_info(f: Path, data: dict[str, Any], directory: Path) -> AgentInfo:
+    """Build an :class:`AgentInfo` for a user-level (``~/.kiro/agents``) config.
+
+    *directory* is the scope *f* was scanned from, which is what turns a path
+    into an id and a reopenable ``filename``. The package-filename convention
+    below stays keyed on the bare stem: a package manager installs
+    ``{package}-{name}.json`` at the top level, so reading a package out of a
+    nested path would invent one.
+    """
     # Coerced BEFORE the package-detection below, which does
     # ``stem.endswith(agent_name)``: a non-string name raised TypeError there, and
     # the broad ``except`` around the caller's loop turned that into a silently
     # DROPPED agent rather than a degraded one. Falling back to the filename stem
     # keeps the row selectable under the name its file already implies.
-    agent_name = spec_str(data, "name", f.stem)
+    agent_name = spec_str(data, "name", spec_relname(directory, f))
     stem = f.stem
 
     package = ""
@@ -1449,8 +1481,12 @@ def _global_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
         source = "builtin"
 
     return AgentInfo(
+        # Relative to the scope, not the bare name: the roster's readers reopen
+        # the spec as ``directory / filename`` (``agent_welcome_message``,
+        # ``agent_skill_globs``), and a bare name would reopen nothing for a
+        # spec that lives in a subdirectory.
         name=agent_name,
-        filename=f.name,
+        filename=spec_relname(directory, f) + f.suffix,
         description=spec_str(data, "description"),
         model=spec_model(data),
         skills=_extract_skills(data),
@@ -1462,7 +1498,7 @@ def _global_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
     )
 
 
-def _project_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
+def _project_agent_info(f: Path, data: dict[str, Any], root: Path) -> AgentInfo:
     """Build an :class:`AgentInfo` for a project-level (``<project>/.kiro``) config.
 
     The ``{package}-{name}`` filename convention is deliberately NOT applied here:
@@ -1470,8 +1506,8 @@ def _project_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
     filename is just a filename and reading a package out of it would invent one.
     """
     return AgentInfo(
-        name=project_agent_name(f),
-        filename=f.name,
+        name=project_agent_name(f, root),
+        filename=spec_relname(root, f) + f.suffix,
         description=spec_str(data, "description"),
         model=spec_model(data),
         skills=_extract_skills(data),
@@ -1533,10 +1569,11 @@ def list_agents(
         for hidden_md in shadowed_markdown_specs(d):
             # The one user-facing surface every author reads, so this is where
             # the JSON-wins rule is announced rather than silently applied.
+            hidden_id = spec_relname(d, hidden_md)
             logger.warning(
                 "agent %r: %s is shadowed by its JSON twin %s.json and is not read; "
                 "delete one of the two files",
-                hidden_md.stem,
+                hidden_id,
                 hidden_md.name,
                 hidden_md.stem,
             )
@@ -1551,7 +1588,7 @@ def list_agents(
                 data = _read_agent_spec(f, operation="list_agents", source="unknown")
                 if data is None:
                     continue
-                agents.append(_global_agent_info(f, data))
+                agents.append(_global_agent_info(f, data, d))
                 # Counted AFTER the append: a spec that parses but whose row
                 # construction raises into the handler below still ends in
                 # "discovery listed nothing", which is exactly what the
@@ -1620,6 +1657,7 @@ def list_agents(
     # shadowing is not, because the two configs can differ in tools and permissions.
     project_candidates = 0
     project_parsed = 0
+    project_scope = project_agents_dir(project_dir or "")
     for pf in project_files:
         if not pf.name.startswith("._"):
             project_candidates += 1
@@ -1627,7 +1665,7 @@ def list_agents(
             data = _read_agent_spec(pf, operation="list_agents", source="unknown")
             if data is None:
                 continue
-            info = _project_agent_info(pf, data)
+            info = _project_agent_info(pf, data, project_scope)
             shadowed = seen.get(info.name)
             if shadowed is not None and shadowed.scope == SCOPE_GLOBAL:
                 logger.warning(

@@ -140,7 +140,7 @@ class TestProjectScopeDiscovery:
         kiro.mkdir(parents=True)
         spec = kiro / "legacy.agent-spec.json"
         spec.write_text(json.dumps({}))
-        assert project_agent_name(spec) == "legacy"
+        assert project_agent_name(spec, _project_agents_dir(tmp_path / "repo")) == "legacy"
 
     def test_sensitive_project_dir_yields_no_agents(self, tmp_path, monkeypatch):
         """A project path the security gate rejects must not be scanned at all."""

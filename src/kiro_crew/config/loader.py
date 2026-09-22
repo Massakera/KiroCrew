@@ -44,7 +44,11 @@ from kiro_crew import (
     windows_acl,
 )
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
-from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
+from kiro_crew.agent_spec_format import (
+    iter_agent_spec_files,
+    parse_agent_spec_text,
+    spec_relname,
+)
 
 # Leaf module (stdlib + platform_compat only) — no import cycle with config.
 from kiro_crew.atomic_write import atomic_write, on_event_loop
@@ -5372,7 +5376,9 @@ class KiroCrewConfig:
         rows.sort(key=lambda row: row[1].suffix.lower() != ".json")
         for ad, af in rows:
             # Skip stray non-object JSON a user may have dropped in the dir.
-            if isinstance(ad, dict) and (ad.get("name") == agent or af.stem == agent):
+            if isinstance(ad, dict) and (
+                ad.get("name") == agent or spec_relname(base, af) == agent
+            ):
                 return ad.get("model") or ""
         return ""
 
@@ -5756,7 +5762,7 @@ def _scan_materialized_agents(agents_dir: Path) -> frozenset[str]:
         if isinstance(declared, str) and declared:
             names.add(declared)
         else:
-            names.add(af.stem)
+            names.add(spec_relname(agents_dir, af))
     return frozenset(names)
 
 

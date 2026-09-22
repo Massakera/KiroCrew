@@ -25,7 +25,11 @@ from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
-from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
+from kiro_crew.agent_spec_format import (
+    iter_agent_spec_files,
+    parse_agent_spec_text,
+    spec_relname,
+)
 from kiro_crew.board_tag_grammar import is_grantable_tag_id
 from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
@@ -2241,7 +2245,7 @@ def _read_include_crew_context(agent: str) -> bool:
             data = parse_agent_spec_text(safe_read_file(str(f)), f)
             if not isinstance(data, dict):
                 continue
-            if data.get("name") == agent or f.stem == agent:
+            if data.get("name") == agent or spec_relname(kiro_agents_dir(), f) == agent:
                 val = data.get("includeCrewContext", True)
                 # Honor only an explicit boolean; anything else defaults to inject.
                 return val if isinstance(val, bool) else True

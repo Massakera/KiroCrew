@@ -228,9 +228,9 @@ class TestResolveAgentNameWithProject:
         read: list[str] = []
         original = h.project_agent_name
 
-        def _tracking(spec):
+        def _tracking(spec, root):
             read.append(spec.name)
-            return original(spec)
+            return original(spec, root)
 
         monkeypatch.setattr(h, "project_agent_name", _tracking)
         assert _resolve_agent_name("wanted", str(tmp_path)) == "wanted-resolved"

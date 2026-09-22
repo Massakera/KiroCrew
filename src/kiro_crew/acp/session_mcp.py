@@ -89,6 +89,7 @@ from kiro_crew.agent import (
 )
 from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
 from kiro_crew.agent_sdk.mcp_refs import parse_tools_refs
+from kiro_crew.config.paths import project_agents_dir
 from kiro_crew.env import sanitize_spec_env
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 
@@ -335,8 +336,9 @@ def _project_spec_path_for(agent: str, work_dir: str | Path | None) -> Path | No
     if not work_dir:
         return None
     try:
+        scope = project_agents_dir(work_dir)
         for spec in project_agent_files(work_dir):
-            if project_agent_name(spec) == agent:
+            if project_agent_name(spec, scope) == agent:
                 return spec
     except OSError:
         logger.debug("session MCP: could not scan %s for project agents", work_dir, exc_info=True)

@@ -37,6 +37,7 @@ from kiro_crew.agent_spec_format import (
     is_markdown_spec,
     iter_agent_spec_files,
     parse_agent_spec_text,
+    spec_relname,
 )
 from kiro_crew.config.loader import (
     ACTIVATION_MENTION,
@@ -647,7 +648,7 @@ def _get_agent_names() -> list[str]:
             # `/kirocrew channels` handler / channel-modal refresh task before
             # it opens. Mirrors agent.py's _load_json.
             name = None
-        names.append(name or f.stem)
+        names.append(name or spec_relname(agents_dir, f))
     return sorted(names)
 
 

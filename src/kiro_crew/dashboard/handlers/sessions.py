@@ -75,7 +75,7 @@ from kiro_crew.sandbox import (
     wrap_argv,
 )
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
-from kiro_crew.validation import sanitize_string
+from kiro_crew.validation import AGENT_ID_RE, sanitize_string
 
 logger = logging.getLogger(__name__)
 
@@ -3682,8 +3682,17 @@ async def api_session_tool_policy(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "agent not resolved"}, status=404)
 
-    # Sanitize agent_name to prevent path traversal
-    if "/" in agent_name or "\\" in agent_name or ".." in agent_name:
+    # The shared agent-id grammar, not a character denylist. It admits the
+    # nested id a spec in a subdirectory carries (``team/planner``) and still
+    # forbids every traversal shape the denylist was here for: a segment must
+    # begin and end alphanumeric, so no segment can be ``..`` or empty, and a
+    # backslash, a drive letter and a leading ``/`` are all unmatched.
+    #
+    # Accepting it is load-bearing, not cosmetic: a rejection here returns 400,
+    # ``mcp_shared`` maps that to ``policy_forbidden``, and that value is absent
+    # from ``_UNRESOLVED_REFUSES_CALL`` -- so a refusal to ANSWER was read as
+    # "this agent excludes nothing" and the excluded tool ran.
+    if not AGENT_ID_RE.fullmatch(agent_name):
         _sel().log_api_access(
             caller=session_key,
             operation="session_tool_policy",

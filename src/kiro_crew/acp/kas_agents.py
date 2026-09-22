@@ -607,6 +607,14 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
     the failure uniform.
     """
     candidates = agent_spec_candidates(agents_dir, agent_id)
+    if not candidates:
+        # No filename can hold this id (absolute, drive-qualified, or carrying a
+        # ``..`` segment), so there is nothing to read and nothing to report a
+        # path for. Refused as a translation failure like any other unusable
+        # spec rather than joined onto the agents directory and read.
+        raise KasAgentTranslationError(
+            f"agent id {agent_id!r} is not a name any spec file can have"
+        )
     path = candidates[0]
     try:
         declared = spec_by_declared_name(

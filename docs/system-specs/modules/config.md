@@ -1014,6 +1014,38 @@ agents dir) and `<project>/.kiro` (which holds Kiro Crew's older
 spawns kiro-cli with the session's project directory as its cwd, so this is exactly
 the directory the backend searches for that session.
 
+Both agents directories are **trees**. `agent_spec_format.iter_agent_spec_files()`
+walks subdirectories and `spec_relname()` names an agent by its path relative to the
+scan root with the spec suffix removed and `/` as the separator, which is the id the
+v3 engine derives for the same file — so `~/.kiro/agents/team/planner.md` is the agent
+`team/planner`, and a spec sitting directly in the directory keeps its plain stem. The
+`<stem>.json`-wins twin rule applies per directory, because a twin is one agent authored
+twice; the same stem in two directories is two agents with two ids. The walk is bounded by
+`MAX_AGENT_SPEC_DEPTH`, which `validation.AGENT_ID_RE` is also built from so the two
+cannot disagree — a spec found one level below where the grammar stops would be listed
+under a name every selection surface rejects. A dotted directory is skipped (Kiro Crew's
+own skill-projection leases live in one, and every file in it is JSON). A symlinked
+DIRECTORY is not descended into: a spec inside one resolves outside the agents directory
+and `agent._spec_path_is_safe` refuses it, so following the link would list an agent no
+writer or capability lookup will find. A symlinked FILE is still read, which is the case
+authors use and the hardened reader already covers by checking the resolved target. An id
+is also a path, so `is_safe_agent_relname()` is the one rule for what may be joined back
+onto an agents directory and `AGENT_ID_RE` is the wire grammar that accepts one.
+`project_agent_name()` and its two helpers take the scope root as a REQUIRED argument:
+optional, a lookup that omitted it fell back to the bare filename, so a restricted spec in
+a subdirectory answered to a name no caller was asking about and its restriction was not
+applied.
+`agent.migrate_agent_specs()` stays FLAT by design — the keys it lifts are ones Kiro
+Crew itself wrote, into specs it wrote, at the top level.
+
+`AgentInfo.filename` is therefore relative to its scope (`team/planner.md`), which is
+what the roster's own readers reopen it as (`agent_welcome_message`,
+`agent_skill_globs`). Two filename conventions still encode an agent name into a FLAT
+filename and do not yet round-trip a nested id — the app-overlay glob in
+`dashboard/handlers/agents.py` and the session overlay in
+`mcp_gateway/session_servers.py` — and both already confirm a hit against the spec's own
+`name` field, which is the seam an encoding belongs on.
+
 Only `.kiro/agents/*.json` is **dispatchable**: kiro-cli does not read
 `*.agent-spec.json`, so `agent_discovery.project_agent_files()` excludes it unless
 the caller opts in with `include_legacy=True` (only the Slack handler does, for its

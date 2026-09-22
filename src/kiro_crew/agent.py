@@ -92,6 +92,7 @@ from kiro_crew.config.paths import (
     ambient_agents_dir,
     isolated_agents_dir,
     kiro_agents_dir,
+    project_agents_dir,
 )
 from kiro_crew.env import (
     MCP_PATH_HINT,
@@ -127,7 +128,7 @@ from kiro_crew.sel import (  # circular import: sel imports config which imports
     SecurityEvent,
     sel,
 )
-from kiro_crew.validation import _AGENT_NAME_RE
+from kiro_crew.validation import AGENT_ID_RE
 
 logger = logging.getLogger(__name__)
 
@@ -3579,6 +3580,11 @@ def migrate_agent_specs() -> int:
     # JSON only, deliberately: this is a rewrite pass, and a markdown spec is
     # never rewritten by Kiro Crew. A bookkeeping key in a markdown
     # frontmatter is the author's to remove.
+    #
+    # FLAT, also deliberately, where the reading scans walk the tree: the keys
+    # this lifts are ones Kiro Crew itself wrote, into specs it wrote, at the top
+    # level. Walking would put a rewrite on every hand-authored file an author
+    # grouped in a folder for a key that cannot be there.
     for spec_path in sorted(agents_dir.glob("*.json")):
         # This read is followed by a rewrite, so the hardened reader's
         # sensitive-target refusal is not sufficient on its own: refuse every
@@ -3665,12 +3671,36 @@ def _spec_path_is_safe(path: Path, agents_dir: Path) -> bool:
     Also refuses a resolved path that leaves the agents directory, and any
     sensitive path, which is the same fence this module already applies before
     touching a resolved path elsewhere.
+
+    Containment is against the whole TREE, not one directory, because a spec may
+    live in a subdirectory (``team/planner.md`` is the agent ``team/planner``).
+    No asymmetry with the discovery walk: that walk does not descend into a
+    symlinked directory or a junction either, so every spec it yields resolves
+    inside the tree and reaches this gate acceptable. A symlinked FILE is still
+    refused here and still read there -- this gate guards a rewrite, and the
+    copy-out it exists to stop is a rewrite of content that lives elsewhere.
+
+    Every ANCESTOR up to *agents_dir* is checked, not only the final component.
+    The resolved-containment test below is not sufficient on its own: it answers
+    for the path as it resolves NOW, while the writer reopens by path, so an
+    intermediate directory that is a link leaves the write following it. One
+    component was enough while every spec was ``<agents>/<name>.json`` -- a
+    subdirectory is what put intermediate components on this path.
     """
     try:
         if path.is_symlink():
             return False
+        root = agents_dir.resolve()
         resolved = path.resolve()
-        if resolved.parent != agents_dir.resolve():
+        if root not in resolved.parents:
+            return False
+        for parent in path.parents:
+            if parent.resolve() == root:
+                break
+            if parent.is_symlink():
+                return False
+        else:
+            # Ran out of components without meeting the root: not under it.
             return False
         if is_sensitive_path(str(resolved)):
             return False
@@ -3715,7 +3745,7 @@ def agent_spec_path(name: str, *, agents_dir: Path | None = None) -> Path | None
     iterates the directory unordered, so which of them is live is undefined, and
     a writer cannot pick without risking clearing the pin nothing is reading.
     """
-    if not _AGENT_NAME_RE.match(name or ""):
+    if not AGENT_ID_RE.match(name or ""):
         return None
     agents_dir = agents_dir if agents_dir is not None else kiro_agents_dir_path()
     if not agents_dir.is_dir():
@@ -3784,8 +3814,9 @@ def markdown_spec_for_agent(agent: str, work_dir: str | Path | None = None) -> P
     project_markdown: Path | None = None
     try:
         if work_dir:
+            scope = project_agents_dir(work_dir)
             for spec in project_agent_files(work_dir):
-                if project_agent_name(spec) != agent:
+                if project_agent_name(spec, scope) != agent:
                     continue
                 if not is_markdown_spec(spec):
                     return None
@@ -3844,6 +3875,20 @@ def reset_agent_model(name: str) -> tuple[Path, str]:
         raise ValueError(
             f"agent {name!r} is defined in markdown ({spec_path}); edit its frontmatter "
             f"'model' field directly -- Kiro Crew does not rewrite markdown agent specs"
+        )
+    if spec_path.parent != kiro_agents_dir_path():
+        # A spec in a SUBDIRECTORY is read-only to this writer. Mutating a
+        # nested spec is not something Kiro Crew offers (the roster lists it and
+        # a session runs it; nothing edits it), and the reason to refuse rather
+        # than support it is the write itself: this path is checked and then
+        # reopened by name, so an intermediate directory swapped to a link
+        # between the two is followed by the rewrite. A flat spec has no
+        # intermediate component to swap, and ``os.replace`` swaps a link at the
+        # FINAL component rather than writing through it.
+        raise ValueError(
+            f"agent {name!r} is defined in a subdirectory ({spec_path}); edit its "
+            f"'model' field directly -- Kiro Crew does not rewrite specs below the "
+            f"agents directory"
         )
     conflict = _conflicting_spec_for(name, spec_path, kiro_agents_dir_path())
     if conflict is not None:
@@ -8358,14 +8403,15 @@ def _project_shadow_of(
     if not work_dir:
         return None
     try:
+        scope = project_agents_dir(work_dir)
         for spec in project_agent_files(work_dir):
             if not markdown_specs and is_markdown_spec(spec):
                 continue
             if dispatchable_only:
-                if _declared_project_agent_name(spec) == agent:
+                if _declared_project_agent_name(spec, scope) == agent:
                     return spec
                 continue
-            if project_agent_name(spec) == agent:
+            if project_agent_name(spec, scope) == agent:
                 return spec
     except OSError:
         logger.debug("could not scan %s for project agents", work_dir, exc_info=True)
