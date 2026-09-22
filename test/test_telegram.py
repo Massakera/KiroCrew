@@ -193,6 +193,9 @@ class FakeClient:
         #: the wrong chat's address reaches a chat that message id does not exist in.
         self.send_chats: list[int] = []
         self.edit_chats: list[int] = []
+        #: The real client reports a non-2xx (a rate limit) as False, not by
+        #: raising, and the registry retires a receipt on that answer.
+        self.edit_ok = True
         self.drafts: list[tuple[int, str]] = []
         self.markup_edits: list[tuple[int, Any]] = []
         self.answered: list[str] = []
@@ -280,7 +283,7 @@ class FakeClient:
     ) -> bool:
         self.edits.append((message_id, text, reply_markup))
         self.edit_chats.append(chat_id)
-        return True
+        return self.edit_ok
 
     async def edit_message_reply_markup(
         self, chat_id: int, message_id: int, reply_markup: Any = None
@@ -3440,6 +3443,29 @@ class TestConfigMasking:
         # Unset stays empty (UI shows "not set"), never a fake mask sentinel.
         assert out["telegram"]["bot_token"] == ""
         assert _SENSITIVE_MASK not in str(out)
+
+
+class TestReceiptSurfaceReportsTheEdit:
+    """The receipt surface hands the registry the client's own answer.
+
+    The client reports a non-2xx as False rather than raising, and the registry
+    retires a receipt -- destroying the bubble's only handle -- on that answer.
+    Discarding it presents a rate-limited edit as a written record, so the bubble
+    stays on "Queued" for good with no retry left to rescue it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_refused_edit_is_reported_and_an_accepted_one_is_too(self) -> None:
+        d, client, _sess = _dispatcher({1})
+        surface = d._receipt_surface(1, None)
+
+        client.edit_ok = False
+        refused = await surface.edit_receipt(9, "body")
+        client.edit_ok = True
+        accepted = await surface.edit_receipt(9, "body")
+
+        assert refused is False, "a refused edit was reported as written"
+        assert accepted is True, "an accepted edit was not reported as written"
 
 
 class TestTelegramMidTurn:

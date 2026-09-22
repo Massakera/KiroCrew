@@ -1558,11 +1558,135 @@ tail, the ordinary contract for any mid-turn message. And a peer whose drain rai
 waker has finished its own work by then, and one dead channel must not strand the
 others' accepted messages.
 
-The receipt registry itself is still keyed on the session key alone, so a second
-sender's mid-turn receipt edit targets the first sender's bubble; that is shared
-cross-channel state and is tracked in #12575. The drain's own receipt FLIP is not
-affected: it edits the bubble at the address of whoever queued first, taken from
-that entry's origin.
+**A receipt belongs to a conversation, not to a session.** `ReceiptQueue` registers
+each live receipt under `(session_key, surface.receipt_key)`, where `receipt_key`
+names the conversation the bubble was posted in. The session key alone is too
+coarse for the same reason the approval and choice registries are route-keyed: a
+receipt is a message in ONE chat and its id is meaningless in any other, while
+`dm_scope = "unified"` deliberately collapses every allow-listed person's direct
+DM onto one key. Each channel supplies `receipt_key` from the opaque conversation
+id its `ReceiptSurface` already binds -- Teams the conversation id, Webex room and
+reply parent (a space's threads share its `space:{id}` session key, so the thread
+has to be in the receipt key), Telegram the chat id and Discord the channel id (a
+forum Topic or thread is already in the session key, so it does not). Webex takes
+that thread root from the inbound itself rather than from the value
+`webex.reply_in_thread` filters: the setting is read per turn, so keying on the
+filtered value would move an existing receipt's key the moment an operator flipped
+it, and the drain would then miss a bubble it had already posted and leave it on
+"⏳ Queued" with nothing to correct it. Where a reply GOES stays the live setting's
+call; which thread a posted bubble IS was settled when it was posted, and the raw
+root is also the identity the drain collapses queue entries by. A receipt
+also holds the surface that posted it, because that is the only thing able to
+address its bubble.
+
+The three transitions take their scope from the queue operation each pairs with.
+`create_or_grow` is per-conversation: a mid-turn message opens its own
+conversation's bubble. `flip_answering` flips the conversation it answers, and
+shows it only the part of `answered` that bubble was DISPLAYING -- a cap can leave
+the rest of its messages queued, and naming those would claim them answered.
+`answered` carries one conversation's messages: every drain collapses a turn from
+entries sharing a sender and a place and defers the rest, and builds the flip's
+surface from that same entry, so a co-tenant's copy is never in it. The session's
+other receipts are then reconciled against `answered` off their own `texts` --
+exactly what each displayed -- rather than guessed from the channel. One whose every text the turn
+answered stands for nothing and is finalized in its OWN chat with its OWN texts:
+its messages are gone, so a live receipt would sit on "Queued" and then grow with
+already-answered text. One with a text left over is NOT finalized -- a message of
+its own is still waiting -- but it does shrink to that remainder, so a cap that
+splits one conversation never leaves it showing text the turn already answered.
+Counting is by multiset over a tally of EVERY receipt in the session, the keyed
+one included, so two people who happen to send the same word are not mistaken for
+each other. While the turn answered at least as many copies of a text as the
+session holds, that accounting is exact and each conversation takes its own.
+Short of that, display text stops being an identity and the registry declines to
+use it FOR A CO-TENANT: a text the session wants more copies of than were
+answered, and that more than one conversation is displaying, is claimed by no
+co-tenant, because claiming the copy would spend what another conversation's own
+message accounts for and present as answered a message that may still be queued in
+another chat. Those
+bubbles stay live rather than one being finalized on whichever the dict yielded
+first, and an unattributable leftover is not counted as a conversation's own
+deferred message either -- that is the mirror-image false claim. Leaving one live
+self-corrects at that conversation's own next turn; finalizing the wrong chat
+never does. The conversation the flip is KEYED to is outside that test, because
+`answered` holds no copy but its own: subjecting it to the test made the
+self-correction circular, since the next turn it defers to is the very turn that
+would have to claim the copy -- so two ordinary people who both sent "ok" had both
+bubbles stranded on "⏳ Queued" for good, each turn declining to attribute the
+message it had just answered. Exact per-entry attribution needs the
+dequeued entry's own origin, which is #12574 -- this is what the registry can say
+honestly without it, and is why it stays independent of that issue. When NONE of
+`answered` matches the keyed receipt, it is not finalized on that alone, because
+two different things produce it: a channel whose rendering differs from what the
+bubble displayed, where the receipt's own texts are the right body; or these
+messages simply not having been answered, left past a cap or holding a text that
+was never attributable. Only the first may be finalized, and they are told apart
+from evidence in hand -- the queue is provably empty when the drain re-enqueued
+nothing AND no text here was ambiguous. Otherwise the bubble stays live, as a
+co-tenant in that state does. NO receipt is retired until its record is ON the
+bubble, the keyed one included: `_edit` reports whether it landed, and the
+registry entry is that bubble's only handle, so dropping it on a transient
+platform failure strands it reading "Queued" for good while the next message opens
+a second bubble beside it. A kept entry is TERMINAL and carries the record it owes
+in `final_body`. Terminal because its messages were consumed: left live, the next
+mid-turn message would GROW it, and one bubble would present an answered message
+and a queued one as a single queue. Carrying the body because the retry must write
+the record that was intended -- a flip retried as a flip, a cancel as a cancel --
+not one recomputed later from whichever transition happens to run.
+`finish_cancelled` keeps its entry the same way; there `clear_queue` has already
+discarded the messages rather than answering them, which is the same reason a kept
+entry must not stay live. A terminal entry is never grown, never flipped, not
+counted as queued, and reported absent by `has_receipt`; the next thing that
+conversation does writes that record once and releases the key, so an edit that
+keeps failing cannot hold the key its next bubble needs. A bubble that already
+owes a record is SKIPPED by `finish_cancelled` rather than relabelled: its
+messages left the queue when that earlier transition ran, not when this `/stop`
+did, so writing "Cancelled" over a flip's owed "Now answering" would state the
+opposite of what happened and do it permanently.
+
+**`edit_receipt` reports whether the edit LANDED, and that is load-bearing.**
+Every channel client answers a non-2xx with `False` rather than raising -- a rate
+limit, or Webex's cap of ten edits per message, after which the API replies 400 --
+so a surface wrapper that discards the client's boolean makes an ordinary refusal
+indistinguishable from success. The registry retires a receipt on that answer, so
+the entry is destroyed over a bubble still reading "Queued", and the terminal
+record that would have retried it is never created. `_edit` therefore treats a
+returned `False` exactly like an exception. It reads `is False` and not falsiness:
+a surface that returns None has not REPORTED a failure, and reading its silence as
+one would retain every receipt for ever. Because the whole
+reconciliation matches on what each bubble DISPLAYS, a channel's drain must report
+`answered` in those same terms: an uncaptioned attachment is registered under the
+channel's placeholder, so passing its raw empty text matches nothing and the
+registry reads an answered receipt as unanswered, leaving it on "Queued" for its
+next message to grow. Every channel that substitutes a placeholder on create
+substitutes it on the flip as well. When the keyed
+receipt is not there at all -- its send failed, so it was never recorded -- the
+reconciliation does not run: without its texts there is no way to take its own
+share out of the tally first, and this conversation's messages would be credited to
+whoever shows the same words. A TERMINAL entry on that key is a different state and
+is not that case: its messages left the queue in an earlier transition, and a later
+one would have replaced it with a live bubble, so the conversation is known to hold
+nothing and contributes nothing to the tally. There is no unseen share to net out,
+so the record it owes is retried, its key released, and the co-tenants this turn
+did answer are still reconciled -- stopping at the retry would leave a consumed
+co-tenant reading "Queued" for no reason the registry can state. The
+`deferred` count the caller passes -- entries the drain re-enqueued -- counts only
+THIS conversation's, so it is recorded in the flipped body as-is while that
+conversation is alone on the session key. Once
+a co-tenant holds a receipt the body states only what the split proved this
+conversation did not get answered, so a miscounted total cannot reach another
+person's chat as a promise of messages they never sent. Either
+way the remainder is stated rather than implied. A
+drain also builds its flip surface from the conversation it DEQUEUED, not from the
+inbound that merely finished the turn -- Teams from the replayed origin, Webex from
+the first entry's room and thread. `finish_cancelled` is session-wide,
+because `clear_queue(session_key)` is: `/stop` drops the held messages of every
+conversation sharing the key, so every one of their receipts is finalized to
+"🛑 Cancelled" in its own chat. A flip that resolves no receipt while other
+conversations in the session still hold one logs at WARNING rather than passing in
+silence: the conversation that finished the turn has no bubble to flip -- its send
+failed, so it was never recorded -- and without its texts no co-tenant can be
+reconciled either, so every bubble is left for its own turn to resolve.
 
 The combined turn itself runs outside `ReceiptQueue.lock`, and the drain replays via
 `handle_message(..., interpret_commands=False)`. Drained payloads therefore
