@@ -17,7 +17,7 @@ const CAPABILITIES_TAB_LABEL_KEY: Record<CapabilitiesTab, string> = {
   skills: 'pages.capabilitiesPage.skills_label',
 }
 
-/** `{{capabilities}} → {{tab}}`: the Agent Capabilities rail entry and one of its tabs. */
+/** `{{capabilities}} → {{tab}}`: the Customize rail entry and one of its tabs. */
 export function capabilitiesVars(tab: CapabilitiesTab): { capabilities: string; tab: string } {
   return {
     capabilities: i18nT('nav.agent_capabilities'),

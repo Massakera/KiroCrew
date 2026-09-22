@@ -8872,7 +8872,7 @@
     }
   },
   "nav": {
-    "agent_capabilities": "এজেন্ট সক্ষমতা",
+    "agent_capabilities": "কাস্টমাইজ",
     "artifacts": "আর্টিফ্যাক্ট",
     "discover": "আবিষ্কার",
     "library": "লাইব্রেরি",
@@ -9519,7 +9519,7 @@
       "saved_to_library_notice": "“{{name}}” তোমার আর্টিফ্যাক্টে সংরক্ষিত হয়েছে।"
     },
     "capabilitiesPage": {
-      "agent_capabilities": "এজেন্টের সক্ষমতা",
+      "agent_capabilities": "কাস্টমাইজ",
       "workflows_label": "ওয়ার্কফ্লো",
       "workflows_description": "পুনর্ব্যবহারযোগ্য এজেন্ট ওয়ার্কফ্লো তৈরি, সম্পাদনা ও চালান",
       "connections_description": "অফিশিয়াল পরিষেবা সংযুক্ত করুন এবং কাস্টম MCP সার্ভার পরিচালনা করুন",

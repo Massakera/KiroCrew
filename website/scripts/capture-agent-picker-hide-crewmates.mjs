@@ -77,7 +77,7 @@ async function openPicker(theme) {
   await page.waitForTimeout(2500)
 
   // Anchored on the composer control's own label -- a loose /agent/i matches the
-  // sidebar's "Agent Capabilities" entry first and opens the wrong surface.
+  // sidebar's "Customize" entry first and opens the wrong surface.
   await page.getByRole('button', { name: /^Agent: / }).first().click()
   const picker = page.getByRole('dialog', { name: 'Agent selector' })
   await picker.waitFor({ state: 'visible', timeout: 5000 })

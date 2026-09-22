@@ -1,7 +1,7 @@
 /**
  * Measures — and photographs — the gap between the narrow tab strip's border
  * and the first thing each SidePanelLayout tab paints, across all three pages
- * built on that shell: Agent Capabilities, Developer, and Settings.
+ * built on that shell: Customize, Developer, and Settings.
  *
  * On a phone SidePanelLayout replaces the desktop header block (whose `pb-3`
  * spaces a tab's title from its content) with a pill strip that ends in a drawn

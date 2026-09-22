@@ -5,10 +5,10 @@
  * `pb-3` puts 12px between a tab's title and its content — and replaces it with
  * a scrolling pill strip that ends in a drawn `border-b`. With no inset on the
  * pane, every tab's first element (a Card, a stat row, a banner) rendered
- * directly ON that border: measured at 390px, four of Agent Capabilities' seven
+ * directly ON that border: measured at 390px, four of Customize's seven
  * tabs and most of Developer's nine had a 0px gap.
  *
- * The shell is shared by Agent Capabilities, Developer and Settings, so the
+ * The shell is shared by Customize, Developer and Settings, so the
  * inset is one number for all three — which makes the second half of the rule
  * matter as much as the first: a tab that ALSO puts a top margin on its own
  * first element stacks on the inset and lands further down than its siblings

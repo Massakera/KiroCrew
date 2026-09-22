@@ -1,5 +1,5 @@
 /**
- * Screenshot harness for Agent Capabilities > Agents (the first tab).
+ * Screenshot harness for Customize > Agents (the first tab).
  *
  * Runs the REAL built SPA (website/dist) behind the shared in-process static
  * server and answers every /api/** call from fixtures via Playwright route

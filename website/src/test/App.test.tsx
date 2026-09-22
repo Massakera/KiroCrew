@@ -416,7 +416,7 @@ describe('App routing', () => {
     expect(shell!.className).toContain('supports-[height:100dvh]:h-dvh')
   })
 
-  it('redirects /agents to the Agent Capabilities panel', () => {
+  it('redirects /agents to the Customize panel', () => {
     renderWithProviders(<App />, { route: '/agents' })
     expect(screen.getByTestId('capabilities-page')).toBeInTheDocument()
   })
@@ -447,7 +447,7 @@ describe('App routing', () => {
   it('renders nav items', () => {
     renderWithProviders(<App />, { route: '/chat' })
     expect(screen.getByText('Sessions')).toBeInTheDocument()
-    expect(screen.getByText('Agent Capabilities')).toBeInTheDocument()
+    expect(screen.getByText('Customize')).toBeInTheDocument()
     expect(screen.getByText('Settings')).toBeInTheDocument()
     // PR1 App Store split: the single 'Explore' entry is gone — the sidebar
     // now carries TWO App Store rows, Discover (/apps) and Library
@@ -495,7 +495,7 @@ describe('App routing', () => {
     // to a hardcoded array that omitted Artifacts. Artifacts is registered
     // unconditionally in `surfaces/builtins.tsx`, so it must always appear in
     // the rail. Knowledge is the opposite pin: it deliberately has NO rail
-    // item — it lives as a tab inside Agent Capabilities and /knowledge
+    // item — it lives as a tab inside Customize and /knowledge
     // redirects there — so a rail entry reappearing is itself a regression.
     renderWithProviders(<App />, { route: '/chat' })
     expect(screen.getByText('Artifacts')).toBeInTheDocument()

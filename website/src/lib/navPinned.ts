@@ -2,7 +2,7 @@
  * Pin-persistence contract for PROMOTED SUB-ITEMS on the left nav rail.
  *
  * A `pinnable` surface (see `Surface.pinnable`) is a destination that lives
- * inside another surface's secondary panel — Agent Capabilities' Steering
+ * inside another surface's secondary panel — Customize's Steering
  * files, Skills, Hooks and so on. It is registered like any other surface, so
  * it is routable and covered by the registry-wide invariants, but it occupies
  * a rail row only while the user has promoted it here.

@@ -1,4 +1,4 @@
-# Smoke: the Agents tab of Agent Capabilities -- the roster of crews (the tab
+# Smoke: the Agents tab of Customize -- the roster of crews (the tab
 # is labelled "Agents"; the rows are still "crew members" in the add button and
 # the editor's accessible name) read in both of its layouts, then one crew's
 # editor opened. The `rich` seed ships no crews; the one card is the member
@@ -27,7 +27,7 @@ preconditions:
   members: [nova-sky]
   start_url: /capabilities
 steps:
-  - You are on the Agent Capabilities page. It has a rail of tabs on the left, grouped under "Agent", "Knowledge & instructions" and "Automation". If the tab labelled "Agents" (people icon, first under "Agent") is not already highlighted, click it.
+  - You are on the Customize page. It has a rail of tabs on the left, grouped under "Agent", "Knowledge & instructions" and "Automation". If the tab labelled "Agents" (people icon, first under "Agent") is not already highlighted, click it.
   - The pane shows one card named "nova-sky" whose description reads "Nova Sky -- seeded crew member for the GUI user test." and whose binding grid has small-capital labels with values, among them AGENT TEMPLATE "kirocrew" and WORKSPACE "default". Above the cards is a filter box ("Filter agents…"), a "Cards | List" switcher and an "Add crew member" button. Do not click the card yet.
   - Click "List" in the "Cards | List" switcher (if "List" is already highlighted, leave it). The cards are replaced by a table with the columns Agent, Agent Template, Workspace, Memory Store and Model, and one row for nova-sky.
   - Click the "nova-sky" row to open its editor. A dialog opens whose title is the name "nova-sky" in a monospace font.

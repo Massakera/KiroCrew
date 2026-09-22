@@ -157,7 +157,7 @@ export interface Surface {
   previewFlag?: string
   /**
    * Mark this surface as a PROMOTABLE SUB-ITEM: a destination that normally
-   * lives inside another surface's secondary panel (Agent Capabilities'
+   * lives inside another surface's secondary panel (Customize's
    * Steering files, Skills, Hooks), which the user may promote onto the rail.
    *
    * It is registered exactly like any other surface — so it stays in

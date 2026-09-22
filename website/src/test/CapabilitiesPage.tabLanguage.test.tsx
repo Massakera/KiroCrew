@@ -1,5 +1,5 @@
 /**
- * The tab rail of Agent Capabilities has to follow the active language.
+ * The tab rail of Customize has to follow the active language.
  *
  * Its labels come from `i18nT`, which reads the active language at call time but
  * does not subscribe to changes, and they are built inside a `useMemo`. Keyed on

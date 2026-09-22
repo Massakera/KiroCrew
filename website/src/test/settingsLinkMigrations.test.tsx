@@ -1,7 +1,7 @@
 /**
  * Settings-redirect migration: prose that names a Settings tab now renders the
  * tab name as a <SettingsLink> (via the react-i18next <Trans> `<0>` idiom)
- * instead of plain text, and prose that names an Agent Capabilities tab
+ * instead of plain text, and prose that names a Customize tab
  * interpolates the rail / tab labels instead of re-spelling them.
  *
  * The link hosts (OpsMissionControl SettingsPanel, InstancesViewport) are

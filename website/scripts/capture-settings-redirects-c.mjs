@@ -2,7 +2,7 @@
  * Evidence capture for the Group C settings-redirect copy fixes — the surfaces
  * whose prose pointed at a Settings destination that does not exist (Settings →
  * MCP / Deploy / the Skills settings page) and now names the real one
- * (Agent Capabilities → Connections / Knowledge / Skills).
+ * (Customize → Connections / Knowledge / Skills).
  *
  * Runs a BUILT dist (any dist — the same script is run against the BEFORE and
  * the AFTER build so the pairs line up by file name) on the shared static

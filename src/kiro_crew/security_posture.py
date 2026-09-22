@@ -415,7 +415,7 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "Workflow management responses",
         "dashboard/handlers/workflows.py",
         "Authored workflow source, reusable definitions, revision lineage, and run output "
-        "served to the Agent Capabilities panel or returned through the workflow MCP tools. "
+        "served to the Customize panel or returned through the workflow MCP tools. "
         "These values can contain model-authored text or tool results, so every nested key and "
         "value passes through the credential + exfiltration-URL chain before egress.",
     ),

@@ -8989,7 +8989,7 @@
     }
   },
   "nav": {
-    "agent_capabilities": "Capacités de l'agent",
+    "agent_capabilities": "Personnaliser",
     "artifacts": "Artefacts",
     "discover": "Découvrir",
     "library": "Bibliothèque",
@@ -9649,7 +9649,7 @@
       "saved_to_library_notice": "« {{name}} » a été enregistré dans vos artefacts."
     },
     "capabilitiesPage": {
-      "agent_capabilities": "Capacités de l'agent",
+      "agent_capabilities": "Personnaliser",
       "workflows_label": "Workflows",
       "workflows_description": "Créer, modifier et exécuter des workflows d’agents réutilisables",
       "connections_description": "Connectez des services officiels et gérez des serveurs MCP personnalisés",

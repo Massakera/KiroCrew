@@ -97,7 +97,7 @@ createRoot(document.getElementById('root')!).render(
           style={{ background: 'var(--bg)', color: 'var(--text)', height: '100vh', display: 'flex' }}
           data-capture-root
         >
-          <SidePanelLayout title="Agent Capabilities" tabs={TABS}>
+          <SidePanelLayout title="Customize" tabs={TABS}>
             {tab => <>
               {tab === 'prompts' && <PromptsTab />}
               {tab === 'steering' && <div data-testid="other-pane" style={{ padding: 8 }}>Steering pane</div>}

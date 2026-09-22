@@ -8755,7 +8755,7 @@
     }
   },
   "nav": {
-    "agent_capabilities": "代理能力",
+    "agent_capabilities": "自定义",
     "artifacts": "产物",
     "discover": "发现",
     "library": "库",
@@ -9389,7 +9389,7 @@
       "saved_to_library_notice": "已将“{{name}}”保存到你的产物中。"
     },
     "capabilitiesPage": {
-      "agent_capabilities": "代理能力",
+      "agent_capabilities": "自定义",
       "workflows_label": "工作流",
       "workflows_description": "创建、编辑和运行可复用的代理工作流",
       "connections_description": "连接官方服务并管理自定义 MCP 服务器",

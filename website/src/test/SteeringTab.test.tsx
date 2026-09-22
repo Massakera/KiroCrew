@@ -1,5 +1,5 @@
 /**
- * SteeringTab — the Steering tab under Agent Capabilities.
+ * SteeringTab — the Steering tab under Customize.
  *
  * Pins: both steering sources are listed with provenance badges, selecting a
  * file renders its markdown, Edit round-trips the raw content through the

@@ -9106,7 +9106,7 @@
     }
   },
   "nav": {
-    "agent_capabilities": "Возможности агента",
+    "agent_capabilities": "Настройка",
     "artifacts": "Артефакты",
     "discover": "Обзор",
     "library": "Библиотека",
@@ -9779,7 +9779,7 @@
       "saved_to_library_notice": "«{{name}}» сохранён в ваших артефактах."
     },
     "capabilitiesPage": {
-      "agent_capabilities": "Возможности агента",
+      "agent_capabilities": "Настройка",
       "workflows_label": "Рабочие процессы",
       "workflows_description": "Создавайте, изменяйте и запускайте повторно используемые процессы агентов",
       "connections_description": "Подключайте официальные сервисы и управляйте пользовательскими MCP-серверами",

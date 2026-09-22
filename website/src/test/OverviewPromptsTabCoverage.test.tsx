@@ -1,5 +1,5 @@
 /**
- * PromptsTab — the Prompts tab under Agent Capabilities.
+ * PromptsTab — the Prompts tab under Customize.
  *
  * Pins the four query states (loading / error / empty / loaded), the
  * user-vs-package split with its per-package grouping, the filter's effect on

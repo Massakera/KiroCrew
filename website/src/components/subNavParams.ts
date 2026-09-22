@@ -1,7 +1,7 @@
 /** Shared vocabulary of the Settings second-level navigation, in its own tiny
  *  module so the generic SidePanelLayout never imports from the Settings
  *  SubNav component (which would drag the SubNav module graph into every
- *  SidePanelLayout consumer's bundle — Developer, Agent Capabilities). */
+ *  SidePanelLayout consumer's bundle — Developer, Customize). */
 
 /** Canonical URL param for a second-level selection inside a Settings tab. */
 export const SUBNAV_PARAM = 'sub'

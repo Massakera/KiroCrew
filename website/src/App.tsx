@@ -4498,7 +4498,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Bottom-fixed: Agent Capabilities, Developer (only when dev mode is
+        {/* Bottom-fixed: Customize, Developer (only when dev mode is
             enabled), Settings, and the community row. Pinned to the
             rail's bottom edge — the Apps frame above absorbs the scroll. */}
         {(() => {
@@ -4747,13 +4747,13 @@ export default function App() {
             {/* Bookmarkable session chooser: neutral list, no auto-select; rows
                 open the full /chat/<key> experience inside this same shell. */}
             <Route path="/sessions" element={<ErrorBoundary><Suspense fallback={null}><SessionsPage /></Suspense></ErrorBoundary>} />
-            {/* Knowledge moved into Agent Capabilities; old bookmarks land on its tab. */}
+            {/* Knowledge moved into Customize; old bookmarks land on its tab. */}
             <Route path="/knowledge" element={<Navigate to="/capabilities?tab=knowledge" replace />} />
 
             <Route path="/members" element={<ErrorBoundary><Suspense fallback={null}><MembersPage /></Suspense></ErrorBoundary>} />
             <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
             <Route path="/schedule" element={<SchedulePage />} />
-            {/* Agents and Connections live in the Agent Capabilities panel. */}
+            {/* Agents and Connections live in the Customize panel. */}
             <Route path="/agents" element={<Navigate to="/capabilities" replace />} />
             <Route path="/mc-agents" element={<Navigate to="/capabilities" replace />} />
             <Route path="/connections" element={<Navigate to="/capabilities?tab=mcp" replace />} />

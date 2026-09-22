@@ -8872,7 +8872,7 @@
     }
   },
   "nav": {
-    "agent_capabilities": "Agenten-Fähigkeiten",
+    "agent_capabilities": "Anpassen",
     "artifacts": "Artefakte",
     "discover": "Entdecken",
     "library": "Bibliothek",
@@ -9519,7 +9519,7 @@
       "saved_to_library_notice": "„{{name}}“ wurde in Ihren Artefakten gespeichert."
     },
     "capabilitiesPage": {
-      "agent_capabilities": "Agenten-Fähigkeiten",
+      "agent_capabilities": "Anpassen",
       "workflows_label": "Workflows",
       "workflows_description": "Wiederverwendbare Agenten-Workflows erstellen, bearbeiten und ausführen",
       "connections_description": "Offizielle Dienste verbinden und benutzerdefinierte MCP-Server verwalten",

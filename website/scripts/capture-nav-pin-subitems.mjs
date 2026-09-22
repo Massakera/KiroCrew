@@ -1,5 +1,5 @@
 /**
- * Screenshots of the nav pin affordance for Agent Capabilities tabs (issue #8500).
+ * Screenshots of the nav pin affordance for Customize tabs (issue #8500).
  *
  * Drives the REAL SPA with the backend stubbed, the same way
  * capture-leftnav-footer-border.mjs does, because the thing under review is the

@@ -3483,7 +3483,7 @@
     }
   },
   "nav": {
-    "agent_capabilities": "Agent Capabilities",
+    "agent_capabilities": "Customize",
     "artifacts": "Artifacts",
     "discover": "Discover",
     "library": "Library",
@@ -5537,7 +5537,7 @@
         "resources": "Resources",
         "read_only_here": "read-only here",
         "mcp_servers": "MCP servers — external tool connections",
-        "mcp_read_only_hint": "read-only in this version — manage servers under Agent Capabilities → Connections",
+        "mcp_read_only_hint": "read-only in this version — manage servers under Customize → Connections",
         "none": "None",
         "unsaved_changes": "Unsaved changes",
         "discard": "Discard",

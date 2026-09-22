@@ -1,5 +1,5 @@
 /**
- * AgentTemplatesTab — the Agent templates tab under Agent Capabilities.
+ * AgentTemplatesTab — the Agent templates tab under Customize.
  *
  * Pins what a management page must not get wrong: the roster groups by origin
  * (Mine / Private copies / From packages / Built-in), a read-only row explains

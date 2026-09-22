@@ -8872,7 +8872,7 @@
     }
   },
   "nav": {
-    "agent_capabilities": "एजेंट क्षमताएँ",
+    "agent_capabilities": "कस्टमाइज़ करें",
     "artifacts": "आर्टिफ़ैक्ट",
     "discover": "डिस्कवर",
     "library": "लाइब्रेरी",
@@ -9519,7 +9519,7 @@
       "saved_to_library_notice": "“{{name}}” तुम्हारे आर्टिफ़ैक्ट में सहेजा गया।"
     },
     "capabilitiesPage": {
-      "agent_capabilities": "एजेंट क्षमताएँ",
+      "agent_capabilities": "कस्टमाइज़ करें",
       "workflows_label": "वर्कफ़्लो",
       "workflows_description": "दोबारा उपयोग योग्य एजेंट वर्कफ़्लो बनाएँ, संपादित करें और चलाएँ",
       "connections_description": "आधिकारिक सेवाएँ कनेक्ट करो और कस्टम MCP सर्वर प्रबंधित करो",

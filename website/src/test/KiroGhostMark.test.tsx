@@ -1,6 +1,6 @@
 /**
  * The Kiro ghost brand mark (`components/KiroGhostMark.tsx`) and its use as the
- * "Agent Capabilities" nav icon.
+ * "Customize" nav icon.
  *
  * Two things are pinned here:
  * - the mark paints the ghost asset as a CSS mask over `currentColor`, which is
@@ -67,10 +67,10 @@ describe('KiroGhostMark', () => {
   })
 })
 
-describe('Agent Capabilities nav icon', () => {
+describe('Customize nav icon', () => {
   it('uses the Kiro ghost mark', () => {
     const surface = getBuiltinSurface('capabilities')
-    expect(surface?.label).toBe('Agent Capabilities')
+    expect(surface?.label).toBe('Customize')
     expect((surface?.icon as ReactElement).type).toBe(KiroGhostMark)
   })
 })

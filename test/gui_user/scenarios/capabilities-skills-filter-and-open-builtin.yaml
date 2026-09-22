@@ -1,4 +1,4 @@
-# Smoke: moving between two tabs of the Agent Capabilities panel and reading a
+# Smoke: moving between two tabs of the Customize panel and reading a
 # skill's files. The panel groups its tabs in a left rail (Agent: Agents,
 # Skills, Connections; Knowledge & instructions; Automation) and remembers the
 # last tab per browser session, so the flow names each tab it clicks instead of
@@ -28,7 +28,7 @@ preconditions:
   start_url: /capabilities
 steps:
   - >-
-    You are on the Agent Capabilities page, which has a rail of tabs on the left grouped under
+    You are on the Customize page, which has a rail of tabs on the left grouped under
     "Agent", "Knowledge & instructions" and "Automation". Under "Agent", click the tab labelled
     "Agents" (people icon). The pane shows the agent roster (one card, "nova-sky") with an
     "Add crew member" button.

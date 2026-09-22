@@ -8755,7 +8755,7 @@
     }
   },
   "nav": {
-    "agent_capabilities": "エージェント機能",
+    "agent_capabilities": "カスタマイズ",
     "artifacts": "アーティファクト",
     "discover": "発見",
     "library": "ライブラリ",
@@ -9389,7 +9389,7 @@
       "saved_to_library_notice": "「{{name}}」をアーティファクトに保存しました。"
     },
     "capabilitiesPage": {
-      "agent_capabilities": "エージェント機能",
+      "agent_capabilities": "カスタマイズ",
       "workflows_label": "ワークフロー",
       "workflows_description": "再利用可能なエージェントワークフローを作成、編集、実行します",
       "connections_description": "公式サービスを接続してカスタム MCP サーバーを管理",

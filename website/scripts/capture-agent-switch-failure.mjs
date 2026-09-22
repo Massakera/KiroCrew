@@ -67,7 +67,7 @@ await page.waitForTimeout(2500)
 
 // Open the agent picker and choose the other agent; the stubbed 400 rejects it.
 // Anchored on the composer control's own label — a loose /agent/i matches the
-// sidebar's "Agent Capabilities" entry first and opens the wrong surface.
+// sidebar's "Customize" entry first and opens the wrong surface.
 await page.getByRole('button', { name: /^Agent: / }).first().click()
 await page.getByRole('option', { name: /reviewer/ }).first().click()
 

@@ -8755,7 +8755,7 @@
     }
   },
   "nav": {
-    "agent_capabilities": "에이전트 기능",
+    "agent_capabilities": "맞춤 설정",
     "artifacts": "아티팩트",
     "discover": "탐색",
     "library": "라이브러리",
@@ -9389,7 +9389,7 @@
       "saved_to_library_notice": "‘{{name}}’을(를) 아티팩트에 저장했습니다."
     },
     "capabilitiesPage": {
-      "agent_capabilities": "에이전트 기능",
+      "agent_capabilities": "맞춤 설정",
       "workflows_label": "워크플로",
       "workflows_description": "재사용 가능한 에이전트 워크플로를 만들고 편집하고 실행합니다",
       "connections_description": "공식 서비스를 연결하고 사용자 지정 MCP 서버를 관리합니다",

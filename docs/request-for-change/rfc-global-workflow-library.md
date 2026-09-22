@@ -47,7 +47,7 @@ it never mutates the matched definition. If the user explicitly invokes a saved
 workflow by id or slug, Kiro Crew executes the exact saved source instead of
 asking the harness to reinterpret the request.
 
-The Agent Capabilities page gains a Workflows surface for listing, searching,
+The Customize page gains a Workflows surface for listing, searching,
 authoring, reviewing, saving, editing, and running definitions. Chat gains one
 namespace command:
 
@@ -377,13 +377,13 @@ session identity per call through the existing MCP transport.
 
 Create and update are not model-facing tools. The core MCP server auto-approves
 its own handlers, so a tool description or model-supplied confirmation flag could
-not prove that a human chose durable retention. The Agent Capabilities editor and
+not prove that a human chose durable retention. The Customize editor and
 the completed-session save dialog call the HTTP mutation routes only after a user
 clicks the corresponding confirmation action.
 
-### 6.8 Agent Capabilities UI
+### 6.8 Customize UI
 
-Agent Capabilities gains a Workflows tab with two views:
+Customize gains a Workflows tab with two views:
 
 - **Workflow library** contains a searchable definition list and a
   detail/editor pane.
@@ -682,7 +682,7 @@ responses carry codes; MCP schema coverage includes every new handler; bare
 slash lists definitions; named slash passes exact source and free-form input;
 harness-parity gate remains green.
 
-### Phase 3 — Agent Capabilities management surface
+### Phase 3 — Customize management surface
 
 - Add the Workflows tab and localized catalog entries.
 - Support search, intent authoring, unsaved draft review, explicit promotion,
@@ -841,7 +841,7 @@ Adopt the two-layer model:
   drafts.
 - Explicit saved references execute exact source through Kiro Crew.
 - `/workflow <name> [input]` is the cross-harness invocation contract.
-- Agent Capabilities → Workflows is the human management surface.
+- Customize → Workflows is the human management surface.
 - The workflow system owns the common run substrate and definition identity.
 - TaskRunner composes planning, approvals, quality gates, and project delivery
   around a host-side workflow run.

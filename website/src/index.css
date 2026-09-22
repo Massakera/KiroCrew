@@ -2924,7 +2924,7 @@ html[data-font-family="mono"] .rail-community-links{ letter-spacing:-0.05em; wor
    OpenDyslexic's taller x-height (cap-height/UPM ~0.78 vs Space Grotesk's
    ~0.72) increases each nav-item's painted height by ~8%. On a rail with
    ~12 items, the cumulative growth pushes the bottom-pinned section
-   (Agent Capabilities, Settings, community row) below the rail's overflow
+   (Customize, Settings, community row) below the rail's overflow
    boundary.
 
    Tighten the vertical padding from py-2 (8px) to 6px on nav items when

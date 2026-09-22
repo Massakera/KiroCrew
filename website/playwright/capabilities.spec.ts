@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test'
 
 /**
- * /capabilities — Agent Capabilities page.
+ * /capabilities — Customize page.
  * SidePanelLayout with 6 tabs: Agents, Connections,
  * Skills, Steering, Hooks, Prompts. Default tab is "crews" (KiroCrewAgentsPage).
  *
@@ -18,8 +18,8 @@ test.describe('Capabilities Page — /capabilities', () => {
   })
 
   test('renders the page title and default Agents tab heading', async ({ page }) => {
-    // SidePanelLayout nav title "Agent Capabilities" — scoped inside main-content
-    await expect(page.locator('#main-content .text-lg.font-bold').first()).toHaveText('Agent Capabilities')
+    // SidePanelLayout nav title "Customize" — scoped inside main-content
+    await expect(page.locator('#main-content .text-lg.font-bold').first()).toHaveText('Customize')
     // Default tab description from the content area header
     // Prose deliberately: on /capabilities this string is a TAB DESCRIPTION
     // (CapabilitiesPage.tsx:16), not a PageHeader subtitle, so there is no

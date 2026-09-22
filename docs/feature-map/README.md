@@ -107,7 +107,7 @@ this area is reached from inside it unless stated otherwise.
 The Notifications surface is registered `hiddenFromNav`: its route and badge
 stay wired, but it is entered from the topbar bell rather than a rail row.
 
-## Agent Capabilities
+## Customize
 
 One destination, pinned to the bottom of the rail, hosting nine tabs. Every tab
 is a `?tab=` value on `/capabilities` (`pages/CapabilitiesPage.tsx`).
@@ -119,7 +119,7 @@ registered as a `pinnable` surface (`surfaces/builtins.tsx`,
 the promoted set is a per-browser preference held under `mc-nav-pinned` and
 owned by `lib/navPinned.ts` (the sibling of `lib/appNavHidden.ts`, which does
 the same job for app rows in the Apps group). Reach it from the pin control in
-the Agent Capabilities page header (`components/PinSurfaceButton.tsx`), which
+the Customize page header (`components/PinSurfaceButton.tsx`), which
 resolves its subject from the current `?tab=` value. Promotions are capped at
 `NAV_PINNED_LIMIT`, and the rail applies the filter in `App.tsx`. No handler and
 no endpoint: the preference never leaves the browser.

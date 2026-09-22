@@ -175,7 +175,7 @@ function BulkActions({ selectedIds, items, onDone }: { selectedIds: Set<string>;
   )
 }
 
-/** `embedded` — hosted as a pane inside Agent Capabilities' SidePanelLayout,
+/** `embedded` — hosted as a pane inside Customize's SidePanelLayout,
  *  which already renders the tab's label + description as the pane header, so
  *  the page's own title block would duplicate it. The Help affordance moves
  *  into the internal tab strip instead of disappearing with the header. */

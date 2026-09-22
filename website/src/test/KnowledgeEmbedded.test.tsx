@@ -1,5 +1,5 @@
 /**
- * KnowledgePage's `embedded` mode: inside Agent Capabilities the pane header
+ * KnowledgePage's `embedded` mode: inside Customize the pane header
  * already shows the tab's label + description, so the page must not render its
  * own title block — but the Help affordance (onboarding + shortcuts dialog)
  * must survive the header's removal, docked at the end of the internal tab
