@@ -6885,6 +6885,7 @@
         "onboarded": false,
         "import_onboarded": false,
         "privacy_acked": false,
+        "crewmates_onboarded": false,
         "user_role": "",
         "user_role_other": "",
         "user_technical_level": "",
@@ -7735,6 +7736,20 @@
       "tags": [],
       "label": "Privacy Acknowledged",
       "help": "Whether the user has seen the mandatory first-run Privacy chapter, which discloses the anonymous heartbeat and offers the opt-out. Server-backed rather than browser-local because the gateway gates the very FIRST heartbeat on it: until this is true the user has not yet been shown the opt-out, and a ping sent before the offer makes the offer meaningless.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "dashboard.crewmates_onboarded",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Crewmates Onboarded",
+      "help": "Whether the user has finished or dismissed the first-run Meet CrewMates flow (the four-step introduction that creates the first crewmate). Server-backed like the other first-run flags so a second machine does not replay it. Also set when the flow is re-run from the Crewmates page.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false

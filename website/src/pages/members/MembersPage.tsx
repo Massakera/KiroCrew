@@ -41,7 +41,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Cloud, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Pencil, Plus, Route, Square, Star, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Cloud, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Pencil, Plus, Route, Sparkles, Square, Star, Zap } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { CrewMemberMark } from '../../components/CrewMemberMark'
 import DeployMyCrewDialog from './DeployMyCrew'
@@ -76,6 +76,7 @@ import ChatPane from '../../components/ChatPane'
 import CrewWebview from './CrewWebview'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
+import { START_MEET_CREWMATES_EVENT } from '../../components/MeetCrewmatesFlow'
 import { useGuardedLeave } from '../../components/NavigationLeaveGuard'
 import CrewNotesTab from './CrewNotesTab'
 import { CrewLogTab } from '../chat/CrewLogPanel'
@@ -2036,6 +2037,22 @@ export default function MembersPage() {
               >
                 <Plus size={12} className="lucide-inline" />
                 {t('pages.membersPage.add_member')}
+              </button>
+            </li>
+          )}
+          {loaded && !loadError && members.every(m => m.name === 'default') && (
+            /* The Meet CrewMates entry point: the built-in `default` row is the
+               main assistant, so a roster holding only it has no crewmate yet.
+               Re-opens the first-run flow (App hosts it) — the user asked, so
+               no eligibility check applies. */
+            <li className="px-4 py-2">
+              <button
+                onClick={() => window.dispatchEvent(new Event(START_MEET_CREWMATES_EVENT))}
+                className="inline-flex items-center gap-1 text-[11.5px] px-2 py-1 rounded border border-border hover:bg-accent/40"
+                data-testid="member-meet-crewmates"
+              >
+                <Sparkles className="lucide-inline" />
+                {t('pages.membersPage.meet_crewmates')}
               </button>
             </li>
           )}

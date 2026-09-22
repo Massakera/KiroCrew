@@ -167,7 +167,11 @@ export const CHUNK_BUDGETS = {
   // percent of headroom fails on the next feature's ordinary strings rather than
   // on the new library it exists to catch. Back to the 5% convention over the
   // measured size.
-  t: 951 * KB, // measured 905.8 KB on this branch (~5% headroom)
+  // Meet CrewMates (first-run flow) added ~60 catalog keys x 12 languages plus
+  // the regenerated `en-XA`, which all land in this chunk by construction: measured
+  // 907.7 KB on this branch before the judge row above landed on main, so the two
+  // features together sit near 909 KB; same 5% convention over that size.
+  t: 955 * KB, // measured ~909 KB on this branch (~5% headroom)
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor

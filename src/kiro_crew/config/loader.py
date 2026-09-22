@@ -3342,6 +3342,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             dashboard_data.get("privacy_acked"),
             _safe_bool(dashboard_data.get("onboarded"), False),
         ),
+        crewmates_onboarded=_safe_bool(dashboard_data.get("crewmates_onboarded"), False),
         user_role=str(dashboard_data.get("user_role", "")),
         user_role_other=str(dashboard_data.get("user_role_other", "")),
         user_technical_level=str(dashboard_data.get("user_technical_level", "")),

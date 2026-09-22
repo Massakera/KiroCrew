@@ -602,6 +602,7 @@ def _theme_payload(cfg: KiroCrewConfig) -> dict[str, object]:
         "onboarded": cfg.dashboard.onboarded,
         "import_onboarded": cfg.dashboard.import_onboarded,
         "privacy_acked": cfg.dashboard.privacy_acked,
+        "crewmates_onboarded": cfg.dashboard.crewmates_onboarded,
     }
 
 
@@ -620,8 +621,8 @@ async def api_theme_config(request: web.Request) -> web.Response:
     """GET/PUT /api/config/theme — read or update workspace display settings.
 
     GET returns the current config. PUT accepts
-    {mode?, color?, language?, onboarded?, import_onboarded?} and persists to
-    the workspace config file.
+    {mode?, color?, language?, onboarded?, import_onboarded?, privacy_acked?,
+    crewmates_onboarded?} and persists to the workspace config file.
     """
     if request.method == "GET":
         cfg = KiroCrewConfig.load()
@@ -682,6 +683,13 @@ async def api_theme_config(request: web.Request) -> web.Response:
                 raise web.HTTPBadRequest(text="privacy_acked must be a boolean")
             if cfg.dashboard.privacy_acked != privacy_acked:
                 cfg.dashboard.privacy_acked = privacy_acked
+                changed = True
+        if "crewmates_onboarded" in body:
+            crewmates_onboarded = body["crewmates_onboarded"]
+            if not isinstance(crewmates_onboarded, bool):
+                raise web.HTTPBadRequest(text="crewmates_onboarded must be a boolean")
+            if cfg.dashboard.crewmates_onboarded != crewmates_onboarded:
+                cfg.dashboard.crewmates_onboarded = crewmates_onboarded
                 changed = True
 
         if changed:

@@ -59,6 +59,7 @@ SHIPPED_SMOKE = {
 SHIPPED = SHIPPED_SMOKE | {
     "crewmate-panel-tabs",
     "knowledge-add-folder-source-and-scan",
+    "meet-crewmates-flow",
     "members-dm-hello",
     "members-private-memory-keeps-thread",
 }
@@ -185,6 +186,7 @@ class TestShippedScenarios:
             "search": ["search-everywhere-jump-to-setting"],
             "members": [
                 "crewmate-panel-tabs",
+                "meet-crewmates-flow",
                 "members-dm-hello",
                 "members-private-memory-keeps-thread",
             ],
@@ -597,7 +599,7 @@ class TestReport:
         md = report.render_features(catalog, _summary(), run_url="https://x/run")
         assert md.startswith("# GUI user-test feature catalog\n")
         assert (
-            f"_18 of {len(scenarios.FEATURES)} features covered · 36 scenarios (32 smoke / 4 nightly)._"
+            f"_18 of {len(scenarios.FEATURES)} features covered · 37 scenarios (32 smoke / 5 nightly)._"
             in md
         )
         assert (

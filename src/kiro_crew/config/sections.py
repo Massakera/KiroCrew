@@ -3540,6 +3540,16 @@ class DashboardConfig:
             "opt-out, and a ping sent before the offer makes the offer meaningless.",
         ),
     )
+    crewmates_onboarded: bool = field(
+        default=False,
+        metadata=_meta(
+            "Crewmates Onboarded",
+            "Whether the user has finished or dismissed the first-run Meet CrewMates "
+            "flow (the four-step introduction that creates the first crewmate). "
+            "Server-backed like the other first-run flags so a second machine does "
+            "not replay it. Also set when the flow is re-run from the Crewmates page.",
+        ),
+    )
     user_role: str = field(
         default="",
         metadata=_meta(

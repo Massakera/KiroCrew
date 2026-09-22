@@ -1975,6 +1975,7 @@ class DashboardConfig:
     language: str = ""             # dashboard UI language, BCP-47 (e.g. "en", "zh-CN"); empty = auto-detect from the browser. See "Dashboard UI language" below.
     onboarded: bool = False         # whether the "Choose your look" onboarding modal was completed
     import_onboarded: bool = False  # whether foreign-agent import was completed or skipped
+    crewmates_onboarded: bool = False  # whether the first-run Meet CrewMates flow was finished or dismissed
     tips_enabled: bool = True      # feature-discovery tips (GET /api/tips/next); live-read
     tips_cadence_hours: float = 6.0    # min hours between surfaced tips (server-side gate; clamped >= 0)
     tips_snooze_hours: float = 48.0    # hours before a snoozed tip is eligible again (clamped >= 0)
@@ -2633,6 +2634,49 @@ Kiro Crew value on collision, and reports unsupported or secret-bearing source
 settings without copying them. Foreign credentials, security policy,
 approval/sandbox settings, agent/runtime state, hooks, and arbitrary unknown
 config sections cannot enter configuration through this path.
+
+### Meet CrewMates first-run state
+
+`DashboardConfig.crewmates_onboarded` records that the four-step "Meet CrewMates"
+flow (`website/src/components/MeetCrewmatesFlow.tsx`) was finished or dismissed.
+The flow fires once, after the other first-run chapters, only while the Crew
+Members preview (`PREVIEW_CREW`, Settings → Developer → Feature Previews — the
+switch that shows the Crewmates page) is on, and only for a workspace with no
+crewmate beyond the `default` row and no installed agent beyond the built-in
+ones (`useMeetCrewmatesGate`); an existing user with custom agents is
+shown the opt-in step instead, so the two never both fire. A failed eligibility
+read (roster or installed agents) is surfaced by App as a dismissible
+`ErrorNotice` rather than silently leaving the chapter unfired; the Crew
+Members page entry works regardless. Its Create step is two
+existing writes — `POST /api/agents` (the crewmate, job text stored as
+`description`) and `POST /api/crons` with `member_id` naming the crewmate so the
+schedule runs on the crewmate's own memory. Delivery is mechanical, never an
+instruction to the model: the job is created non-`silent`, so every run rings
+the dashboard bell and — when Slack is connected — reaches the owner's Slack DM
+through the runtime's own leg (the flow's Slack row therefore only states that
+fact; it is not a switch), and "Its own chat" maps to `hide_in_chat`, the one
+delivery choice the runtime actually offers. A crewmate write with no usable
+answer (a dropped response, a 5xx) is reconciled against `GET /api/members`
+before it is called a failure, and a 409 `agent_exists` on a retry of that same
+name is treated as the flow's own crewmate, so a committed crewmate is never
+stranded without its job; only a 409 on a first attempt is a taken name. A
+schedule write the server refused
+(4xx) is reported as "not saved"; any other failure after the request left (a
+dropped response, a 5xx) is reconciled against `GET /api/crons` -- a job bound
+to the crewmate means it was saved -- and only when that read fails too is it
+reported as "may not have been saved", pointing at the Schedule page rather
+than inviting a duplicate. The flag is written through
+`PUT /api/config/theme` the moment the crewmate exists (the flow stays open for
+its ready step) or the user leaves.
+The Crewmates page re-opens the flow on demand; that run sets the flag too.
+`GET /api/theme/boot` exposes it beside the other first-run flags. The frontend
+mirrors it in `localStorage['mc-crewmates-onboarded']` as a render cache only,
+and — like `privacy_acked` — treats a workspace that was already `onboarded`
+before this chapter existed as done locally (never persisted): an existing user
+is not interrupted and reaches the flow from the Crewmates page, while a new
+user, whose tour completes in the same session, flows straight on. The same
+rule keeps the E2E and capture harnesses, which seed only `mc-onboarded`, clear
+of the chapter.
 
 ### `ChannelConfig.from_dict(data: dict) -> ChannelConfig`
 Parses a channel config entry from JSON. Invalid activation values fall back to `"mention"`.

@@ -5008,6 +5008,8 @@ export const api = {
     import_onboarded?: boolean
     /** Gates the gateway's first heartbeat; see `beacon.telemetry_permitted`. */
     privacy_acked?: boolean
+    /** Set once the first-run Meet CrewMates flow was finished or dismissed. */
+    crewmates_onboarded?: boolean
   }) =>
     put('/api/config/theme', body).then(j),
   // Voice

@@ -4913,6 +4913,16 @@ class TestOrchestratorWatchdogThemeAreParsed:
         assert cfg.dashboard.import_onboarded is True
         assert cfg.to_dict()["dashboard"]["import_onboarded"] is True
 
+    def test_crewmates_onboarded_defaults_false_for_new_config(self) -> None:
+        assert DashboardConfig().crewmates_onboarded is False
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.crewmates_onboarded is False
+
+    def test_crewmates_onboarded_round_trips(self) -> None:
+        cfg = _load_from_dict({"dashboard": {"crewmates_onboarded": True}})
+        assert cfg.dashboard.crewmates_onboarded is True
+        assert cfg.to_dict()["dashboard"]["crewmates_onboarded"] is True
+
     def test_import_onboarded_string_false_falls_back_without_jsonschema(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
