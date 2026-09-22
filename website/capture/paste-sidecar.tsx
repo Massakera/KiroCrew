@@ -25,7 +25,7 @@ import SideChat from '../src/pages/chat/SideChat'
 import { initI18n } from '../src/i18n/all'
 import { store } from '../src/store'
 import { sseConnected, sseSlots } from '../src/store/dashboardSlice'
-import { hydrateSlotMessages, sideOptimisticAppend } from '../src/store/chatSlice'
+import { hydrateSlotMessages, sseSideResult } from '../src/store/chatSlice'
 import '../src/index.css'
 
 const params = new URLSearchParams(location.search)
@@ -58,7 +58,10 @@ store.dispatch(
   } as never),
 )
 if (host === 'side') {
-  store.dispatch(sideOptimisticAppend({ slot: SLOT, message: { role: 'user', content: 'what does the stack trace in my log mean?', ts: '2026-09-22T00:00:10Z' } }))
+  // A settled side exchange (the same frames the WS delivers), so the panel
+  // is idle: the send under test starts a turn and mints its own bubble.
+  store.dispatch(sseSideResult({ slot: SLOT, run_id: 'r-seed', role: 'user', content: 'what does the stack trace in my log mean?', ts: 1758499210 }))
+  store.dispatch(sseSideResult({ slot: SLOT, run_id: 'r-seed', role: 'assistant', content: 'It is a retry loop hitting a closed socket — paste the log lines and I will point at the first failing step.', ts: 1758499215, final: true }))
 }
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })

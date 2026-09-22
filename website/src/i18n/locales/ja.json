@@ -9804,6 +9804,7 @@
         "context_only_tools_unavailable_backend": "コンテキストのみ · このエージェントバックエンドでは、ここでツールは使えません。操作はメインチャットで依頼してください。",
         "context_only_config_unavailable": "エージェント設定を読み込めなかったため、サイドチャットはツールなしで動作します。操作はメインチャットで依頼してください。",
         "question_too_long": "質問が長すぎます — 約 {{max}} 文字未満に短くしてください（現在は {{current}} 文字）",
+        "question_too_long_with_paste": "質問が長すぎます — 約 {{max}} 文字未満に短くしてください（現在は {{current}} 文字、折りたたんだペーストを含む）。ペーストのチップを選択して Backspace で削除するか、短い抜粋を貼り付けてください。",
         "queue_cancel_failed": "キューに入っている質問をキャンセルできませんでした",
         "queue_edit_failed": "キューに入っている質問を更新できませんでした",
         "refresh_context": "コンテキストを更新",

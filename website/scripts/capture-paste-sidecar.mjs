@@ -8,7 +8,10 @@
  *   pane-sent-{dark,light}      ChatPane after Enter: the bubble carries the paste chip,
  *                               the composer is empty, the wire text is the expanded paste
  *   side-pill-{dark,light}      SideChat: the same paste collapsed to a token
- *   side-sent-{dark,light}      SideChat after Enter: composer empty, wire text expanded
+ *   side-sent-{dark,light}      SideChat after Enter: composer empty, wire text expanded, and the
+ *                               sent bubble showing the paste EXPANDED (the side buffer has no meta)
+ *   side-toolong-{dark,light}   SideChat: a pill whose EXPANDED text is over the byte limit —
+ *                               the error names the collapsed paste, nothing was sent, pill stays
  *
  * Every frame also asserts that no dialog is open on top of the surface.
  *
@@ -129,10 +132,41 @@ for (const theme of ['dark', 'light']) {
 
     await box.press('Enter')
     await page.waitForFunction(() => document.querySelector('[data-side-chat-input] textarea[data-composer-input]')?.value === '')
+    // The composer clears on submit, before the open+turn POST chain lands.
+    for (let i = 0; i < 50 && sent.length === 0; i++) await page.waitForTimeout(100)
     const wire = sent[0]?.question ?? ''
+    // The sent question in the side transcript: the side buffer carries no
+    // per-message meta, so the bubble shows the EXPANDED paste — the frame
+    // must show that rendering, not only the cleared composer.
+    const bubble = page.locator('[data-capture-root] .user-bubble', { hasText: 'worker-3 finished' }).last()
+    await bubble.waitFor({ timeout: 5000 })
+    await bubble.scrollIntoViewIfNeeded()
+    check(`side-sent-${theme} expanded bubble shown`, await bubble.isVisible(), 'sent side bubble renders the pasted lines')
     check(`side-sent-${theme} wire expanded`, sent.length === 1 && wire.includes('worker-3 finished') && !wire.includes(TOKEN), `sends=${sent.length}`)
     await noDialog(page, `side-sent-${theme}`)
     await page.locator('[data-capture-root]').screenshot({ path: `${OUT}/side-sent-${theme}.png` })
+    await page.close()
+  }
+  // -- SideChat, over the byte limit with a collapsed paste --
+  {
+    const sent = []
+    const page = await newPage('side', theme, sent)
+    const box = page.locator('[data-side-chat-input] textarea[data-composer-input]')
+    await box.waitFor()
+    await box.fill('Why did this happen? ')
+    // 33 lines x 1000 chars: past the 32 KiB side-question limit once expanded.
+    await pasteInto(box, Array.from({ length: 33 }, (_, i) => `${String(i).padStart(3, '0')} ${'x'.repeat(996)}`).join('\n'))
+    await page.waitForFunction((sel) => document.querySelector(sel)?.value.includes('[ Paste #1 · 33 lines ]'), '[data-side-chat-input] textarea[data-composer-input]')
+    await box.press('Enter')
+    const notice = page.getByText(/counting the collapsed paste/)
+    await notice.waitFor({ timeout: 5000 })
+    const text = await notice.textContent()
+    check(`side-toolong-${theme} error names the paste`, /Question too long — reduce to under ~32,768 characters \(yours: 3\d,\d{3}, counting the collapsed paste\)/.test(text ?? ''), `text=${JSON.stringify(text)}`)
+    check(`side-toolong-${theme} nothing sent`, sent.length === 0, `sends=${sent.length}`)
+    check(`side-toolong-${theme} pill kept`, (await box.inputValue()).includes('[ Paste #1 · 33 lines ]'), 'composer still holds the pill')
+    await chips(page, `side-toolong-${theme}`, '[data-side-chat-input]')
+    await noDialog(page, `side-toolong-${theme}`)
+    await page.locator('[data-capture-root]').screenshot({ path: `${OUT}/side-toolong-${theme}.png` })
     await page.close()
   }
 }
@@ -142,4 +176,4 @@ if (failed) {
   console.error('CAPTURE FAILED: at least one frame did not match its asserted state')
   process.exit(1)
 }
-console.log(`wrote 8 screenshots to ${OUT}`)
+console.log(`wrote 10 screenshots to ${OUT}`)

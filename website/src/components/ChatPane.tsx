@@ -53,9 +53,8 @@ import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
 import { tryQuickSend } from '../lib/quickSend'
-import { mergeRecoveredDraft } from '../utils/chatDrafts'
-import { takePaneDraft, writePaneDraft, mergePaneDraft, subscribePaneDraft, carryPastes } from '../utils/chatPaneDrafts'
-import { type PasteBlock, expandAll as expandPasteTokens, pruneBlocks, saveStoredPaste } from '../utils/pasteTokens'
+import { takePaneDraft, writePaneDraft, mergePaneDraft, subscribePaneDraft } from '../utils/chatPaneDrafts'
+import { type PasteBlock, type CarriedPastes, carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft, pruneBlocks, saveStoredPaste } from '../utils/pasteTokens'
 import { sendTurn, type SendReceiptStatus } from '../chat-core/transport/sendTurn'
 import { applySteerReceipt } from '../chat-core/transport/steerReceipt'
 import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
@@ -207,6 +206,24 @@ export default function ChatPane({
   inputRef.current = input
   pendingFilesRef.current = pendingFiles
   pasteBlocksRef.current = pasteBlocks
+  /** Bring recovered paste blocks into the live composer: the blocks behind
+   *  the tokens in `text` are re-numbered past the ones held now, and the text
+   *  with its rewritten tokens is returned for the caller's text merge.
+   *
+   *  The ref is advanced HERE, synchronously, not left to the next render:
+   *  two recoveries can land in one React batch (two sends refused together),
+   *  and both would otherwise read the same stale block list, so the second
+   *  `setPasteBlocks` would drop the first recovery's blocks while both tokens
+   *  still land in the text — a chip with nothing behind it, and a retry that
+   *  sends one paste twice and the other not at all. With the ref advanced
+   *  per call, the second recovery carries on top of the first. */
+  const carryIntoComposer = useCallback((text: string, pastes: PasteBlock[]): CarriedPastes => {
+    const carried = carryPastes(text, pastes, pasteBlocksRef.current)
+    if (!pastes.length) return carried
+    pasteBlocksRef.current = carried.pastes
+    setPasteBlocks(carried.pastes)
+    return carried
+  }, [])
   // A LAYOUT effect, not a passive one: `slotKeyRef` and the park/take below
   // must move in the same commit as the `slotKey` prop. With a passive effect
   // there is a gap between the commit and the effect in which the ref still
@@ -227,6 +244,10 @@ export default function ChatPane({
       const incoming = takePaneDraft(slotKey)
       setInput(incoming.text)
       setPendingFiles(incoming.files)
+      // Ref advanced with the state (see carryIntoComposer): a recovery for the
+      // incoming slot that lands in this same commit carries on top of ITS
+      // parked blocks, not the outgoing slot's.
+      pasteBlocksRef.current = incoming.pastes
       setPasteBlocks(incoming.pastes)
     } else {
       // First mount: pick up whatever this slot parked before (a page the user
@@ -235,9 +256,8 @@ export default function ChatPane({
       // composer already holds so no two tokens share a number.
       const parked = takePaneDraft(slotKey)
       if (parked.text) {
-        const carried = carryPastes(parked.text, parked.pastes, pasteBlocksRef.current)
-        setInput(cur => mergeRecoveredDraft(cur, carried.text))
-        if (parked.pastes.length) setPasteBlocks(carried.pastes)
+        const carried = carryIntoComposer(parked.text, parked.pastes)
+        setInput(cur => mergeCarriedDraft(cur, carried))
       }
       if (parked.files.length) setPendingFiles(cur => [...cur, ...parked.files.filter(f => !cur.includes(f))])
     }
@@ -248,9 +268,8 @@ export default function ChatPane({
     const unsubscribe = subscribePaneDraft(slotKey, () => {
       const arrived = takePaneDraft(slotKey)
       if (arrived.text) {
-        const carried = carryPastes(arrived.text, arrived.pastes, pasteBlocksRef.current)
-        setInput(cur => mergeRecoveredDraft(cur, carried.text))
-        if (arrived.pastes.length) setPasteBlocks(carried.pastes)
+        const carried = carryIntoComposer(arrived.text, arrived.pastes)
+        setInput(cur => mergeCarriedDraft(cur, carried))
       }
       if (arrived.files.length) setPendingFiles(cur => [...cur, ...arrived.files.filter(f => !cur.includes(f))])
     })
@@ -261,7 +280,7 @@ export default function ChatPane({
       mountedRef.current = false
       writePaneDraft(slotKeyRef.current, { text: inputRef.current, files: pendingFilesRef.current, pastes: pasteBlocksRef.current })
     }
-  }, [slotKey])
+  }, [slotKey, carryIntoComposer])
   /** Stage uploaded attachment paths for the slot they were picked in. A slow
    *  upload can resolve after the pane was rebound to another member; the
    *  paths then belong to the ORIGINATING slot's parked draft, not to whoever
@@ -741,13 +760,12 @@ export default function ChatPane({
   const restoreIntoComposer = useCallback((text: string, files: string[] = [], pastes: PasteBlock[] = [], forSlot: string = slotKeyRef.current) => {
     if (!mountedRef.current || forSlot !== slotKeyRef.current) { mergePaneDraft(forSlot, text, files, pastes); return }
     // The paste blocks behind the payload's tokens come back with it, numbered
-    // past whatever the composer holds now (carryPastes), or the restored
-    // token would be a chip with nothing behind it.
-    const carried = carryPastes(text, pastes, pasteBlocksRef.current)
-    setInput(prev => mergeRecoveredDraft(prev, carried.text))
-    if (pastes.length) setPasteBlocks(carried.pastes)
+    // past whatever the composer holds now, or the restored token would be a
+    // chip with nothing behind it.
+    const carried = carryIntoComposer(text, pastes)
+    setInput(prev => mergeCarriedDraft(prev, carried))
     if (files.length) setPendingFiles(prev => [...prev, ...files.filter(f => !prev.includes(f))])
-  }, [])
+  }, [carryIntoComposer])
 
   /** Say, in the transcript that owns the message, that it never went out.
    *
@@ -950,7 +968,8 @@ export default function ChatPane({
         // composer-consumption gate above -- an option send never consumed the
         // draft, so there is no pre-send state to bind.
         // `raw` is what a cancel of that card puts back in the composer. A
-        // paste goes back EXPANDED: the stash carries no blocks, so the token
+        // paste goes back EXPANDED: the stash carries no blocks (the same
+        // conservative shape ChatPage's cancel restores through), so the token
         // string alone would be a dead chip that sends literally on retry —
         // the pasted text itself is the lossless form of what the user put in.
         stashDemoted: (queueId) => { if (!optionText) queuedSendStash.set(queueId, { raw: bubblePastes.length ? expandPasteTokens(text, bubblePastes) : text, files, sent: llm }) },

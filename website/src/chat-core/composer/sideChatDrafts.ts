@@ -1,6 +1,6 @@
 import { useCallback, useSyncExternalStore } from 'react'
 import { quoteIntoDraft } from './quoteDraft'
-import { pruneBlocks, type PasteBlock } from '../../utils/pasteTokens'
+import { carryPastes, mergeCarriedDraft, pruneBlocks, type PasteBlock } from '../../utils/pasteTokens'
 
 /**
  * Side Chat drafts, kept per slot for the life of the page — the ONE place a
@@ -78,15 +78,26 @@ export function writeSideChatDraft(slot: string, text: string): void {
   set(slot, { text, seedTick: cur.seedTick, pastes: pruneBlocks(text, cur.pastes) })
 }
 
-export function readSideChatPastes(slot: string): PasteBlock[] {
-  return entry(slot).pastes
-}
-
 /** Replace the slot's paste blocks — the composer's `onPasteBlocksChange`. */
 export function writeSideChatPastes(slot: string, pastes: PasteBlock[]): void {
   const cur = entry(slot)
   if (cur.pastes === pastes) return
   set(slot, { text: cur.text, seedTick: cur.seedTick, pastes: pastes.length ? pastes : NO_PASTES })
+}
+
+/** Hand a payload the server never accepted back to the slot's draft: the
+ *  TOKEN text (not the expanded lines) appended under the shared recovery rule,
+ *  with its blocks carried in past whatever the slot holds now (`carryPastes`
+ *  re-numbers a colliding one and rewrites its token). Restoring the expanded
+ *  text instead would lose the tokens' identity: a paste whose content happens
+ *  to contain a token-shaped string would then be re-claimed by the next
+ *  paste's block on retry. */
+export function restoreSideChatDraft(slot: string, text: string, pastes: PasteBlock[] = []): void {
+  const cur = entry(slot)
+  const carried = carryPastes(text, pastes, cur.pastes)
+  // The recovery merge, not the plain append: a payload the composer already
+  // holds whole (an undo put it back before the refusal landed) is not added.
+  set(slot, { text: mergeCarriedDraft(cur.text, carried), seedTick: cur.seedTick, pastes: carried.pastes.length ? carried.pastes : NO_PASTES })
 }
 
 /** Select-to-Ask: append `selection` to the slot's draft as a blockquote and
