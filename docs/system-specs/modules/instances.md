@@ -574,6 +574,14 @@ what its own edit invalidated, and never reopens anything on the user's behalf.
   the minted token's signed `embed_parent_port` claim, never a wildcard and never
   a hardcoded port, so a local page with no validly-signed token can never frame
   the dashboard.
+- **One level of instances.** A remote instance's dashboard runs inside the
+  local one's iframe (`isEmbeddedPane()`, `lib/embedded.ts`), and in that pane
+  every way to reach onward is withheld so a remote cannot connect to yet
+  another remote and stack tunnels: the Settings > Remote Crew tab is not
+  in the pane's roster (`SettingsPage.tsx`). A `/settings/instances` link
+  followed inside a pane therefore resolves to the roster's first tab; a
+  surface that wants to send a reader there must either hide itself in a pane
+  or hand the request to the host window, never navigate the pane.
 - **Untrusted ssh stderr.** A proxy banner is ANSI-stripped, credential- and
   exfiltration-redacted, and truncated before it is surfaced in status, and it is
   a secondary detail only: failure *classification* keys on real ssh signals, so
