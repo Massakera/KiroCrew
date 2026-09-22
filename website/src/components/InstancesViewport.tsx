@@ -370,7 +370,13 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
         const note = parseNativeNotifyEnvelope(data)
         if (!note) return
         const name = instancesRef.current.find(i => i.id === id)?.name || id
-        postRelayedNativeNotification(name, id, note)
+        // Clicking the banner brings the named crew forward, not whichever tab
+        // happened to be active; the id is a warm instance, so the switch is
+        // the same one the inline switcher would honour.
+        postRelayedNativeNotification(name, id, note, () => {
+          window.focus()
+          dispatch(setActiveId(id))
+        })
       } else if (data.type === 'mc-auth-expired') {
         // Reactive recovery: the embedded dashboard reported an expired session.
         // Force a fresh mint and reload its iframe rather than letting it show

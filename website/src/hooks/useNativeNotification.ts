@@ -50,6 +50,7 @@ import { isWindowAway } from './windowAway'
 // Posts the toast, or relays it to the parent frame when this dashboard is an
 // embedded instance pane (where Notification.permission is denied by design).
 import { nativeNotificationPermitted, postNativeNotification } from '../lib/nativeNotify'
+import { i18nT } from '../i18n/t'
 
 export function useNativeNotification(botName: string, avatar: string) {
   const notifCount = useAppSelector(
@@ -74,8 +75,7 @@ export function useNativeNotification(botName: string, avatar: string) {
         // verbatim, never as markdown).
         const noteBody = latestNotif?.body ? stripMd(latestNotif.body) : ''
         const body =
-          noteBody ||
-          (delta > 1 ? `${delta} new notifications` : 'New notification')
+          noteBody || i18nT('hooks.useNativeNotification.new_notifications', { count: delta })
         // Best-effort: Android Chrome throws "Illegal constructor" for a
         // page-context Notification even with permission granted; the helper
         // swallows it and the in-app notification center still shows the event.

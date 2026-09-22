@@ -8897,6 +8897,11 @@
       "toggle_side_panel": "Afficher/masquer le panneau latéral",
       "toggle_terminal": "Afficher/masquer le terminal"
     },
+    "useNativeNotification": {
+      "new_notifications_many": "{{count}} nouvelles notifications",
+      "new_notifications_one": "{{count}} nouvelle notification",
+      "new_notifications_other": "{{count}} nouvelles notifications"
+    },
     "usePanelTabs": {
       "artifacts": "Artefacts",
       "browser": "Navigateur",

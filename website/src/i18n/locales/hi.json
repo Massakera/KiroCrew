@@ -8780,6 +8780,10 @@
       "toggle_side_panel": "साइड पैनल दिखाएँ/छिपाएँ",
       "toggle_terminal": "टर्मिनल दिखाएँ/छिपाएँ"
     },
+    "useNativeNotification": {
+      "new_notifications_one": "{{count}} नई सूचना",
+      "new_notifications_other": "{{count}} नई सूचनाएँ"
+    },
     "usePanelTabs": {
       "artifacts": "आर्टिफ़ैक्ट",
       "browser": "ब्राउज़र",

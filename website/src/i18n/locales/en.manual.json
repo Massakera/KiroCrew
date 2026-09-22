@@ -3422,6 +3422,10 @@
       "toggle_side_panel": "Toggle side panel",
       "toggle_terminal": "Toggle terminal"
     },
+    "useNativeNotification": {
+      "new_notifications_one": "{{count}} new notification",
+      "new_notifications_other": "{{count}} new notifications"
+    },
     "useSceneInteraction": {
       "all_slots_are_occupied": "All slots are occupied",
       "create_a_new_chat_session_a_new_agent_joins_this": "Create a new chat session — a new agent joins this world",

@@ -8663,6 +8663,9 @@
       "toggle_side_panel": "サイドパネルの表示を切り替え",
       "toggle_terminal": "ターミナルの表示を切り替え"
     },
+    "useNativeNotification": {
+      "new_notifications_other": "{{count}} 件の新しい通知"
+    },
     "usePanelTabs": {
       "artifacts": "アーティファクト",
       "browser": "ブラウザー",

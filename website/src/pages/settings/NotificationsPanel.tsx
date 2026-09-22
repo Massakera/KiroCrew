@@ -254,7 +254,9 @@ function ChannelsSection() {
  * action: `default` offers the button (the click is the browser's required
  * user gesture), `granted` confirms, `denied` says where the browser keeps the
  * switch — this page cannot flip it, so it offers no button that would fail.
- * Unmounted entirely where the platform has no `Notification` at all.
+ * Unmounted entirely where the platform has no `Notification` at all, and in
+ * an embedded instance pane, whose banners the hub window posts on its behalf
+ * (`readNotificationPermission` reports `unsupported` there).
  */
 function SystemNotificationsRow() {
   const { permission, request } = useNotificationPermission()

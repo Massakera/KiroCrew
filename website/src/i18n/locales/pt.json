@@ -8897,6 +8897,11 @@
       "toggle_side_panel": "Alternar painel lateral",
       "toggle_terminal": "Alternar terminal"
     },
+    "useNativeNotification": {
+      "new_notifications_many": "{{count}} novas notificações",
+      "new_notifications_one": "{{count}} nova notificação",
+      "new_notifications_other": "{{count}} novas notificações"
+    },
     "usePanelTabs": {
       "artifacts": "Artefatos",
       "browser": "Navegador",

@@ -8897,6 +8897,11 @@
       "toggle_side_panel": "Mostrar u ocultar el panel lateral",
       "toggle_terminal": "Mostrar u ocultar el terminal"
     },
+    "useNativeNotification": {
+      "new_notifications_many": "{{count}} notificaciones nuevas",
+      "new_notifications_one": "{{count}} notificación nueva",
+      "new_notifications_other": "{{count}} notificaciones nuevas"
+    },
     "usePanelTabs": {
       "artifacts": "Artefactos",
       "browser": "Navegador",

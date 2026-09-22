@@ -212,5 +212,6 @@
   "pages.overview.agentTemplatesTab.private_copies_count",
   "pages.overview.agentTemplatesTab.crewmates_count",
   "pages.overview.agentTemplatesTab.affects_crewmates",
-  "pages.overview.agentTemplatesTab.chars_count"
+  "pages.overview.agentTemplatesTab.chars_count",
+  "hooks.useNativeNotification.new_notifications"
 ]

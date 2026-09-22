@@ -98,19 +98,24 @@ describe('InstancesViewport relay listener', () => {
 
   describe('mc-native-notify relay (a pane cannot post an OS banner itself)', () => {
     const CONSTRUCTED: Array<{ title: string; options: NotificationOptions | undefined }> = []
+    const INSTANCES: Array<{ onclick: (() => void) | null }> = []
     const ENVELOPE = { type: 'mc-native-notify', v: 1, title: 'Approval required', body: 'Bash', tag: 'kirocrew-approval', silent: true }
 
     function stubNotification(permission: 'granted' | 'default') {
       class FakeNotification {
         static permission = permission
         static requestPermission = vi.fn()
-        constructor(title: string, options?: NotificationOptions) { CONSTRUCTED.push({ title, options }) }
+        onclick: (() => void) | null = null
+        constructor(title: string, options?: NotificationOptions) {
+          CONSTRUCTED.push({ title, options })
+          INSTANCES.push(this)
+        }
       }
       vi.stubGlobal('Notification', FakeNotification)
       return FakeNotification
     }
 
-    beforeEach(() => { CONSTRUCTED.length = 0 })
+    beforeEach(() => { CONSTRUCTED.length = 0; INSTANCES.length = 0 })
     afterEach(() => { vi.unstubAllGlobals() })
 
     it('posts the banner for a warm-tunnel origin, title prefixed with the instance name, tag namespaced per id', async () => {
@@ -126,6 +131,19 @@ describe('InstancesViewport relay listener', () => {
         title: 'Zzq One: Approval required',
         options: { body: 'Bash', tag: 'cd-1:kirocrew-approval', silent: true },
       })
+    })
+
+    it('clicking the relayed banner brings that instance\'s tab forward', async () => {
+      stubNotification('granted')
+      const store = warmStore(null)
+      renderWithProviders(<InstancesViewport />, { store })
+      await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+      expect(store.getState().instances.activeId).toBeNull()
+
+      post(ENVELOPE)
+      await waitFor(() => expect(INSTANCES).toHaveLength(1))
+      act(() => { INSTANCES[0].onclick?.() })
+      expect(store.getState().instances.activeId).toBe('cd-1')
     })
 
     it('ignores the envelope from an unowned loopback port and from a foreign origin', async () => {

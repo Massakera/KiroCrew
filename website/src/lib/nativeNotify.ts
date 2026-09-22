@@ -19,10 +19,11 @@
  * `document.hidden`, `silent`) -- only a note the pane would have shown is
  * relayed, so no policy is duplicated here. The parent is the gate.
  *
- * Three call sites: `hooks/useNativeNotification.ts` (bell notes),
- * `hooks/useWebSocket.ts` (approval required, chat finished).
+ * Two call sites: `hooks/useNativeNotification.ts` (bell notes, which is also
+ * how an approval reaches the OS) and `hooks/useWebSocket.ts` (chat finished).
  */
 import { isEmbeddedPane } from './embedded'
+import { parseLoopbackOriginPort } from './tunnelOrigin'
 
 export const NATIVE_NOTIFY_TYPE = 'mc-native-notify'
 export const NATIVE_NOTIFY_VERSION = 1
@@ -52,30 +53,44 @@ export interface NativeNotifyEnvelope {
 }
 
 /**
- * Whether a call site may proceed to post a native notification.
+ * The exact origin to relay to, or null when this frame must not relay.
  *
- * Embedded: always true -- the pane's own permission is irrelevant (it is
- * denied by design) and the parent applies its own `Notification.permission`
- * check before posting. Top-level: the usual granted check.
+ * A note body is user content (an approval's tool name, a bell note's text),
+ * so the relay is narrower than "any iframe": the embedding page must be a
+ * loopback http origin -- the only shape an Instances hub parent can have
+ * (`InstancesViewport.srcFor` loads panes from the hub's own loopback host, and
+ * `tunnelOrigin.ts` is the parent-side mirror of this rule) -- and this frame
+ * must be the full dashboard, not a `/embed/*` document, which the operator may
+ * have authorised a different host to DISPLAY (`frame-ancestors`) but not to
+ * receive notifications from. An iframe's `document.referrer` is its embedding
+ * page's origin under the dashboard's `strict-origin-when-cross-origin` policy;
+ * when the browser withholds it there is no target and nothing is sent. Never
+ * `'*'`.
  */
-export function nativeNotificationPermitted(): boolean {
-  if (isEmbeddedPane()) return true
-  return typeof Notification !== 'undefined' && Notification.permission === 'granted'
+export function relayTargetOrigin(): string | null {
+  if (!isEmbeddedPane()) return null
+  try {
+    if (window.location.pathname.startsWith('/embed/')) return null
+    if (!document.referrer) return null
+    const origin = new URL(document.referrer).origin
+    return parseLoopbackOriginPort(origin) === null ? null : origin
+  } catch {
+    return null
+  }
 }
 
 /**
- * The parent's origin when the browser tells us (an iframe's `document.referrer`
- * is the embedding page), else `'*'`. Same narrowing as the unread-count relay
- * in `store/dashboardSlice.ts`: a note body is user content, so avoid
- * broadcasting it wider than the hub that embedded us.
+ * Whether a call site may proceed to post a native notification.
+ *
+ * Embedded: true only when there is a relay target -- the pane's own permission
+ * is irrelevant (it is denied by design) and the parent applies its own
+ * `Notification.permission` check before posting. An embedded frame with no
+ * relay target posts nothing (it could not anyway). Top-level: the usual
+ * granted check.
  */
-function parentTargetOrigin(): string {
-  try {
-    if (document.referrer) return new URL(document.referrer).origin
-  } catch {
-    /* keep '*' */
-  }
-  return '*'
+export function nativeNotificationPermitted(): boolean {
+  if (isEmbeddedPane()) return relayTargetOrigin() !== null
+  return typeof Notification !== 'undefined' && Notification.permission === 'granted'
 }
 
 /**
@@ -88,6 +103,8 @@ function parentTargetOrigin(): string {
 export function postNativeNotification(title: string, options: NativeNotifyOptions = {}): void {
   const silent = options.silent ?? true
   if (isEmbeddedPane()) {
+    const target = relayTargetOrigin()
+    if (target === null) return
     try {
       const envelope: NativeNotifyEnvelope = {
         type: NATIVE_NOTIFY_TYPE,
@@ -97,7 +114,7 @@ export function postNativeNotification(title: string, options: NativeNotifyOptio
         tag: String(options.tag ?? '').slice(0, NATIVE_NOTIFY_MAX_TAG),
         silent,
       }
-      window.parent?.postMessage(envelope, parentTargetOrigin())
+      window.parent?.postMessage(envelope, target)
     } catch {
       /* never let the relay break the caller */
     }
@@ -138,20 +155,25 @@ export function parseNativeNotifyEnvelope(data: unknown): NativeNotifyEnvelope |
  * The title carries the instance's name so a user with several crews can tell
  * them apart, and the tag is namespaced per instance so two crews' notes never
  * collapse onto one. Only posts when this (main) frame holds the grant; it
- * never prompts -- prompting belongs to a user gesture in Settings.
+ * never prompts -- prompting belongs to a user gesture in Settings. `onClick`
+ * runs when the user clicks the banner, so the caller can bring that
+ * instance's tab forward: a banner that names a crew and then lands on
+ * whichever tab was last active would not keep its own promise.
  */
 export function postRelayedNativeNotification(
   instanceName: string,
   instanceId: string,
   note: NativeNotifyEnvelope,
+  onClick?: () => void,
 ): boolean {
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false
   try {
-    new Notification(`${instanceName}: ${note.title}`, {
+    const n = new Notification(`${instanceName}: ${note.title}`, {
       body: note.body,
       tag: `${instanceId}:${note.tag}`,
       silent: note.silent,
     })
+    if (onClick) n.onclick = onClick
     return true
   } catch {
     return false

@@ -8780,6 +8780,10 @@
       "toggle_side_panel": "Seitenpanel umschalten",
       "toggle_terminal": "Terminal umschalten"
     },
+    "useNativeNotification": {
+      "new_notifications_one": "{{count}} neue Benachrichtigung",
+      "new_notifications_other": "{{count}} neue Benachrichtigungen"
+    },
     "usePanelTabs": {
       "artifacts": "Artefakte",
       "browser": "Browser",

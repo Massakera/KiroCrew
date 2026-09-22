@@ -8663,6 +8663,9 @@
       "toggle_side_panel": "切换侧边面板",
       "toggle_terminal": "切换终端"
     },
+    "useNativeNotification": {
+      "new_notifications_other": "{{count}} 条新通知"
+    },
     "usePanelTabs": {
       "artifacts": "产物",
       "browser": "浏览器",

@@ -8897,6 +8897,11 @@
       "toggle_side_panel": "Attiva/disattiva il pannello laterale",
       "toggle_terminal": "Attiva/disattiva il terminale"
     },
+    "useNativeNotification": {
+      "new_notifications_many": "{{count}} nuove notifiche",
+      "new_notifications_one": "{{count}} nuova notifica",
+      "new_notifications_other": "{{count}} nuove notifiche"
+    },
     "usePanelTabs": {
       "artifacts": "Artefatti",
       "browser": "Browser",

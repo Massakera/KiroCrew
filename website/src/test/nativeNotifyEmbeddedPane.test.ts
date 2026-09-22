@@ -4,7 +4,7 @@
  * `notifications` to the main frame only and a browser denies it to a
  * cross-origin iframe. Every page-context toast site must therefore relay the
  * note to the parent frame (`mc-native-notify`) instead of constructing a
- * Notification that can never show. These tests drive the three real sites
+ * Notification that can never show. These tests drive the two real sites
  * through their hooks with the pane flag on.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -17,6 +17,7 @@ import { store as globalStore } from '../store'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useNativeNotification } from '../hooks/useNativeNotification'
 import { CHAT_COMPLETE_NOTIFY_KEY } from '../hooks/chatCompleteNotify'
+import { readNotificationPermission } from '../hooks/useNotificationPermission'
 import { addNotification } from '../store/notificationsSlice'
 import { sseSlots } from '../store/dashboardSlice'
 import type { Notification as AppNotification } from '../types'
@@ -84,6 +85,8 @@ describe('embedded instance pane relays native notifications to the parent', () 
     postMessage = vi.fn()
     originalParent = window.parent
     Object.defineProperty(window, 'parent', { configurable: true, value: { postMessage } })
+    // The Instances hub that embedded this pane: a loopback http origin.
+    Object.defineProperty(document, 'referrer', { configurable: true, value: 'http://127.0.0.1:8787/' })
   })
 
   afterEach(() => {
@@ -110,7 +113,9 @@ describe('embedded instance pane relays native notifications to the parent', () 
       .filter(m => m && m.type === 'mc-native-notify')
   }
 
-  it('approval required (hidden tab): relays the envelope, constructs nothing, never prompts', () => {
+  it('approval frame: no direct toast site remains; the feed still records the approval', () => {
+    // Approvals reach the OS through the bell note path (useNativeNotification)
+    // -- one toast per event -- so the socket handler itself relays nothing.
     Object.defineProperty(document, 'hidden', { configurable: true, get: () => true })
     const store = createTestStore()
     const { ws } = mountWs(store)
@@ -123,28 +128,8 @@ describe('embedded instance pane relays native notifications to the parent', () 
     })
 
     expect(CONSTRUCTED).toHaveLength(0)
-    expect(DeniedNotification.requestPermission).not.toHaveBeenCalled()
-    expect(relayed()).toEqual([
-      { type: 'mc-native-notify', v: 1, title: 'Approval Required', body: 'Bash', tag: 'kirocrew-approval', silent: true },
-    ])
-    // The feed still records the approval: the relay never breaks the handler.
-    expect(store.getState().notifications.items.find(n => n.approval_id === 'ap-pane-1')).toBeDefined()
-  })
-
-  it('approval required (visible tab): keeps the site guard -- nothing relayed', () => {
-    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false })
-    const store = createTestStore()
-    const { ws } = mountWs(store)
-
-    act(() => {
-      ws.simulateMessage({
-        type: 'approval',
-        data: { id: 'ap-pane-2', source: 'cron', tool: 'Bash', tool_input: '{}', ts: 1.0 },
-      })
-    })
-
     expect(relayed()).toHaveLength(0)
-    expect(CONSTRUCTED).toHaveLength(0)
+    expect(store.getState().notifications.items.find(n => n.approval_id === 'ap-pane-1')).toBeDefined()
   })
 
   it('chat finished while away (opt-in on): relays with the slot title and a per-slot tag', () => {
@@ -184,7 +169,35 @@ describe('embedded instance pane relays native notifications to the parent', () 
     expect(relayed()).toHaveLength(0)
   })
 
-  it('bell note: relays the note, constructs nothing, never prompts', () => {
+  it('bell note (window focused): relays nothing -- the away gate is the pane\'s own', () => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false })
+    const hadFocus = document.hasFocus
+    document.hasFocus = () => true
+    try {
+      const store = createTestStore()
+      function wrapper({ children }: { children: React.ReactNode }) {
+        return createElement(Provider, { store }, children)
+      }
+      renderHook(() => useNativeNotification('Kiro Crew', '/avatar.png'), { wrapper })
+      act(() => {
+        store.dispatch(addNotification({ kind: 'approval', title: 'T', body: 'B', ts: '1.0', approval_id: 'ap-pane-4' } as AppNotification))
+      })
+      expect(relayed()).toHaveLength(0)
+      expect(CONSTRUCTED).toHaveLength(0)
+    } finally {
+      document.hasFocus = hadFocus
+    }
+  })
+
+  it('permission-facing UI defers to the hub: the pane reads unsupported, not its own denied', () => {
+    expect(readNotificationPermission()).toBe('unsupported')
+    // An embedded frame with no relay target keeps reporting its real verdict.
+    Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://host.example/' })
+    expect(readNotificationPermission()).toBe('denied')
+  })
+
+  it('bell note (window away): relays the note, constructs nothing, never prompts', () => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true })
     const store = createTestStore()
     function wrapper({ children }: { children: React.ReactNode }) {
       return createElement(Provider, { store }, children)

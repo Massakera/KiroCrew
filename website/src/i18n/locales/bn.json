@@ -8780,6 +8780,10 @@
       "toggle_side_panel": "সাইড প্যানেল দেখান/লুকান",
       "toggle_terminal": "টার্মিনাল দেখান/লুকান"
     },
+    "useNativeNotification": {
+      "new_notifications_one": "{{count}}টি নতুন বিজ্ঞপ্তি",
+      "new_notifications_other": "{{count}}টি নতুন বিজ্ঞপ্তি"
+    },
     "usePanelTabs": {
       "artifacts": "আর্টিফ্যাক্ট",
       "browser": "ব্রাউজার",

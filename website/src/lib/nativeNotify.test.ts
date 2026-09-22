@@ -14,17 +14,23 @@ import {
   parseNativeNotifyEnvelope,
   postNativeNotification,
   postRelayedNativeNotification,
+  relayTargetOrigin,
 } from './nativeNotify'
 
+/** The Instances hub that embedded us: always a loopback http origin. */
+const HUB = 'http://127.0.0.1:8787'
 const CONSTRUCTED: Array<{ title: string; options: NotificationOptions | undefined }> = []
+const INSTANCES: Array<{ onclick: (() => void) | null }> = []
 
 function stubNotification(permission: 'granted' | 'denied' | 'default', throwing = false) {
   class FakeNotification {
     static permission = permission
     static requestPermission = vi.fn()
+    onclick: (() => void) | null = null
     constructor(title: string, options?: NotificationOptions) {
       if (throwing) throw new TypeError('Illegal constructor')
       CONSTRUCTED.push({ title, options })
+      INSTANCES.push(this)
     }
   }
   vi.stubGlobal('Notification', FakeNotification)
@@ -37,11 +43,12 @@ describe('nativeNotify', () => {
 
   beforeEach(() => {
     CONSTRUCTED.length = 0
+    INSTANCES.length = 0
     vi.mocked(isEmbeddedPane).mockReturnValue(false)
     postMessage = vi.fn()
     originalParent = window.parent
     Object.defineProperty(window, 'parent', { configurable: true, value: { postMessage } })
-    Object.defineProperty(document, 'referrer', { configurable: true, value: '' })
+    Object.defineProperty(document, 'referrer', { configurable: true, value: HUB + '/' })
   })
 
   afterEach(() => {
@@ -54,6 +61,22 @@ describe('nativeNotify', () => {
       vi.mocked(isEmbeddedPane).mockReturnValue(true)
       stubNotification('denied')
       expect(nativeNotificationPermitted()).toBe(true)
+    })
+
+    it('is false in an embedded frame with no relay target (non-loopback parent, no referrer, /embed route)', () => {
+      vi.mocked(isEmbeddedPane).mockReturnValue(true)
+      stubNotification('granted')
+      Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://host.example/page' })
+      expect(nativeNotificationPermitted()).toBe(false)
+      Object.defineProperty(document, 'referrer', { configurable: true, value: '' })
+      expect(nativeNotificationPermitted()).toBe(false)
+      Object.defineProperty(document, 'referrer', { configurable: true, value: HUB + '/' })
+      window.history.replaceState(null, '', '/embed/chat/slot-1')
+      try {
+        expect(nativeNotificationPermitted()).toBe(false)
+      } finally {
+        window.history.replaceState(null, '', '/')
+      }
     })
 
     it('top-level: true only when granted', () => {
@@ -71,6 +94,33 @@ describe('nativeNotify', () => {
     })
   })
 
+  describe('relayTargetOrigin', () => {
+    it('is the loopback hub origin for a full-dashboard pane, exact and never a wildcard', () => {
+      vi.mocked(isEmbeddedPane).mockReturnValue(true)
+      expect(relayTargetOrigin()).toBe(HUB)
+      Object.defineProperty(document, 'referrer', { configurable: true, value: 'http://localhost:9000/x/y?z' })
+      expect(relayTargetOrigin()).toBe('http://localhost:9000')
+      Object.defineProperty(document, 'referrer', { configurable: true, value: 'http://crew.localhost:9000/' })
+      expect(relayTargetOrigin()).toBe('http://crew.localhost:9000')
+    })
+
+    it('is null at top level, for a non-loopback or https parent, an empty referrer, and an /embed/* document', () => {
+      expect(relayTargetOrigin()).toBeNull()
+      vi.mocked(isEmbeddedPane).mockReturnValue(true)
+      for (const ref of ['https://host.example/', 'http://evil.example:8787/', 'https://127.0.0.1:8787/', 'http://127.0.0.1/', '', 'not a url']) {
+        Object.defineProperty(document, 'referrer', { configurable: true, value: ref })
+        expect(relayTargetOrigin(), ref).toBeNull()
+      }
+      Object.defineProperty(document, 'referrer', { configurable: true, value: HUB + '/' })
+      window.history.replaceState(null, '', '/embed/chat/slot-1')
+      try {
+        expect(relayTargetOrigin()).toBeNull()
+      } finally {
+        window.history.replaceState(null, '', '/')
+      }
+    })
+  })
+
   describe('postNativeNotification', () => {
     it('embedded: relays the exact envelope to the parent and constructs nothing', () => {
       vi.mocked(isEmbeddedPane).mockReturnValue(true)
@@ -80,7 +130,7 @@ describe('nativeNotify', () => {
       expect(postMessage).toHaveBeenCalledTimes(1)
       expect(postMessage).toHaveBeenCalledWith(
         { type: 'mc-native-notify', v: 1, title: 'Approval required', body: 'Bash', tag: 'kirocrew-approval', silent: true },
-        '*',
+        HUB,
       )
     })
 
@@ -89,7 +139,7 @@ describe('nativeNotify', () => {
       postNativeNotification('T', { icon: '/avatar.png' })
       expect(postMessage).toHaveBeenCalledWith(
         { type: 'mc-native-notify', v: 1, title: 'T', body: '', tag: '', silent: true },
-        '*',
+        HUB,
       )
     })
 
@@ -99,11 +149,22 @@ describe('nativeNotify', () => {
       expect(postMessage.mock.calls[0][0]).toMatchObject({ silent: false })
     })
 
-    it('embedded: targets the referrer origin (the hub) when the browser exposes it', () => {
+    it('embedded: targets the referrer origin (the hub) exactly', () => {
       vi.mocked(isEmbeddedPane).mockReturnValue(true)
       Object.defineProperty(document, 'referrer', { configurable: true, value: 'http://localhost:8787/some/page' })
       postNativeNotification('T', { body: 'b', tag: 't' })
       expect(postMessage.mock.calls[0][1]).toBe('http://localhost:8787')
+    })
+
+    it('embedded: sends nothing at all when the parent is not a loopback hub or the referrer is withheld', () => {
+      vi.mocked(isEmbeddedPane).mockReturnValue(true)
+      stubNotification('granted')
+      Object.defineProperty(document, 'referrer', { configurable: true, value: 'https://host.example/' })
+      postNativeNotification('T', { body: 'b', tag: 't' })
+      Object.defineProperty(document, 'referrer', { configurable: true, value: '' })
+      postNativeNotification('T', { body: 'b', tag: 't' })
+      expect(postMessage).not.toHaveBeenCalled()
+      expect(CONSTRUCTED).toHaveLength(0)
     })
 
     it('embedded: bounds the relayed strings', () => {
@@ -180,6 +241,17 @@ describe('nativeNotify', () => {
       expect(CONSTRUCTED).toEqual([
         { title: 'Zzq One: Approval required', options: { body: 'Bash', tag: 'cd-1:kirocrew-approval', silent: true } },
       ])
+    })
+
+    it('wires the click handler onto the banner, and leaves it unset when none is given', () => {
+      stubNotification('granted')
+      const onClick = vi.fn()
+      postRelayedNativeNotification('Zzq One', 'cd-1', note, onClick)
+      postRelayedNativeNotification('Zzq One', 'cd-1', note)
+      expect(INSTANCES).toHaveLength(2)
+      INSTANCES[0].onclick?.()
+      expect(onClick).toHaveBeenCalledTimes(1)
+      expect(INSTANCES[1].onclick).toBeNull()
     })
 
     it('posts nothing, and never prompts, unless this frame holds the grant', () => {

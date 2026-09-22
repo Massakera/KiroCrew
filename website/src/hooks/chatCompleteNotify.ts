@@ -70,17 +70,8 @@ export function shouldNotifyOnChatComplete(opts: {
 }): boolean {
   if (!opts.slot || opts.reconnecting) return false
   if (!loadChatCompleteNotify()) return false
- * rather than at the call site so the whole gate is one testable predicate; the
- * caller is left with the construction the platform may still refuse. In an
- * embedded instance pane the permission is denied by design and the parent
- * frame posts on the pane's behalf, so the capability check defers to
- * `nativeNotificationPermitted()` rather than reading the pane's own verdict.
- */
-export function shouldNotifyOnChatComplete(opts: {
-  slot: string | undefined | null
-  reconnecting: boolean
-}): boolean {
-  if (!opts.slot || opts.reconnecting) return false
-  if (!loadChatCompleteNotify()) return false
   if (!nativeNotificationPermitted()) return false
+  // The shared "away" predicate (both axes: hidden, and visible-but-unfocused);
+  // see windowAway.ts for why one axis is not enough.
+  return isWindowAway()
 }

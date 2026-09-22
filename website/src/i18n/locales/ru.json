@@ -9014,6 +9014,12 @@
       "toggle_side_panel": "Показать или скрыть боковую панель",
       "toggle_terminal": "Показать или скрыть терминал"
     },
+    "useNativeNotification": {
+      "new_notifications_few": "{{count}} новых уведомления",
+      "new_notifications_many": "{{count}} новых уведомлений",
+      "new_notifications_one": "{{count}} новое уведомление",
+      "new_notifications_other": "{{count}} новых уведомления"
+    },
     "usePanelTabs": {
       "artifacts": "Артефакты",
       "browser": "Браузер",
