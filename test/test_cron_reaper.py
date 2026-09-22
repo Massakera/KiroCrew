@@ -50,6 +50,8 @@ class TestCronReaper:
         job = _make_job("expired1")
         svc._jobs = [job]
         svc._job_start_times["expired1"] = time.time() - _JOB_TIMEOUT_SECS - 120
+        meta = (time.time() - _JOB_TIMEOUT_SECS - 120, "scheduled")
+        svc._job_run_meta["expired1"] = meta
         svc._running_tasks["expired1"] = MagicMock(done=MagicMock(return_value=False))
 
         with patch("kiro_crew.sel.sel") as mock_sel, patch.object(svc, "_save"):
@@ -57,7 +59,7 @@ class TestCronReaper:
 
         assert job.last_status == "error"
         assert "Reaped" in (job.last_error or "")
-        assert "expired1" in svc._reaped_jobs
+        assert svc._reaped_jobs.has("expired1", meta)
         assert "expired1" not in svc._job_start_times  # popped early
         # ``ends_conversation``: the reaper has given up on the run, so its conversation
         # is over and its sub-agent runs end with it. Asserting the whole call keeps a
@@ -91,7 +93,7 @@ class TestCronReaper:
                 await svc._reaper_loop()
 
         # Should not have been reaped
-        assert "ok1" not in svc._reaped_jobs
+        assert not svc._reaped_jobs._marks  # nothing reaped
         sessions.reset.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -111,7 +113,7 @@ class TestCronReaper:
             with pytest.raises(asyncio.CancelledError):
                 await svc._reaper_loop()
 
-        assert "done1" not in svc._reaped_jobs
+        assert not svc._reaped_jobs._marks  # nothing reaped
         assert "done1" not in svc._job_start_times  # cleaned up
 
     @pytest.mark.asyncio
@@ -206,16 +208,18 @@ class TestCronReaper:
 
         job = _make_job("reaped1")
         svc._jobs = [job]
-        svc._reaped_jobs.add("reaped1")
+        meta = (time.time(), "scheduled")
+        svc._job_run_meta["reaped1"] = meta
+        svc._reaped_jobs.mark("reaped1", meta)
         svc._executing.add("reaped1")
 
         with patch.object(svc, "_execute_with_timeout", new_callable=AsyncMock), patch.object(
             svc, "_merge_job_result"
         ) as mock_merge:
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, meta)
 
         mock_merge.assert_not_called()
-        assert "reaped1" not in svc._reaped_jobs  # cleaned up
+        assert not svc._reaped_jobs.has("reaped1", meta)  # cleaned up
 
     @pytest.mark.asyncio
     async def test_reaped_flag_prevents_merge_on_cancel(self) -> None:
@@ -225,17 +229,19 @@ class TestCronReaper:
 
         job = _make_job("reaped2")
         svc._jobs = [job]
-        svc._reaped_jobs.add("reaped2")
+        meta = (time.time(), "scheduled")
+        svc._job_run_meta["reaped2"] = meta
+        svc._reaped_jobs.mark("reaped2", meta)
         svc._executing.add("reaped2")
 
         with patch.object(
             svc, "_execute_with_timeout", side_effect=asyncio.CancelledError
         ), patch.object(svc, "_merge_job_result") as mock_merge:
             with pytest.raises(asyncio.CancelledError):
-                await svc._run_job_isolated(job)
+                await svc._run_job_isolated(job, meta)
 
         mock_merge.assert_not_called()
-        assert "reaped2" not in svc._reaped_jobs
+        assert not svc._reaped_jobs.has("reaped2", meta)
 
     @pytest.mark.asyncio
     async def test_non_reaped_job_merges_normally(self) -> None:
@@ -251,7 +257,14 @@ class TestCronReaper:
         ) as mock_merge:
             await svc._run_job_isolated(job)
 
-        mock_merge.assert_called_once_with(job)
+        mock_merge.assert_called_once()
+        (record,) = mock_merge.call_args.args
+        # The record is the job as the run left it, plus this run's own
+        # generation, which only a merge ever writes to the job.
+        assert record.run_generation == 1
+        assert job.run_generation == 0
+        record.run_generation = 0
+        assert record == job
 
     @pytest.mark.asyncio
     async def test_start_reaper_creates_task(self) -> None:
@@ -289,12 +302,14 @@ class TestCronReaper:
 
         job = _make_job("nosess1")
         svc._jobs = [job]
+        meta = (time.time() - _JOB_TIMEOUT_SECS - 10, "scheduled")
+        svc._job_run_meta["nosess1"] = meta
 
         with patch("kiro_crew.sel.sel"), patch.object(svc, "_save"):
             await svc._force_reap("nosess1", _JOB_TIMEOUT_SECS + 10)
 
         assert job.last_status == "error"
-        assert "nosess1" in svc._reaped_jobs
+        assert svc._reaped_jobs.has("nosess1", meta)
 
     @pytest.mark.asyncio
     async def test_job_start_time_tracked(self) -> None:
@@ -305,7 +320,7 @@ class TestCronReaper:
 
         start_captured: list[bool] = []
 
-        async def capture_start(j: CronJob) -> None:
+        async def capture_start(j: CronJob, meta: object = None) -> None:
             start_captured.append("track1" in svc._job_start_times)
 
         with patch.object(svc, "_execute_with_timeout", side_effect=capture_start), patch.object(
@@ -373,7 +388,7 @@ class TestCronReaper:
             with pytest.raises(asyncio.CancelledError):
                 await svc._reaper_loop()
 
-        assert "custom1" not in svc._reaped_jobs
+        assert not svc._reaped_jobs._marks  # nothing reaped
 
     @pytest.mark.asyncio
     async def test_reaper_kills_job_exceeding_custom_timeout(self, tmp_path: object) -> None:
@@ -386,6 +401,8 @@ class TestCronReaper:
         job.timeout_secs = 5400
         svc._jobs = [job]
         svc._job_start_times["custom2"] = time.time() - 5500
+        meta = (time.time() - 5500, "scheduled")
+        svc._job_run_meta["custom2"] = meta
         svc._running_tasks["custom2"] = MagicMock(done=MagicMock(return_value=False))
 
         with patch("kiro_crew.sel.sel"), patch.object(svc, "_save"), patch(
@@ -394,7 +411,7 @@ class TestCronReaper:
             with pytest.raises(asyncio.CancelledError):
                 await svc._reaper_loop()
 
-        assert "custom2" in svc._reaped_jobs
+        assert svc._reaped_jobs.has("custom2", meta)
         assert job.last_status == "error"
         assert "exceeded 5400s deadline" in (job.last_error or "")
 
@@ -415,7 +432,7 @@ class TestCronReaper:
             with pytest.raises(asyncio.CancelledError):
                 await svc._reaper_loop()
 
-        assert "floor1" not in svc._reaped_jobs
+        assert not svc._reaped_jobs._marks  # nothing reaped
 
     @pytest.mark.asyncio
     async def test_reaper_caps_at_86400(self, tmp_path: object) -> None:
@@ -428,6 +445,8 @@ class TestCronReaper:
         job.timeout_secs = 100000  # exceeds 86400 cap
         svc._jobs = [job]
         svc._job_start_times["cap1"] = time.time() - 86500
+        meta = (time.time() - 86500, "scheduled")
+        svc._job_run_meta["cap1"] = meta
         svc._running_tasks["cap1"] = MagicMock(done=MagicMock(return_value=False))
 
         with patch("kiro_crew.sel.sel"), patch.object(svc, "_save"), patch(
@@ -436,7 +455,7 @@ class TestCronReaper:
             with pytest.raises(asyncio.CancelledError):
                 await svc._reaper_loop()
 
-        assert "cap1" in svc._reaped_jobs
+        assert svc._reaped_jobs.has("cap1", meta)
         assert "exceeded 86400s deadline" in (job.last_error or "")
 
     @pytest.mark.asyncio
@@ -449,6 +468,8 @@ class TestCronReaper:
         # No job in self._jobs, but start time still tracked (race: job removed while running)
         svc._jobs = []
         svc._job_start_times["ghost1"] = time.time() - _JOB_TIMEOUT_SECS - 60
+        meta = (time.time() - _JOB_TIMEOUT_SECS - 60, "scheduled")
+        svc._job_run_meta["ghost1"] = meta
         svc._running_tasks["ghost1"] = MagicMock(done=MagicMock(return_value=False))
 
         with patch("kiro_crew.sel.sel"), patch.object(svc, "_save"), patch(
@@ -457,7 +478,7 @@ class TestCronReaper:
             with pytest.raises(asyncio.CancelledError):
                 await svc._reaper_loop()
 
-        assert "ghost1" in svc._reaped_jobs
+        assert svc._reaped_jobs.has("ghost1", meta)
 
 
 def _one_sweep() -> Any:
@@ -494,7 +515,7 @@ class TestReaperMonotonicDeadline:
                 await svc._reaper_loop()
 
         mock_reap.assert_not_awaited()
-        assert "slept1" not in svc._reaped_jobs
+        assert not svc._reaped_jobs._marks  # nothing reaped
 
     @pytest.mark.asyncio
     async def test_reaper_still_kills_genuine_overrun_on_monotonic_clock(self) -> None:
@@ -524,7 +545,7 @@ class TestReaperMonotonicDeadline:
 
         seen: list[bool] = []
 
-        async def capture(j: CronJob) -> None:
+        async def capture(j: CronJob, meta: object = None) -> None:
             seen.append("mono1" in svc._job_start_monotonic)
 
         with patch.object(svc, "_merge_job_result"):
@@ -551,6 +572,54 @@ class TestReaperMonotonicDeadline:
             await svc._force_reap("reap1", _JOB_TIMEOUT_SECS + 60)
 
         assert "reap1" not in svc._job_start_monotonic
+
+    @pytest.mark.asyncio
+    async def test_force_reap_releases_the_jitter_stamp_its_fenced_finalizer_skips(
+        self, tmp_path: object
+    ) -> None:
+        """A reaped run's ``_job_jitter`` entry is released by the reap itself.
+
+        ``_run_job_isolated`` stamps the jitter and its ``finally`` clears it
+        only while the run still holds the claim (``_job_run_meta`` identity).
+        ``_force_reap`` pops that claim before the finalizer runs, so the fence
+        is False for a reaped run and the finalizer leaves the stamp alone; the
+        reap has to pop it with the other tracking dicts, or a one-shot that is
+        reaped and then removed keeps its entry for the process lifetime.
+        """
+        svc = CronService(base_dir=None, on_job=AsyncMock())
+        svc._history = CronHistoryStore(base_dir=tmp_path)
+        svc._sessions = _mock_sessions()
+
+        job = _make_job("reapjit1")
+        svc._jobs = [job]
+        meta = (time.time() - _JOB_TIMEOUT_SECS - 60, "scheduled")
+        svc._job_run_meta["reapjit1"] = meta
+        svc._executing.add("reapjit1")
+
+        async def reap_mid_run(job_arg: CronJob, meta_arg: Any = None) -> None:
+            # The sweep fires while this run is in flight: it pops the claim
+            # and cancels the task, whose CancelledError lands here.
+            assert "reapjit1" in svc._job_jitter  # stamped by the run itself
+            await svc._force_reap("reapjit1", _JOB_TIMEOUT_SECS + 60)
+            raise asyncio.CancelledError
+
+        with (
+            patch("kiro_crew.sel.sel"),
+            patch.object(svc, "_save"),
+            patch.object(svc, "_execute_with_timeout", side_effect=reap_mid_run),
+            patch.object(svc, "_merge_job_result") as mock_merge,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await svc._run_job_isolated(job, meta)
+
+        mock_merge.assert_not_called()
+        assert "reapjit1" not in svc._job_run_meta
+        assert "reapjit1" not in svc._executing
+        assert "reapjit1" not in svc._job_jitter, (
+            "the reaped run's jitter stamp was orphaned: _force_reap popped the "
+            "claim, the finalizer's ownership fence then skipped its jitter clear, "
+            f"and _job_jitter still holds {svc._job_jitter!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_reaper_done_task_cleanup_clears_monotonic_start(self) -> None:
@@ -582,6 +651,8 @@ class TestReaperMonotonicDeadline:
         job = _make_job("legacy1")
         svc._jobs = [job]
         svc._job_start_times["legacy1"] = time.time() - _JOB_TIMEOUT_SECS - 60
+        meta = (time.time() - _JOB_TIMEOUT_SECS - 60, "scheduled")
+        svc._job_run_meta["legacy1"] = meta
         svc._running_tasks["legacy1"] = MagicMock(done=MagicMock(return_value=False))
         assert "legacy1" not in svc._job_start_monotonic
 
@@ -589,7 +660,7 @@ class TestReaperMonotonicDeadline:
             with pytest.raises(asyncio.CancelledError):
                 await svc._reaper_loop()
 
-        assert "legacy1" in svc._reaped_jobs
+        assert svc._reaped_jobs.has("legacy1", meta)
 
 
 class TestReaperReleasesFinishedTask:
@@ -660,7 +731,7 @@ class TestReaperReleasesFinishedTask:
             assert job.id not in svc._job_jitter
             assert job.id not in svc._job_run_meta
             # Released, not reaped: the run was over, there was nothing to kill.
-            assert job.id not in svc._reaped_jobs
+            assert not svc._reaped_jobs._marks
             svc._sessions.reset.assert_not_awaited()
 
             # The next tick fires the job again.

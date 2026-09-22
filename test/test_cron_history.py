@@ -329,7 +329,7 @@ async def test_run_job_stores_manual_trigger_meta() -> None:
     svc._loop = None
     svc._file = None
 
-    async def fake_run(job):
+    async def fake_run(job, meta=None):
         pass
 
     with patch.object(svc, "_run_job_isolated", side_effect=fake_run), patch.object(
@@ -431,7 +431,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _produce(job):
+        async def _produce(job, meta=None):
             job.set_run_result("new run output")
             job.last_status = "ok"
             job.last_error = None
@@ -461,7 +461,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _script_ok(job):
+        async def _script_ok(job, meta=None):
             job.set_run_result("ok")  # interned literal, same object every run
             job.last_status = "ok"
             job.last_error = None
@@ -489,7 +489,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _one_char(job):
+        async def _one_char(job, meta=None):
             job.set_run_result("y")
             job.last_status = "ok"
             job.last_error = None
@@ -515,7 +515,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _no_output(job):
+        async def _no_output(job, meta=None):
             job.last_status = "ok"
             job.last_error = None
 
@@ -540,12 +540,12 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _produce(job):
+        async def _produce(job, meta=None):
             job.set_run_result("run one output")
             job.last_status = "ok"
             job.last_error = None
 
-        async def _no_output(job):
+        async def _no_output(job, meta=None):
             job.last_status = "ok"
             job.last_error = None
 

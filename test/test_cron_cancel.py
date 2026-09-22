@@ -67,7 +67,8 @@ class TestCronServiceCancel:
         svc._jobs = [job]
         svc._executing.add("run1")
         svc._job_start_times["run1"] = time.time() - 42
-        svc._job_run_meta["run1"] = (time.time() - 42, "manual")
+        meta = (time.time() - 42, "manual")
+        svc._job_run_meta["run1"] = meta
         task = MagicMock(done=MagicMock(return_value=False))
         svc._running_tasks["run1"] = task
         refresh_calls: list[str] = []
@@ -78,7 +79,7 @@ class TestCronServiceCancel:
 
         assert job.last_status == "error"
         assert "Cancelled by user" in (job.last_error or "")
-        assert "run1" in svc._cancelled_jobs
+        assert svc._cancelled_jobs.has("run1", meta)
         assert "run1" not in svc._executing
         assert "run1" not in svc._job_start_times
         assert "run1" not in svc._running_tasks
@@ -151,15 +152,17 @@ class TestCronServiceCancel:
         svc._history = CronHistoryStore(base_dir=tmp_path)
         job = _make_job("run3")
         svc._jobs = [job]
-        svc._cancelled_jobs.add("run3")
+        meta = (time.time(), "manual")
+        svc._job_run_meta["run3"] = meta
+        svc._cancelled_jobs.mark("run3", meta)
 
         with patch.object(svc, "_merge_job_result") as mock_merge:
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, meta)
 
         mock_merge.assert_not_called()
         _, total = await svc._history.get_job_history("run3")
         assert total == 0
-        assert "run3" not in svc._cancelled_jobs  # flag consumed
+        assert not svc._cancelled_jobs.has("run3", meta)  # flag consumed
 
 
 class TestSubprocessRegistry:
