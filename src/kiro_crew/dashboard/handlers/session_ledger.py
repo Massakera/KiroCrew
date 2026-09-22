@@ -201,3 +201,143 @@ def _session_unit(state: DashboardState, session_key: str) -> str:
     except Exception:
         logger.debug("session ledger: resolving the calling session's unit failed", exc_info=True)
         return ""
+
+
+def _creator_owned_slot(
+    state: DashboardState, caller_key: str, target_session_key: str
+) -> tuple[object | None, web.Response | None]:
+    """The slot for *target_session_key*, if *caller_key* created it.
+
+    The same ownership rule ``session_read_message`` enforces, reached the same
+    way ``handlers/work_ledger.py`` reaches it: ``session_create`` stamps
+    ``_created_by`` with the calling session's key inside the synchronous window
+    after the mint, and it is the only entry point that does -- a person's own tab
+    stays unattributed, so an unattributed slot is owned by nobody and is refused.
+
+    Three spellings are tried because one dashboard session is legitimately
+    spelled both ``dashboard_chat-X`` and ``chat-X``; :func:`session_ledger.ledger_key`
+    is the lossless fold between them.
+
+    Workspace is checked too. It is the memory boundary ``authorize_target``
+    already refuses across, and a ledger carries a workstream's goal and artifacts,
+    which is exactly the kind of state that boundary exists to keep apart.
+
+    Returns ``(slot, None)`` or ``(None, refusal)``.
+    """
+    folded = session_ledger.ledger_key(target_session_key)
+    slot = None
+    for candidate in (target_session_key, folded, f"dashboard_{folded}"):
+        try:
+            slot = state.get_slot(candidate)
+        except Exception:  # pragma: no cover - a slot-table read must not 500
+            logger.debug("child ledger: slot lookup failed for %s", candidate, exc_info=True)
+            slot = None
+        if slot is not None:
+            break
+    if slot is None:
+        # 404 rather than 403: the caller is allowed to ask, and there is nothing
+        # there. The ownership refusal below is what protects a slot that DOES
+        # exist, so the pair is not an existence oracle for sessions the caller
+        # could not read anyway -- it created them or it gets nothing.
+        return None, web.json_response(
+            {
+                "error": (
+                    "That session is not open, so its ledger cannot be read. A "
+                    "conductor reads the ledgers of sessions it created."
+                ),
+                "code": "unknown_child_session",
+            },
+            status=404,
+        )
+    creator = session_ledger.ledger_key(str(getattr(slot, "_created_by", "") or ""))
+    if not creator or creator != caller_key:
+        sel().log_api_access(
+            caller=caller_key,
+            operation="session_ledger_read_child",
+            outcome="denied",
+            source="mcp",
+            resources=f"target={folded}:child_not_owned",
+            error="That session was not created by this one.",
+        )
+        return None, web.json_response(
+            {
+                "error": (
+                    "That session was not created by this one, so its ledger is "
+                    "not readable from here. A session reads its own ledger and "
+                    "the ledgers of the sessions it created."
+                ),
+                "code": "child_not_owned",
+            },
+            status=403,
+        )
+    caller_slot = None
+    for candidate in (caller_key, f"dashboard_{caller_key}"):
+        try:
+            caller_slot = state.get_slot(candidate)
+        except Exception:  # pragma: no cover
+            caller_slot = None
+        if caller_slot is not None:
+            break
+    if caller_slot is not None:
+        mine = str(getattr(caller_slot, "workspace", "default") or "default")
+        theirs = str(getattr(slot, "workspace", "default") or "default")
+        if mine != theirs:
+            sel().log_api_access(
+                caller=caller_key,
+                operation="session_ledger_read_child",
+                outcome="denied",
+                source="mcp",
+                resources=f"target={folded}:child_cross_workspace",
+                error="That session is in a different workspace.",
+            )
+            return None, web.json_response(
+                {
+                    "error": (
+                        "That session is in a different workspace. Workspace is "
+                        "the memory boundary, and a ledger is not readable across it."
+                    ),
+                    "code": "child_cross_workspace",
+                },
+                status=403,
+            )
+    return slot, None
+
+
+async def api_session_ledger_child_get(request: web.Request) -> web.Response:
+    """GET /api/session-ledger/child?target=<session_key> — a CHILD's ledger.
+
+    The read a conductor needs to act on a wake, and the only way it can get one:
+    a ledger lives under a fenced path, so a shell listing there shows the
+    sandbox placeholder and proves nothing. Permission is creator-only, identical
+    to ``session_read_message`` -- the caller's identity comes from the vetted
+    session header and the target from the query, so a caller can only ever widen
+    its reach to sessions it created itself.
+
+    Same response shape as the self-read, deliberately: a conductor that can
+    already read its own ledger needs no second shape to learn, and the board and
+    the wake snapshot are then one projection rather than two.
+    """
+    caller_key, refusal = await _resolve_ledger_key(request, "session_ledger_read_child")
+    if refusal is not None:
+        return refusal
+    assert caller_key is not None
+    target = (request.query.get("target") or "").strip()
+    if not target:
+        return web.json_response(
+            {"error": "target is required", "code": "missing_target"}, status=400
+        )
+    state: DashboardState = request.app["state"]
+    slot, denied = _creator_owned_slot(state, caller_key, target)
+    if denied is not None:
+        return denied
+    assert slot is not None
+    folded = session_ledger.ledger_key(target)
+    # The CHILD's own unit, not the caller's: the fold joins the units that child
+    # recorded under, and passing the caller's would read the wrong slot's log.
+    state_record = await asyncio.to_thread(
+        session_ledger.read_state,
+        folded,
+        _session_unit(state, target),
+    )
+    events = state_record.get("events", [])[-session_ledger._MAX_EVENT_TAIL :]
+    return web.json_response({"state": state_record, "events": events, "child": folded})
