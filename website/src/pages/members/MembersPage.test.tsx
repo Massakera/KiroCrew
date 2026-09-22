@@ -24,6 +24,9 @@ import {
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The roster's team grouping reads the team list; "no teams" keeps the
+    // list flat, which is the shape every case here was written against.
+    teams: { list: vi.fn(() => Promise.resolve({ teams: [] })), update: vi.fn() },
     memberThread: vi.fn(),
     memberActivity: vi.fn(() => Promise.resolve({ slug: '', member: '', capped: false, entries: [] })),
     // The Notes tab's read. "No notes yet" is the state every case not about
@@ -32,6 +35,8 @@ vi.mock('../../api/client', () => ({
     // The Work log's session record (CrewLogTab) reads the thread's crew-log
     // folds; an empty, resolved read renders its own quiet empty state.
     sessionCrewLogProjections: vi.fn(() => Promise.resolve({ folds: {}, resolved: true, writesDrained: true })),
+    // The team view's "Needs you" reads each bound crewmate's chat tail.
+    chatSlotDetail: vi.fn(() => Promise.resolve({ messages: [] })),
     // The auto-patrol block and roster badge read the whole loop registry;
     // the default is "feature on, nothing armed" so every other case renders
     // the page without a loop in the way.
@@ -263,6 +268,8 @@ beforeEach(() => {
   // outlives clearAllMocks); a leaked rejection renders the roster's patrol
   // error alert into every later case.
   vi.mocked(api.autonudgeList).mockImplementation(() => Promise.resolve({ enabled: true, loops: [] }))
+  // A case that grouped the roster by team must not leave its team list behind.
+  vi.mocked(api.teams.list).mockImplementation(() => Promise.resolve({ teams: [] }))
   // The remembered member must not leak between cases.
   localStorage.clear()
   // The projection store is a module-level singleton fed by the roster seed;
@@ -1114,8 +1121,204 @@ describe('MembersPage side panel (Notes / Work log / Dashboard) and edit jump', 
     // explicit ?tab=crews, same as the edit affordance). It opens the create
     // form directly — `new=1` — not the crew list a second click would be
     // needed on (#9513), and names its origin so the create can return here.
-    fireEvent.click(screen.getByTestId('member-add'))
+    // The "+" opens a menu (a team can be added here too); its first row is
+    // the crewmate entry and carries the navigation.
+    // Radix opens the dropdown on pointerdown (mouse), not click.
+    fireEvent.pointerDown(screen.getByTestId('member-add'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByTestId('member-add-crewmate'))
     expect(navigateSpy).toHaveBeenCalledWith('/capabilities?tab=crews&new=1&from=members')
+  })
+
+  it('the "+" menu offers New team, which opens the team dialog with every crewmate listed', async () => {
+    await renderPage([row({ name: 'oncall', slug: 'oncall' }), row({ name: 'docs', slug: 'docs' })])
+    await rosterRow('oncall')
+    // Radix opens the dropdown on pointerdown (mouse), not click.
+    fireEvent.pointerDown(screen.getByTestId('member-add'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByTestId('member-add-team'))
+    const body = await screen.findByTestId('team-dialog-body')
+    expect(within(body).getAllByTestId('team-dialog-row')).toHaveLength(2)
+    // Nothing on a team yet: every row says so, and the hint names the rule.
+    expect(within(body).getAllByText('No team')).toHaveLength(2)
+    expect(within(body).getByText(/on one team at a time/i)).toBeInTheDocument()
+    // Create is gated on a name.
+    expect(screen.getByTestId('team-dialog-save')).toBeDisabled()
+    fireEvent.change(screen.getByTestId('team-dialog-name'), { target: { value: 'Triage' } })
+    expect(screen.getByTestId('team-dialog-save')).toBeEnabled()
+  })
+
+  it('groups the roster by team with a trailing "No team" group, and a team header opens the team view', async () => {
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Triage', members: ['oncall'] }] })
+    await renderPage([row({ name: 'oncall', slug: 'oncall' }), row({ name: 'docs', slug: 'docs' })])
+    await rosterRow('oncall')
+    const headers = await screen.findAllByTestId('team-group-header')
+    // Teams in their stored order, the unlisted rows last under "No team".
+    expect(headers.map((h) => h.dataset.team)).toEqual(['abc123abc123', 'no-team'])
+    expect(headers[0]).toHaveTextContent('Triage')
+    expect(headers[1]).toHaveTextContent('No team')
+    // Selecting the header opens the team view where a chat would be: the URL
+    // names the team, no member is open, and the empty-pane sentence is gone.
+    fireEvent.click(headers[0])
+    const view = await screen.findByTestId('team-view')
+    expect(view.dataset.team).toBe('abc123abc123')
+    expect(currentUrl()).toBe('/members?team=abc123abc123')
+    expect(within(view).getAllByTestId('team-status-row')).toHaveLength(1)
+    expect(within(view).getByTestId('team-status-row')).toHaveTextContent('oncall')
+    expect(screen.queryByText(/Pick a member/i)).toBeNull()
+    expect(screen.queryByTestId('member-thread-header')).toBeNull()
+    // Never talked to: nothing can be waiting, and the week is empty.
+    expect(await within(view).findByTestId('team-inbox-empty')).toBeInTheDocument()
+    expect(await within(view).findByTestId('team-week-empty')).toBeInTheDocument()
+  })
+
+  it('the team view lists an unanswered question with at most two answer controls and says a chip only drafts', async () => {
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Triage', members: ['oncall'] }] })
+    vi.mocked(api.chatSlotDetail).mockResolvedValue({
+      messages: [
+        { role: 'user', content: 'Fix the flake.', ts: '2026-09-22T10:00:00Z' },
+        { role: 'assistant', content: 'Merge as is, keep digging, or park it?\n\n[OPTIONS: Merge as is | Find the race | Park it]', ts: '2026-09-22T10:05:00Z' },
+      ],
+    } as never)
+    await renderPage([row({ name: 'oncall', slug: 'oncall', bound: true, slot_key: 'member-oncall' })])
+    await rosterRow('oncall')
+    fireEvent.click((await screen.findAllByTestId('team-group-header'))[0])
+    const view = await screen.findByTestId('team-view')
+    const card = await within(view).findByTestId('team-inbox-card')
+    // Three options: one chip plus ONE overflow menu holding the rest -- never
+    // three peer buttons in a row.
+    expect(within(card).getAllByTestId('team-inbox-option')).toHaveLength(1)
+    expect(within(card).getByTestId('team-inbox-option')).toHaveTextContent('Merge as is')
+    expect(within(card).getByTestId('team-inbox-option-more')).toBeInTheDocument()
+    // The chip's effect is written where the reader looks, not only in a tooltip.
+    expect(within(card).getByTestId('team-inbox-option-lead')).toHaveTextContent(/drafts a reply in oncall's chat; nothing is sent until you do/i)
+  })
+
+  it('two answers render as two chips with no overflow menu', async () => {
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Triage', members: ['oncall'] }] })
+    vi.mocked(api.chatSlotDetail).mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Ship it?\n\n[OPTIONS: Yes | No]', ts: '2026-09-22T10:05:00Z' }],
+    } as never)
+    await renderPage([row({ name: 'oncall', slug: 'oncall', bound: true, slot_key: 'member-oncall' })])
+    await rosterRow('oncall')
+    fireEvent.click((await screen.findAllByTestId('team-group-header'))[0])
+    const card = await within(await screen.findByTestId('team-view')).findByTestId('team-inbox-card')
+    expect(within(card).getAllByTestId('team-inbox-option').map((b) => b.textContent)).toEqual(['Yes', 'No'])
+    expect(within(card).queryByTestId('team-inbox-option-more')).toBeNull()
+  })
+
+  it('a team with no crewmates keeps its header and opens an empty team view', async () => {
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Release', members: [] }] })
+    await renderPage([row({ name: 'oncall', slug: 'oncall' })])
+    await rosterRow('oncall')
+    const headers = await screen.findAllByTestId('team-group-header')
+    // The empty team is still the user's team: its header is the way back to
+    // Edit team, so it stays -- at "0 crewmates" -- above the No-team group.
+    expect(headers.map((h) => h.dataset.team)).toEqual(['abc123abc123', 'no-team'])
+    expect(headers[0]).toHaveTextContent('Release')
+    expect(headers[0]).toHaveTextContent('0 crewmates')
+    fireEvent.click(headers[0])
+    const view = await screen.findByTestId('team-view')
+    expect(within(view).getByTestId('team-empty')).toBeInTheDocument()
+    expect(within(view).getByTestId('team-edit')).toBeInTheDocument()
+  })
+
+  it('a crewmate waiting on the user with no question in its tail gets a plain waiting card', async () => {
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Triage', members: ['oncall'] }] })
+    vi.mocked(api.chatSlotDetail).mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Running the approval now.', ts: '2026-09-22T10:05:00Z' }],
+    } as never)
+    const { store } = await renderPage([row({ name: 'oncall', slug: 'oncall', bound: true, slot_key: 'member-oncall' })])
+    await rosterRow('oncall')
+    act(() => {
+      store.dispatch(sseSlots([{ key: 'member-oncall', mode: 'member', running: false, needs_input: true, messages: 3 }] as never))
+    })
+    fireEvent.click((await screen.findAllByTestId('team-group-header'))[0])
+    const view = await screen.findByTestId('team-view')
+    // The strip says waiting, so the inbox must not say "nothing waiting":
+    // a card without a bubble names the state and offers the chat.
+    const card = await within(view).findByTestId('team-inbox-card')
+    expect(within(card).getByTestId('team-inbox-waiting')).toHaveTextContent(/waiting on you in its chat/i)
+    expect(within(card).queryByTestId('team-inbox-bubble')).toBeNull()
+    expect(within(card).getByTestId('team-inbox-open')).toBeInTheDocument()
+    expect(within(view).queryByTestId('team-inbox-empty')).toBeNull()
+  })
+
+  it('the inbox reads a chat only through the thread endpoint, never the roster binding', async () => {
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Triage', members: ['oncall'] }] })
+    // The roster binding names one slot; the thread endpoint confirms another.
+    vi.mocked(api.chatSlotDetail).mockResolvedValue({ messages: [{ role: 'assistant', content: 'Ship it?', ts: '2026-09-22T10:05:00Z' }] } as never)
+    await renderPage([row({ name: 'oncall', slug: 'oncall', bound: true, slot_key: 'member-oncall-stale' })], 'kirocrew', {
+      thread: { slot_key: 'member-oncall-confirmed', slug: 'oncall', member: 'oncall' },
+    })
+    await rosterRow('oncall')
+    fireEvent.click((await screen.findAllByTestId('team-group-header'))[0])
+    const view = await screen.findByTestId('team-view')
+    await within(view).findByTestId('team-inbox-card')
+    expect(api.memberThread).toHaveBeenCalledWith('oncall')
+    const tailKeys = vi.mocked(api.chatSlotDetail).mock.calls.map((c) => c[0])
+    expect(tailKeys).toContain('member-oncall-confirmed')
+    expect(tailKeys).not.toContain('member-oncall-stale')
+  })
+
+  it('the Edit team dialog sends only the field it changed, so a stale dialog cannot clobber the other', async () => {
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Triage', members: ['oncall'] }] })
+    const update = vi.mocked(api.teams.update)
+    update.mockResolvedValue({ team: { id: 'abc123abc123', name: 'Release', members: ['oncall'] } })
+    await renderPage([row({ name: 'oncall', slug: 'oncall' }), row({ name: 'scribe', slug: 'scribe' })])
+    await rosterRow('oncall')
+    fireEvent.click((await screen.findAllByTestId('team-group-header'))[0])
+    const view = await screen.findByTestId('team-view')
+    fireEvent.click(within(view).getByTestId('team-edit'))
+    await screen.findByTestId('team-dialog-body')
+    // Nothing changed yet: an edit with nothing to send stays disabled.
+    expect(screen.getByTestId('team-dialog-save')).toBeDisabled()
+    fireEvent.change(screen.getByTestId('team-dialog-name'), { target: { value: 'Release' } })
+    expect(screen.getByTestId('team-dialog-save')).toBeEnabled()
+    fireEvent.click(screen.getByTestId('team-dialog-save'))
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1))
+    // The rename alone travels; membership is omitted so the route keeps whatever is current.
+    expect(update).toHaveBeenCalledWith('abc123abc123', { name: 'Release' })
+  })
+
+  it('a team header says it opens the team, and the New team dialog guards an unsaved draft against Escape', async () => {
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Triage', members: ['oncall'] }] })
+    await renderPage([row({ name: 'oncall', slug: 'oncall' }), row({ name: 'docs', slug: 'docs' })])
+    await rosterRow('oncall')
+    const header = (await screen.findAllByTestId('team-group-header'))[0]
+    // The header's click opens rather than folds, so it says so.
+    expect(within(header).getByTestId('team-group-open')).toHaveTextContent('Open team')
+    expect(header).toHaveAttribute('aria-label', 'Open team Triage')
+    // The New team dialog: nothing typed -> Escape closes; a typed name -> Escape is ignored.
+    // Radix opens the dropdown on pointerdown (mouse), not click.
+    fireEvent.pointerDown(screen.getByTestId('member-add'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByTestId('member-add-team'))
+    await screen.findByTestId('team-dialog-body')
+    // A crewmate already on a team reads "On Triage", not a bare team name.
+    expect(screen.getAllByTestId('team-dialog-row').map((r) => r.textContent)).toEqual(
+      expect.arrayContaining([expect.stringContaining('On Triage')]),
+    )
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByTestId('team-dialog-body')).toBeNull())
+    // Radix opens the dropdown on pointerdown (mouse), not click.
+    fireEvent.pointerDown(screen.getByTestId('member-add'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByTestId('member-add-team'))
+    await screen.findByTestId('team-dialog-body')
+    fireEvent.change(screen.getByTestId('team-dialog-name'), { target: { value: 'Release' } })
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(screen.getByTestId('team-dialog-body')).toBeInTheDocument()
+    // Cancel is the deliberate exit and still works.
+    fireEvent.click(screen.getByTestId('team-dialog-cancel'))
+    await waitFor(() => expect(screen.queryByTestId('team-dialog-body')).toBeNull())
+  })
+
+  it('a collapsed team hides its rows and the fold persists per team', async () => {
+    vi.mocked(api.teams.list).mockResolvedValue({ teams: [{ id: 'abc123abc123', name: 'Triage', members: ['oncall'] }] })
+    await renderPage([row({ name: 'oncall', slug: 'oncall' }), row({ name: 'docs', slug: 'docs' })])
+    await rosterRow('oncall')
+    fireEvent.click(screen.getByTestId('team-group-toggle'))
+    await waitFor(() => expect(within(screen.getByTestId('member-roster')).queryByText('oncall')).toBeNull())
+    // The other group is untouched, and the fold is remembered by team id.
+    expect(await rosterRow('docs')).toBeInTheDocument()
+    expect(JSON.parse(localStorage.getItem('mc-members-teams-collapsed') ?? '[]')).toEqual(['abc123abc123'])
   })
 
   it('the empty roster\'s call to action lands on the same create form as the header "+"', async () => {
