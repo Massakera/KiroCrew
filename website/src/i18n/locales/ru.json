@@ -7230,6 +7230,10 @@
       "generating_diagram": "создание диаграммы…",
       "image_failed_to_load": "Не удалось загрузить изображение",
       "image_file_no_longer_exists": "Файл изображения больше не существует",
+      "remote_image_click_to_load": "Внешнее изображение заблокировано — нажмите, чтобы загрузить",
+      "remote_media_loads_once": "Ради приватности загрузит только этот файл с указанного сайта, один раз.",
+      "remote_media_loads_once_plural": "Ради приватности загрузит только эти файлы с указанных сайтов, один раз.",
+      "remote_media_model_description": "В сообщении описано как: «{{description}}»",
       "reset_zoom": "Сбросить масштаб (0)",
       "zoom_in": "Увеличить (+)",
       "zoom_out": "Уменьшить (-)",
@@ -7243,7 +7247,11 @@
       "diagram_source": "Исходный код диаграммы",
       "copy_failed": "Не удалось скопировать",
       "mermaid_render_failed": "Не удалось отобразить эту диаграмму. Вместо неё показан исходный код.",
-      "image_position": "{{index}} из {{total}}"
+      "image_position": "{{index}} из {{total}}",
+      "remote_video_click_to_load": "Внешнее видео заблокировано — нажмите, чтобы загрузить",
+      "remote_audio_click_to_load": "Внешнее аудио заблокировано — нажмите, чтобы загрузить",
+      "remote_media_site": "Сайт: <host/>",
+      "remote_media_sites": "Сайты: <host/>"
     },
     "markdownToc": {
       "contents": "Содержание",

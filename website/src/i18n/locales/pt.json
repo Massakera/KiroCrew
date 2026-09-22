@@ -7127,6 +7127,10 @@
       "generating_diagram": "gerando diagrama…",
       "image_failed_to_load": "Falha ao carregar a imagem",
       "image_file_no_longer_exists": "O arquivo de imagem não existe mais",
+      "remote_image_click_to_load": "Imagem externa bloqueada — clique para carregar",
+      "remote_media_loads_once": "Por privacidade, carrega apenas este arquivo do site indicado, uma única vez.",
+      "remote_media_loads_once_plural": "Por privacidade, carrega apenas estes arquivos dos sites indicados, uma única vez.",
+      "remote_media_model_description": "Descrito na mensagem como: “{{description}}”",
       "reset_zoom": "Redefinir zoom (0)",
       "zoom_in": "Ampliar (+)",
       "zoom_out": "Reduzir (-)",
@@ -7140,7 +7144,11 @@
       "diagram_source": "Código-fonte do diagrama",
       "copy_failed": "Falha ao copiar",
       "mermaid_render_failed": "Não foi possível renderizar este diagrama. Exibindo o código-fonte.",
-      "image_position": "{{index}} de {{total}}"
+      "image_position": "{{index}} de {{total}}",
+      "remote_video_click_to_load": "Vídeo externo bloqueado — clique para carregar",
+      "remote_audio_click_to_load": "Áudio externo bloqueado — clique para carregar",
+      "remote_media_site": "Site: <host/>",
+      "remote_media_sites": "Sites: <host/>"
     },
     "markdownToc": {
       "contents": "Conteúdo",

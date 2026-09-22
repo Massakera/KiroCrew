@@ -7127,6 +7127,10 @@
       "generating_diagram": "génération du diagramme…",
       "image_failed_to_load": "Échec du chargement de l'image",
       "image_file_no_longer_exists": "Le fichier image n'existe plus",
+      "remote_image_click_to_load": "Image externe bloquée — cliquer pour charger",
+      "remote_media_loads_once": "Par confidentialité, charge uniquement ce fichier depuis le site indiqué, une seule fois.",
+      "remote_media_loads_once_plural": "Par confidentialité, charge uniquement ces fichiers depuis les sites indiqués, une seule fois.",
+      "remote_media_model_description": "Décrit dans le message comme : « {{description}} »",
       "reset_zoom": "Réinitialiser le zoom (0)",
       "zoom_in": "Zoom avant (+)",
       "zoom_out": "Zoom arrière (-)",
@@ -7140,7 +7144,11 @@
       "diagram_source": "Source du diagramme",
       "copy_failed": "Échec de la copie",
       "mermaid_render_failed": "Impossible d’afficher ce diagramme. La source est affichée à la place.",
-      "image_position": "{{index}} sur {{total}}"
+      "image_position": "{{index}} sur {{total}}",
+      "remote_video_click_to_load": "Vidéo externe bloquée — cliquer pour charger",
+      "remote_audio_click_to_load": "Audio externe bloqué — cliquer pour charger",
+      "remote_media_site": "Site : <host/>",
+      "remote_media_sites": "Sites : <host/>"
     },
     "markdownToc": {
       "contents": "Sommaire",

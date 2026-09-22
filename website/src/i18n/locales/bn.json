@@ -7024,6 +7024,10 @@
       "generating_diagram": "ডায়াগ্রাম তৈরি হচ্ছে…",
       "image_failed_to_load": "ছবি লোড করা যায়নি",
       "image_file_no_longer_exists": "ছবির ফাইলটি আর নেই",
+      "remote_image_click_to_load": "বাহ্যিক ছবি ব্লক করা হয়েছে — লোড করতে ক্লিক করো",
+      "remote_media_loads_once": "গোপনীয়তার জন্য দেখানো সাইট থেকে শুধু এই ফাইলটি একবারই লোড করো।",
+      "remote_media_loads_once_plural": "গোপনীয়তার জন্য দেখানো সাইটগুলো থেকে শুধু এই ফাইলগুলো একবারই লোড করো।",
+      "remote_media_model_description": "মেসেজে বর্ণনা করা হয়েছে: “{{description}}”",
       "reset_zoom": "জুম রিসেট করুন (0)",
       "zoom_in": "জুম ইন (+)",
       "zoom_out": "জুম আউট (-)",
@@ -7037,7 +7041,11 @@
       "diagram_source": "ডায়াগ্রামের সোর্স",
       "copy_failed": "কপি ব্যর্থ",
       "mermaid_render_failed": "এই ডায়াগ্রামটি রেন্ডার করা যায়নি। এর পরিবর্তে সোর্স দেখানো হচ্ছে।",
-      "image_position": "{{total}}টির মধ্যে {{index}}"
+      "image_position": "{{total}}টির মধ্যে {{index}}",
+      "remote_video_click_to_load": "বাহ্যিক ভিডিও ব্লক করা হয়েছে — লোড করতে ক্লিক করো",
+      "remote_audio_click_to_load": "বাহ্যিক অডিও ব্লক করা হয়েছে — লোড করতে ক্লিক করো",
+      "remote_media_site": "সাইট: <host/>",
+      "remote_media_sites": "সাইটগুলো: <host/>"
     },
     "markdownToc": {
       "contents": "বিষয়সূচি",

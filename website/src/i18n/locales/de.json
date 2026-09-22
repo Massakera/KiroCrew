@@ -7024,6 +7024,10 @@
       "generating_diagram": "Diagramm wird erstellt…",
       "image_failed_to_load": "Bild konnte nicht geladen werden",
       "image_file_no_longer_exists": "Bilddatei existiert nicht mehr",
+      "remote_image_click_to_load": "Externes Bild blockiert — zum Laden klicken",
+      "remote_media_loads_once": "Aus Datenschutzgründen wird nur diese Datei von der angezeigten Website geladen, einmalig.",
+      "remote_media_loads_once_plural": "Aus Datenschutzgründen werden nur diese Dateien von den angezeigten Websites geladen, einmalig.",
+      "remote_media_model_description": "In der Nachricht beschrieben als: „{{description}}“",
       "reset_zoom": "Zoom zurücksetzen (0)",
       "zoom_in": "Vergrößern (+)",
       "zoom_out": "Verkleinern (-)",
@@ -7037,7 +7041,11 @@
       "diagram_source": "Diagrammquelltext",
       "copy_failed": "Kopieren fehlgeschlagen",
       "mermaid_render_failed": "Dieses Diagramm konnte nicht gerendert werden. Stattdessen wird der Quelltext angezeigt.",
-      "image_position": "{{index}} von {{total}}"
+      "image_position": "{{index}} von {{total}}",
+      "remote_video_click_to_load": "Externes Video blockiert — zum Laden klicken",
+      "remote_audio_click_to_load": "Externes Audio blockiert — zum Laden klicken",
+      "remote_media_site": "Website: <host/>",
+      "remote_media_sites": "Websites: <host/>"
     },
     "markdownToc": {
       "contents": "Inhalt",

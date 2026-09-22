@@ -6921,6 +6921,10 @@
       "generating_diagram": "다이어그램을 생성하는 중…",
       "image_failed_to_load": "이미지를 불러오지 못했습니다",
       "image_file_no_longer_exists": "이미지 파일이 더 이상 존재하지 않습니다",
+      "remote_image_click_to_load": "외부 이미지 차단됨 — 클릭하여 불러오기",
+      "remote_media_loads_once": "개인정보 보호를 위해 표시된 사이트에서 이 파일만 한 번 불러옵니다.",
+      "remote_media_loads_once_plural": "개인정보 보호를 위해 표시된 사이트들에서 이 파일들만 한 번 불러옵니다.",
+      "remote_media_model_description": "메시지에 적힌 설명: ‘{{description}}’",
       "reset_zoom": "확대/축소 초기화 (0)",
       "zoom_in": "확대 (+)",
       "zoom_out": "축소 (-)",
@@ -6934,7 +6938,11 @@
       "diagram_source": "다이어그램 소스",
       "copy_failed": "복사 실패",
       "mermaid_render_failed": "이 다이어그램을 렌더링할 수 없습니다. 대신 소스를 표시합니다.",
-      "image_position": "{{total}}개 중 {{index}}번째"
+      "image_position": "{{total}}개 중 {{index}}번째",
+      "remote_video_click_to_load": "외부 동영상 차단됨 — 클릭하여 불러오기",
+      "remote_audio_click_to_load": "외부 오디오 차단됨 — 클릭하여 불러오기",
+      "remote_media_site": "사이트: <host/>",
+      "remote_media_sites": "사이트: <host/>"
     },
     "markdownToc": {
       "contents": "목차",

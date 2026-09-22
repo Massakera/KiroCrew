@@ -4705,7 +4705,15 @@
       "download_image": "Download image",
       "generating_diagram": "generating diagram…",
       "image_failed_to_load": "Image failed to load",
-      "image_file_no_longer_exists": "Image file no longer exists"
+      "image_file_no_longer_exists": "Image file no longer exists",
+      "remote_image_click_to_load": "External image blocked — click to load",
+      "remote_media_loads_once": "For privacy, loads only this file from the site shown, one time.",
+      "remote_media_loads_once_plural": "For privacy, loads only these files from the sites shown, one time.",
+      "remote_media_model_description": "Described in the message as: “{{description}}”",
+      "remote_video_click_to_load": "External video blocked — click to load",
+      "remote_audio_click_to_load": "External audio blocked — click to load",
+      "remote_media_site": "Site: <host/>",
+      "remote_media_sites": "Sites: <host/>"
     },
     "markdownToc": {
       "contents": "Contents",

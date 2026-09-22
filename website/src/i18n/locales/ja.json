@@ -6921,6 +6921,10 @@
       "generating_diagram": "ダイアグラムを生成中…",
       "image_failed_to_load": "画像を読み込めませんでした",
       "image_file_no_longer_exists": "画像ファイルはもう存在しません",
+      "remote_image_click_to_load": "外部画像をブロック — クリックして読み込み",
+      "remote_media_loads_once": "プライバシー保護のため、表示中のサイトからこのファイルのみを 1 回だけ読み込みます。",
+      "remote_media_loads_once_plural": "プライバシー保護のため、表示中のサイトからこれらのファイルのみを 1 回だけ読み込みます。",
+      "remote_media_model_description": "メッセージ内の説明:「{{description}}」",
       "reset_zoom": "ズームをリセット (0)",
       "zoom_in": "ズームイン (+)",
       "zoom_out": "ズームアウト (-)",
@@ -6934,7 +6938,11 @@
       "diagram_source": "図のソース",
       "copy_failed": "コピーできませんでした",
       "mermaid_render_failed": "この図を描画できませんでした。代わりにソースを表示します。",
-      "image_position": "{{total}} 枚中 {{index}} 枚目"
+      "image_position": "{{total}} 枚中 {{index}} 枚目",
+      "remote_video_click_to_load": "外部動画をブロック — クリックして読み込み",
+      "remote_audio_click_to_load": "外部音声をブロック — クリックして読み込み",
+      "remote_media_site": "サイト: <host/>",
+      "remote_media_sites": "サイト: <host/>"
     },
     "markdownToc": {
       "contents": "目次",

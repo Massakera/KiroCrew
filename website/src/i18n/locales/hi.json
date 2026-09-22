@@ -7024,6 +7024,10 @@
       "generating_diagram": "डायग्राम बन रहा है…",
       "image_failed_to_load": "छवि लोड नहीं हो सकी",
       "image_file_no_longer_exists": "छवि फ़ाइल अब मौजूद नहीं है",
+      "remote_image_click_to_load": "बाहरी छवि अवरोधित — लोड करने के लिए क्लिक करें",
+      "remote_media_loads_once": "निजता के लिए, दिखाई गई साइट से केवल यह फ़ाइल एक ही बार लोड होती है।",
+      "remote_media_loads_once_plural": "निजता के लिए, दिखाई गई साइटों से केवल ये फ़ाइलें एक ही बार लोड होती हैं।",
+      "remote_media_model_description": "संदेश में इसका विवरण: “{{description}}”",
       "reset_zoom": "ज़ूम रीसेट करें (0)",
       "zoom_in": "ज़ूम इन (+)",
       "zoom_out": "ज़ूम आउट (-)",
@@ -7037,7 +7041,11 @@
       "diagram_source": "आरेख स्रोत",
       "copy_failed": "कॉपी विफल",
       "mermaid_render_failed": "यह आरेख रेंडर नहीं किया जा सका। इसके बजाय स्रोत दिखाया जा रहा है।",
-      "image_position": "{{total}} में से {{index}}"
+      "image_position": "{{total}} में से {{index}}",
+      "remote_video_click_to_load": "बाहरी वीडियो अवरोधित — लोड करने के लिए क्लिक करें",
+      "remote_audio_click_to_load": "बाहरी ऑडियो अवरोधित — लोड करने के लिए क्लिक करें",
+      "remote_media_site": "साइट: <host/>",
+      "remote_media_sites": "साइटें: <host/>"
     },
     "markdownToc": {
       "contents": "विषय-सूची",
