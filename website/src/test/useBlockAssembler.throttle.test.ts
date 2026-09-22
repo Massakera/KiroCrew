@@ -70,18 +70,67 @@ describe('useBlockAssembler streaming throttle', () => {
     expect(result.current).toEqual(parseBlocks(text, false))
   })
 
-  it('returns a stable reference across renders inside one window', () => {
+  it('returns a stable reference when the text has not changed', () => {
     const { result, rerender } = renderHook(
       ({ text }) => useBlockAssembler(text, true),
       { initialProps: { text: 'alpha' } },
     )
     const first = result.current
-    rerender({ text: 'alpha beta' })
-    rerender({ text: 'alpha beta gamma' })
+    rerender({ text: 'alpha' })
+    rerender({ text: 'alpha' })
     expect(result.current).toBe(first)
   })
 
-  it('holds the stale parse inside a window and lands an exact parse when streaming ends', () => {
+  it('extends the tail block per render inside a window, keeping settled block identity', () => {
+    const opening = 'settled paragraph\n```js\nconst x = 1'
+    const { result, rerender } = renderHook(
+      ({ text }) => useBlockAssembler(text, true),
+      { initialProps: { text: opening } },
+    )
+    const before = result.current
+    expect(before).toHaveLength(2)
+
+    // No timer advance: the growth must be visible in the SAME window.
+    rerender({ text: opening + ' + 2' })
+    const after = result.current
+    expect(after).toHaveLength(2)
+    // Settled block: same object, so memoized renderers skip it.
+    expect(after[0]).toBe(before[0])
+    // Tail block: text is current even though no structural parse ran.
+    expect(after[1].content).toBe('const x = 1 + 2')
+    expect(after[1].complete).toBe(false)
+  })
+
+  it('starts a synthetic markdown tail when the snapshot ended on a closed block', () => {
+    const closed = '```js\nconst x = 1\n```'
+    const { result, rerender } = renderHook(
+      ({ text }) => useBlockAssembler(text, true),
+      { initialProps: { text: closed } },
+    )
+    act(() => { vi.advanceTimersByTime(THROTTLE_MS) })
+    expect(result.current).toHaveLength(1)
+
+    rerender({ text: closed + '\nAnd then' })
+    expect(result.current).toHaveLength(2)
+    expect(result.current[1].type).toBe('markdown')
+    expect(result.current[1].content).toContain('And then')
+  })
+
+  it('does not extend across a rewrite that is not a pure extension', () => {
+    const { result, rerender } = renderHook(
+      ({ text }) => useBlockAssembler(text, true),
+      { initialProps: { text: 'original text' } },
+    )
+    act(() => { vi.advanceTimersByTime(THROTTLE_MS) })
+    const snap = result.current
+    rerender({ text: 'rewritten' })
+    // Not an extension: hold the snapshot; the next tick re-parses exactly.
+    expect(result.current).toBe(snap)
+    act(() => { vi.advanceTimersByTime(THROTTLE_MS) })
+    expect(result.current).toEqual(parseBlocks('rewritten', true))
+  })
+
+  it('keeps structure stale inside a window but text fresh, and lands an exact parse when streaming ends', () => {
     const opening = 'intro\n```js\nconst x = 1'
     const closed = 'intro\n```js\nconst x = 1\n```\noutro'
 
@@ -93,9 +142,12 @@ describe('useBlockAssembler streaming throttle', () => {
     expect(result.current).toEqual(parseBlocks(opening, true))
 
     rerender({ text: closed, streaming: true })
-    // Pins that the throttle defers: a settled result is identical either way,
-    // so only the moment of the write separates throttled from unthrottled.
-    expect(result.current).toEqual(parseBlocks(opening, true))
+    // Pins that the throttle defers STRUCTURE: the closing fence has not been
+    // reclassified yet (the code block is still provisional), but the streamed
+    // characters are already visible inside the tail block.
+    expect(result.current).toHaveLength(2)
+    expect(result.current[1].complete).toBe(false)
+    expect(result.current[1].content).toContain('outro')
     expect(result.current).not.toEqual(parseBlocks(closed, true))
 
     rerender({ text: closed, streaming: false })
