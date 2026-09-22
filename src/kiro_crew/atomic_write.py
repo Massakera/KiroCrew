@@ -499,7 +499,7 @@ def fsync_dir(path: Path | str, *, best_effort: bool = False) -> None:
         )
 
 
-def read_bytes_with_retry(path: Path | str) -> bytes:
+def read_bytes_with_retry(path: Path | str, *, max_bytes: int | None = None) -> bytes:
     """``Path.read_bytes()``, retrying the Windows sharing-violation window.
 
     The read-side twin of :func:`replace_with_retry`, and the same OS fact seen
@@ -530,11 +530,17 @@ def read_bytes_with_retry(path: Path | str) -> bytes:
     The final attempt sits OUTSIDE the loop for the same reason it does in
     :func:`replace_with_retry`: with it inside, a budget of 0 would fall out
     having read nothing and return ``None`` to a caller expecting bytes.
+
+    ``max_bytes`` bounds the allocation, not the file: at most that many bytes
+    are read and returned, so a caller enforcing a size cap passes ``cap + 1``
+    and refuses the document when the result is longer than ``cap`` -- without
+    first allocating whatever an oversized file at the path happens to hold.
+    ``None`` (the default) reads the whole file.
     """
     target = Path(path)
     for attempt in range(_REPLACE_MAX_ATTEMPTS - 1):
         try:
-            return target.read_bytes()
+            return _read_bytes(target, max_bytes)
         except PermissionError:
             if not platform_compat.IS_WINDOWS:
                 raise
@@ -552,7 +558,15 @@ def read_bytes_with_retry(path: Path | str) -> bytes:
                 _REPLACE_MAX_ATTEMPTS,
             )
             time.sleep(_REPLACE_BACKOFF_SECONDS)
-    return target.read_bytes()
+    return _read_bytes(target, max_bytes)
+
+
+def _read_bytes(target: Path, max_bytes: int | None) -> bytes:
+    """One read attempt: whole file, or the first ``max_bytes`` bytes of it."""
+    if max_bytes is None:
+        return target.read_bytes()
+    with target.open("rb") as handle:
+        return handle.read(max_bytes)
 
 
 def _resolved_or_none(path: Path) -> Path | None:

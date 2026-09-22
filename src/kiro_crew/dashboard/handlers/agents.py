@@ -20,7 +20,9 @@ from typing import Any
 
 from aiohttp import BodyPartReader, web
 
-from kiro_crew import agent_state, model_registry, model_scope
+from kiro_crew import agent_state
+from kiro_crew import crew_teams as teams_mod
+from kiro_crew import model_registry, model_scope
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
@@ -4361,17 +4363,45 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
             # asyncio lock while the worker is mid-write.
             to_add = {n: cfg.agents[n] for n in synced if n in cfg.agents}
 
-            def _write_sync() -> list[str]:
+            def _write_sync() -> tuple[list[str], list[str], list[str]]:
                 retired_stores: list[str] = []
+                # The names _mutate REALLY deleted -- a subset of the snapshot
+                # candidates, because an entry edited between the snapshot and
+                # the lock hold survives (see the comment inside _mutate).
+                deleted_names: list[str] = []
+                # Names this sync could NOT register: their stale team
+                # membership could not be purged (see below).
+                deferred_names: list[str] = []
 
                 def _mutate(doc: dict) -> dict | None:
                     agents = coerce_dict_section(doc, "agents")
                     stores = coerce_dict_section(doc, "memory_stores")
                     changed = False
+                    deferred_names.clear()
                     for aname, acfg in to_add.items():
-                        if aname not in agents:
-                            agents[aname] = dataclasses.asdict(acfg)
-                            changed = True
+                        if aname in agents:
+                            continue
+                        # A discovered name may have been a crew before (its
+                        # package was removed and has come back): purge any
+                        # stale team membership INSIDE this locked mutation,
+                        # right before the name is registered, as every create
+                        # path does. The sync is periodic, so a name whose
+                        # purge cannot be made is left out of THIS sync and
+                        # picked up by the next one -- never registered while
+                        # its old membership could resurface.
+                        try:
+                            teams_mod.release_for_create(aname)
+                        except teams_mod.TeamsUnavailable:
+                            logger.warning(
+                                "sync: deferring agent %r -- its stale team membership "
+                                "could not be purged; retrying next sync",
+                                aname,
+                                exc_info=True,
+                            )
+                            deferred_names.append(aname)
+                            continue
+                        agents[aname] = dataclasses.asdict(acfg)
+                        changed = True
                     # Prune ONLY this sync's snapshot candidates, and only
                     # while the in-lock entry still equals the snapshot entry:
                     # an agent (re)added or edited between the discovery
@@ -4389,18 +4419,34 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
                                     )
                                 retired_stores.append(store_name)
                             del agents[aname]
+                            deleted_names.append(aname)
                             changed = True
                     return doc if changed else None
 
+                def _drop_pruned() -> None:
+                    # A pruned package agent may be on a team; drop it like the
+                    # delete route does -- AFTER the registry write committed,
+                    # still inside its lock. ONLY the names _mutate actually
+                    # deleted: a snapshot candidate that survived (edited
+                    # concurrently) keeps its team. Best-effort: the list route
+                    # reconciles against the registry anyway.
+                    for deleted_name in deleted_names:
+                        teams_mod.drop_member(deleted_name)
+
                 with memory_store_namespace_lock():
-                    update_config_locked(mutate=_mutate)
+                    update_config_locked(mutate=_mutate, after_write=_drop_pruned)
                 from kiro_crew.context import release_cached_memory_store
 
                 for store_name in retired_stores:
                     release_cached_memory_store(store_name)
-                return retired_stores
+                return retired_stores, deleted_names, deferred_names
 
-            retired_stores = await _drained_to_thread(_write_sync)
+            retired_stores, deleted_names, deferred_names = await _drained_to_thread(_write_sync)
+            # A deferred name is NOT a synced name: it leaves `synced` too, so
+            # neither the response nor the audit record reports a registration
+            # that did not happen (a refusal is not a commit).
+            if deferred_names:
+                synced[:] = [n for n in synced if n not in deferred_names]
             if (state := request.app.get("state")) is not None:
                 from kiro_crew.dashboard.handlers._shared import release_markdown_memory_store
 
@@ -4832,6 +4878,14 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+        # A crew that carried this name before may still be listed on a team
+        # (every removal path drops it best-effort). persist_member_config
+        # purges that INSIDE the registry's locked mutation, right before the
+        # record is published, on every create path: the in-process config
+        # lock keeps this process's team writes out, and the cross-process
+        # sidecar lock keeps `kirocrew agent create` out, so no writer can
+        # create and team the same name between the purge and the registration.
+        # A purge that cannot be made refuses the create (409 below).
         new_agent = KiroCrewAgentConfig(
             kiro_agent=kiro_agent,
             workspace=body.get("workspace", "default"),
@@ -4872,6 +4926,16 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
         except MemberAlreadyExists:
             return web.json_response(
                 {"error": f"Agent '{name}' already exists", "code": "agent_exists"}, status=409
+            )
+        except teams_mod.TeamsUnavailable as exc:
+            return web.json_response(
+                {
+                    "error": f"A previous crew named '{name}' may still be on a team and "
+                    f"the crew-teams store is unavailable ({exc}); retry once it is "
+                    "readable and writable.",
+                    "code": "teams_unavailable",
+                },
+                status=409,
             )
         except (OSError, UnknownMemoryStore) as exc:
             return web.json_response(
@@ -5457,7 +5521,19 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
                 del agents[name]
                 return doc
 
-            update_config_locked(mutate=mutate)
+            # Drop the crew from its team AFTER the registry write has
+            # committed and still INSIDE its lock. After the commit, so a
+            # config write that fails leaves the membership untouched (the
+            # crew stays, on its team); inside the lock, so a same-name create
+            # in another process (which needs this same sidecar lock) cannot
+            # land between the delete and the drop and have its fresh
+            # membership dropped instead. Best-effort (drop_member swallows
+            # its own failures): a team entry the drop could not remove is
+            # hidden by every reader and purged by the next same-name create.
+            def _drop_from_team() -> None:
+                teams_mod.drop_member(name)
+
+            update_config_locked(mutate=mutate, after_write=_drop_from_team)
             return retired_store
 
         retired_store = await _drained_to_thread(_delete_member)

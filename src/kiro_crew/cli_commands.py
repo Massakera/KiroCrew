@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from kiro_crew import __version__, app_lifecycle_client, beacon, platform_compat
+from kiro_crew import __version__, app_lifecycle_client, beacon, crew_teams, platform_compat
 from kiro_crew.agent import reset_agent_model
 from kiro_crew.apps.bridges import (
     deregister_app,
@@ -401,7 +401,9 @@ class _CliConflict(Exception):
     """
 
 
-def _locked_config_write(mutate, *, cleanup_conflict=None, cleanup_failure=None) -> None:
+def _locked_config_write(
+    mutate, *, cleanup_conflict=None, cleanup_failure=None, after_write=None
+) -> None:
     """Run one config delta under the sidecar flock; exit(1) on a conflict.
 
     A load -> mutate dataclass -> ``cfg.save()`` shape cannot be used here: its
@@ -415,11 +417,13 @@ def _locked_config_write(mutate, *, cleanup_conflict=None, cleanup_failure=None)
     ``cleanup_conflict`` runs before the exit(1) on a refused precondition;
     ``cleanup_failure`` runs when the write itself fails -- the workspace
     create passes its staging-drop / install-rollback handlers here.
+    ``after_write`` runs inside the lock once the write has committed (see
+    ``update_config_locked``).
     """
     from kiro_crew.config import loader as _loader
 
     try:
-        _loader.update_config_locked(_loader.config_path(), mutate=mutate)
+        _loader.update_config_locked(_loader.config_path(), mutate=mutate, after_write=after_write)
     except _CliConflict as exc:
         if cleanup_conflict is not None:
             cleanup_conflict()
@@ -1264,6 +1268,11 @@ def _handle_agent(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        # A crew that carried this name before may still be listed on a team
+        # (every removal path drops it best-effort). persist_member_config
+        # purges that INSIDE the registry's locked mutation, right before the
+        # name is registered, on every create path; a purge that cannot be made
+        # refuses the create (TeamsUnavailable, answered below).
         cfg.agents[args.name] = KiroCrewAgentConfig(
             kiro_agent=args.kiro_agent,
             workspace=args.workspace,
@@ -1285,6 +1294,15 @@ def _handle_agent(args: argparse.Namespace) -> None:
                     previous_store=previous_store,
                     previous_member_id=previous_member_id,
                 )
+            if isinstance(exc, crew_teams.TeamsUnavailable):
+                print(
+                    f"Error: cannot create agent '{args.name}': a previous crew of that "
+                    f"name may still be on a team and the crew-teams store is unavailable "
+                    f"({exc}); fix or remove {crew_teams.teams_path()} (an absent file "
+                    "reads as no teams), then retry",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             if not isinstance(exc, (OSError, UnknownMemoryStore)):
                 raise
             print(f"Error: {exc}", file=sys.stderr)
@@ -1351,8 +1369,20 @@ def _handle_agent(args: argparse.Namespace) -> None:
             del agents[args.name]
             return doc
 
+        # Same best-effort drop as the dashboard delete route, and in the same
+        # place: AFTER the registry write has committed and still INSIDE its
+        # lock. After the commit, so a config write that fails leaves the
+        # membership as it was (the crew stays, on its team); inside the lock,
+        # so a same-name create in another process (which needs this lock)
+        # cannot land between the delete and the drop. A stale team entry is
+        # hidden by every reader and never turns a committed delete into a
+        # failure; the recreate-under-the-same-name harm is closed on the
+        # create path (release_name), not here.
+        def _drop_from_team() -> None:
+            crew_teams.drop_member(args.name)
+
         with memory_store_namespace_lock():
-            _locked_config_write(_mutate_agent_delete)
+            _locked_config_write(_mutate_agent_delete, after_write=_drop_from_team)
         print(f"Deleted agent: {args.name}")
 
     elif action == "reset-model":

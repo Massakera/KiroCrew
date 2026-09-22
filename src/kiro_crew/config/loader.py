@@ -1534,8 +1534,15 @@ def update_config_locked(
     stamp_meta: bool = True,
     on_corrupt: Literal["fail", "reset"] = "fail",
     wait_for_lock: bool = True,
+    after_write: Callable[[], None] | None = None,
 ) -> dict:
     """Perform an atomic read-modify-write of a config file under an advisory lock.
+
+    ``after_write`` runs INSIDE the lock, only after the rename has committed the
+    new document (never when ``mutate`` returned ``None``): the hook for a
+    companion record that must follow the registry change and must not be
+    interleaved with another writer's -- the crew-teams drop that accompanies a
+    crew delete. Its exceptions propagate; the config write has already landed.
 
     The locked primitive for every DIRECT
     ``write_config_atomically(config_path())`` caller outside this module, and
@@ -1678,6 +1685,8 @@ def update_config_locked(
         # than on its next poll.
         _invalidate_config_cache()
         _notify_live_watch()
+        if after_write is not None:
+            after_write()
         return result
 
 

@@ -1442,6 +1442,111 @@ class TestAgentCli:
         assert "spare" not in _read_doc(cfg_path)["agents"]
         assert "Deleted agent: spare" in capsys.readouterr().out
 
+    def test_delete_drops_the_crew_from_its_team_best_effort(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Same contract as the dashboard delete: the crew is dropped from its
+        team, and a store that cannot even be locked never refuses the delete
+        (the recreate-inherits harm is closed on the create path instead)."""
+        from kiro_crew import crew_teams
+
+        cfg = _cfg_with(
+            agents={"default": KiroCrewAgentConfig(), "spare": KiroCrewAgentConfig()},
+        )
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        dropped: list[str] = []
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            patch.object(crew_teams, "drop_member", lambda name: dropped.append(name)),
+        ):
+            cc._handle_agent(_ns(agent_action="delete", name="spare"))
+        assert dropped == ["spare"]
+        assert "spare" not in _read_doc(cfg_path)["agents"]
+        assert "Deleted agent: spare" in capsys.readouterr().out
+
+        class _Broken:
+            def __enter__(self):
+                raise OSError("crew-teams: lock file unwritable")
+
+            def __exit__(self, *exc):
+                return False
+
+        cfg = _cfg_with(
+            agents={"default": KiroCrewAgentConfig(), "other": KiroCrewAgentConfig()},
+        )
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            patch.object(crew_teams, "document_lock", lambda: _Broken()),
+        ):
+            cc._handle_agent(_ns(agent_action="delete", name="other"))
+        assert "other" not in _read_doc(cfg_path)["agents"]
+        assert "Deleted agent: other" in capsys.readouterr().out
+
+    def test_create_releases_the_name_from_a_stale_team_first(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A name a deleted crew left on a team is purged BEFORE the new crew
+        is registered, so it never inherits the old membership."""
+        from kiro_crew import crew_teams
+
+        cfg = _cfg_with(agents={})
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        released: list[str] = []
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            patch.object(crew_teams, "release_name", lambda name: released.append(name)),
+        ):
+            cc._handle_agent(
+                _ns(
+                    agent_action="create",
+                    name="new",
+                    kiro_agent="ka",
+                    workspace="ws",
+                    memory_store="",
+                )
+            )
+        assert released == ["new"]
+        assert "new" in _read_doc(cfg_path)["agents"]
+
+    def test_create_is_refused_while_a_stale_membership_cannot_be_purged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Registering the name while its old team entry cannot be removed is
+        exactly what would expose that entry, so the create is refused with
+        the registry untouched."""
+        from kiro_crew import crew_teams
+
+        cfg = _cfg_with(agents={})
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+
+        def _boom(name: str) -> bool:
+            raise OSError("crew-teams: disk full")
+
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            patch.object(crew_teams, "release_name", _boom),
+            pytest.raises(SystemExit) as exc,
+        ):
+            cc._handle_agent(
+                _ns(
+                    agent_action="create",
+                    name="new",
+                    kiro_agent="ka",
+                    workspace="ws",
+                    memory_store="",
+                )
+            )
+        assert exc.value.code == 1
+        assert "new" not in _read_doc(cfg_path)["agents"]
+        out = capsys.readouterr()
+        assert "Created agent" not in out.out
+        assert "cannot create agent 'new'" in out.err
+
     def test_delete_default_is_refused(self, capsys: pytest.CaptureFixture[str]) -> None:
         cfg = _cfg_with(agents={"default": KiroCrewAgentConfig()})
         with (

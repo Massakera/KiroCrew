@@ -436,6 +436,15 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # is SKIPPED, which on a fresh install is exactly the disposition this entry
     # exists to deny.
     "crew-panels",
+    # Crewmate teams (``crew_teams.py``): which crewmates are on which team. The
+    # same shape as ``crew-panels`` and for the same reason it is not under
+    # ``trust/``: a team is the OWNER's grouping, so the crewmates it groups must
+    # not be able to rewrite it, and ``trust`` stays sandbox read-write. Two
+    # owner-invoked writers open it, neither sandboxed: the gateway (the
+    # owner-gated ``/api/teams`` routes, the crew create/delete/package-sync
+    # hooks) and ``kirocrew agent create`` / ``delete`` from the operator's shell. Whole
+    # directory: ``atomic_write`` publishes through a sibling temp.
+    "crew-teams",
     # Auth stores and signing keys owned by the gateway web server alone.
     "token_signing.key",
     "refresh_chains.json",
@@ -1534,6 +1543,11 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     # otherwise the first sandbox spawned before the first grant write sees an
     # unmasked leaf appear later.
     "tag-grants",
+    # The crewmate-teams store is created on the first team the owner makes, so a
+    # sandbox spawned before that finds the name absent and the mask is vacuous
+    # for its lifetime; materialised empty at 0700 so the bind always has a
+    # target.
+    "crew-teams",
 )
 
 #: The masked md-notebook leaves materialised before a namespace spawn, and what each
