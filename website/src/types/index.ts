@@ -1476,6 +1476,7 @@ export interface SubagentInfo {
 
 export interface SessionInfo {
   key: string; title?: string; messages: number; created?: string; modified?: number; agent?: string; memory_mode?: 'persistent' | 'incognito' | 'temporary'
+  folder_id?: string; tags?: string[]; is_subagent?: boolean
 }
 
 export interface TaskDetail {

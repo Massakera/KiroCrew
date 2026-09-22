@@ -992,6 +992,17 @@ class SessionCatalogProjection:
                 "modified": stat.st_mtime,
                 "created": datetime.fromtimestamp(stat.st_mtime).isoformat(),
             }
+            # Flag sub-agent/sub-task sessions so the dashboard can filter them
+            # out of the "Older Sessions" list by default. Keyed purely on the
+            # session-key prefix, mirroring validation.infer_use_case's
+            # "subagent" case. A runtime ``subagent:`` key lands on disk as
+            # ``subagent_`` (``_safe_key`` maps the colon to an underscore), so
+            # the underscore form is what actually fires here; the colon form is
+            # kept for defensive symmetry. ``_bg`` is deliberately NOT flagged:
+            # it is the background session, and the "Show sub-agent sessions"
+            # toggle label would not describe it.
+            if key.startswith("subagent:") or key.startswith("subagent_"):
+                meta["is_subagent"] = True
             # Try metadata cache first (populated by _read_metadata calls)
             cached_meta = self._log._meta_cache.get(key)
             if (
@@ -1009,6 +1020,8 @@ class SessionCatalogProjection:
                 meta["memory_mode"] = d.get("memory_mode", "persistent")
                 if d.get("folder_id"):
                     meta["folder_id"] = d["folder_id"]
+                if d.get("tags"):
+                    meta["tags"] = list(d["tags"])
             else:
                 # Read only the first line for metadata
                 try:
@@ -1026,6 +1039,8 @@ class SessionCatalogProjection:
                             meta["memory_mode"] = d.get("memory_mode", "persistent")
                             if d.get("folder_id"):
                                 meta["folder_id"] = d["folder_id"]
+                            if d.get("tags"):
+                                meta["tags"] = list(d["tags"])
                             # Guarded publish — discard the fill if a write
                             # invalidated this key inside the stat → read
                             # window (see the generation snapshot above).

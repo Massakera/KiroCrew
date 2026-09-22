@@ -11170,7 +11170,12 @@
       "opening_session_locally": "Открываем этот сеанс здесь…",
       "opens_here_runs_on_instance": "Откроет этот сеанс здесь — его выполнение продолжится на {{name}}",
       "opens_on_crew_switches_there": "Откроется на {{name}} — переключит на этот Crew, а не здесь",
-      "remote_instances_list_unavailable": "Не удалось получить список удалённых команд, поэтому их сеансы не показаны."
+      "remote_instances_list_unavailable": "Не удалось получить список удалённых команд, поэтому их сеансы не показаны.",
+      "show_subagent_sessions": "Показать сессии субагентов",
+      "all_subagent_sessions_hidden_one": "Скрыта {{count}} сессия субагента. Выберите «Показать сессии субагентов», чтобы увидеть её.",
+      "all_subagent_sessions_hidden_few": "Скрыто {{count}} сессии субагентов. Выберите «Показать сессии субагентов», чтобы увидеть их.",
+      "all_subagent_sessions_hidden_many": "Скрыто {{count}} сессий субагентов. Выберите «Показать сессии субагентов», чтобы увидеть их.",
+      "all_subagent_sessions_hidden_other": "Скрыто {{count}} сессии субагентов. Выберите «Показать сессии субагентов», чтобы увидеть их."
     },
     "connectionsPage": {
       "action_failed": "Не удалось выполнить действие: {{error}}",

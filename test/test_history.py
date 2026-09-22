@@ -246,6 +246,38 @@ class TestConversationLog:
         assert by_key["t-filed"].get("folder_id") == "folder-123"
         assert "folder_id" not in by_key["t-unfiled"]
 
+    def test_list_sessions_surfaces_tags(self, tmp_path):
+        """list_sessions() surfaces tag ids from the metadata line so the
+        dashboard can render inline tag badges."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t-tagged", "user", "hi")
+        log.update_metadata("t-tagged", {"tags": ["tag-1", "tag-2"]})
+        log.append("t-untagged", "user", "hi")
+        by_key = {s["key"]: s for s in log.list_sessions()}
+        assert by_key["t-tagged"].get("tags") == ["tag-1", "tag-2"]
+        # A session with no tags carries no tags key at all (not an empty list),
+        # matching how folder_id is omitted when unset.
+        assert "tags" not in by_key["t-untagged"]
+
+    def test_list_sessions_flags_subagent_sessions(self, tmp_path):
+        """list_sessions() flags sub-agent/sub-task sessions by key prefix so the
+        dashboard can hide them from Older Sessions by default.
+
+        A ``subagent:`` key lands on disk as ``subagent_`` (``_safe_key`` maps
+        the colon to an underscore), so the underscore-prefix check is what
+        actually fires. The ``_bg`` background session is deliberately NOT
+        flagged: the "Show sub-agent sessions" toggle label would not describe
+        it."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("subagent:df09562c", "user", "spawned work")
+        log.append("_bg", "user", "background work")
+        log.append("chat-1-100", "user", "a real conversation")
+        by_key = {s["key"]: s for s in log.list_sessions()}
+        assert by_key["subagent_df09562c"].get("is_subagent") is True
+        # The background session and a normal chat are not flagged (key absent).
+        assert "is_subagent" not in by_key["_bg"]
+        assert "is_subagent" not in by_key["chat-1-100"]
+
     def test_search_sessions_surfaces_folder_id(self, tmp_path):
         """search_sessions() results carry folder_id — the frontend groups on it."""
         log = ConversationLog(base_dir=tmp_path)
