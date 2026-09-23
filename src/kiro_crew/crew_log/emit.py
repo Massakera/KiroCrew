@@ -4970,5 +4970,14 @@ def _record_session_tree_edge(
             # An unreadable header orders nothing and blocks nothing.
             created_at = 0
         record_opened(session_id, slot, created_at, parent_slot, superseded)
-    except Exception:  # pragma: no cover -- defensive; record_opened guards itself
-        logger.debug("session tree projection not advanced for %s", session_id, exc_info=True)
+    except Exception as exc:  # pragma: no cover -- defensive; record_opened guards itself
+        # Rendered to TEXT for the reason :func:`_report` gives: ``log`` is a live
+        # handle, an ``exc_info`` triple keeps this frame on the record, and a handler
+        # that keeps records would then hold the handle's write lease. Debug level,
+        # because the append has already landed and a missed edge is recovered by the
+        # projection's tail replay.
+        logger.debug(
+            "session tree projection not advanced for %s:\n%s",
+            session_id,
+            "".join(traceback.format_exception(exc)).rstrip(),
+        )
