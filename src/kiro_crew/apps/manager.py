@@ -1179,9 +1179,12 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
                 # redirect them into another app's tree. Deferred import:
                 # backend imports this module at load, so the reverse import
                 # must not run at module level (same pattern as bridges).
-                from kiro_crew.apps.backend import _PinnedDir
+                from kiro_crew.apps.backend import _pinned_ancestors, _PinnedDir
 
-                _data_pin = _PinnedDir(data)
+                # Canonical above the app directory, literal from its name
+                # down: pin_parent refuses any link it walks, so a home reached
+                # through one is resolved first and <name>/data never is.
+                _data_pin = _PinnedDir(_pinned_ancestors(dest) / "data")
             if data.is_dir():
                 # data/ preservation exists for USER data. The gateway's own
                 # generated dependency trees (data/.kirocrew-deps*) must NOT
