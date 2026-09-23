@@ -52,7 +52,9 @@ def _frames(rel: str) -> list[dict]:
 
 
 def _result_with(frames: list[dict], key: str) -> dict:
-    return next(f["result"] for f in frames if isinstance(f.get("result"), dict) and key in f["result"])
+    return next(
+        f["result"] for f in frames if isinstance(f.get("result"), dict) and key in f["result"]
+    )
 
 
 # ── droid: what the recorded frames establish ──
@@ -104,9 +106,9 @@ def test_droid_has_no_steer_and_no_compact_on_its_acp_surface() -> None:
     assert ACP_BACKEND_DROID not in ACP_BACKENDS_STEERING_EXTENSION
 
     compact = _frames("droid/compact-as-prompt-live.jsonl")
-    assert any(f.get("error", {}).get("code") == -32603 for f in compact), (
-        "/compact must reach the model as a turn, not be answered as a command"
-    )
+    assert any(
+        f.get("error", {}).get("code") == -32603 for f in compact
+    ), "/compact must reach the model as a turn, not be answered as a command"
     assert ACP_BACKEND_DROID not in ACP_BACKENDS_COMPACT
 
 
@@ -189,7 +191,10 @@ async def test_a_droid_resume_is_adopted_from_the_recorded_load(tmp_path: pathli
     assert "_meta" not in load_params, "droid reads no kiro session_file"
     assert client._session_id == "sess-droid-live-b"
     assert client._resumed is True
-    assert ("session/set_config_option", {"sessionId": "sess-droid-live-b", "configId": "autonomy_level", "value": "normal"}) in sent
+    assert (
+        "session/set_config_option",
+        {"sessionId": "sess-droid-live-b", "configId": "autonomy_level", "value": "normal"},
+    ) in sent
 
 
 # ── codex: _session/steering on the runtime-served handle ──

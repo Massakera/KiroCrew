@@ -871,7 +871,9 @@ class ContinuationCoordinator(ManagerComponent):
                 try:
                     outcome = await provider.inject_steering(message)
                 except Exception:
-                    logger.warning("steer_run %s: _session/steering failed", agent_id, exc_info=True)
+                    logger.warning(
+                        "steer_run %s: _session/steering failed", agent_id, exc_info=True
+                    )
                     outcome = "failed"
                 ok = outcome == "injected"
                 fallback_reason = f"_session/steering answered {outcome or 'nothing'}"
