@@ -624,6 +624,15 @@ export function useChatPageResourcesController({
     return () => window.removeEventListener(PREVIEW_SNIP_EVENT, onSnip)
   }, [snipSlotRef, activeSlotRef, takeScreenshot, setSnipFrame])
 
+  // Holds the in-flight upload's controller so the composer's cancel control
+  // can abort it. One at a time by construction: every attach entry point is
+  // disabled while `uploading`, so a second upload cannot start.
+  const uploadAbortRef = useRef<AbortController | null>(null)
+  /** Abort the composer upload in flight, if any. */
+  const cancelUpload = useCallback(() => {
+    uploadAbortRef.current?.abort()
+  }, [])
+
   /** Upload files via browser File API (cross-platform) */
   const uploadFiles = useCallback(async (files: File[], targetSlot?: string | null) => {
     if (!files.length) return
@@ -642,8 +651,10 @@ export function useChatPageResourcesController({
     const big = files.find(f => !VIDEO_EXT.test(f.name) && f.size > 50 * 1024 * 1024)
     if (big) { setUploadHint(i18nT('pages.chatPage.file_too_large', { name: big.name })); return }
     setUploading(true)
+    const controller = new AbortController()
+    uploadAbortRef.current = controller
     try {
-      const res = await api.uploadFiles(files)
+      const res = await api.uploadFiles(files, controller.signal)
       if (res.error) {
         setUploadError(i18nT('pages.chatPage.upload_failed_error', { error: res.error }))
       } else if (res.paths?.length) {
@@ -659,8 +670,19 @@ export function useChatPageResourcesController({
       if (!res.error && res.resizedByPath && Object.keys(res.resizedByPath).length) {
         setResizedInfo(prev => ({ ...prev, ...res.resizedByPath }))
       }
-    } catch { setUploadError(i18nT('pages.chatPage.upload_failed_check_file_type_and_size_max_50_mb')) }
-    setUploading(false)
+    } catch (err) {
+      // A cancel the user asked for is not a failure. Without this branch the
+      // blanket message blames file type and a 50 MB cap for a 150 MB
+      // recording the user deliberately stopped.
+      if ((err as Error | undefined)?.name !== 'AbortError') {
+        setUploadError(i18nT('pages.chatPage.upload_failed_check_file_type_and_size_max_50_mb'))
+      }
+    } finally {
+      // Only clear the ref when it still holds THIS request's controller, so a
+      // later upload's controller is never dropped by an earlier settle.
+      if (uploadAbortRef.current === controller) uploadAbortRef.current = null
+      setUploading(false)
+    }
   }, [activeSlotRef, setUploadError, setUploadHint, setUploading, setPendingFiles, fileDrafts, saveDrafts, setResizedInfo])
 
   // The Browser panel's element annotations arrive as a DRAFT plus a marker
@@ -760,6 +782,7 @@ export function useChatPageResourcesController({
     handleFileSave,
     handleCapture,
     uploadFiles,
+    cancelUpload,
     handleOptimizeResult,
     dragOver,
     dropTargetProps,
