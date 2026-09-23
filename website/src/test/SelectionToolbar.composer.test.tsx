@@ -313,6 +313,45 @@ describe('SelectionToolbar — composer mode', () => {
     expect(composer.onClose).not.toHaveBeenCalled()
   })
 
+  it('Cmd/Ctrl+C copies the selection EXACTLY as made, boundary whitespace included', async () => {
+    // A double-click word selection carries its trailing space; the anchor is
+    // trimmed, the copy must not be.
+    render(<Harness actions={actions} composer={composer} />)
+    const input = await openComposer(' beta ')
+    expect(composer.onOpen).toHaveBeenCalledWith('beta')
+    fireEvent.keyDown(input, { key: 'c', ctrlKey: true })
+    await waitFor(() => expect(copyToClipboardMock).toHaveBeenCalledWith(' beta '))
+  })
+
+  it('Cmd/Ctrl+C copies EVERY range of a multi-range selection, though the anchor is the first', async () => {
+    render(<Harness actions={actions} composer={composer} />)
+    const textNode = screen.getByTestId('container').firstChild as Text
+    const mk = (word: string) => {
+      const r = document.createRange()
+      r.setStart(textNode, TEXT.indexOf(word)); r.setEnd(textNode, TEXT.indexOf(word) + word.length)
+      return r
+    }
+    const ranges = [mk('alpha'), mk('gamma')]
+    const sel = window.getSelection()!
+    sel.removeAllRanges(); sel.addRange(ranges[0])
+    // Only Gecko exposes more than one range; shape the Selection the way it does.
+    Object.defineProperty(sel, 'rangeCount', { configurable: true, get: () => ranges.length })
+    Object.defineProperty(sel, 'getRangeAt', { configurable: true, value: (i: number) => ranges[i] })
+    Object.defineProperty(sel, 'toString', { configurable: true, value: () => 'alpha gamma' })
+    try {
+      fireEvent.mouseUp(document, { clientX: 100, clientY: 50 })
+      const input = await screen.findByLabelText('Comment on the selected text')
+      expect(composer.onOpen).toHaveBeenCalledWith('alpha')
+      fireEvent.keyDown(input, { key: 'c', ctrlKey: true })
+      // The anchor is range 0; the copy is the whole selection.
+      await waitFor(() => expect(copyToClipboardMock).toHaveBeenCalledWith('alpha gamma'))
+    } finally {
+      delete (sel as unknown as Record<string, unknown>).rangeCount
+      delete (sel as unknown as Record<string, unknown>).getRangeAt
+      delete (sel as unknown as Record<string, unknown>).toString
+    }
+  })
+
   it('Cmd/Ctrl+C with a draft is the textarea\u2019s own shortcut and never copies the document text', async () => {
     render(<Harness actions={actions} composer={composer} />)
     const input = await openComposer()
@@ -797,6 +836,145 @@ describe('SelectionToolbar — plain row without a composer (chat)', () => {
     expect(copy).toHaveTextContent('Copy')
     expect(screen.queryByLabelText('Comment on the selected text')).toBeNull()
     expect(screen.queryByTestId('selection-composer')).toBeNull()
+  })
+})
+
+/**
+ * A selection the document does not hold — made inside a sandboxed iframe and
+ * relayed by its bridge (the artifact pages), or in a code editor — reaches the
+ * toolbar as `externalSelection`. With a composer it must open the SAME box the
+ * DOM path opens: the host hears `onOpen` before focus moves, and a submit
+ * carries the external text. Without this the artifact pages would need a second
+ * comment input for their iframe bodies.
+ */
+function ExternalHarness({ actions, composer, externalSelection }: {
+  actions: SelectionAction[]
+  composer?: SelectionComposer
+  externalSelection: { text: string; x: number; y: number } | null
+}) {
+  const ref = useRef<HTMLDivElement>(null)
+  return (
+    <div>
+      <div ref={ref} data-testid="container">{TEXT}</div>
+      <SelectionToolbar containerRef={ref} actions={actions} composer={composer} externalSelection={externalSelection} />
+    </div>
+  )
+}
+
+describe('SelectionToolbar — composer opened from an external selection', () => {
+  const external = { text: 'from the frame', x: 20, y: 40 }
+
+  it('opens the composer, telling the host first, and submits the external text', async () => {
+    let activeAtOpen: string | undefined
+    composer.onOpen = vi.fn(() => { activeAtOpen = document.activeElement?.tagName })
+    render(<ExternalHarness actions={actions} composer={composer} externalSelection={external} />)
+    const input = await screen.findByLabelText('Comment on the selected text')
+    expect(composer.onOpen).toHaveBeenCalledWith('from the frame')
+    expect(activeAtOpen).not.toBe('TEXTAREA')
+    await waitFor(() => expect(input).toHaveFocus())
+
+    fireEvent.change(input, { target: { value: 'looks off' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add comment' }))
+    expect(composer.onSubmit).toHaveBeenCalledWith('looks off', 'from the frame')
+    await waitFor(() => expect(screen.queryByTestId('selection-composer')).toBeNull())
+    // Submit and close are exclusive here as on the DOM path.
+    expect(composer.onClose).not.toHaveBeenCalled()
+  })
+
+  it('sits BELOW the point the host handed over, never over the annotated line', async () => {
+    // The external point is the selection's bottom-left and carries no height;
+    // the DOM path's above-the-selection placement would put the box over the
+    // line itself, so the external path takes the below placement.
+    render(<ExternalHarness actions={actions} composer={composer} externalSelection={external} />)
+    await screen.findByLabelText('Comment on the selected text')
+    const positioned = composerBox().parentElement as HTMLElement
+    await waitFor(() => expect(positioned.style.top).toBe(`${external.y + 8}px`))
+  })
+
+  it('Escape closes it and the host hears onClose once', async () => {
+    render(<ExternalHarness actions={actions} composer={composer} externalSelection={external} />)
+    const input = await screen.findByLabelText('Comment on the selected text')
+    fireEvent.keyDown(input, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByTestId('selection-composer')).toBeNull())
+    expect(composer.onClose).toHaveBeenCalledTimes(1)
+    expect(composer.onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('a new external selection over a typed draft does not re-anchor the draft', async () => {
+    const { rerender } = render(<ExternalHarness actions={actions} composer={composer} externalSelection={external} />)
+    const input = await screen.findByLabelText('Comment on the selected text')
+    fireEvent.change(input, { target: { value: 'about the first passage' } })
+    rerender(<ExternalHarness actions={actions} composer={composer} externalSelection={{ text: 'another passage', x: 30, y: 60 }} />)
+    // The host was told about the first open only; the box keeps its draft.
+    expect(composer.onOpen).toHaveBeenCalledTimes(1)
+    expect(input).toHaveValue('about the first passage')
+    fireEvent.click(screen.getByRole('button', { name: 'Add comment' }))
+    expect(composer.onSubmit).toHaveBeenCalledWith('about the first passage', 'from the frame')
+  })
+
+  it('a fresh external selection over an EMPTY box re-opens it for the host', async () => {
+    const { rerender } = render(<ExternalHarness actions={actions} composer={composer} externalSelection={external} />)
+    await screen.findByLabelText('Comment on the selected text')
+    rerender(<ExternalHarness actions={actions} composer={composer} externalSelection={{ text: 'another passage', x: 30, y: 60 }} />)
+    expect(composer.onOpen).toHaveBeenCalledTimes(2)
+    expect(composer.onOpen).toHaveBeenLastCalledWith('another passage')
+    fireEvent.change(screen.getByLabelText('Comment on the selected text'), { target: { value: 'x' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add comment' }))
+    expect(composer.onSubmit).toHaveBeenCalledWith('x', 'another passage')
+  })
+
+  it('clearing the external selection closes the box and tells the host once, so nothing can be submitted against a revoked anchor', async () => {
+    const { rerender } = render(<ExternalHarness actions={actions} composer={composer} externalSelection={external} />)
+    const input = await screen.findByLabelText('Comment on the selected text')
+    fireEvent.change(input, { target: { value: 'half a thought' } })
+    rerender(<ExternalHarness actions={actions} composer={composer} externalSelection={null} />)
+    await waitFor(() => expect(screen.queryByTestId('selection-composer')).toBeNull())
+    expect(composer.onClose).toHaveBeenCalledTimes(1)
+    expect(composer.onSubmit).not.toHaveBeenCalled()
+    // The next external selection opens a FRESH box, not the stale draft.
+    rerender(<ExternalHarness actions={actions} composer={composer} externalSelection={{ text: 'another passage', x: 30, y: 60 }} />)
+    expect(await screen.findByLabelText('Comment on the selected text')).toHaveValue('')
+    expect(composer.onOpen).toHaveBeenLastCalledWith('another passage')
+  })
+
+  it('clearing the external selection after a DOM-selection open leaves that box alone', async () => {
+    // The host clears its external selection on every close/submit; a box
+    // opened from the document (a different source) must not be torn down by it.
+    const { rerender } = render(<ExternalHarness actions={actions} composer={composer} externalSelection={null} />)
+    selectInContainer(screen.getByTestId('container'), 'beta')
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 50 })
+    await screen.findByLabelText('Comment on the selected text')
+    rerender(<ExternalHarness actions={actions} composer={composer} externalSelection={null} />)
+    expect(screen.getByLabelText('Comment on the selected text')).toBeInTheDocument()
+    expect(composer.onClose).not.toHaveBeenCalled()
+  })
+
+  it('externalOnly ignores a document selection inside the container but still opens for an external one', async () => {
+    function ExternalOnlyHarness({ externalSelection }: { externalSelection: { text: string; x: number; y: number } | null }) {
+      const ref = useRef<HTMLDivElement>(null)
+      return (
+        <div>
+          <div ref={ref} data-testid="container">{TEXT}</div>
+          <SelectionToolbar containerRef={ref} actions={actions} composer={composer} externalSelection={externalSelection} externalOnly />
+        </div>
+      )
+    }
+    const { rerender } = render(<ExternalOnlyHarness externalSelection={null} />)
+    selectInContainer(screen.getByTestId('container'), 'beta')
+    fireEvent.mouseUp(document, { clientX: 100, clientY: 50 })
+    await act(() => new Promise<void>(resolve => { setTimeout(resolve, 80) }))
+    expect(screen.queryByLabelText('Comment on the selected text')).toBeNull()
+    expect(composer.onOpen).not.toHaveBeenCalled()
+
+    rerender(<ExternalOnlyHarness externalSelection={external} />)
+    await screen.findByLabelText('Comment on the selected text')
+    expect(composer.onOpen).toHaveBeenCalledWith('from the frame')
+  })
+
+  it('without a composer the external selection still shows the plain action row', async () => {
+    render(<ExternalHarness actions={actions} externalSelection={external} />)
+    expect(await screen.findByRole('button', { name: 'Copy' })).toHaveTextContent('Copy')
+    expect(screen.queryByLabelText('Comment on the selected text')).toBeNull()
   })
 })
 

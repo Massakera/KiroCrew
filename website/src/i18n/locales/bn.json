@@ -6172,7 +6172,6 @@
       "settings_subtitle": "{{tab}} · {{detail}}"
     },
     "commentOverlay": {
-      "add_a_comment": "একটি মন্তব্য যোগ করুন",
       "add_comment": "মন্তব্য যোগ করুন",
       "add_instruction": "নির্দেশ যোগ করুন",
       "additional_prompt": "অতিরিক্ত প্রম্পট",

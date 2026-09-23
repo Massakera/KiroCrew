@@ -6078,7 +6078,6 @@
       "settings_subtitle": "{{tab}} · {{detail}}"
     },
     "commentOverlay": {
-      "add_a_comment": "댓글 추가",
       "add_comment": "댓글 추가",
       "add_instruction": "지시 추가",
       "additional_prompt": "추가 프롬프트",

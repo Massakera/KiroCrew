@@ -6078,7 +6078,6 @@
       "settings_subtitle": "{{tab}} · {{detail}}"
     },
     "commentOverlay": {
-      "add_a_comment": "添加评论",
       "add_comment": "添加评论",
       "add_instruction": "添加指令",
       "additional_prompt": "附加提示词",

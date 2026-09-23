@@ -6266,7 +6266,6 @@
       "settings_subtitle": "{{tab}} · {{detail}}"
     },
     "commentOverlay": {
-      "add_a_comment": "Ajouter un commentaire",
       "add_comment": "Ajouter un commentaire",
       "add_instruction": "Ajouter une instruction",
       "additional_prompt": "Prompt supplémentaire",

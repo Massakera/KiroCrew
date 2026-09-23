@@ -26,7 +26,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { ReactNode } from 'react'
-import { screen, waitFor, fireEvent, within } from '@testing-library/react'
+import { screen, waitFor, fireEvent, within, act } from '@testing-library/react'
 import { Routes, Route, useNavigate } from 'react-router-dom'
 import RemoteArtifactDetailPage from '../pages/RemoteArtifactDetailPage'
 import { renderWithProviders } from './helpers'
@@ -121,12 +121,20 @@ function SwitchArtifact({ to }: { to: string }) {
 /** The comment-panel toggle (a `Btn` carrying `aria-pressed`). */
 const commentToggle = () => screen.getByRole('button', { name: /Comments/ })
 
+/** The selection toolbar's comment composer textarea, as the toolbar labels it. */
+const COMPOSER_INPUT = 'Comment on the selected text'
+
+/** Let the toolbar's debounced selection check run, so a negative assertion
+ *  ("no composer") is made after the point at which one would have opened. */
+const settle = () => act(() => new Promise<void>(resolve => { setTimeout(resolve, 80) }))
+
 /**
- * Select `word` inside the rendered markdown body and fire the mouseup the page
- * listens on. Returns false when the body text node isn't found so a test fails
- * loudly rather than silently asserting nothing. jsdom has no real selection, so
- * a real `Range` over the rendered DOM backs `window.getSelection` — the same
- * object shape the production code reads.
+ * Select `word` inside the rendered markdown body and fire the mouseup the
+ * selection toolbar listens on (it opens the type-first composer, whose `onOpen`
+ * is where the page resolves the anchor). Returns false when the body text node
+ * isn't found so a test fails loudly rather than silently asserting nothing. The
+ * test DOM has no real selection, so a real `Range` over the rendered DOM backs
+ * `window.getSelection` — the same object shape the production code reads.
  */
 function selectInMarkdown(word: string): boolean {
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
@@ -141,7 +149,7 @@ function selectInMarkdown(word: string): boolean {
   const range = document.createRange()
   range.setStart(node, start)
   range.setEnd(node, start + word.length)
-  // jsdom Range has no layout; the page reads the rect only to place the popover.
+  // The test DOM's Range has no layout; the toolbar reads the rect only to place the box.
   range.getBoundingClientRect = () => ({
     left: 12, top: 10, bottom: 34, right: 60, width: 48, height: 24, x: 12, y: 10,
     toJSON: () => ({}),
@@ -154,6 +162,8 @@ function selectInMarkdown(word: string): boolean {
     getRangeAt: () => range,
     toString: () => word,
     removeAllRanges: () => {},
+    // The composer's ✕ / Escape hands the selection back through `addRange`.
+    addRange: () => {},
   } as unknown as Selection)
 
   const host = document.querySelector('.msg-content')
@@ -491,13 +501,13 @@ describe('RemoteArtifactDetailPage', async () => {
     const mdDetail = (overrides: RemoteDetailFixture = {}) =>
       mkDetail({ content_type: 'text/markdown', content: MD_BODY, ...overrides })
 
-    it('opens the popover on a body selection and posts the anchor with offsets and version', async () => {
+    it('opens the composer on a body selection and posts the anchor with offsets and version', async () => {
       vi.mocked(api).remoteArtifactDetail = vi.fn().mockResolvedValue(mdDetail())
       renderPage()
       await screen.findByText(MD_BODY)
       expect(selectInMarkdown('beta')).toBe(true)
 
-      const box = await screen.findByLabelText('Add a comment')
+      const box = await screen.findByLabelText(COMPOSER_INPUT)
       fireEvent.change(box, { target: { value: 'this number is stale' } })
       fireEvent.click(screen.getByRole('button', { name: 'Add comment' }))
 
@@ -522,7 +532,7 @@ describe('RemoteArtifactDetailPage', async () => {
       await screen.findByText(MD_BODY)
       await waitFor(() => expect(commentToggle()).toHaveAttribute('aria-pressed', 'false'))
       expect(selectInMarkdown('gamma')).toBe(true)
-      fireEvent.change(await screen.findByLabelText('Add a comment'), { target: { value: 'note' } })
+      fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'note' } })
       fireEvent.click(screen.getByRole('button', { name: 'Add comment' }))
       await waitFor(() => expect(commentToggle()).toHaveAttribute('aria-pressed', 'true'))
     })
@@ -532,21 +542,21 @@ describe('RemoteArtifactDetailPage', async () => {
       renderPage()
       await screen.findByText(MD_BODY)
       expect(selectInMarkdown('alpha')).toBe(true)
-      fireEvent.change(await screen.findByLabelText('Add a comment'), { target: { value: 'x' } })
+      fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'x' } })
       fireEvent.click(screen.getByRole('button', { name: 'Add comment' }))
       await waitFor(() => expect(vi.mocked(api).postRemoteArtifactComment).toHaveBeenCalled())
       const [, , body] = vi.mocked(api).postRemoteArtifactComment.mock.calls[0]
       expect(body.anchor).toMatchObject({ quote: 'alpha', prefix: '', start_offset: 0, version_number: 1 })
     })
 
-    it('dismisses the popover on cancel without posting', async () => {
+    it('dismisses the composer on close without posting', async () => {
       vi.mocked(api).remoteArtifactDetail = vi.fn().mockResolvedValue(mdDetail())
       renderPage()
       await screen.findByText(MD_BODY)
       expect(selectInMarkdown('beta')).toBe(true)
-      await screen.findByLabelText('Add a comment')
+      await screen.findByLabelText(COMPOSER_INPUT)
       fireEvent.click(screen.getByRole('button', { name: 'Close' }))
-      await waitFor(() => expect(screen.queryByLabelText('Add a comment')).not.toBeInTheDocument())
+      await waitFor(() => expect(screen.queryByLabelText(COMPOSER_INPUT)).not.toBeInTheDocument())
       expect(vi.mocked(api).postRemoteArtifactComment).not.toHaveBeenCalled()
     })
 
@@ -564,7 +574,8 @@ describe('RemoteArtifactDetailPage', async () => {
       const host = document.querySelector('.msg-content')
       expect(host).not.toBeNull()
       fireEvent.mouseUp(host as Element)
-      expect(screen.queryByLabelText('Add a comment')).not.toBeInTheDocument()
+      await settle()
+      expect(screen.queryByLabelText(COMPOSER_INPUT)).not.toBeInTheDocument()
     })
 
     it('ignores a selection made outside the artifact body', async () => {
@@ -585,16 +596,17 @@ describe('RemoteArtifactDetailPage', async () => {
       } as unknown as Selection)
       const host = document.querySelector('.msg-content')
       fireEvent.mouseUp(host as Element)
-      expect(screen.queryByLabelText('Add a comment')).not.toBeInTheDocument()
+      await settle()
+      expect(screen.queryByLabelText(COMPOSER_INPUT)).not.toBeInTheDocument()
     })
 
-    it('does not open the popover from a selection on a plain-source body', async () => {
-      // The mouseup handler is bound only on the markdown branch; a text/plain
-      // body renders a <pre> with no preview ref to map a selection back to.
+    it('does not open the composer from a selection on a plain-source body', async () => {
+      // The selection toolbar is mounted only for the markdown and HTML bodies; a
+      // text/plain body renders a <pre> with no preview ref to map a selection back to.
       renderPage()
       await screen.findByText('plain body text')
       expect(document.querySelector('.msg-content')).toBeNull()
-      expect(screen.queryByLabelText('Add a comment')).not.toBeInTheDocument()
+      expect(screen.queryByLabelText(COMPOSER_INPUT)).not.toBeInTheDocument()
     })
   })
 
@@ -703,7 +715,7 @@ describe('RemoteArtifactDetailPage', async () => {
       return (await screen.findByTitle(`Remote artifact: ${EXT_ID}`)) as HTMLIFrameElement
     }
 
-    it('opens the popover for a selection made inside the iframe and posts the anchor', async () => {
+    it('opens the composer for a selection made inside the iframe and posts the anchor', async () => {
       const frame = await renderHtmlPage()
       postFromIframe(frame, {
         type: 'mc-comment-select',
@@ -714,7 +726,7 @@ describe('RemoteArtifactDetailPage', async () => {
         endOffset: 18,
         rect: { x: 20, y: 40 },
       })
-      fireEvent.change(await screen.findByLabelText('Add a comment'), { target: { value: 'from the frame' } })
+      fireEvent.change(await screen.findByLabelText(COMPOSER_INPUT), { target: { value: 'from the frame' } })
       fireEvent.click(screen.getByRole('button', { name: 'Add comment' }))
       await waitFor(() => expect(vi.mocked(api).postRemoteArtifactComment).toHaveBeenCalled())
       const [, , body] = vi.mocked(api).postRemoteArtifactComment.mock.calls[0]

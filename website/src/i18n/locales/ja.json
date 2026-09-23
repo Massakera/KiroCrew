@@ -6078,7 +6078,6 @@
       "settings_subtitle": "{{tab}} · {{detail}}"
     },
     "commentOverlay": {
-      "add_a_comment": "コメントを追加",
       "add_comment": "コメント追加",
       "add_instruction": "指示を追加",
       "additional_prompt": "追加プロンプト",
