@@ -942,8 +942,8 @@ class TestRunJobIsolatedPreambleFailure:
 
         # Exactly what _on_timer leaves for the task: the claim, then no awaiter.
         svc._executing.add(job.id)
-        svc._job_run_meta[job.id] = (time.time(), "scheduled")
-        task = asyncio.create_task(svc._run_job_isolated(job))
+        claim = svc._job_run_meta[job.id] = (time.time(), "scheduled")
+        task = asyncio.create_task(svc._run_job_isolated(job, claim))
         svc._running_tasks[job.id] = task
         with pytest.raises(RuntimeError, match="fire counter raised ahead of the try"):
             await task
@@ -981,9 +981,9 @@ class TestRunJobIsolatedPreambleFailure:
         )
         monkeypatch.setattr(svc, "_compute_jitter", lambda _job: (order.append("jitter"), 0.0)[1])
 
-        svc._job_run_meta[job.id] = (time.time(), "scheduled")
+        claim = svc._job_run_meta[job.id] = (time.time(), "scheduled")
         with patch.object(svc, "_execute_with_timeout", return_value=None):
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, claim)
 
         assert emitted == [("kirocrew.cron.fires", {"kind": "agent", "trigger": "scheduled"})]
         assert order == ["counter", "jitter"]
@@ -1033,7 +1033,7 @@ class TestCancelAgainstFinishedTask:
         with patch("kiro_crew.sel.sel"):
             cancelled = await svc.cancel(job.id)
 
-        assert job.id not in svc._cancelled_jobs, (
+        assert not svc._cancelled_jobs._marks, (
             "cancel() against a finished task left _cancelled_jobs set; the job's "
             "next real run will be treated as cancelled and its result dropped"
         )

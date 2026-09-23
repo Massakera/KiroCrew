@@ -285,6 +285,12 @@
     }
   },
   "apps": {
+    "builtinAppRoute": {
+      "refused_page_detail_label": "このコピーを組み立てた担当者向けの詳細",
+      "refused_page_handoff_note": "エージェントに質問すると、これらの詳細が添付された状態でチャットが開きます。",
+      "refused_page_lead": "{{productName}} は起動時にこのページを拒否しました。このコピーでの設定が誤っているためです。再試行しても元には戻らず、このコピーを組み立てた担当者が修正する必要があります。",
+      "refused_page_title": "{{route}} を読み込めませんでした"
+    },
     "agentWorlds": {
       "manifest": {
         "use_case_1": "クルーの作業中、実行中のエージェント、cron、サブエージェントをセカンドスクリーンで一覧できます。",
@@ -739,6 +745,7 @@
           "approve": "承認",
           "approve_is_unavailable_because_this_base_branch_": "このプルリクエストのベースブランチは新しいコミットがプッシュされても承認を取り消さない設定のため（またはここから保護設定を読み取れないため）、承認は利用できません。そのままでは、レビュー対象のコミットより承認が長く残る可能性があります。GitHub 上で承認してください。",
           "approve_is_unavailable_while_auto_merge_is_armed": "自動マージが有効な間は承認できません。古いヘッドの検査が間に合う前に、承認によってこのプルリクエストがマージされる可能性があります。自動マージを解除するか、GitHub 上で承認してください。",
+          "ask_agent_about_this_failure": "このエラーについてエージェントに尋ねる",
           "cancel": "キャンセル",
           "confirm_approve": "このプルリクエストを承認しますか？",
           "confirm_request_changes": "変更を要求するレビューを公開しますか？",
@@ -1116,6 +1123,7 @@
       "action_ask": "質問",
       "ask_agent": "エージェントに質問：「{{query}}」",
       "group_attention": "あなたの対応待ち",
+      "group_recent_sessions": "最近のセッション",
       "action_enter": "ビューを開く",
       "action_continue": "続ける",
       "action_open": "開く",
@@ -5865,6 +5873,7 @@
       "approve_all": "すべて承認",
       "approve_sub_agent": "サブエージェントを承認：{{name}}",
       "attach_files": "ファイルを添付",
+      "cancel_upload": "アップロードをキャンセル",
       "editor_unavailable_standard_input": "拡張エディターを読み込めなかったため、標準入力が有効になっています。下書きは変更されていません。",
       "branch": "ブランチ：{{branch}}",
       "click_again_to_force_stop": "もう一度クリックして強制停止",
@@ -7311,8 +7320,6 @@
       "no_commits_were_returned": "コミットが返されませんでした。",
       "no_description_was_provided": "説明が提供されませんでした。",
       "open_pull_request": "プルリクエストを開く",
-      "open_slack_settings": "Slack 設定を開く",
-      "owner_not_configured_guidance": "この操作には設定済みのオーナーが必要です。{{productName}} はオーナーを Slack メンバー ID で識別します。設定 → チャットプラットフォーム → Slack で「Owner Slack member ID」を設定し、ゲートウェイを再起動してから、再度サインインしてください。",
       "pr_number": "PR #{{number}}",
       "provider_results_may_be_partial_merge_request": "{{sections}}のプロバイダー結果が部分的である可能性があります。完全なセットについてはマージリクエストを開いてください。",
       "provider_results_may_be_partial_pull_request": "{{sections}}のプロバイダー結果が部分的である可能性があります。完全なセットについてはプルリクエストを開いてください。",
@@ -8080,7 +8087,8 @@
       "time_to_live": "生存時間",
       "views": "ビュー",
       "what_if_traffic_scenarios_you_pay_only_for_actua": "What-ifトラフィックシナリオ — 実際の使用量に対してのみ支払います ·",
-      "will_provision": "プロビジョニングされます"
+      "will_provision": "プロビジョニングされます",
+      "deployment_available_under_feature_previews": "デプロイは「設定 → 開発者 → 機能プレビュー」から利用できます。"
     },
     "webPreviewPanel": {
       "back": "戻る",
@@ -8127,7 +8135,7 @@
       "the_gateway_could_not_open_a_browser_for_this_page": "ゲートウェイはこのページ用のブラウザーを開けませんでした。",
       "the_server_at": "サーバー：",
       "the_view_runs_on_the_gateway_host_pin_and_forward": "ビューはゲートウェイホストのループバックアドレスで提供されており、このブラウザーからは接続できませんでした。SSHトンネル経由でダッシュボードにアクセスしている場合は、下の設定でビューのポートを固定し、そのポートも転送してください。",
-      "this_chat_s_browser_session": "このチャットのブラウザー",
+      "opened_from_this_chat": "このチャットから開いたページ",
       "this_dashboard_is_served_over_https_so_the_brows": "このダッシュボードはHTTPSで提供されるため、ブラウザーは",
       "this_url_is_the_dashboard_s_own_server_which_ref": "この URL はダッシュボード自身のサーバーであり、埋め込みは許可されていません。代わりに開発サーバーの URL を入力してください。",
       "web_preview": "ウェブプレビュー",
@@ -8606,6 +8614,18 @@
       "label": "変更には再起動が必要",
       "tooltip": "この設定は {{productName}} の実行中には変更できません。保存した値は保持され、次に {{productName}} を再起動したときに適用されます（設定 → バージョン情報、または起動したターミナルから）。",
       "schema_unavailable": "この設定に再起動が必要かどうかを確認できませんでした。"
+    },
+    "directDeploy": {
+      "deploy_via_agent": "エージェント経由でデプロイ",
+      "deploy_as_permanent": "無期限でデプロイ",
+      "ttl_permanent": "無期限（期限なし）",
+      "ttl_expires_in_hours": "{{hours}} 時間後に期限切れ",
+      "deploys_from_here_confirm_gated": "ここからデプロイします — 先に確認します",
+      "propagating_note": "初回デプロイでは、どこからでも開けるまで 5〜15 分かかることがあります。",
+      "deployed": "デプロイしました！",
+      "unexpected_response": "予期しないレスポンス",
+      "deploy_failed": "デプロイに失敗",
+      "stale_preview_retry": "チェック後にアプリが変更されました — もう一度お試しください。"
     }
   },
   "hooks": {
@@ -9038,7 +9058,6 @@
       "deploy": "デプロイ",
       "deploy_anyway": "それでもデプロイ",
       "deploy_artifact": "{{name}} をデプロイ",
-      "deploy_opens_a_new_chat_session_that_runs_the_ar": "デプロイは選択したプロファイルで artifact-deploy スキルを実行する新しいチャットセッションを開きます。",
       "deploy_profile_for_slug": "{{slug}} のデプロイプロファイル",
       "deploy_recall_destroy_each_require_explicit_conf": "デプロイ / Recall / 破棄のそれぞれが明示的な確認を必要とします\n              （自動承認なし）および SEL 監査イベントを発行します。",
       "deployments_count": "デプロイ（{{count}}）",
@@ -9150,7 +9169,16 @@
       "remove_profile_title": "プロファイルを削除しますか？",
       "remove_profile_button": "プロファイルを削除",
       "retry": "再試行",
-      "profile_errors_title": "一部のプロファイルを一覧表示できませんでした"
+      "profile_errors_title": "一部のプロファイルを一覧表示できませんでした",
+      "4_optional_install_auto_cleanup": "4. 任意: 自動クリーンアップを導入",
+      "auto_cleanup_explainer": "自動で期限切れにしたいデプロイにのみ必要です。",
+      "deploy_publishes_directly_from_this_page": "Deploy は確認後このページから公開します。",
+      "deployments_read_live_from_tags": "この一覧は AWS リソースタグから直接読み取っています。作成直後のデプロイは、ここに表示されるまで数分かかることがあります。",
+      "col_name": "名前",
+      "col_status": "ステータス",
+      "col_est_cost": "推定コスト",
+      "col_profile": "プロファイル",
+      "col_expiry": "期限"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· リモートコピーでより新しいバージョンが利用可能です",
@@ -9804,6 +9832,7 @@
         "context_only_tools_unavailable_backend": "コンテキストのみ · このエージェントバックエンドでは、ここでツールは使えません。操作はメインチャットで依頼してください。",
         "context_only_config_unavailable": "エージェント設定を読み込めなかったため、サイドチャットはツールなしで動作します。操作はメインチャットで依頼してください。",
         "question_too_long": "質問が長すぎます — 約 {{max}} 文字未満に短くしてください（現在は {{current}} 文字）",
+        "question_too_long_with_paste": "質問が長すぎます — 約 {{max}} 文字未満に短くしてください（現在は {{current}} 文字、折りたたんだペーストを含む）。ペーストのチップを選択して Backspace で削除するか、短い抜粋を貼り付けてください。",
         "queue_cancel_failed": "キューに入っている質問をキャンセルできませんでした",
         "queue_edit_failed": "キューに入っている質問を更新できませんでした",
         "refresh_context": "コンテキストを更新",
@@ -11242,7 +11271,10 @@
         "decisions_api_key_remove": "キーを削除",
         "decisions_api_key_remove_confirm": "キーの削除は取り消せません。保管庫は値を返さないので、新しいものを貼り付け直すことになります。",
         "decisions_api_key_remove_cancel": "残す",
-        "decisions_api_key_delete": "キーを完全に削除"
+        "decisions_api_key_delete": "キーを完全に削除",
+        "artifact_deploy": "アーティファクトデプロイ",
+        "artifact_deploy_desc": "アーティファクトを自分の AWS アカウント上の公開 HTTPS URL に公開します。既定でオフです。デプロイごとにアカウントへ課金が発生し、内容はインターネットに公開されます。",
+        "open_artifact_deploy": "アーティファクトデプロイ を開く"
       },
       "kiroSignInCard": {
         "title": "Kiro サインイン",
@@ -12491,6 +12523,10 @@
         "cache_creation": "キャッシュ作成",
         "cache_read": "キャッシュ読み込み",
         "credits": "クレジット",
+        "credits_used": "使用クレジット",
+        "credits_used_compact": "使用クレジット: {{credits}} · {{pct}}",
+        "credits_used_pct": "使用クレジット (%)",
+        "credits_used_pct_title": "現在の請求期間のプラン割り当てに対する割合。一日で 100% を超えることがあります。",
         "daily_history": "日別履歴",
         "daily_token_usage": "日別トークン使用量",
         "date": "日付",
@@ -13861,7 +13897,7 @@
         "minimap_location": "ミニマップの位置",
         "minimap_location_desc": "右端に配置すると、ミニマップがスクロールバーを置き換えます。",
         "message_font_size": "メッセージのフォントサイズ",
-        "message_font_size_desc": "メッセージ内のテキストのフォントサイズ（すべてのセッションに適用）。サイドバー、セッション一覧、その他のUIには影響しません。"
+        "message_font_size_desc": "会話のフォントサイズ（すべてのセッションに適用）：メッセージのテキスト、コード、表、返信候補、メッセージ入力欄。コンパクトなコンテンツ幅もそれに合わせて広がります。サイドバー、セッション一覧、その他のUIには影響しません。"
       },
       "computerUsePanel": {
         "accessibility": "アクセシビリティ",

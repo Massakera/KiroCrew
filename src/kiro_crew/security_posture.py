@@ -756,6 +756,15 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "StreamRedactor mirroring the main chat for the side-question stream.",
     ),
     (
+        "Reply-thread stream and store",
+        "dashboard/chat_threads.py",
+        "Three boundaries of a reply thread on a crewmate chat message: the "
+        "StreamRedactor on the crewmate's live reply (as the side panel's), the "
+        "thread envelope (parent, surrounding chat and prior replies, which "
+        "kiro-cli persists into its own session file), and every stored reply "
+        "and quoted parent on its way out of the sidecar to the browser.",
+    ),
+    (
         "Steering file metadata",
         "dashboard/handlers/steering.py",
         "First-heading descriptions and display paths in the /api/steering listing "
@@ -1451,6 +1460,16 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "would alter is DROPPED rather than served redacted: a redacted "
         "preference is not one the client can use, and the sync loop would "
         "write the sentinel back over the file.",
+    ),
+    (
+        "WakaTime coding-activity heartbeats",
+        "wakatime/heartbeats.py",
+        "The project label sent as the heartbeat entity and project fields when "
+        "WakaTime send-heartbeats is enabled. The label is the agent/user-selected "
+        "project directory basename, so a directory whose name is itself "
+        "credential- or URL-shaped would otherwise be POSTed verbatim to WakaTime. "
+        "The basename passes through the shared credential + exfiltration-URL chain "
+        "in `_entity_for_project` before it can leave for the external API.",
     ),
     (
         "Crew webview panels",

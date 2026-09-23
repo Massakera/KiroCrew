@@ -1809,7 +1809,7 @@ class TestCronPoolQueueWait:
 
             ran = threading.Event()
 
-            async def _execute(_job):
+            async def _execute(_job, _meta=None):
                 return await ex.run_in_cron_pool(ran.set, timeout=30, queue_timeout=60)
 
             svc._execute = _execute  # type: ignore[method-assign]
@@ -1841,7 +1841,7 @@ class TestCronPoolQueueWait:
         )
         job.timeout_secs = 2
 
-        async def _slow(_job):
+        async def _slow(_job, _meta=None):
             await asyncio.sleep(30)
 
         svc._execute = _slow  # type: ignore[method-assign]

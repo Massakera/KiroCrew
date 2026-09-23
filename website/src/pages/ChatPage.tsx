@@ -110,7 +110,7 @@ import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { addPendingFile, prepareSendPayload, buildRelMap, hasExactRelMention, normalizeWindowsPath, parseDirTokens, serializeDirTokens, spliceDirTokens } from '../utils/fileTokens'
 import { makeRelative } from '../components/FilePickerMenu'
-import { type PasteBlock, expandAll as expandPasteTokens, pruneBlocks as pruneBlocksUtil, remapCarriedBlocks, saveStoredPaste } from '../utils/pasteTokens'
+import { type PasteBlock, carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft, pruneBlocks as pruneBlocksUtil, saveStoredPaste } from '../utils/pasteTokens'
 import { extractPromptFromToken, extractSlackContextFromToken } from '../utils/tokenPrompt'
 /** Map message index → displayItems index, for scroll-to-match and the turn minimap. */
 function buildMessageToDisplayIdx(items: DisplayItem[]): Map<number, number> {
@@ -335,6 +335,7 @@ import { deriveFollowUpOptions, parseOptions } from '../app-sdk/protocol'
 import { isNoteRow } from '../lib/noteContract'
 import OverlayDrawer from '../components/OverlayDrawer'
 import { loadChatConfig, CONTENT_WIDTH, type ChatConfig } from './chat/ChatSettings'
+import { scaleContentWidth } from './chat/contentWidth'
 import SessionFlyout, { TOGGLE_RECT } from './chat/SessionFlyout'
 import { focusComposer, focusComposerAfter, revealComposer } from './chat/composerFocus'
 import { useHoverIntent } from '../hooks/useHoverIntent'
@@ -2065,6 +2066,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     handleFileSave,
     handleCapture,
     uploadFiles,
+    cancelUpload,
+    uploadCancellable,
     handleOptimizeResult,
     dragOver,
     dropTargetProps,
@@ -2580,25 +2583,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         const keepRefs = onScreen ? pendingSessionsRef.current : (uiSlot ? sessionRefDrafts.current[uiSlot] ?? [] : [])
         const restoredRefs = mergeSessionRefs(keepRefs, sentSessionRefs)
         const keepPastes = onScreen ? pasteBlocksRef.current : (uiSlot ? pasteDrafts.current[uiSlot] ?? [] : [])
-        const keptPasteIds = new Set(keepPastes.map(b => b.id))
         // Collapsed pastes resolve by `seq`, not id, and a paste made while the
         // composer was empty restarts at #1 — so a naive id-merge can leave two
         // blocks sharing #1, with both markers resolving to one of them and
-        // silently swapping the user's content on retry. Re-sequence the carried
-        // blocks past the kept ones and rewrite their markers in the payload text.
-        const { text: payload, blocks: carriedPastes } = remapCarriedBlocks(
-          raw,
-          activePastes.filter(x => !keptPasteIds.has(x.id)),
-          new Set(keepPastes.map(b => b.seq)),
-        )
-        const restoredPastes = [...keepPastes, ...carriedPastes]
+        // silently swapping the user's content on retry. `carryPastes` owns the
+        // rule: re-sequence the carried blocks past the kept ones and rewrite
+        // their markers in the payload text.
+        const carried = carryPastes(raw, activePastes, keepPastes)
+        // `full` keeps every token: it is the payload a retry re-sends whole.
+        const { full: payload, pastes: restoredPastes } = carried
         const keepText = onScreen ? inputRef.current : (uiSlot ? drafts.current[uiSlot] ?? '' : '')
         // Keep whatever the user typed while the create was in flight and append
         // the payload after it, without duplicating one the composer already
         // holds — a synchronously rejected create can land before React flushes
         // the clear. `mergeRecoveredDraft` owns that rule for every recovery
         // site, including the send-failure path further down.
-        const restoredText = mergeRecoveredDraft(keepText, payload)
+        const restoredText = mergeCarriedDraft(keepText, carried)
         if (onScreen && uiSlot) {
           setInput(restoredText); setPasteBlocks(restoredPastes); setPendingFiles(restoredFiles); setPendingSessions(restoredRefs)
           // clearPending() above already consumed the knowledge selection, so a
@@ -2769,19 +2769,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // blocks cannot claim one `[ Paste #N ]` marker.
       const keepText = onScreenNow ? inputRef.current : (drafts.current[slot] ?? '')
       const keepPastes = onScreenNow ? pasteBlocksRef.current : (pasteDrafts.current[slot] ?? [])
-      const keptIds = new Set(keepPastes.map(b => b.id))
-      const { text: carriedText, blocks: carriedPastes } = remapCarriedBlocks(
-        typedTxt,
-        activePastes.filter(b => !keptIds.has(b.id)),
-        new Set(keepPastes.map(b => b.seq)),
-      )
-      const pastesBack = [...keepPastes, ...carriedPastes]
+      const carried = carryPastes(typedTxt, activePastes, keepPastes)
+      const pastesBack = carried.pastes
       // Same merge rule as the create-failure path above, and the separator lives
       // in `mergeRecoveredDraft` rather than in a template literal here: the blank
       // line between the kept draft and the recovered payload is message
       // structure, not copy, so it stays off the i18n gate honestly rather than by
       // exemption (same treatment as appendSessionRefLinks).
-      const textBack = mergeRecoveredDraft(keepText, carriedText)
+      const textBack = mergeCarriedDraft(keepText, carried)
       setDraft(drafts.current, slot, textBack)
       setPasteDraft(pasteDrafts.current, slot, pastesBack)
       setSessionRefDraft(sessionRefDrafts.current, slot, refsBack)
@@ -6580,6 +6575,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
          attribute carries a guarantee about a case it cannot affect. */
       data-owns-swipe={embedded ? undefined : 'left right'}
       className="flex flex-1 min-h-0 h-full overflow-hidden relative"
+      /* Published here, not on the chat pane, because the side panel (Activity,
+         Browser, SideChat's composer and follow-up chips) is this element's
+         child and the chat pane's SIBLING. Anything that reads the setting via
+         `var(--mc-message-font-size, 14px)` from inside the panel would
+         otherwise silently take the fallback and look right at the default
+         only. Content width stays on the pane: it is a column geometry, and the
+         panel has its own. */
+      style={{ '--mc-message-font-size': `${chatConfig.messageFontSize}px` } as React.CSSProperties}
     >
       <AnimatePresence>
         {isMobile && drawerMounted && (
@@ -6729,7 +6732,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
 
       {/* Chat pane */}
       {embedMode !== 'sessions' && (
-      <div ref={setChatPaneEl} className={`relative flex flex-col bg-bg min-w-0 min-h-0 h-full overflow-hidden ${(activityOpen && !activitySlot) || search.isOpen ? 'flex-[1_1_60%]' : 'flex-1'}`} style={{ transition: 'flex 0.2s', ...(!sidebarOpen && !isMobile ? { marginLeft: '-0.5rem' } : {}), '--mc-content-width': CONTENT_WIDTH[chatConfig.contentWidth].messages, '--mc-input-width': CONTENT_WIDTH[chatConfig.contentWidth].input, '--mc-message-font-size': `${chatConfig.messageFontSize}px` } as React.CSSProperties}>
+      <div ref={setChatPaneEl} className={`relative flex flex-col bg-bg min-w-0 min-h-0 h-full overflow-hidden ${(activityOpen && !activitySlot) || search.isOpen ? 'flex-[1_1_60%]' : 'flex-1'}`} style={{ transition: 'flex 0.2s', ...(!sidebarOpen && !isMobile ? { marginLeft: '-0.5rem' } : {}), '--mc-content-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).messages, '--mc-input-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).input } as React.CSSProperties}>
         {snipFrame && (
           <SnipOverlay
             frame={snipFrame}
@@ -7665,6 +7668,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onDismissHint={() => setPrefillHint(false)}
               onScreenshot={handleCapture}
               onUploadFiles={uploadFiles}
+              /* Only while a real upload is abortable. `uploading` is shared
+                 with the screenshot path, which has no request to cancel. */
+              onCancelUpload={uploadCancellable ? cancelUpload : undefined}
               /* The one collapsible composer. Opt-in rather than default so the
                  shared preference key and the window-level expand event stay
                  correct by construction -- see ChatInput's `collapsible` prop. */

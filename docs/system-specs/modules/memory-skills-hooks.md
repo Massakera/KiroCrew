@@ -1855,7 +1855,7 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 - **Non-blocking model load**: the GGUF load runs on a background daemon thread (`_kick_background_load()`, thread name `kc-embed-load`) — `embed()`/`embed_batch()` NEVER block on the load. When the model isn't in memory yet, the call kicks the background load and returns `None` immediately; memory degrades to keyword search until the load lands. The gateway/dashboard event loop is never stalled by embedding work. `wait_ready(timeout)` exists for sync contexts (tests, one-shot CLI flows) that legitimately want to block — never call it from an event-loop thread
 - The underlying `Llama` object is NOT thread-safe — inference on a loaded model is serialized behind a lock (tens of ms per short text)
 - `get_shared_embedder()` — process-wide singleton (~700MB RSS when loaded), shared by vector memory AND the knowledge library; `close()` unloads the model to free RSS
-- **Bounded llama.cpp scratch memory**: the accepted context and logical batch remain 2,048 tokens, while the physical decode micro-batch (`n_ubatch`) is 512. llama.cpp splits a long input across those physical batches before applying last-token pooling, so the complete context still contributes to one vector. Against the shipped Qwen model, a maximum 6,000-character input produced byte-identical 1,024-dimensional vectors at 512 and 2,048 (`cosine=1.0`, max absolute difference `0.0`); 512 reduced Linux peak/resident RSS by approximately 419 MiB for that pass. Do not lower `n_ctx` or `n_batch` as a memory shortcut: either would reduce the semantic input the model can accept.
+- **Metadata-sized llama.cpp context and bounded scratch memory**: before constructing the native context, a custom GGUF reads `general.architecture`, `<architecture>.attention.causal` and `<architecture>.context_length` from its KV header. The file's `pooling_type` key is not read: every model, custom encoders included, is loaded with last-token pooling passed explicitly, the pooling every earlier release produced, so this metadata never changes stored vectors (honouring a declared `pooling_type` is tracked separately). Measured with the vendored runtime on two BERT-family f16 GGUFs (`all-MiniLM-L6-v2`, trained for mean pooling, and `bge-small-en-v1.5`, trained for cls pooling): under last-token pooling two paraphrase pairs scored cosine 0.745 and 0.791 against 0.112 for an unrelated pair (MiniLM) and 0.765 and 0.787 against 0.382 (bge), the same ordering mean pooling gave (0.638 and 0.612 against 0.005; 0.752 and 0.793 against 0.328), and over twelve sentences from six paraphrase pairs each sentence's nearest neighbour was its paraphrase 12/12 times under both poolings on both models. A model is non-causal when its GGUF declares `<architecture>.attention.causal = false` (the boolean llama.cpp reads into `hparams.causal_attn` for every architecture, `llama-embed` included; absent, the runtime defaults to causal) or when its architecture is one the vendored llama.cpp runs without a KV cache (`_ENCODER_ARCHITECTURES`, a verbatim mirror of the `res = nullptr` cases of `llama_model::create_memory` plus `t5encoder`). That mirror is checked mechanically: `test/test_encoder_architecture_mirror.py` opens every vendored `libllama` binary and requires each listed name as a NUL-terminated string, so a runtime bump that removes or renames a cache-less architecture fails the test unless the name is the suffix of another listed name (`bert` inside `modern-bert`: GNU ld tail-merges such strings, so only the terminating NUL can be required and the longer name still satisfies the check); an architecture the bump adds is invisible to it, so the bump procedure in `_vendor/README.md` re-reads the `res = nullptr` cases by hand and confirms suffix names there. The accepted context and logical batch remain 2,048 tokens for every decoder model, which also retains a physical decode micro-batch (`n_ubatch`) of 512; non-causal models use one physical micro-batch the size of their whole context because llama.cpp aborts when their token count exceeds `n_ubatch` — cache-less architectures in `encode()` (`encoder requires n_ubatch >= n_tokens`) and declared-non-causal cached models in `decode()` (`non-causal attention requires n_ubatch >= n_tokens`). The 512 micro-batch is kept for custom decoders on measurement, and it is the only reason the cache-less architecture set exists (giving every custom file `n_ubatch = n_batch` would need no list): with the vendored runtime, four compute threads and a 2,048/2,048 window, the shipped Qwen3-Embedding-0.6B Q8_0 file standing in for a custom decoder, one 5,000-character embedding (936 tokens) took the process's peak resident memory (Linux `VmHWM`) from 1,826 MiB at `n_ubatch` 512 to 2,098 MiB at 2,048, 272 MiB more (two runs each, within 0.5 MiB), and an input filling the whole 2,048-token batch took it from 2,493 MiB to 3,502 MiB, 1,009 MiB more; constructing the context alone showed no difference (0.2 MiB) because the reserved compute arena is not resident until the first graph runs. The same comparison on the `gpt2` Q8_0 file cost 37 MiB at 2,048/2,048 (655 tokens) and 98 MiB between `n_ubatch` 512 and 1,024 at its clamped 1,024 window (935 tokens). That cost, paid by every process holding a custom decoder embedder, outweighs maintaining the mirrored list, which the binary pin and the bump procedure keep honest. For every custom GGUF the context and logical batch are additionally clamped to the trained position count the file declares in `<architecture>.context_length` (llama.cpp's `n_ctx_train`): a model with learned absolute positions — encoder families, but causal `gpt2` and `starcoder` as well — indexes a position table of that many rows, and a token past it aborts the process in ggml's `get_rows` (`GGML_ASSERT(i01 >= 0 && i01 < ne01)`) whatever the model's causality, so `n_ctx` and `n_batch` are set to `min(2048, context_length)` (2,048 when the key is absent), a non-causal model's `n_ubatch` equals that count and a decoder's stays 512 bounded by it, and a longer input is truncated to its first `n_batch` tokens by the vendored binding's `create_embedding()` → `embed(truncate=True)` path, a default `test_vendored_embed_truncates_to_the_logical_batch_by_default` pins. The truncation is stated as one WARNING when the model loads, naming the file and the count, never per embed call; a GGUF whose KV header cannot be read is loaded with the decoder sizes after one WARNING naming the file. Because the header is read before the native constructor opens the same path again, the loader stamps the file (device, inode, size, mtime, ctime) before the header read and re-checks the stamp once the constructor returns: a file replaced in between is closed unpublished after one WARNING and the load is retried after the failure cooldown, so a context sized from a previous header never serves. Measured with the vendored runtime on a 5,000-character input: `bge-small-en-v1.5` (`bert`, `context_length` 512, 895 tokens) aborted with that assertion at a 2,048/2,048/2,048 sizing and returns a 384-dimensional vector at 512/512/512; `gpt2` Q8_0 (causal, `context_length` 1,024) aborted with the same assertion at 2,048/2,048/512 and returns a 768-dimensional vector at 1,024/1,024/512; `nomic-embed-text-v1.5` Q2_K (`nomic-bert`, `context_length` 2,048) keeps 2,048/2,048/2,048 and its 768-dimensional vector. The shipped Qwen model declares 32,768 positions, so it keeps 2,048/2,048/512 and produces byte-identical vectors: a 6,000-character input gave the same 1,024-dimensional vectors at a 512 and a 2,048 micro-batch (`cosine=1.0`, max absolute difference `0.0`) while 512 reduced Linux peak/resident RSS by approximately 419 MiB for that pass. Do not lower `n_ctx` or `n_batch` below the policy-selected window as a memory shortcut: either would reduce the semantic input the model can accept.
 - Per-platform native libs live in `_vendor/llama_cpp_libs/{linux_x86_64,linux_aarch64,macos_arm64,macos_x86_64,win_amd64}`, selected at import time via `LLAMA_CPP_LIB_PATH` (upstream-supported override; an operator-set value wins, enabling e.g. a GPU build). Before loading the bundled Linux x86_64 runtime, `_load_llama_class()` intersects the `flags` reported for every visible processor in `/proc/cpuinfo` and requires the baseline compiled into the shipped upstream wheel (AVX, AVX2, BMI2, F16C, FMA, SSE3, SSSE3). A missing or unreadable feature list refuses the native runtime before it can raise an uncatchable SIGILL; memory stays available through keyword search. The gate does not apply to an operator-set `LLAMA_CPP_LIB_PATH`, because that directory may contain a lower-baseline build. Unsupported platforms, incompatible bundled CPUs, and import failures all degrade to keyword-only memory search. See `_vendor/README.md`
 - **The shipped closure is declared, not inferred.** `_REQUIRED_VENDORED_LIBS` names the exact files each platform must carry, and `verify_vendored_libs(root=None)` returns `{platform: [missing…]}` (empty when complete) against a source tree, an unpacked sdist, or an installed wheel. `_load_llama_class()` consults it before importing, so an incomplete install is reported as a **packaging defect naming the absent files** rather than surfacing as ctypes' `Shared library with base name 'llama' not found` — which reads as an unsupported architecture and misdirected the real-world diagnosis of this bug. `kirocrew doctor` prints the same detail. The check is **skipped when `LLAMA_CPP_LIB_PATH` is set**: the libs then load from the operator's directory, so the bundled tree's contents no longer determine whether the runtime works, and refusing on them would disable the documented override for exactly the users an incomplete wheel stranded (the warning names the env var as a remedy for that reason). Each packaging lane selects these files by a different mechanism (MANIFEST.in for the sdist, `package_data` for the wheel — which the desktop bundle inherits, since it pip-installs the project into its bundled interpreter), so each is guarded independently in `test/test_vendored_llama_payload.py`, and both `build.yml` (every PR) and `build-wheel.yml` (release/nightly) re-check the built wheel **and** sdist against the same declaration via the shared `scripts/verify_vendored_payload.py` (one script for both lanes, so they cannot drift into a gate that stops guarding without failing) — the sdist explicitly, because `python -m build --wheel` never evaluates `MANIFEST.in` and so cannot see an sdist regression at all. Linux ships no BLAS backend by design: upstream publishes none in its Linux CPU wheels (macOS gets `libggml-blas` only via the system Accelerate framework), and the Linux `libggml-cpu` carries the optimized GEMM kernels instead
 - **The artifact verifier needs only the Python standard library.** `scripts/verify_vendored_payload.py` reads `_LIBS_DIR_NAME` and `_REQUIRED_VENDORED_LIBS` from the source with `ast.parse` and `ast.literal_eval`. It never imports the embedding runtime or its config dependencies. Both constants must stay literal top-level assignments; a missing or computed declaration fails the gate. Tests run the real script with `python -I -S`, checking complete archives and missing members in the wheel, sdist, or both.
@@ -4491,6 +4491,231 @@ paths that are *not* sensitive (e.g. the kiro-cli SQLite auth store under `~/.lo
 sibling `emit_internal_read_audit(read_id)` — same audit + fail-closed contract, gated by its own
 `_AUDIT_ONLY_READ_IDS` registry. Adding an allowlist entry is a security-review event; the bytes
 never reach an LLM/agent surface.
+
+### `SessionLaneChanged` — board-lane transitions (`_fire_session_lane_changed`)
+
+**Status: this section specifies a PENDING implementation, not the tree as it
+stands.** `SessionLaneChanged` is not a live hook event yet: `HOOK_EVENTS`,
+`ALLOWED_HOOK_EVENTS` and `_VALID_HOOK_EVENTS` carry exactly the five
+turn-lifecycle events, and none of the symbols named below exist in `src/`. Read
+every present-tense sentence here as the contract the implementation must meet.
+Until it lands, `handlers/hooks.py` and the Hooks page behave as the rest of this
+module already describes.
+
+The implementation is PR #7669, and this section stands or falls with it: it is
+owned by that PR, is asserted against the code by a spec-pinning test that ships
+there, and **must be deleted if #7669 is withdrawn** rather than left describing
+code that never arrived. The RFC amendment in
+`docs/request-for-change/rfc-session-tag-change-event.md` records which writers
+emit and which remain silent; that document, not this section, is where the
+firing coverage is stated.
+
+Fires when a chat session's **status** tags change through a session-level tag
+transition, so an automation can react to a board lane transition as it happens
+rather than on a timer.
+
+**What it buys, stated exactly: latency, not the removal of reconciliation.**
+Reaction is no longer bounded by a poll interval, and the delta is computed once
+here instead of by every consumer. It does NOT retire the polling loop for a
+subscriber that needs certainty: the RFC states the v1 delivery bar this event
+ships under, and it does not promise every arrival, so such a subscriber still
+re-reads the board. A subscriber that can
+tolerate a missed transition can drop its timer; one doing irreversible work
+cannot, and gains only latency.
+
+**What counts as a status tag, stated once.** `_is_status_tag` is
+`bool(isinstance(tag, dict) and tag.get("status"))` — plain truthiness — and every reader asks
+it: the drop path's mutual-exclusion strip, the delete path, the auto-tagger, and this event's
+dispatch filter. One rule rather than two, and deliberately the rule the board ALREADY uses:
+the tag manager's lightning toggle reads `!!t.status`, and `GET /api/chat/tags` serves the
+field as stored. So any value Python calls truthy is a lane, including a hand-edited
+`"status": "false"` (a non-empty string), and only an absent field, `false`, `0` or `""` is
+not. A stricter predicate would read better in isolation and would RECLASSIFY such a tag from
+a lane to an ordinary one — silently un-stripping it on the drop path, where the board still
+draws it as a column — so the narrowing is left to whatever change owns board behaviour. This
+one adds an event.
+
+**Why the name is LANE-scoped, not tag-general.** The event name is the one part of
+this surface that can never be corrected: once a hook subscribes, renaming is a
+breaking change for that hook, and unlike a payload key there is no additive way to
+migrate it. The firing contract is status-tags-only, so a tag-general name would
+promise more than the event delivers — and it would make the obvious future
+widening (fire on ALL tag changes) a BREAKING change rather than an additive one:
+every no-matcher subscriber would silently begin receiving auto-tag noise from
+`maybe_auto_tag`, which writes non-status tags routinely. Under a lane-scoped name
+that widening is a NEW event (`SessionTagsChanged`, still unused) beside this one,
+and existing subscribers are untouched. The name was deliberately narrowed before
+merge for exactly that reason; widening the contract later must add an event rather
+than redefine this one.
+
+**This section is the event's compatibility surface.** The payload keys and the matcher token grammar are what a registered hook binds to, so changing either
+breaks existing hooks — they are documented here rather than left to be inferred
+from the first subscriber.
+
+**It ships with ZERO registered subscribers, and that is the cheapest moment it
+will ever have.** The event name, the four payload keys and the token grammar are a
+one-way door: every one of them becomes a compatibility obligation the instant a
+hook binds to it, and today nothing does, so the surface is still free to change.
+That is inherent to adding any hook event rather than a defect of this one — but it
+is the reason the contract is written down BEFORE a subscriber exists rather than
+after, and the reason the name was narrowed pre-merge. Reviewers judging this
+surface should treat now as the last point at which a correction is free; the
+status-only scoping is what keeps the expected future widening additive.
+
+**Payload (stdin JSON).** All three keys are stamped unconditionally, so a hook that
+always reads one never `KeyError`s on an addition-only or removal-only change:
+
+| key | meaning |
+|-----------|--------------------------------------------------|
+| `slot` | the session key whose tags changed |
+| `added` | **status** tag ids added by this transition |
+| `removed` | **status** tag ids removed by this transition |
+
+`added` and `removed` are **status-only**, not the raw set difference. A single tag
+edit can bundle a lane change with a plain-label change, and emitting the whole
+delta would put `added:<label>` in the matcher context — letting a hook match a
+non-status tag, which contradicts the status-only firing contract above. There is no
+`tags` key: a subscriber needing the session's full current state re-reads the live
+store, because dispatch is off the request path and the board can move again first.
+
+Filtering the delta cannot make it empty. The fire gate compares the status-only
+sets, so a dispatch happens only when they differ — the symmetric difference then
+holds at least one id. This is load-bearing rather than incidental: `fire` consults
+a matcher only when the context is non-empty, so an empty delta would skip matcher
+filtering and run EVERY hook registered for the event, the opposite of the intent.
+
+The **delta** is the point: with `tags` alone every consumer would have to persist
+its own prior snapshot to answer "was Done just added?", which moves the diffing
+into every subscriber instead of doing it once here.
+
+**Matcher grammar** (built by the module-private `_session_lane_matcher_context`,
+which lives beside `HOOK_EVENT_SESSION_LANE_CHANGED` because the GRAMMAR is the
+event's contract, not the writer's; the builder has no caller outside `hooks.py`,
+since the fire derives the context itself). Tokens are **direction-tagged** and carry the tag **id only**:
+
+```
+added:<id>;  removed:<id>;
+```
+
+Direction is in the grammar because the motivating case is "a session **entered**
+Done"; an untagged context cannot express it, since an `<id>` matcher would fire on
+leaving the lane too.
+
+**A bare lane id matches NOTHING.** The default matcher mode is `glob` and
+matching is **whole-string** `fnmatch`, so a selector must carry wildcards:
+
+| intent            | `glob` selector   | `contains` selector |
+|-------------------|-------------------|---------------------|
+| entered a lane    | `*added:<id>;*`   | `added:<id>;`       |
+| left a lane       | `*removed:<id>;*` | `removed:<id>;`     |
+| any movement      | `*:<id>;*`        | `:<id>;`            |
+
+**Both bounds of the id are load-bearing, not decoration.** Matching is `fnmatch`
+against the whole context, so a selector must pin the id at each end or it matches a
+DIFFERENT lane and the hook that runs belongs to someone else — for a close-out hook,
+an irreversible action on the wrong session.
+
+- The trailing `;` stops a selector for a short id also matching every longer id it
+  **prefixes**: without it `*added:abc*` fires on `added:abcdef;`.
+- The leading `:` stops it matching an id it is a **suffix** of: `*abc;*` fires on
+  `added:xabc;`, because that token ends with the same `abc;`. The direction-tagged
+  rows get this bound for free from `added:`/`removed:`, which is why only the
+  direction-free row has to spell the `:` out.
+
+Neither bound is forgeable: `:` and `;` are both outside the id allowlist
+(`_TOKEN_ALLOWED = re.compile(r"\A[a-z0-9_.-]+\Z")`), so no id can contain either. Two
+generated ids are the same length `uuid4().hex[:12]` and can neither prefix nor suffix each
+other, but `tags.json` is
+hand-editable and legacy artifacts exist — the same path the token validator guards.
+
+**Why the validator is an allowlist and not a separator screen.** `:` and `;` are
+rejected inside an id so it cannot forge its own bounds, but refusing only the
+separators still admits glob metacharacters, and the grammar is consumed by `fnmatch`:
+an id of `*` would make the selector written for it match EVERY lane change and run
+that tag's hook on sessions it was never registered for. Enumerating the safe
+characters refuses that whole class instead of the separators that happened to be
+foreseen. `.` IS admitted, because it is none of those things — `fnmatch` treats it as a
+literal, so a hand-named `in.review` reaches the grammar rather than vanishing from every
+matcher context. The allowlist is lower-case only, because `_context_matches` folds case and
+an upper-case id would otherwise admit two spellings of one token; an id the validator
+refuses is skipped with a logged warning rather than silently dropped.
+
+**Why ids and not display names.** Emitting `added:<name>` alongside the id read
+better — an author could write `*added:In_Review*` for a lane shown as "In Review" —
+but it put a user-controlled string into a structural grammar and cost more than it
+bought. Whitespace divides tokens and `:` divides a direction from its value, so a
+name had to be escaped or one lane could forge another lane's token; a collapsing
+sanitizer turned out to be many-to-one (`In Review`, `In:Review` and a literal
+`In_Review` all became `In_Review`), which fires a destructive close-out hook for
+the **wrong** lane, so the escape had to be injective; and the resulting spelling
+(`*added:In_20Review*`) would have been frozen contract from the first subscriber
+onward. Ids already select a lane, contain no separator to escape, and are stable
+across renames, so a matcher keeps working when a lane is relabelled.
+
+The sequencing is settled by the asymmetry: adding name tokens later is **additive**,
+removing them later is **breaking**, and this event ships with zero subscribers — so
+leaving that grammar unfrozen costs nothing today. A subscriber wanting the
+human-readable label reads `added`/`removed` from the payload and resolves the
+ids it finds there; the follow-up event-picker UI can resolve a name to an id when
+composing the matcher.
+
+An id is **validated, not escaped**: ids are `uuid4().hex[:12]`, but `tags.json` is
+persisted state a human can edit, so an id carrying whitespace or `:` is skipped
+rather than tokenized. That degrades matching for that one tag instead of splitting
+into two tokens or forging the opposite direction.
+
+**Contract limits, all deliberate:**
+
+- **Status tags only.** `chat_auto_tag.maybe_auto_tag` writes non-status tags
+  routinely and never writes status ones, so firing on every tag would make the
+  event chatty for the board-lane case that motivates it while adding nothing.
+- **Informational — a hook cannot veto.** Exit code 2 blocks a `PreToolUse` call;
+  this event ignores it. By the time it fires the write is applied and the drag has
+  happened, so a veto would make the board unusable when a hook breaks rather than
+  preventing anything. A refused or rolled-back write never fires it.
+- **Only ids are tokenized, and an id must match the single `_TOKEN_ALLOWED` allowlist stated above, so nothing user-controlled reaches the grammar.**
+  Whitespace separates tokens and `:` separates a direction from its value, so a tag
+  NAME reaching a token raw could forge either: a lane named `removed:done` would
+  emit `added:removed:done` and fire a `*removed:done*` cleanup hook on a session
+  that just ENTERED a lane, and `done x` would split and forge a match for a
+  different lane called `done`. Escaping names was tried and dropped as a
+  subtraction: the escape had to be *injective* (collapsing separator runs to `_`
+  made `In Review`, `In:Review` and a literal `In_Review` share one token, firing a
+  destructive hook for the wrong lane), and its spelling would then be frozen
+  contract. Dropping name tokens removes that surface instead of guarding it — see
+  the matcher-grammar section above for the sequencing argument. Ids are
+  `uuid4().hex[:12]` and carry no separator, but are **validated** anyway because
+  `tags.json` is persisted state: a malformed id is skipped, never rewritten.
+- **Three event allowlists diverge intentionally.** The event is in
+  `hooks.HOOK_EVENTS` (dispatchable) and `validation.ALLOWED_HOOK_EVENTS`
+  (registrable through the hook create/update API), and deliberately **absent**
+  from `agent._VALID_HOOK_EVENTS` — kiro-cli rejects a generated agent config
+  naming an event it does not know. A test pins all three memberships together
+  with this rationale, so the divergence cannot be "fixed" by syncing them.
+
+**The SEL rows this event adds, stated so an auditor can find them and a host can
+budget them.** A lane-dispatch decision writes ONE `log_api_access` row under
+`operation="hooks.session_lane_changed"`, on either outcome, so the count does not
+depend on whether the dispatch was permitted. The rate is per DECISION, not per
+session and not per tag: deleting a status tag strips it from every session holding
+it and still records one row for that whole batch. The floor is zero and zero is the
+default shipping state — the row is written only once an enabled `SessionLaneChanged`
+hook is registered, so a host with no subscriber adds none. No volume figure is
+stated here on purpose: nothing in the implementation measures one, so any
+rows-per-day number would be an estimate rather than a contract.
+
+**Known deferral (partially mitigated here).** Resolving the `capabilities.script_hooks`
+gate walks `profiles/` synchronously, so any `async` caller resolving it inline stalls the
+event loop for that walk — a `no-blocking-call-on-event-loop` violation reachable from lane
+dispatch. Both `async` call sites in `hooks.py` therefore await ONE seam,
+`_script_hooks_capability_denied_async`, which hops to a thread. Unconditional, not keyed on
+the event: scoping it to `SessionLaneChanged` was tried and withdrawn, because it put an
+equality branch in shared dispatch that every future event would grow while leaving the
+other events stalling anyway. Centralised in one wrapper rather than a hop at each call
+site, because it remains a CALLER-side workaround: the cause-level remedy is non-blocking
+resolution, or a cached fingerprint, in the owning module — and when that lands there is one
+seam to delete instead of a hop per caller. Synchronous callers outside this module still
+resolve inline and still stall.
 
 ### User kiro-cli Hooks (`agent.kiro_hooks` in `config.json`)
 

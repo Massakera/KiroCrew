@@ -22,6 +22,7 @@ Supports three schedule types:
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -35,7 +36,16 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Collection, Iterator, NamedTuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Iterator,
+    NamedTuple,
+)
 from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
@@ -914,6 +924,22 @@ class CronJob:
     #: the schedule drifts) and never reaches the stamp, so the two disagree and
     #: the Schedule page shows no count for it rather than the previous run's.
     last_retry_run_ts: float = 0.0
+    #: The run GENERATION the store holds: a per-job counter, one above the
+    #: previous run's, allocated to a run at its first step -- or to the
+    #: ``cancel()`` / reap that takes its claim before that -- by
+    #: ``CronService._next_run_generation`` and written to the record by the
+    #: two terminal merges only (``_merge_job_result`` for a completed run,
+    #: ``_merge_terminal_state_locked`` for a cancelled or reaped one). Both
+    #: merges run in a worker thread behind the release of the run's claim,
+    #: under a store lock other writers contend for, so a replacement run
+    #: accepted in that window can complete and merge FIRST; the older run's
+    #: record is then discarded rather than applied over it (status, error,
+    #: result and the failure counter would all revert until some later run
+    #: merged again). An integer, not a timestamp: Windows' ``time.time()``
+    #: ticks every ~15.6 ms, so two runs of one job can claim with EQUAL
+    #: timestamps, which no "newer wins" rule can order. 0 is a legacy record
+    #: or a job that never ran.
+    run_generation: int = 0
 
     # A sequence of MORE THAN ONE agent takes precedence over agent_id: the
     # gateway runs those agents in order, each on its own session key. A
@@ -2061,6 +2087,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         model=_guard_str("model"),
         last_retry_count=_guard_num("last_retry_count", 0),
         last_retry_run_ts=_guard_num("last_retry_run_ts", 0.0),
+        run_generation=_guard_num("run_generation", 0),
         agent_sequence=_str_list("agent_sequence"),
         env=j.get("env", {}),
         timeout_secs=_guard_num("timeout_secs", _JOB_TIMEOUT_SECS),
@@ -2082,6 +2109,60 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
             ", ".join(coerced),
         )
     return job
+
+
+async def _manual_run_refused() -> bool:
+    """The coroutine :meth:`CronService.run_job` hands back without a claim.
+
+    ``run_job`` decides synchronously whether the job is already executing; a
+    refused trigger still has to return something the caller can ``await`` or
+    wrap in a task, so it gets this instead of the claimed body.
+    """
+    return False
+
+
+class _RunMarkers:
+    """Cancel / reap markers keyed by job id AND the run they were set for.
+
+    ``cancel()`` and the reaper mark the run whose meta tuple they popped, and
+    a finalizer consumes only a marker set for its own tuple (identity, like
+    every claim fence in :class:`CronService`). Keyed by job id alone, a marker
+    is shared by every run of the job: a finalizer stalled in its executor
+    round trip consumes a replacement run's marker, that run's finalizer then
+    finds none and appends a failure row after the cancelled row ``cancel()``
+    already wrote for it -- and two cancellations landing before either is
+    consumed collapse into one marker, so one of the two runs finalizes as if
+    it had completed. Every question asked of a marker names the run: there is
+    no by-job-id membership, because no product path has a job-id-only question
+    to ask.
+    """
+
+    __slots__ = ("_marks",)
+
+    def __init__(self) -> None:
+        self._marks: dict[str, list[tuple[float, str]]] = {}
+
+    def mark(self, job_id: str, run: tuple[float, str]) -> None:
+        """Set the marker for ``run``; a run already marked is not marked twice."""
+        if not self.has(job_id, run):
+            self._marks.setdefault(job_id, []).append(run)
+
+    def has(self, job_id: str, run: tuple[float, str] | None) -> bool:
+        """Whether ``run`` -- this tuple, not an equal one -- is marked."""
+        return any(mark is run for mark in self._marks.get(job_id, ()))
+
+    def consume(self, job_id: str, run: tuple[float, str] | None) -> bool:
+        """Remove ``run``'s marker, leaving every other run's in place."""
+        marks = self._marks.get(job_id)
+        if not marks:
+            return False
+        for index, mark in enumerate(marks):
+            if mark is run:
+                del marks[index]
+                if not marks:
+                    del self._marks[job_id]
+                return True
+        return False
 
 
 class CronService:
@@ -2153,10 +2234,19 @@ class CronService:
         # considers healthy. The epoch map stays for human-facing timestamps
         # (running_since, history, the "ran Ns" log).
         self._job_start_monotonic: dict[str, float] = {}  # job ID → monotonic start
-        self._reaped_jobs: set[str] = set()  # job IDs killed by the reaper
-        self._cancelled_jobs: set[str] = set()  # job IDs cancelled by the user
+        # Runs killed by the reaper / cancelled by the user, keyed by job id AND
+        # the run's meta tuple: the run's own finalizer consumes its marker and
+        # skips the merge + history row its cancel() / reap already wrote.
+        self._reaped_jobs = _RunMarkers()
+        self._cancelled_jobs = _RunMarkers()
         self._job_jitter: dict[str, float] = {}  # job ID → jitter seconds applied
         self._job_run_meta: dict[str, tuple[float, str]] = {}  # job_id → (start_time, trigger)
+        # job_id → the highest run generation this process has allocated for
+        # the job (see _next_run_generation). Service state, not job state:
+        # every _sync() reload replaces the CronJob objects, and a counter kept
+        # on one of them would be lost with it before the run's merge persisted
+        # it, handing the next run the same number.
+        self._run_generations: dict[str, int] = {}
         # Where the loop-stall breaker looks for crash dumps. None = the data
         # home's dump directory; tests point it at a temp dir.
         self._dumps_dir: Path | None = None
@@ -2396,12 +2486,20 @@ class CronService:
         # use the active per-run session key if registered;
         # fall back to the stable key for persistent or legacy callers.
         session_key = self.get_active_session_key(job_id) or f"cron:{job_id}"
-        self._reaped_jobs.add(job_id)
         meta = self._job_run_meta.pop(job_id, None)
+        # Mark the run this reap found: its finalizer consumes only its own
+        # marker. No meta means a cancel() or an earlier reap already took the
+        # run and marked it; a second marker would have no run to consume it.
+        if meta is not None:
+            self._reaped_jobs.mark(job_id, meta)
         reap_started_at = meta[0] if meta else time.time() - elapsed
         reap_trigger = meta[1] if meta else "scheduled"
         self._job_start_times.pop(job_id, None)  # prevent repeated reaping
         self._job_start_monotonic.pop(job_id, None)
+        # The run's finalizer clears its jitter only while it still holds the
+        # claim popped above, so the reap must release the stamp itself or a
+        # reaped one-shot that is then removed keeps its entry for good.
+        self._job_jitter.pop(job_id, None)
         # Kill the session process first.
         if self._sessions:
             try:
@@ -2436,6 +2534,10 @@ class CronService:
         if job:
             last_error = f"Reaped after {int(elapsed)}s (exceeded {deadline}s deadline)"
             last_run_ts = time.time()
+            # Drawn here, in the same loop step as the release above (no await
+            # between them), so a replacement claim always draws a higher one
+            # and this record can never land over that run's.
+            generation = self._next_run_generation(job)
             # Reflect into the in-memory snapshot for the history record below
             # and any immediate reader; the authoritative persist is the locked
             # merge, which re-derives the disk copy after _sync().
@@ -2449,6 +2551,7 @@ class CronService:
                     last_status="error",
                     last_error=last_error,
                     last_run_ts=last_run_ts,
+                    run_generation=generation,
                 )
             except Exception:
                 logger.exception("Reaper: failed to persist state for cron %s", job_id)
@@ -2602,8 +2705,13 @@ class CronService:
         if job_id not in self._executing:
             return False
         logger.info("Cancel: user-initiated cancellation of cron job %s", job_id)
-        self._cancelled_jobs.add(job_id)
         meta = self._job_run_meta.pop(job_id, None)
+        # Mark the run this cancel found (see _RunMarkers): a marker keyed by
+        # job id alone would be consumed by whichever finalizer of this job
+        # reads it first. No meta means another cancel() or the reaper already
+        # took this run and marked it.
+        if meta is not None:
+            self._cancelled_jobs.mark(job_id, meta)
         started_at = meta[0] if meta else self._job_start_times.get(job_id, time.time())
         trigger = meta[1] if meta else "scheduled"
         elapsed = time.time() - started_at
@@ -2652,6 +2760,10 @@ class CronService:
         if job:
             last_error = f"Cancelled by user after {int(elapsed)}s"
             last_run_ts = time.time()
+            # Drawn here, in the same loop step as the release in step 3 (no
+            # await between them), so a replacement claim always draws a higher
+            # one and this record can never land over that run's.
+            generation = self._next_run_generation(job)
             # In-memory snapshot for the history record / immediate readers;
             # the locked merge is authoritative.
             job.last_status = "error"
@@ -2664,6 +2776,7 @@ class CronService:
                     last_status="error",
                     last_error=last_error,
                     last_run_ts=last_run_ts,
+                    run_generation=generation,
                 )
             except Exception:
                 logger.exception("Cancel: failed to persist state for cron %s", job_id)
@@ -4581,16 +4694,84 @@ class CronService:
         """Set the dashboard refresh callback."""
         self._push_refresh = cb
 
-    async def run_job(self, job_id: str) -> bool:
-        """Manually trigger a job via _run_job_isolated (records history)."""
-        # Refresh the store off the loop, then resolve + claim on the loop.
+    def run_job(self, job_id: str) -> Coroutine[Any, Any, bool]:
+        """Manually trigger a job via _run_job_isolated (records history).
+
+        A plain ``def`` that returns the coroutine, on purpose: the claim on the
+        job -- its ``_executing`` entry and its ``(started, "manual")`` run meta
+        -- is taken HERE, synchronously, while the call expression is evaluated.
+        It therefore exists before the caller's ``asyncio.create_task`` has
+        scheduled anything and before the coroutine's first ``await``. The
+        manual-run route stores the task it creates in ``_running_tasks`` and
+        answers 409 "already running" off that entry, while ``cancel()`` reads
+        only ``_executing``: a claim taken only inside the coroutine -- after
+        the offloaded store refresh, up to a full lock spin later -- leaves a
+        window in which Cancel answers "not running" about a run that Run calls
+        "already running", and the run then executes anyway. Loop-only and
+        await-free, so the check-and-claim stays atomic against the due-scan
+        and a concurrent manual trigger; ``_run_claimed_manual`` releases the
+        claim if the store does not hold the job. Every caller awaits or
+        schedules the returned coroutine at once (the route wraps it in a task
+        on the same line); one that dropped it would leave the job claimed.
+        """
+        if job_id in self._executing:
+            return _manual_run_refused()
+        claim = (time.time(), "manual")
+        self._job_run_meta[job_id] = claim
+        self._executing.add(job_id)
+        return self._run_claimed_manual(job_id, claim)
+
+    def _release_manual_claim(self, job_id: str, claim: tuple[float, str]) -> None:
+        """Undo :meth:`run_job`'s claim when no run consumed it, or none will.
+
+        Identity, not equality: ``cancel()`` pops the run meta and discards
+        ``_executing`` when it cancels a parked manual run, and any later manual
+        or scheduled claim installs a NEW meta tuple, so a claim that is not the
+        stored one belongs to someone else and is left alone. Every site that
+        releases a job's run state -- this helper, ``_run_job_isolated``'s
+        finally, the manual wrapper's backstop -- checks the stored meta tuple
+        the same way, so a newer claim is never released by an older run;
+        ``cancel()`` and the reaper release only the run they found, while its
+        ``_executing`` entry still keeps every other claimant out. The cancel
+        and reap markers are keyed by the same tuple (:class:`_RunMarkers`), so
+        a finalizer consumes only the marker set for its own run.
+        """
+        if self._job_run_meta.get(job_id) is claim:
+            self._job_run_meta.pop(job_id, None)
+            self._executing.discard(job_id)
+
+    def _next_run_generation(self, job: CronJob) -> int:
+        """Allocate the next run generation of ``job``. Loop-side, no store I/O.
+
+        One above both the generation the store holds for the job
+        (``job.run_generation``: the last record merged, as of the object's
+        last sync) and the highest this process has handed out for it, so two
+        runs of one job never share a number -- whatever the clock says
+        (Windows' ``time.time()`` ticks every ~15.6 ms, so two claims in one
+        tick carry equal timestamps), across the reloads that replace the job
+        object before a run's merge lands, and across restarts, which resume
+        above the persisted value. Called once per run at its first step, and
+        by ``cancel()`` / ``_force_reap`` for the terminal record they write,
+        each BEFORE the run's ``_executing`` entry is released and without an
+        ``await`` in between, so a replacement claim always draws a higher
+        number. Not a locked store write: the claim sites are loop-resident
+        and never take the store lock, and the merge that carries the number
+        persists it under the lock anyway.
+        """
+        generation = max(job.run_generation, self._run_generations.get(job.id, 0)) + 1
+        self._run_generations[job.id] = generation
+        return generation
+
+    async def _run_claimed_manual(self, job_id: str, claim: tuple[float, str]) -> bool:
+        """Body of :meth:`run_job`, entered with the claim already taken."""
+        # Refresh the store off the loop, then resolve + spawn on the loop.
         #
         # The locked _sync() + snapshot runs in a worker thread (_synced_snapshot
         # via asyncio.to_thread) so a manual trigger never pays the whole-file
         # read_bytes() + blake2b hash of crons.json on the event loop.
-        # _executing / _job_run_meta are loop-owned, so the find + claim stays
-        # on the loop, with NO await between the snapshot read and the claim so
-        # it is atomic against every other loop task (the timer due-scan).
+        # _executing / _job_run_meta are loop-owned; the claim was taken on the
+        # loop before this coroutine started, so a cancel() that lands while the
+        # refresh is in flight finds the run and cancels THIS task.
         #
         # One residual, benign race remains against the batch-remove worker: it
         # may delete the job on its own thread in the instant between our
@@ -4599,15 +4780,33 @@ class CronService:
         # see it). The batch-remove worker holds the SAME flock, so a lock-held
         # claim could not observe a delete mid-way regardless. Degrades to the
         # in-memory snapshot under lock contention.
-        snapshot = await asyncio.to_thread(self._synced_snapshot, True)
+        try:
+            snapshot = await asyncio.to_thread(self._synced_snapshot, True)
+        except BaseException:
+            # No run will consume the claim: release it unless cancel() already
+            # did (it pops the meta, so the identity check fails) or a newer
+            # claim has replaced it. A cancel() that reached us here also marked
+            # this claim in _cancelled_jobs for _run_job_isolated's finally to
+            # consume -- a finally this run never spawns -- so consume it here,
+            # or the marker would outlive its run.
+            self._release_manual_claim(job_id, claim)
+            self._cancelled_jobs.consume(job_id, claim)
+            raise
+        if self._job_run_meta.get(job_id) is not claim:
+            # cancel() took the claim while the refresh was in flight and is
+            # still tearing down: it pops the run meta first and cancels the
+            # tracked task only after its process-kill / session-reset awaits,
+            # so this coroutine can resume inside that gap. Dispatching here
+            # would start the very run cancel() is about to report cancelled.
+            # The marker cancel() left is keyed to this claim, for a
+            # _run_job_isolated finally that never runs; consume it here.
+            self._cancelled_jobs.consume(job_id, claim)
+            return False
         job = next((j for j in snapshot if j.id == job_id), None)
         if not job:
+            self._release_manual_claim(job_id, claim)
             return False
-        if job.id in self._executing:
-            return False
-        self._job_run_meta[job.id] = (time.time(), "manual")
-        self._executing.add(job.id)
-        task = asyncio.create_task(self._run_job_isolated(job))
+        task = asyncio.create_task(self._run_job_isolated(job, claim))
         self._running_tasks[job.id] = task
         try:
             await task
@@ -4615,7 +4814,11 @@ class CronService:
             if not task.cancelled():
                 raise  # outer coroutine was cancelled, propagate
         finally:
-            if task.done():
+            # Backstop for a run whose finally was cut short, idempotent with
+            # it and fenced the same way: the wrapper resumes one loop
+            # iteration after the run ends, and a claim that is not this
+            # wrapper's by then belongs to a replacement run.
+            if task.done() and self._job_run_meta.get(job.id) is claim:
                 self._executing.discard(job.id)
                 self._running_tasks.pop(job.id, None)
         return True
@@ -5020,17 +5223,45 @@ class CronService:
                 return
 
             # Fire each job independently — one hung job never blocks others.
+            # The claim taken here is handed to the task rather than read back
+            # by it: see _run_job_isolated.
             for j in due:
                 self._executing.add(j.id)
-                self._job_run_meta.setdefault(j.id, (time.time(), "scheduled"))
-                task = asyncio.create_task(self._run_job_isolated(j))
+                claim = self._job_run_meta.setdefault(j.id, (time.time(), "scheduled"))
+                task = asyncio.create_task(self._run_job_isolated(j, claim))
                 self._running_tasks[j.id] = task
         finally:
             self._on_timer_running = False
 
-    async def _run_job_isolated(self, job: CronJob) -> None:
-        """Execute a single job and merge results back to disk."""
-        meta = self._job_run_meta.get(job.id)
+    async def _run_job_isolated(self, job: CronJob, meta: tuple[float, str] | None = None) -> None:
+        """Execute a single job and merge results back to disk.
+
+        ``meta`` is the claim the dispatcher took for this run -- the tuple it
+        stored in ``_job_run_meta`` as it added the job to ``_executing`` and
+        tracked this task (``_on_timer``, ``_run_claimed_manual``) -- handed in
+        rather than read back here. This first step runs at least one loop
+        iteration after ``create_task``, and a ``cancel()`` in that gap pops the
+        claim, marks the cancellation for that tuple, and awaits the process kill
+        BEFORE it cancels the task, so the task starts inside ``cancel()``: a
+        meta read here is then None, the finally's marker lookup for None misses,
+        and the run is filed as a failure beside the cancelled row ``cancel()``
+        writes. ``None`` is a run that holds no claim (a test harness driving a
+        bare run); it proceeds only while the store holds no claim either.
+        """
+        if self._job_run_meta.get(job.id) is not meta:
+            # Released before this run's first step: cancel() took the claim
+            # and every stamp it found, wrote the run's terminal row and is
+            # about to cancel this task. Run nothing -- a stamp set now would
+            # sit behind the release fence in the finally (the claim is no
+            # longer this run's), and that finally would double the row already
+            # written. The markers cancel() and the reaper key to this claim are
+            # consumed here, the one place left that can.
+            self._cancelled_jobs.consume(job.id, meta)
+            self._reaped_jobs.consume(job.id, meta)
+            return
+        # This run's generation, drawn while it verifiably holds the claim;
+        # the finally stamps it on the record it merges (see CronJob).
+        generation = self._next_run_generation(job)
         started_at = meta[0] if meta else time.time()
         trigger = meta[1] if meta else "scheduled"
         # Provisional; refined once the jitter sleep completes. Only read on
@@ -5038,6 +5269,11 @@ class CronService:
         exec_started_at = started_at
         being_cancelled = False
         marker_write: "asyncio.Future[None] | None" = None
+        # The in-flight marker is one file per RUN, named by this token, so the
+        # clear in the finally can only remove this run's own marker -- never
+        # the one a replacement run wrote while this run's cancellation was
+        # still unwinding (see cron_inflight.clear_marker).
+        marker_run = uuid.uuid4().hex
         # Everything the finally below releases is claimed INSIDE the try. The
         # caller (_on_timer, run_job) has already added the job to _executing
         # and stored this task in _running_tasks, and the timer path never
@@ -5087,10 +5323,10 @@ class CronService:
             # The jitter sleep MUST live inside this try: hourly/daily jobs
             # sleep up to 59 min here, and a user cancel() during that window
             # raises CancelledError at the sleep — if that happened BEFORE the
-            # try, the finally below would never run, leaking the
-            # _cancelled_jobs marker (and the rest of the bookkeeping) so the
-            # job's NEXT run would see the stale marker and silently drop its
-            # real result as "cancelled".
+            # try, the finally below would never run, leaking this run's
+            # _cancelled_jobs marker (and the rest of the bookkeeping): the
+            # run-keyed marker stays inert for later runs, but nothing else
+            # would ever consume it.
             if jitter > 0:
                 logger.debug("Cron: applying %.0fs jitter to job '%s'", jitter, job.name)
                 await asyncio.sleep(jitter)
@@ -5108,7 +5344,12 @@ class CronService:
             # read as an abandoned run on the next boot.
             marker_write = asyncio.ensure_future(
                 asyncio.to_thread(
-                    cron_inflight.write_marker, self._dir, job.id, job.name, exec_started_at
+                    cron_inflight.write_marker,
+                    self._dir,
+                    job.id,
+                    job.name,
+                    exec_started_at,
+                    run=marker_run,
                 )
             )
             await asyncio.shield(marker_write)
@@ -5119,7 +5360,7 @@ class CronService:
                     self._push_refresh("crons")
             except Exception:
                 logger.debug("push_refresh failed on job start", exc_info=True)
-            await self._execute_with_timeout(job)
+            await self._execute_with_timeout(job, meta)
         except asyncio.CancelledError:
             # stop() cancels this task WITHOUT marking _cancelled_jobs, so the
             # finally must know not to clear the last completed run's result.
@@ -5138,25 +5379,34 @@ class CronService:
             except (asyncio.CancelledError, Exception):
                 pass  # the write is best-effort; the clear below still runs
             try:
-                await asyncio.to_thread(cron_inflight.clear_marker, self._dir, job.id)
+                # This run's file only (the token is in its name): a replacement
+                # run accepted while this cancellation was unwinding -- a whole
+                # session teardown for an agent job -- has its own marker, and
+                # a clear by job id would have taken it, leaving a hard exit
+                # during that run with no evidence for the breaker.
+                await asyncio.to_thread(cron_inflight.clear_marker, self._dir, job.id, marker_run)
             except Exception:
                 logger.debug("in-flight marker not cleared for %s", job.id, exc_info=True)
-            self._job_start_times.pop(job.id, None)
-            self._job_start_monotonic.pop(job.id, None)
-            self._job_jitter.pop(job.id, None)
-            self._job_run_meta.pop(job.id, None)
-            reaped = job.id in self._reaped_jobs
-            self._reaped_jobs.discard(job.id)
-            cancelled = job.id in self._cancelled_jobs
-            self._cancelled_jobs.discard(job.id)
-            self._executing.discard(job.id)
-            self._running_tasks.pop(job.id, None)
-            # Notify dashboard that the job has finished (clears the badge).
-            try:
-                if self._push_refresh:
-                    self._push_refresh("crons")
-            except Exception:
-                logger.debug("push_refresh failed on job end", exc_info=True)
+            # Consume only THIS run's markers (identity on its meta tuple).
+            # cancel() and the reaper mark the run they popped; a marker keyed
+            # by job id alone would let this finalizer, stalled in the clear
+            # above while a replacement run was accepted and cancelled, eat
+            # that run's marker -- its finalizer then finds none and appends a
+            # failure row after the cancelled row cancel() already wrote.
+            reaped = self._reaped_jobs.consume(job.id, meta)
+            cancelled = self._cancelled_jobs.consume(job.id, meta)
+            # This run's terminal record, taken BEFORE the release below. The
+            # job object is shared by every run of the job, and the release
+            # lets a replacement start while the merge and history append are
+            # still pending: that run's `_execute` resets last_status and the
+            # result-produced flag on the same object, so a record read after
+            # the release would file this run as a failure with no summary and
+            # persist the replacement's blank status as this run's. The every-
+            # job stamp move and the carried-result clear are this run's own
+            # terminal writes, so they land here too, inside the claim.
+            terminal: CronJob | None = None
+            status = ""
+            run_result: str | None = None
             if not reaped and not cancelled:
                 # For 'every' jobs, use started_at to prevent cumulative drift.
                 # `_execute` bound this run's retry count to the `last_run_ts` it
@@ -5173,6 +5423,50 @@ class CronService:
                 # what let the fire-time deny and script Skip paths keep a result.
                 if (job.command or job.script) and not being_cancelled:
                     job.clear_carried_result()
+                status = "success" if job.last_status == "ok" else "failure"
+                # Attribute last_result to this run only if the run actually
+                # produced it (set_run_result sets the marker). Reading it
+                # unconditionally recorded the PREVIOUS run's result as this
+                # run's summary/trace whenever the run ended without producing
+                # one (observed in the wild: a timed-out run's history row
+                # carried the prior success's summary verbatim -- fabricated
+                # history on a status=failure record).
+                run_result = job.last_result if job.result_produced else None
+                # The merge copies this run's fields to the disk copy field by
+                # field; a shallow copy freezes them as this run left them.
+                terminal = copy.copy(job)
+                # The record's generation, which the merge compares against the
+                # one the store holds and stamps on it. Set on the copy, not
+                # the shared job -- only a merge moves the store's generation,
+                # so a run that has merely STARTED behind this one does not
+                # discard this record; a run whose record already landed does.
+                terminal.run_generation = generation
+            # Release the job's run state only while the stored claim is still
+            # THIS run's meta tuple (identity, as in _release_manual_claim).
+            # cancel() and the reaper release the run they found before
+            # anything else can claim the job, and the marker clear above is a
+            # full executor round trip: a manual Run accepted in that gap holds
+            # a claim -- meta, start stamps, _executing entry, tracked task --
+            # that is not this run's to remove. Popping it anyway drops that
+            # run at its own claim re-check after the route answered "started",
+            # or, past the re-check, leaves it running with Cancel answering
+            # 409 and a further Run accepted beside it. A run that is still the
+            # claim holder (a normal completion, or stop()'s cancel, which
+            # releases nothing) releases everything here as before.
+            if self._job_run_meta.get(job.id) is meta:
+                self._job_start_times.pop(job.id, None)
+                self._job_start_monotonic.pop(job.id, None)
+                self._job_jitter.pop(job.id, None)
+                self._job_run_meta.pop(job.id, None)
+                self._executing.discard(job.id)
+                self._running_tasks.pop(job.id, None)
+            # Notify dashboard that the job has finished (clears the badge).
+            try:
+                if self._push_refresh:
+                    self._push_refresh("crons")
+            except Exception:
+                logger.debug("push_refresh failed on job end", exc_info=True)
+            if terminal is not None:
                 try:
                     # Offload the lock+sync+save merge to a worker thread:
                     # _merge_job_result enters the bounded sync _file_lock,
@@ -5187,21 +5481,11 @@ class CronService:
                     # swap). CronStoreBusy (a TimeoutError) on sustained
                     # contention is caught below and logged — the merge is
                     # best-effort and the next run / reaper re-persists.
-                    await asyncio.to_thread(self._merge_job_result, job)
+                    await asyncio.to_thread(self._merge_job_result, terminal)
                 except Exception:
                     logger.exception("Failed to merge result for job '%s'", job.name)
                 # Record history
                 try:
-                    status = "success" if job.last_status == "ok" else "failure"
-                    # Attribute last_result to this run only if the run
-                    # actually produced it (set_run_result sets the marker).
-                    # Reading it unconditionally recorded the PREVIOUS run's
-                    # result as this run's summary/trace whenever the run
-                    # ended without producing one (observed in the wild: a
-                    # timed-out run's history row carried the prior success's
-                    # summary verbatim — fabricated history on a
-                    # status=failure record).
-                    run_result = job.last_result if job.result_produced else None
                     record = CronRunRecord(
                         job_id=job.id,
                         trigger=trigger,
@@ -5213,9 +5497,9 @@ class CronService:
                         # truncation site, applying the configured cap through
                         # truncate_summary, which keeps URLs and the outcome
                         # line. A slice here would cut ahead of both.
-                        summary=run_result or job.last_error or "",
+                        summary=run_result or terminal.last_error or "",
                         trace=run_result or "",
-                        error=job.last_error or "",
+                        error=terminal.last_error or "",
                     )
                     await self._history.append(record)
                     if self._push_refresh:
@@ -5309,8 +5593,16 @@ class CronService:
                 return False
         return True
 
-    async def _execute_with_timeout(self, job: CronJob) -> None:
-        """Execute a job with a timeout guard."""
+    async def _execute_with_timeout(
+        self, job: CronJob, meta: tuple[float, str] | None = None
+    ) -> None:
+        """Execute a job with a timeout guard.
+
+        ``meta`` is the run's own meta tuple, handed down so ``_execute`` can
+        ask whether THIS run was cancelled (the markers are keyed by run, and
+        ``cancel()`` has popped the stored tuple by the time that question is
+        asked); a direct call without one matches no marker.
+        """
         timeout = effective_wake_budget(job)
         # The cron pool's QUEUE WAIT happens inside this deadline, so the wake
         # budget has to cover it as well as the execution.  Excluding queue wait
@@ -5340,7 +5632,7 @@ class CronService:
         # failure and then overran the deadline during cleanup.
         job.failure_recorded = False
         try:
-            await asyncio.wait_for(self._execute(job), timeout=deadline)
+            await asyncio.wait_for(self._execute(job, meta), timeout=deadline)
         except asyncio.TimeoutError:
             # NB: Timeout bypasses _cron_callback's except block entirely —
             # which also means it bypasses all Slack notification logic. Adding
@@ -5377,8 +5669,11 @@ class CronService:
                 job.record_failure()
             logger.error("Cron job '%s' timed out after %ds", job.name, deadline)
 
-    async def _execute(self, job: CronJob) -> None:
-        """Run the job callback and update runtime fields (last_run_ts, last_status)."""
+    async def _execute(self, job: CronJob, meta: tuple[float, str] | None = None) -> None:
+        """Run the job callback and update runtime fields (last_run_ts, last_status).
+
+        ``meta`` is this run's meta tuple (see ``_execute_with_timeout``).
+        """
         logger.info("Cron: executing '%s' (%s)", job.name, job.id)
         # Reset status for this run so a prior run's "error" can't leak into an
         # "ok" decision below. Same for the fire-time denial marker.
@@ -5427,8 +5722,10 @@ class CronService:
                 # cancelled branch returns None without setting last_status,
                 # so a callback returning in that window would otherwise
                 # reach this branch — and cancel() documents that it leaves
-                # consecutive_failures untouched.
-                if job.id not in self._cancelled_jobs:
+                # consecutive_failures untouched. Asked for THIS run's meta:
+                # cancel() has popped the stored tuple by now, and a marker
+                # left by another run of the job is not this run's.
+                if not self._cancelled_jobs.has(job.id, meta):
                     job.record_success()
         except Exception as exc:
             job.last_status = "error"
@@ -5468,11 +5765,34 @@ class CronService:
         loop-side caller, :meth:`_run_job_isolated`, offloads it via
         ``asyncio.to_thread`` so the spin never parks the loop. Sync/CLI
         contexts with no running loop may call it directly.
+
+        Fenced by run generation (``run_generation``, see :class:`CronJob`):
+        the record's fields are applied only while its generation is not
+        below the one the store holds, compared under the lock after the
+        ``_sync()``. The finalizer calls this behind the release of its claim,
+        so a replacement run can be accepted, complete and merge while this
+        call is still waiting for the lock; an older record landing after it
+        would revert status, error, result and the failure counter to a run
+        that is not the last one. ONLY the field copies are fenced: the
+        one-shot consume below is owed by this run's completion whatever
+        landed since -- a replacement's terminal merge writes status fields and
+        retires nothing -- and a stale record that skipped it would leave a
+        consumed ``delete_after_run`` at-job enabled on disk, due again on
+        every tick. The consume already tolerates the row being gone.
         """
         with self._file_lock():
             self._sync()
             by_id = {j.id: j for j in self._jobs}
-            if job.id in by_id:
+            if job.id in by_id and job.run_generation < by_id[job.id].run_generation:
+                logger.debug(
+                    "Cron: not applying the record of an older run of '%s' (generation %d);"
+                    " the store already holds generation %d",
+                    job.name,
+                    job.run_generation,
+                    by_id[job.id].run_generation,
+                )
+            elif job.id in by_id:
+                by_id[job.id].run_generation = job.run_generation
                 by_id[job.id].last_run_ts = job.last_run_ts
                 by_id[job.id].last_status = job.last_status
                 by_id[job.id].last_error = job.last_error
@@ -5635,6 +5955,7 @@ class CronService:
         last_status: str,
         last_error: str,
         last_run_ts: float,
+        run_generation: int,
     ) -> None:
         """Persist a job's terminal runtime state under the store lock.
 
@@ -5654,6 +5975,17 @@ class CronService:
         is one lock transaction. Both loop-side callers offload it via
         ``asyncio.to_thread`` so the spin never parks the gateway loop. A
         missing id (removed meanwhile) is a no-op.
+
+        Fenced by run generation like :meth:`_merge_job_result`:
+        ``run_generation`` is the number the caller drew for the run this
+        record is for, and the record is skipped (debug log, nothing saved)
+        when the store already holds a higher one. Both callers release the
+        run's ``_executing`` entry before they offload this call, so a Run
+        accepted in that gap can complete and merge first; applying the older
+        record would persist that run's success as the cancellation or timeout
+        that came before it. Returning early here skips nothing owed: unlike
+        ``_merge_job_result`` this helper writes only the three status fields,
+        and the save after them has nothing to record once they are skipped.
         """
         with self._file_lock():
             self._sync()
@@ -5661,6 +5993,16 @@ class CronService:
             target = by_id.get(job_id)
             if target is None:
                 return
+            if run_generation < target.run_generation:
+                logger.debug(
+                    "Cron: not applying the terminal record of an older run of '%s'"
+                    " (generation %d); the store already holds generation %d",
+                    target.name,
+                    run_generation,
+                    target.run_generation,
+                )
+                return
+            target.run_generation = run_generation
             target.last_status = last_status
             target.last_error = last_error
             target.last_run_ts = last_run_ts
@@ -6323,6 +6665,7 @@ class CronService:
                     "model": j.model,
                     "last_retry_count": j.last_retry_count,
                     "last_retry_run_ts": j.last_retry_run_ts,
+                    "run_generation": j.run_generation,
                     "agent_sequence": j.agent_sequence,
                     "env": j.env,
                     "timeout_secs": j.timeout_secs,

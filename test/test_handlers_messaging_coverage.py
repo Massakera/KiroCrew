@@ -1810,12 +1810,12 @@ class TestTeamsConfigSave:
         monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
         monkeypatch.setenv("MICROSOFT_APP_PASSWORD", "")
 
-        import kiro_crew.agent as _agent
-
         def _boom(*_a, **_k):
             raise OSError("disk full during config write")
 
-        monkeypatch.setattr(_agent, "_atomic_json_write", _boom)
+        # The save writes through ``update_config_locked``, whose file write is
+        # the loader's ``write_config_atomically``; failing THAT is the disk-full.
+        monkeypatch.setattr(loader, "write_config_atomically", _boom)
         try:
             _run(mod.api_teams_config_save, _Req(_state(), {"app_password_clear": True}))
         except Exception:

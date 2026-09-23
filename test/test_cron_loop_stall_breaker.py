@@ -409,7 +409,7 @@ class TestMarkerIoRefusesWhatItDidNotWrite:
         target = tmp_path / "attacker"
         target.mkdir()
         cron_inflight.running_dir(tmp_path).symlink_to(target, target_is_directory=True)
-        cron_inflight.write_marker(tmp_path, "0badc0de", "victim")
+        cron_inflight.write_marker(tmp_path, "0badc0de", "victim", run="aaaa")
         cron_inflight.write_claim(tmp_path, "loopstall-20260101T000000Z.txt")
         assert list(target.iterdir()) == []
 

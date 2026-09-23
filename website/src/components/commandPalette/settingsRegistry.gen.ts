@@ -1012,7 +1012,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.message-font-size",
     "label": "Message Font Size",
     "labelKey": "pages.settings.chatPanel.message_font_size",
-    "description": "Font size for message text, in every session. Sidebar, session list and the rest of the interface are unaffected.",
+    "description": "Font size for the conversation, in every session: message text, code, tables, suggested replies and the message input. The Compact content width grows to match. Sidebar, session list and the rest of the interface are unaffected.",
     "tab": "chat",
     "type": "stepper",
     "occurrence": 1
@@ -1408,6 +1408,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1,
     "label": "Also send tool-call arguments so Jev can flag risky calls",
     "description": "In a session that approves its own tool calls, this also sends the name and arguments of each call to Jev, which then puts a note on the ones it thinks are worth a look. Passwords and keys are replaced before anything is sent. It changes nothing about which tool calls are allowed. Off until you turn it on, even if the switch above is already on."
+  },
+  {
+    "id": "developer.artifact-deploy",
+    "label": "Artifact Deploy",
+    "labelKey": "pages.developer.featurePreviewsTab.artifact_deploy",
+    "description": "Publish an artifact to a public HTTPS URL in your own AWS account. Off by default: every deploy spends money in your account and serves the content on the open internet.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
   },
   {
     "id": "developer.chat-on-a-crew",

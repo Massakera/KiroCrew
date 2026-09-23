@@ -89,12 +89,30 @@ _SPAWN_TIMEOUT_SECS = 60.0
 _POLL_SECS = 0.1
 
 
+def _settle(sessions, *keys):
+    """Backdate transcripts past the backfill quiet window.
+
+    ``backfill_index`` defers a session whose file changed within
+    ``history_search._INDEX_QUIET_WINDOW_SECS``: it is treated as still being
+    written. These tests append and expect the CHILD to index in the same
+    breath, and a monkeypatch does not reach a spawned interpreter, so the
+    file's own mtime is moved back instead -- the one signal the deferral reads
+    that crosses the process boundary.
+    """
+    from kiro_crew import history_search
+
+    settled = time.time() - history_search._INDEX_QUIET_WINDOW_SECS - 600.0
+    for key in keys:
+        os.utime(sessions / f"{key}.jsonl", (settled, settled))
+
+
 def _seeded_sessions(tmp_path):
     """A session directory with transcripts and no index yet."""
     sessions = tmp_path / "sessions"
     log = ConversationLog(base_dir=sessions)
     log.append("alpha", "user", "a session about deployment contention")
     log.append("beta", "user", "a session about astronomy and telescopes")
+    _settle(sessions, "alpha", "beta")
     return sessions
 
 
@@ -800,6 +818,9 @@ def test_the_child_honours_the_cross_process_session_lock(tmp_path):
 
         with log._locked("gamma"):
             log.append("gamma", "user", "a session written while its lock is held")
+            # Settled while the lock is still held, so the only thing keeping
+            # the child off this session below is the lock itself.
+            _settle(sessions, "gamma")
             # The child now sees an unindexed session it cannot lock. Give it
             # several passes (its busy pause is 0.1 s here) to try and fail.
             deadline = time.monotonic() + 2.5

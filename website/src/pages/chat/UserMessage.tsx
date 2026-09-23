@@ -230,6 +230,12 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     e.preventDefault()
   }, [meta])
 
+  const canEditResend = !!(canEdit && onEditResend)
+
+  // Declared before the editing early-return so hook order stays stable across
+  // the read-only and editing renders.
+  const handleDoubleClick = useCallback(() => { startEdit() }, [startEdit])
+
   if (editing) {
     return (
       <div data-role="user" className="group/msg flex flex-col items-end max-w-full">
@@ -239,7 +245,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             bubble it replaces, capped at 550px or the column, whichever is
             smaller. No JS measurement. */}
         <div
-          className="edit-grow user-bubble px-4 py-2 leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline-solid outline-2 -outline-offset-2 outline-accent/60"
+          className="edit-grow user-bubble px-4 py-2 leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline-solid outline-2 -outline-offset-2 outline-accent/60 focus-within:outline-accent"
           data-replicated-value={draft}
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}
         >
@@ -279,7 +285,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   const bubble = (
     // 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md
-    <div ref={userRef} onCopy={handleCopy} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
+    // Disable is safe: the keyboard-accessible edit path is the aria-labelled
+    // pencil button in the action row below, not this bubble.
+    // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+    <div ref={userRef} onCopy={handleCopy} onDoubleClick={canEditResend ? handleDoubleClick : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
       {/* `messageTs` FIRST, `clientTs` only as a fallback. The opposite order is
           correct for the audio key above, which wants the optimistic bubble's own
           identity, but this value is COMPARED against server-clock slot mint

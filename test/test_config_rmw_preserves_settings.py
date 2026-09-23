@@ -783,17 +783,16 @@ class TestEveryConfigWriterIsLocked:
 
 
 class TestTheAtomicJsonWriteConfigFamilyIsRatcheted:
-    """The second config-writer family may shrink but never grow.
+    """The second config-writer family is empty and may not regrow.
 
     ``TestEveryConfigWriterIsLocked`` above covers calls to
-    ``write_config_atomically``. A second family reaches ``config.json``
+    ``write_config_atomically``. A second family reached ``config.json``
     through ``kiro_crew.agent._atomic_json_write``, takes no advisory lock on
-    the ``<path>.lock`` sidecar, and is therefore invisible to that scan --
-    ``loader.py``'s own docstring names the set and calls converting it
-    follow-up work. Those writers hold only the in-process asyncio
+    the ``<path>.lock`` sidecar, and is therefore invisible to that scan. Such
+    a writer holds only the in-process asyncio
     ``_get_config_lock()``, which serializes callers on this event loop and
-    nothing else, so one of them can still land between a lock holder's read
-    and write and silently revert it.
+    nothing else, so it can land between a lock holder's read and write and
+    silently revert it.
 
     The shape matters for channels specifically. Each per-channel settings
     saver in ``messaging.py`` is a hand-copied credential-write skeleton, and
@@ -807,11 +806,12 @@ class TestTheAtomicJsonWriteConfigFamilyIsRatcheted:
     to record. Both directions are enforced, because a baseline that is allowed
     to rot stops describing the code and starts hiding it.
 
-    To clear an entry, route the write through ``update_config_locked`` (see
-    ``api_feishu_config_save`` and ``api_imessage_config_save`` for the shape:
-    stage the mutation in a closure, return ``None`` to skip a no-op write, and
-    map ``ConfigReadError`` to the handler's existing corrupt-config response),
-    then delete its line below.
+    The baseline is empty: every writer routes through ``update_config_locked``
+    (a channel saver through ``messaging._LockedSectionWrite``; see
+    ``api_feishu_config_save`` for the inline shape: stage the mutation in a
+    closure, return ``None`` to skip a no-op write, and map ``ConfigReadError``
+    to the handler's existing corrupt-config response). A new entry is a new
+    unlocked config writer and is refused, not recorded.
     """
 
     #: ``loader.py`` only names this family in prose; it owns the locked
@@ -826,18 +826,7 @@ class TestTheAtomicJsonWriteConfigFamilyIsRatcheted:
     #: ``file.py:function`` for every writer still on the unlocked path.
     #: Keyed by function rather than line so an unrelated edit above does not
     #: churn it. THIS LIST MAY ONLY SHRINK.
-    _BASELINE = frozenset(
-        {
-            "core.py:api_stt_config",
-            "mcp.py:api_mcp_gateway_enable",
-            "messaging.py:_discord_config_save_locked",
-            "messaging.py:_slack_config_save_locked",
-            "messaging.py:_telegram_config_save_locked",
-            "messaging.py:_wecom_config_save_locked",
-            "messaging.py:api_teams_config_save",
-            "messaging.py:api_webex_config_save",
-        }
-    )
+    _BASELINE: frozenset[str] = frozenset()
 
     @classmethod
     def _is_config_path_call(cls, node) -> bool:

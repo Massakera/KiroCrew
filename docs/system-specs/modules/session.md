@@ -79,6 +79,20 @@ the peer's `POST /api/chat/slots` payload, while agent and model remain sparse
 explicit picks. Omitting the mode would let a local Incognito or Temporary row
 execute as Persistent on the peer and read or write memory the user disabled.
 
+A slot ADOPTED from a peer row (`POST /api/chat/slots` with `adopt_remote_slot`)
+inherits `agent`, `title`, `memory_mode` and `workspace` from that row
+(`remote_adopt.peer_row_metadata()`). `workspace` is a mirror of the value the
+peer committed for the session it runs, the same value the forwarded
+agent/workspace picks write back into the field afterwards, so the projection
+and the persisted record name the workspace the turns actually run in rather
+than this machine's create default. It is not a local binding: the peer-bound
+create skips this machine's agent-binding resolution, `default_project_dir` is
+still fed the local default (so `project` and `memory_store` never resolve from
+a peer's name), and the relay hands every turn to the peer before the local turn
+path reads the field. Every control in `remote_relay._PEER_CONTROL_SEGMENTS` is
+classified in `remote_adopt.ADOPT_SEEDED_CONTROLS` / `ADOPT_UNSEEDED_CONTROLS`,
+and a structural test fails for a new forwardable control until it is placed.
+
 Cross-boundary calls that were observable on `SessionManager` route back through
 the facade, and patchable module dependencies are resolved through injected
 call-time functions. Persistence remains owned by the existing `SessionMap`
@@ -1360,6 +1374,10 @@ The `side:` prefix is included so
 `/side` conversations never resume across KiroCrew restarts — each cold-start
 triggers `is_first_turn=True` in `build_side_message` which re-seeds the
 parent snapshot + accumulated side history.
+The `thread:` prefix (a reply thread on a crewmate chat message,
+[history](history.md#reply-threads-on-crewmate-chat-messages-dashboardchat_threadspy))
+is included for the same reason: `build_thread_message` re-seeds the whole
+envelope on a cold session.
 
 **Lifecycle:**
 - `get_or_create()`: looks up mapping → if found and `.json` file exists,
@@ -2068,6 +2086,15 @@ gen, dm_scope)`:
 Legacy bare-thread Slack keys are unaffected — they keep the
 `canonical_key`/`legacy_key` shim. The DM channels are recent, so the key shape
 carries no prior persisted history to migrate.
+
+Slack does not use this key shape even for its own DMs. `slack.dm_single_session`
+gives a 1:1 DM one session by keying it `slack:<channel_id>`
+(`slack.transport_dispatch.flat_dm_session_key`) rather than by minting a
+four-segment bucket: a two-segment Slack key is what the existing thread keys
+already are, so the fold shim, the thread index and every caller that
+reverse-derives from a Slack key keep working unchanged. It carries no
+generation suffix, so the idle/daily rotation above does not apply — a flat DM
+relies on ordinary context compaction instead.
 
 ### Mid-turn messages (steer / queue)
 
