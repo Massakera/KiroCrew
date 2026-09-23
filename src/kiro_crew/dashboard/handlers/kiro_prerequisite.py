@@ -9,6 +9,7 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.dashboard.kiro_readiness import backend_needs_kiro_cli
 from kiro_crew.kiro_prerequisite import (
     KIRO_CLI_LOGIN_COMMAND,
     KIRO_CLI_SSO_LOGIN_COMMAND,
@@ -156,6 +157,10 @@ async def api_kiro_prerequisite_status(request: web.Request) -> web.Response:
             bool(service.initial_setup_complete),
             probe_error=f"{type(exc).__name__}: {exc}"[:400],
         )
+    # The first-run gate is a kiro-cli setup screen. A default session on codex
+    # or droid never spawns kiro-cli, so it must not lock the dashboard behind it.
+    if not await asyncio.to_thread(backend_needs_kiro_cli):
+        snapshot = {**snapshot, "ready": True, "kiro_cli_required": False}
     if _is_dashboard_owner(request):
         return web.json_response({**snapshot, "setup_allowed": True})
 

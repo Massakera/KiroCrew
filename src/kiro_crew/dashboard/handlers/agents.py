@@ -25,6 +25,7 @@ from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DROID,
     ACP_BACKEND_KIRO,
     model_registry_namespace,
     selectable_backend_values,
@@ -2166,7 +2167,17 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
 
 
 def _codex_models(request: web.Request, configured_default: str = "") -> list[dict]:
+    """The codex model dropdown; see :func:`_adapter_advertised_models`."""
+    return _adapter_advertised_models(request, ACP_BACKEND_CODEX, configured_default)
+
+
+def _adapter_advertised_models(
+    request: web.Request, backend: str, configured_default: str = ""
+) -> list[dict]:
     """Assemble the codex model dropdown from what codex-acp itself advertises.
+
+    *backend* reuses the same read for another adapter that advertises its own
+    ``model`` select and has its own registry namespace (droid).
 
     codex-acp has no static catalog on our side: the registry carries no codex
     namespace, and kiro-cli's ``--list-models`` names models codex refuses with a
@@ -2188,7 +2199,7 @@ def _codex_models(request: web.Request, configured_default: str = "") -> list[di
     is known -- force-including a pin the adapter did not advertise would put back
     the exact row that kills the session.
     """
-    codex_namespace = model_registry_namespace(ACP_BACKEND_CODEX)
+    codex_namespace = model_registry_namespace(backend)
     advertised = _advertised_cc_models(request, codex_namespace)
     if not advertised:
         cached = model_registry.advertised_models(codex_namespace)
@@ -2281,9 +2292,11 @@ async def api_models(request: web.Request) -> web.Response:
         return web.json_response(
             _cc_models(request, configured_default=_scoped_default(cfg, backend))
         )
-    if backend == ACP_BACKEND_CODEX:
+    if backend in (ACP_BACKEND_CODEX, ACP_BACKEND_DROID):
         return web.json_response(
-            _codex_models(request, configured_default=_scoped_default(cfg, backend))
+            _adapter_advertised_models(
+                request, backend, configured_default=_scoped_default(cfg, backend)
+            )
         )
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
     # an interactive browser login for ANY subcommand run unauthenticated

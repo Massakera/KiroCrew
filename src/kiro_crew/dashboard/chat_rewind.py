@@ -84,7 +84,9 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
     # Destructive: this truncates and PERSISTS history before the background
     # turn runs, so a failed turn cannot undo it. Unlike an ordinary send, the
     # readiness latch must be honored BEFORE the mutation.
-    blocked = await reject_if_kiro_unverified(request)
+    blocked = await reject_if_kiro_unverified(
+        request, session_key=request.match_info.get("slot")
+    )
     if blocked is not None:
         return blocked
     state: DashboardState = request.app["state"]
