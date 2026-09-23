@@ -1069,6 +1069,28 @@ _SPEC_ENV_DENIED_PREFIXES: tuple[str, ...] = (
 _SPEC_ENV_RESERVED_PREFIXES: tuple[str, ...] = ("KIROCREW_",)
 
 
+def _is_gateway_home_pin(key: str, value: str) -> bool:
+    """True when *key*/*value* is the ``KIROCREW_HOME`` this gateway runs under.
+
+    ``agent._managed_mcp_env`` writes exactly that pair into every managed
+    server's ``env`` on an override install, so each rebuild reads it back here.
+    It is still dropped (the managed caller re-pins it, the probe inherits it),
+    but warning about a value the gateway itself authored would fire on every
+    rebuild and bury the forged-identity case this warning exists for.
+    """
+    if key.upper() != "KIROCREW_HOME":
+        return False
+    own = os.environ.get("KIROCREW_HOME", "")
+    if not own:
+        return False
+    try:
+        return os.path.realpath(os.path.expanduser(value)) == os.path.realpath(
+            os.path.expanduser(own)
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def sanitize_spec_env(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
     """Drop loader-injection and reserved-namespace keys from a spec env.
 
@@ -1151,6 +1173,9 @@ def sanitize_spec_env(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
             logger.warning("dropping spec env key %r: loader/interpreter injection channel", key)
             continue
         if any(folded.startswith(p) for p in _SPEC_ENV_RESERVED_PREFIXES):
+            if _is_gateway_home_pin(key, value):
+                logger.debug("dropping spec env key %r: re-pinned by the gateway", key)
+                continue
             # Distinct message on purpose: reporting a forged KIROCREW_CLI as a
             # "loader injection channel" would send the next reader looking for a
             # sandbox-escape that is not there, and hide the one that is.
