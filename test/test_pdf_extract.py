@@ -62,25 +62,50 @@ class TestBound:
         # end of a parse.
         assert time.monotonic() - started < _FAR / 2
 
-    def test_the_child_itself_exits_with_the_memory_report_under_the_profile(self, bomb):
+    def test_the_child_itself_exits_with_the_memory_report_under_the_profile(self):
         """Same fact one layer down, with no parent-side interpretation.
 
         Spawns the child exactly as the parent does and reads its raw protocol: an
         ``error: memory`` line and :data:`EXIT_FAILED`, not a kill and not a
         traceback -- the child survived its own refused allocation long enough to
         say what happened.
+
+        WHICH ceiling fires is the platform's and not this test's to choose, and
+        ``detail`` names it: Linux refuses the inflate through the profile's
+        ``RLIMIT_AS``, so the exception comes back up out of pdfminer, while macOS
+        accepts ``RLIMIT_AS`` and does not enforce it, leaving the child's own
+        peak-RSS watchdog as the only ceiling. Either name is the same reported
+        ``memory`` failure; asserting one of them on both platforms asserts an
+        implementation detail the module documents as varying.
+
+        On macOS the ceiling is a plain argv number rather than a kernel limit,
+        so it is tested at a smaller one. That is not a weaker test -- the
+        watchdog does not know the magnitude -- and it keeps the run from
+        committing the bomb's full 1.2 GiB of real RSS, which nothing there
+        refuses. A macOS runner is the memory-tightest host this suite runs on,
+        tight enough that such a spike can take the xdist worker with it.
         """
+        argv = pdf_extract._child_argv(400_001, 10)
+        if sys.platform == "darwin":
+            cap = 256 * 1024 * 1024
+            argv = [f"--max-rss={cap}" if a.startswith("--max-rss=") else a for a in argv]
+            document = flate_bomb_pdf(cap + 64 * 1024 * 1024)
+            expected_detail = "rss"
+        else:
+            document = flate_bomb_pdf()
+            expected_detail = "PdfminerException"
+
         proc = sandbox.popen_limited(
-            pdf_extract._child_argv(400_001, 10),
+            argv,
             profile=sandbox.RLIMIT_PROFILE_EXTRACTOR,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        out, _err = proc.communicate(bomb, timeout=_FAR)
+        out, _err = proc.communicate(document, timeout=_FAR)
         assert proc.returncode == pdf_extract_child.EXIT_FAILED
         lines = [json.loads(line) for line in out.decode().splitlines() if line]
-        assert lines == [{"error": "memory", "detail": "PdfminerException"}]
+        assert lines == [{"error": "memory", "detail": expected_detail}]
 
     def test_the_extractor_profile_is_a_fixed_address_space_ceiling(self):
         spec = sandbox._rlimit_spec(sandbox.RLIMIT_PROFILE_EXTRACTOR)
