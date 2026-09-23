@@ -104,9 +104,14 @@ def test_approve_promotes_and_marks_scripts_executable(loader):
 
 def test_approve_refuses_when_live_exists(loader):
     _stage(loader, "dup")
-    loader.create_auto_skill(
-        "dup", description="x", triggers="x", procedure_md="body", provenance=_prov()
-    )
+    # Write the live skill straight to disk: the publish path declines a slug
+    # that is awaiting review, so approval's own guard is exercised against a
+    # live skill that arrives by another route (hand-authored, restored from
+    # the archive, synced in).
+    live = loader._dir / "auto" / "dup"
+    live.mkdir(parents=True)
+    (live / "SKILL.md").write_text("---\nname: auto/dup\n---\nbody\n", encoding="utf-8")
+    loader._invalidate_iter_cache()
     assert loader.approve_pending_skill("dup") is None
     # Candidate remains pending for the user to resolve.
     assert [p["slug"] for p in loader.list_pending_skills()] == ["dup"]
@@ -393,6 +398,123 @@ def test_restage_does_not_clobber_candidate_under_review(loader):
     distinct = loader.get_pending_skill("race-cand-2")
     assert "DIFFERENT" in distinct["content"]
     assert {s["filename"] for s in distinct["scripts"]} == {"b.py"}
+
+
+def _stage_distinct(loader, slug, **kw):
+    """Stage a candidate under ``slug`` without the ``_stage`` mtime handling."""
+    return loader.stage_skill_candidate(
+        slug,
+        description=kw.pop("description", f"desc {slug}"),
+        triggers=kw.pop("triggers", slug),
+        procedure_md=kw.pop("procedure_md", "## Steps\n\nrun it"),
+        provenance=_prov(),
+        **kw,
+    )
+
+
+def test_publish_cannot_occupy_a_queued_candidates_destination(loader):
+    """A live auto-publish must not take the slug a queued candidate will be
+    promoted to. Occupying it makes approval refuse that candidate for as long
+    as the live directory stands, and TTL pruning then deletes unreviewed work."""
+    assert _stage(loader, "sib") == "auto/sib"
+    # A distinct skill slugifying the same is queued as a sibling.
+    assert _stage_distinct(loader, "sib", description="OTHER") == "auto/sib-2"
+    # An auto-publish (approval off, prose-only) proposing that literal sibling
+    # slug is refused rather than served.
+    assert (
+        loader.create_auto_skill(
+            "sib-2",
+            description="publisher",
+            triggers="sib-2",
+            procedure_md="body",
+            provenance=_prov(),
+        )
+        is None
+    )
+    assert not (loader._dir / "auto" / "sib-2").exists()
+    # The queued candidate keeps its destination and stays approvable.
+    assert loader.approve_pending_skill("sib-2") == "auto/sib-2"
+
+
+def test_staging_skips_a_sibling_whose_live_name_is_taken(loader):
+    """The queue must not hand out a NEW-candidate slug whose live counterpart
+    exists: approval refuses such a candidate, so it is queued unapprovable."""
+    assert _stage(loader, "coord") == "auto/coord"
+    assert (
+        loader.create_auto_skill(
+            "coord-2",
+            description="live sibling",
+            triggers="coord-2",
+            procedure_md="body",
+            provenance=_prov(),
+        )
+        == "auto/coord-2"
+    )
+    # -2 is live, so the distinct candidate lands on the next free name.
+    assert _stage_distinct(loader, "coord", description="OTHER") == "auto/coord-3"
+    assert loader.approve_pending_skill("coord-3") == "auto/coord-3"
+
+
+def test_exhausted_pending_slugs_report_failure_not_success(loader):
+    """With every sibling slug taken, staging must return ``None`` so the caller
+    takes its rejection branch. A name returned without a write is recorded as a
+    staged candidate that does not exist, and consolidation's offset advance
+    makes that loss permanent."""
+    root = loader._pending_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "full").mkdir()
+    for n in range(2, 51):
+        (root / f"full-{n}").mkdir()
+    assert _stage_distinct(loader, "full") is None
+    # Nothing was written under any of the occupied claims.
+    assert not any((root / d.name / "SKILL.md").exists() for d in root.iterdir())
+
+
+def test_overlong_sibling_slug_is_refused_not_orphaned(loader):
+    """A sibling suffix that pushes the slug past the canonical length must not
+    be claimed. ``list_pending_skills`` skips a non-canonical directory and
+    ``prune_pending`` walks that list, so such a claim is invisible to the queue,
+    the dashboard and pruning alike."""
+    slug = "a" * 63  # canonical; "-2" would exceed the pattern's length
+    assert _stage(loader, slug) == f"auto/{slug}"
+    assert _stage_distinct(loader, slug, description="OTHER") is None
+    # Exactly one pending directory, and it is listable.
+    assert [d.name for d in loader._pending_root().iterdir()] == [slug]
+    assert {p["slug"] for p in loader.list_pending_skills()} == {slug}
+
+
+def test_update_candidate_may_share_its_live_targets_slug(loader):
+    """An UPDATE candidate is promoted over the live ``target`` in its metadata
+    by a path that never consults ``auto/<candidate-slug>``, so a live skill of
+    that name must not divert it to a sibling."""
+    assert (
+        loader.create_auto_skill(
+            "shared",
+            description="live",
+            triggers="shared",
+            procedure_md="OLD",
+            provenance=_prov(),
+        )
+        == "auto/shared"
+    )
+    assert (
+        _stage_distinct(loader, "shared", kind="update", target="auto/shared", base_version=1)
+        == "auto/shared"
+    )
+
+
+def test_claim_is_the_mkdir_not_the_availability_test(loader, monkeypatch):
+    """The availability test only picks a name; the ``mkdir`` is what claims it.
+    When a directory appears in the window between the two, the walk moves to the
+    next name rather than overwriting a candidate or failing the stage."""
+    assert _stage(loader, "toctou") == "auto/toctou"
+    before = loader.get_pending_skill("toctou")["content"]
+    # Approve an occupied name, leaving mkdir as the only thing between two claims.
+    monkeypatch.setattr(SkillsLoader, "_auto_slug_available", lambda self, slug, **kw: True)
+    assert _stage_distinct(loader, "toctou", description="OTHER") == "auto/toctou-2"
+    # The candidate under review keeps its bytes; the distinct one is queued.
+    assert loader.get_pending_skill("toctou")["content"] == before
+    assert "OTHER" in loader.get_pending_skill("toctou-2")["content"]
 
 
 def test_meta_credentials_are_redacted_in_list_and_detail(loader):
