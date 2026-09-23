@@ -513,8 +513,10 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
   to an arbitrary role — otherwise a leaked credential could tag a pre-existing
   unbounded `kirocrew-ec2-*` role `kirocrew:managed=true`, then inline admin +
   pass it. `iam:TagRole` is therefore **not** unconditioned in the role-management
-  statement; it is its own statement gated on
-  `aws:ResourceTag/kirocrew:managed=true` (`IamTagRoleOnManaged`). `TagRole` is
+  statement; it is gated on `aws:ResourceTag/kirocrew:managed=true` in the merged
+  `IamPutRolePolicyAndTagRoleOnManaged` statement (which it shares with
+  `PutRolePolicy` — same Effect, role ARN and Condition, combined to keep the
+  policy under IAM's 6,144-char cap). `TagRole` is
   still *required* because CloudFormation's `CreateRole` passes the role's `Tags`
   inline and AWS authorizes that as `iam:TagRole` (`id_tags_roles.html`). The
   gate works because of an empirically-verified asymmetry (least-privilege
