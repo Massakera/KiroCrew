@@ -776,6 +776,7 @@ class _PumpMixin(ManagerComponent):
                 execution_context=info.execution_context,
                 memory_mode=info.memory_mode,
                 app=info.app,
+                acp_backend=info.acp_backend,
             )
         except Exception:
             logger.warning(

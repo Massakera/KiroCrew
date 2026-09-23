@@ -1098,6 +1098,14 @@ class RunEventCoordinator(ManagerComponent):
         eff_effort = info.reasoning_effort or _subagent_default_effort()
         if eff_effort:
             extra_kwargs["reasoning_effort_override"] = eff_effort
+        if info.acp_backend:
+            from kiro_crew.subagent_backend import backend_from_name
+
+            requested_backend = backend_from_name(info.acp_backend)
+            if requested_backend is None:
+                info.error_code = "unknown_backend"
+                raise RuntimeError(f"unknown backend {info.acp_backend!r}")
+            extra_kwargs["acp_backend_override"] = requested_backend
         if info.bare:
             extra_kwargs["bare"] = True
         if info.allowed_tools:
@@ -1153,7 +1161,9 @@ class RunEventCoordinator(ManagerComponent):
         # dedicated process path so the override in extra_kwargs actually reaches
         # get_or_create -> the provider factory; otherwise a configured sub-agent
         # model/effort would silently no-op on the default (session-sharing) path.
-        if eff_model or eff_effort:
+        # A per-spawn backend is the same case, only stronger: the parent's
+        # runtime is a process of the parent's HARNESS.
+        if eff_model or eff_effort or info.acp_backend:
             use_session_sharing = False
         if use_session_sharing:
             # Local import: run.py's ``*_impl`` bodies resolve globals through

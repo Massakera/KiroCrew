@@ -399,6 +399,7 @@ def create_agent_folder(
     memory_mode="persistent",
     app="",
     execution_context=None,
+    acp_backend="",
 ) -> Path:
     from kiro_crew.execution_context import ExecutionContext, execution_for_store
 
@@ -437,6 +438,12 @@ def create_agent_folder(
         "app": execution.app,
         "updated_at": time.time(),
     }
+    if acp_backend:
+        state["acp_backend"] = acp_backend
+    elif previous is not None and previous.get("acp_backend"):
+        # A continuation re-creates the folder of the run it resumes; the
+        # harness that owns the conversation's session record must survive.
+        state["acp_backend"] = previous["acp_backend"]
     d = _agent_dir(agent_id)
     if execution.memory_mode != "persistent":
         _LIVE_RUN_STATES[_live_run_key(agent_id)] = state

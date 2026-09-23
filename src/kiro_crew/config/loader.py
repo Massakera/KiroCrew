@@ -5527,6 +5527,9 @@ class KiroCrewConfig:
             # the session would spawn on the backend's default with no error.
             permission_mode: str | None = None,
             shared_scratch: Path | None = None,
+            # Per-spawn harness for a sub-agent (``None`` = no override; ``""``
+            # names kiro). NAMED for the same reason as ``permission_mode``.
+            acp_backend_override: str | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -5573,6 +5576,7 @@ class KiroCrewConfig:
                 session_key,
                 self.agent.member_acp_backend,
                 self.agent.acp_backend,
+                acp_backend_override,
             )
             # Resolved BEFORE the model, and threaded into the resolution: the
             # model's namespace translation and its pin-scope check both have to
