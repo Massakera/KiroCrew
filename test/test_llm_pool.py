@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO
+from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO, ACP_BACKEND_PI
 from kiro_crew.knowledge.llm_pool import (
     DEFAULT_IDLE_TTL_SECS,
     WORKER_RECYCLE_CALLS,
@@ -18,6 +18,7 @@ from kiro_crew.knowledge.llm_pool import (
     CCWorker,
     LLMPool,
     Worker,
+    _get_acp_backend,
     _get_idle_ttl,
     _get_provider_type,
     _get_sandbox_mode,
@@ -472,6 +473,7 @@ class TestReadConfig:
         the no-op-on-malformed-config contract of ``_read_config``."""
         assert _get_provider_type(bad) == "acp"
         assert _get_sandbox_mode(bad) == "auto"
+        assert _get_acp_backend(bad) == ACP_BACKEND_KIRO
 
     def test_read_config_coerces_non_dict_sections(self, tmp_path):
         """``_read_config`` normalises non-dict ``agent``/``knowledge`` to ``{}``
@@ -510,6 +512,42 @@ class TestReadConfig:
             worker = AcpWorker()
             await worker.start()
         assert mk.call_args.kwargs["sandbox_mode"] == "auto"
+        assert mk.call_args.kwargs["acp_backend"] == ACP_BACKEND_KIRO
+
+    def test_acp_backend_parser_reads_the_configured_harness(self):
+        assert _get_acp_backend({"agent": {"acp_backend": "pi"}}) == ACP_BACKEND_PI
+        assert _get_acp_backend({}) == ACP_BACKEND_KIRO
+        assert _get_acp_backend({"agent": {"acp_backend": "not-a-backend"}}) == (
+            ACP_BACKEND_KIRO
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_passes_configured_acp_backend_to_client(self, tmp_path):
+        """A Pi host must spawn pi-acp, not go looking for kiro-cli."""
+        config = tmp_path / ".kirocrew" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text('{"agent": {"acp_backend": "pi"}}')
+        mock_client = AsyncMock()
+        mock_client.is_ready = True
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk:
+            worker = AcpWorker()
+            await worker.start()
+        assert mk.call_args.kwargs["acp_backend"] == ACP_BACKEND_PI
+
+    @pytest.mark.asyncio
+    async def test_explicit_backend_is_not_reread_from_config(self, tmp_path):
+        """A backend passed in is the one spawned, even when config names another."""
+        config = tmp_path / ".kirocrew" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text('{"agent": {"acp_backend": "codex"}}')
+        mock_client = AsyncMock()
+        mock_client.is_ready = True
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk:
+            worker = AcpWorker(acp_backend=ACP_BACKEND_PI)
+            await worker.start()
+        assert mk.call_args.kwargs["acp_backend"] == ACP_BACKEND_PI
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +603,28 @@ class TestLLMPoolStart:
             await pool.start()  # second call should no-op
 
         assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_start_threads_configured_backend_into_workers(self, tmp_path):
+        config = tmp_path / ".kirocrew" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text('{"agent": {"provider": "acp", "acp_backend": "pi"}}')
+        created: list[FakeWorker] = []
+
+        class _Recording(FakeWorker):
+            def __init__(self, *, sandbox_mode=None, effort=None, acp_backend=""):
+                super().__init__()
+                self.acp_backend = acp_backend
+                created.append(self)
+
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpWorker", _Recording):
+            pool = LLMPool(pool_size=1, use_config_pool_size=False)
+            await pool.start()
+
+        assert len(created) == 1
+        assert created[0].acp_backend == ACP_BACKEND_PI
+        assert pool._acp_backend == ACP_BACKEND_PI
 
 
 # ---------------------------------------------------------------------------

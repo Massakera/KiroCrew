@@ -17,8 +17,10 @@ from typing import Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_KIRO,
     effort_config_option_id,
     effort_config_option_value,
+    resolve_selected_backend,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
@@ -163,6 +165,26 @@ def _get_sandbox_mode(config: Optional[dict] = None) -> str:
     return "auto"  # present but malformed -> fail secure, never silently unsandboxed
 
 
+def _get_acp_backend(config: Optional[dict] = None) -> str:
+    """Default ACP harness for knowledge workers.
+
+    Chat already routes through ``agent.acp_backend``. This pool used to ignore
+    that field and construct ``AcpClient`` with no backend, which is the
+    kiro-cli spawn. A host whose sessions run on Pi then failed extraction with
+    ``kiro-cli not found`` even though ``pi`` and ``pi-acp`` were on PATH.
+
+    The raw config value is coerced by ``resolve_selected_backend``, the same
+    gate a persisted ``agent.acp_backend`` crosses on load: an unknown or
+    unselectable id degrades to kiro-cli (the empty string) instead of being
+    handed to ``AcpClient``, which rejects ids outside ``ACP_BACKENDS_KNOWN``.
+    An absent key stays that empty string, so a stock install still spawns
+    kiro-cli.
+    """
+    data = _read_config() if config is None else config
+    raw = _section(data, "agent").get("acp_backend", ACP_BACKEND_KIRO)
+    return resolve_selected_backend(raw)
+
+
 def _get_idle_ttl(config: Optional[dict] = None) -> float:
     """Seconds the pool may sit fully idle before scaling to zero.
 
@@ -276,11 +298,14 @@ class AcpWorker(Worker):
         *,
         sandbox_mode: Optional[str] = None,
         effort: Optional[str] = None,
+        acp_backend: Optional[str] = None,
     ) -> None:
         self._client: Optional[AcpClient] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
+        # ``""`` is a real backend (kiro-cli), so it must not be treated as unset.
         self._sandbox_mode = sandbox_mode
+        self._acp_backend = acp_backend
         self._effort = _normalize_effort(effort)
         self._effective_effort: Optional[str] = None
         # PID currently shielded from the gateway orphan sweep (see module note).
@@ -311,9 +336,21 @@ class AcpWorker(Worker):
             if self._sandbox_mode is not None
             else await asyncio.to_thread(_get_sandbox_mode)
         )
-        logger.info("AcpWorker: starting with agent=%s", AGENT_NAME)
+        acp_backend = (
+            self._acp_backend
+            if self._acp_backend is not None
+            else await asyncio.to_thread(_get_acp_backend)
+        )
+        logger.info(
+            "AcpWorker: starting with agent=%s acp_backend=%r",
+            AGENT_NAME,
+            acp_backend,
+        )
         self._client = AcpClient(
-            agent=AGENT_NAME, sandbox_mode=sandbox_mode, audit_source="subagent"
+            agent=AGENT_NAME,
+            sandbox_mode=sandbox_mode,
+            audit_source="subagent",
+            acp_backend=acp_backend,
         )
         self._effective_effort = None
         await self._client.ensure_ready()
@@ -339,11 +376,10 @@ class AcpWorker(Worker):
         client) and an identity branch: it sent every non-claude harness down the
         ``/effort`` slash command, including one that has no such command.
 
-        This pool constructs its client with the DEFAULT backend and never passes
-        ``acp_backend``, so the answer here is the kiro one and both spellings
-        agree on it; ``test_agent_sdk_capabilities`` pins that, so a future pool
-        that does select a backend gets the capability answer rather than an
-        identity guess.
+        The pool passes the configured ``agent.acp_backend`` into the client
+        (empty is kiro-cli). Effort follows that client's public ``backend``
+        through ``capabilities_for``, so a Pi worker writes Pi's config option
+        and a default worker still sends kiro's ``/effort`` command.
         """
         client = self._client
         requested = self._effort
@@ -638,6 +674,9 @@ class LLMPool:
         self._started = False
         self._provider_type: str = ""
         self._sandbox_mode: str = "auto"
+        # Empty string is kiro-cli. ``start`` replaces this with the resolved
+        # ``agent.acp_backend`` before the first worker is built.
+        self._acp_backend: str = ACP_BACKEND_KIRO
         self._config: dict = {}
         self._start_lock = asyncio.Lock()
         # Idle-TTL scale-to-zero (see DEFAULT_IDLE_TTL_SECS). Set from config in
@@ -741,6 +780,7 @@ class LLMPool:
             config = await asyncio.to_thread(_read_config)
             self._provider_type = _get_provider_type(config)
             self._sandbox_mode = _get_sandbox_mode(config)
+            self._acp_backend = _get_acp_backend(config)
             # Allow config to override pool size (knowledge.extraction_pool_size).
             # Only applies when the key is explicitly set in config (not the
             # fallback default), so callers that pass a specific pool_size to the
@@ -793,6 +833,7 @@ class LLMPool:
             worker = AcpWorker(
                 sandbox_mode=self._sandbox_mode,
                 effort=self._effort,
+                acp_backend=self._acp_backend,
             )
         await worker.start()
         return worker
