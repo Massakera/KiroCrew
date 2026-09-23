@@ -1973,6 +1973,11 @@ def _pod_pid_record_path(cfg: PodConfig, name: str, port: int) -> Path:
     return cfg.home_dir(name) / run_marker.RUN_DIR_NAME / run_marker.pid_file_name(port)
 
 
+def _pod_secret_path(cfg: PodConfig, name: str, port: int) -> Path:
+    """Path of pod *name*'s per-listener credential inside its isolated home."""
+    return cfg.home_dir(name) / run_marker.RUN_DIR_NAME / run_marker.secret_file_name(port)
+
+
 def _pod_recorded_pid(cfg: PodConfig, name: str, port: int) -> int | None:
     """Gateway PID recorded in pod *name*'s isolated home, PROVEN to still name
     that same process, or ``None``.
@@ -2266,15 +2271,161 @@ def _attested_gateway_verifier(cfg: PodConfig, name: str, port: int, socket_path
     return _verify
 
 
-def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
-    secret_file = cfg.home_dir(name) / ".local_secret"
+# Recreating a pod is the only restart the pod CLI offers, and `down` reclaims the
+# pod's HOME, so every remedy that suggests it states that cost. It is offered only
+# where it can actually repair the refusal, which is the pre-code gateway whose
+# transport refusal may really be a missing AF_UNIX admission. A gate that judges
+# who connected is never offered it, and neither is a credential mismatch: a live
+# second gateway in the same home produces one without the pod's state being wrong.
+_POD_RECREATE = (
+    "`kirocrew pod down {name} && kirocrew pod up {name}` — and `down` DELETES the "
+    "pod's HOME, so copy anything you still need out of it first"
+)
+
+# Every 403 this route sends is a fixed short JSON literal, so a longer reply is not
+# one of them and holds no ``code`` worth reading. Bounding the read keeps a single
+# oversized reply from costing the one-shot CLI its own length in memory, and a body
+# over the cap is treated exactly like an unreadable one: the operator is sent to the
+# pod's audit record rather than to a cause parsed out of an untrusted length.
+_MINT_403_BODY_CAP = 64 * 1024
+
+
+def _mint_403_cause(exc: urllib.error.HTTPError, name: str) -> str:
+    """The pod's OWN reason for refusing a token mint, as the remedy that matches it.
+
+    ``/api/token/local`` refuses at three independent gates — transport admission,
+    the credential comparison, and owner provenance — and returns a
+    machine-readable ``code`` for each, alongside the same distinction in its
+    ``security_events.jsonl`` record. Reading that code is what lets a refusal name
+    the gate that applied instead of listing candidates, which matters because the
+    remedies differ and none of the three is a recreate. Transport admission and
+    owner provenance both judge WHO CONNECTED, so recreating the pod clears neither;
+    a credential mismatch has two causes and a live second gateway in the same home
+    produces one of them without the pod's state being wrong. A recreate deletes the
+    pod's HOME.
+
+    A gateway that sends any of these codes carries this endpoint's current shape, so
+    the one cause that a worktree update plus a recreate does fix — a gateway too old
+    to admit ``AF_UNIX`` on this route at all — can only appear on a reply carrying NO
+    code, and is named only there.
+
+    Never raises. An unreadable, over-long, non-JSON or ``code``-less body yields
+    guidance that sends the operator to the pod's own audit record rather than to a
+    guess.
+    """
     try:
-        secret = secret_file.read_text().strip()
-    except FileNotFoundError as exc:
-        raise PodError(
-            f"no .local_secret for pod {name!r} — is it running? ({secret_file})"
-        ) from exc
+        raw = exc.read(_MINT_403_BODY_CAP + 1)
+    except Exception:
+        raw = b""
+    if len(raw) > _MINT_403_BODY_CAP:
+        raw = b""
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+    code = payload.get("code") if isinstance(payload.get("code"), str) else ""
+    detail = payload.get("error") if isinstance(payload.get("error"), str) else ""
+    recreate = _POD_RECREATE.format(name=name)
+    if code == "member_owner_token_refused":
+        return (
+            "the gateway did not accept this CALLER as the pod's local owner "
+            "(code member_owner_token_refused). The transport was admitted and the "
+            "pod's .local_secret was accepted; the process behind them was refused, "
+            "and the pod records that as resources=unverified-owner-process in its "
+            "security_events.jsonl.\n"
+            "  Recreating the pod does NOT change this verdict — the verdict is "
+            "about which process called, not about the pod's state or its secret — "
+            "and `kirocrew pod down` DELETES the pod's HOME.\n"
+            "  The gate admits a caller whose process start id the gateway can read "
+            "and which its own platform accepts as an ordinary host process: on Linux "
+            "that is a caller sharing the gateway's user and mount namespaces, so a "
+            "different namespace is refused even at the same uid, and on macOS it is a "
+            "caller running outside a sandbox profile. Mint from a host process that "
+            "meets this platform's condition."
+        )
+    if code == "loopback_only":
+        return (
+            "the gateway refused this TRANSPORT before it read the secret (code "
+            "loopback_only), and records it as resources=non-loopback in its "
+            "security_events.jsonl. A gateway that sends this code carries the "
+            "unix-socket admission on /api/token/local, so it did not reject the "
+            "socket for being one: it declined to confirm the connecting peer as its "
+            "own principal. That admission takes only a positive kernel MATCH, so a "
+            "mismatched peer credential and an unverifiable one are both refused.\n"
+            "  Recreating the pod does NOT change this verdict either, because it is "
+            "about who connected rather than about the pod's state, and `kirocrew pod "
+            "down` DELETES the pod's HOME. Check that this caller runs as the uid that "
+            "owns the pod's home, and that the kernel can report peer credentials on "
+            "this socket at all: a credential it cannot report is refused exactly like "
+            "one that names another principal."
+        )
+    if code == "invalid_secret":
+        return (
+            "the gateway rejected the credential this mint sent as not matching "
+            "its own (code invalid_secret). Two different things look identical "
+            "here, and only one of them is the pod's state: a credential left "
+            "behind by an earlier run, or a live second gateway in this pod's home "
+            "holding the shared .local_secret slot while the port belongs to "
+            "another generation.\n"
+            "  The pod's run directory tells them apart: the per-listener file for "
+            "this port carries the credential of the process that owns it, and the "
+            "mint prefers it. If that file is absent while the pod is serving, its "
+            "gateway predates the per-listener credential and only then is the "
+            "shared slot the whole story."
+        )
+    said = f" It said: {detail}" if detail else ""
+    return (
+        "the pod sent no machine-readable cause, so its gateway is older than these "
+        f"codes or its reply could not be read.{said}\n"
+        "  The pod's own security_events.jsonl names the gate in its token.local "
+        "record: resources=non-loopback is transport admission, invalid-secret is "
+        "the secret comparison, and unverified-owner-process is caller provenance. "
+        "On a gateway that old, non-loopback can also mean it predates unix-socket "
+        "admission on /api/token/local and refuses this transport whatever the secret; "
+        f"that cause is repaired by updating the pod's worktree before recreating it: "
+        f"{recreate}. Caller provenance is repaired by neither, and a credential "
+        "mismatch only when no second gateway is live in this pod's home."
+    )
+
+
+def _pod_mint_secret(cfg: PodConfig, name: str, port: int) -> str:
+    """Pod *name*'s internal-API credential for the gateway on *port*.
+
+    Resolution is per LISTENER first, then the shared ``.local_secret``, which is
+    the order :func:`kiro_crew.config.loader.read_local_secret` states as the
+    invariant. That helper cannot be reused here because it resolves against the
+    CALLING process's data home, while this reads a pod's isolated one.
+
+    The order is what keeps the mint honest rather than merely tidy. The shared
+    file holds one slot per data home, and a gateway starting while a sibling is
+    still serving on another port publishes its credential ONLY to the per-port
+    file, leaving the shared slot pointing at the sibling. A caller reading the
+    shared slot then authenticates as one generation while dialling another and
+    is refused, which is indistinguishable at the wire from a secret left behind
+    by an earlier run.
+
+    Raises :class:`PodError` when neither file can be read, naming both.
+    """
+    per_port = _pod_secret_path(cfg, name, port)
+    shared = cfg.home_dir(name) / ".local_secret"
+    for candidate in (per_port, shared):
+        try:
+            secret = candidate.read_text().strip()
+        except OSError:
+            continue
+        if secret:
+            return secret
+    raise PodError(
+        f"no internal-API credential for pod {name!r} — is it running? Looked for "
+        f"{per_port}, then {shared}."
+    )
+
+
+def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
     port = derive_port(cfg, name)
+    secret = _pod_mint_secret(cfg, name, port)
     owner = port_owner(cfg, name, port)
     if owner != OWNER_POD:
         # Positive proof kept even though the send below rides the pod's own
@@ -2332,22 +2483,13 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
             token = json.loads(resp.read()).get("token", "")
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
-            # A 403 on this transport has two distinct causes, and only one is
-            # about the caller. Name both, because the operator's next move
-            # differs: a gateway too old to admit AF_UNIX on /api/token/local
-            # refuses EVERY request on this socket regardless of the secret,
-            # and no retry with the right secret can succeed until the pod's
-            # code is updated.
+            # A 403 here is one of three distinct refusals, and the pod says which
+            # in the body it already sends. Report that one: the remedies differ,
+            # and the owner-provenance refusal is not repaired by the recreate the
+            # other two want — a recreate deletes the pod's HOME.
             raise PodError(
                 f"pod {name!r} refused the token mint over its API socket "
-                f"(HTTP 403).\n"
-                f"  If this pod's worktree predates unix-socket admission on "
-                f"/api/token/local, its gateway 403s this transport no matter "
-                f"the secret — update the pod's worktree, then restart it: "
-                f"kirocrew pod down {name} && kirocrew pod up {name}\n"
-                f"  Otherwise the gateway rejected the pod's .local_secret "
-                f"(a stale secret from an earlier run); restarting the pod "
-                f"regenerates both ends.\n"
+                f"(HTTP 403): {_mint_403_cause(exc, name)}\n"
                 f"  Not retried on 127.0.0.1:{port} — the pod's secret must not "
                 f"be sent to a process that is not this pod's gateway."
             ) from exc

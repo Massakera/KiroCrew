@@ -3051,6 +3051,12 @@ async def api_token_local(request: web.Request) -> web.Response:
     peers are admitted only on a positive kernel same-principal check
     (``_unix_peer_is_self``), which is stronger locality evidence than a
     loopback address. The secret is required on both transports.
+
+    Each of the three refusals carries a machine-readable ``code`` beside its
+    ``error`` — ``loopback_only``, ``invalid_secret``, ``member_owner_token_refused``
+    — mirroring the distinction already in the SEL record, so a caller reports the
+    gate that refused rather than listing the ones that might have. The codes
+    restate what the ``error`` text already says and widen no gate.
     """
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
@@ -3062,7 +3068,7 @@ async def api_token_local(request: web.Request) -> web.Response:
             source="local-bootstrap",
             resources="non-loopback",
         )
-        return web.json_response({"error": "loopback only"}, status=403)
+        return web.json_response({"error": "loopback only", "code": "loopback_only"}, status=403)
 
     expected = request.app.get("local_secret", "")
     if not expected:
@@ -3076,7 +3082,7 @@ async def api_token_local(request: web.Request) -> web.Response:
             source="local-bootstrap",
             resources="invalid-secret",
         )
-        return web.json_response({"error": "invalid secret"}, status=403)
+        return web.json_response({"error": "invalid secret", "code": "invalid_secret"}, status=403)
     from kiro_crew.member_memory_auth import local_owner_bootstrap_allowed
 
     if not await asyncio.to_thread(local_owner_bootstrap_allowed, request):

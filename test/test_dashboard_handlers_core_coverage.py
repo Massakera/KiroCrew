@@ -2300,6 +2300,74 @@ class TestLocalToken:
         minted.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_every_refusal_carries_a_code_matching_its_audit_record(
+        self, monkeypatch, fake_sel
+    ) -> None:
+        """All three gates are machine-distinguishable to the caller, not just one.
+
+        The SEL record already tells the three apart. A caller that can read only
+        one of them has to guess between the other two, and their remedies differ:
+        one is a worktree update, one regenerates the secret, and the third is about
+        which process called and is fixed by neither. Each ``code`` therefore pairs
+        with the ``resources`` value written for the same refusal, so the pairing
+        cannot drift apart silently.
+        """
+        from kiro_crew import member_memory_auth as auth
+
+        seen: dict[str, str] = {}
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: False)
+        resp = await core_mod.api_token_local(_req(remote="203.0.113.9"))
+        assert resp.status == 403
+        seen[json.loads(resp.body)["code"]] = fake_sel.log_api_access.call_args.kwargs["resources"]
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        resp = await core_mod.api_token_local(
+            _req(app={"local_secret": "right"}, headers={"X-Local-Secret": "wrong"})
+        )
+        assert resp.status == 403
+        seen[json.loads(resp.body)["code"]] = fake_sel.log_api_access.call_args.kwargs["resources"]
+
+        monkeypatch.setattr(auth, "_request_peer_pid", lambda _request: None)
+        resp = await core_mod.api_token_local(
+            _req(app={"local_secret": "right"}, headers={"X-Local-Secret": "right"})
+        )
+        assert resp.status == 403
+        seen[json.loads(resp.body)["code"]] = fake_sel.log_api_access.call_args.kwargs["resources"]
+
+        assert seen == {
+            "loopback_only": "non-loopback",
+            "invalid_secret": "invalid-secret",
+            "member_owner_token_refused": "unverified-owner-process",
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_codes_do_not_disclose_more_than_the_error_text(
+        self, monkeypatch, fake_sel
+    ) -> None:
+        """A code restates the refusal the body already names in words.
+
+        The endpoint is reachable without a credential, so anything added to its
+        refusal body is readable by whoever could already read the ``error``
+        string. These two codes carry no fact that string does not.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: False)
+        body = json.loads((await core_mod.api_token_local(_req(remote="203.0.113.9"))).body)
+        assert body["error"] == "loopback only"
+        assert body["code"] == "loopback_only"
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        body = json.loads(
+            (
+                await core_mod.api_token_local(
+                    _req(app={"local_secret": "right"}, headers={"X-Local-Secret": "wrong"})
+                )
+            ).body
+        )
+        assert body["error"] == "invalid secret"
+        assert body["code"] == "invalid_secret"
+
+    @pytest.mark.asyncio
     async def test_bad_embed_port_is_dropped(
         self, monkeypatch, fake_sel, verified_owner_process
     ) -> None:

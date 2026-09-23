@@ -305,7 +305,7 @@ The model-facing half is the `pod_up` / `pod_down` / `pod_status` / `pod_ls` too
 `kirocrew-core` (`mcp_tools/apps.py`). The pod token is returned to the agent
 verbatim — redacting it would hand back an unusable handle — which is safe because it
 is a 2h credential scoped to that pod's own gateway, minted server-side from the
-pod's `.local_secret` so the agent never touches the secret itself.
+pod's own internal-API credential so the agent never touches the secret itself.
 
 ## Authorization
 
@@ -441,8 +441,11 @@ worktree removal never blocks the gateway event loop.
 - `runtime.mint_token(cfg, name, ttl)` — credential minting (blocking, offloaded).
   Requires POSITIVE ownership proof and refuses when ownership is merely
   unprovable, unlike `health`, which keeps its reading: this call sends the pod's
-  own `.local_secret`, so failing open would hand a credential to whatever
-  answered
+  own internal-API credential, so failing open would hand a credential to whatever
+  answered. That credential resolves per listener first, from the pod home's
+  `run/gateway-<port>.secret`, and falls back to the shared `.local_secret` only
+  for a gateway predating the per-listener file — the shared slot is one per data
+  home, so a live second gateway leaves it naming the other generation
 - `runtime.recent_journal(cfg, name, n)` — journalctl tail (blocking, offloaded)
 - `provision.has_venv(path)` / `provision.has_dist(path)` — filesystem checks (offloaded)
 
