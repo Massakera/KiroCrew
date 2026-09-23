@@ -144,8 +144,8 @@ class TestPermissionsProjection:
     Omitting the field is not neutral: with no policy KAS resolves every request
     to ``ask``, so an injected agent would prompt for the whole list its kiro-cli
     twin auto-approves. The translation itself is pinned in
-    ``test_kas_permissions.py``; here we pin only that it is wired in, and that a
-    hand-written block outranks it.
+    ``test_kas_permissions.py``; here we pin only that it is wired in, and that an
+    authored block reaches the same ceiling rather than being dropped or obeyed.
     """
 
     def test_the_allowlist_is_translated_rather_than_dropped(self):
@@ -164,34 +164,109 @@ class TestPermissionsProjection:
         out = to_client_custom_agent("a", _spec(allowedTools=["introspect"]), "p")
         assert "permissions" not in out
 
-    def test_a_hand_written_policy_is_not_relayed(self):
-        """The wire carries only what passed Crew's governance ceiling.
-
-        Forwarding an author block would be one line and it is already in KAS's
-        vocabulary — which is the trap. ``allowedTools`` is the only auto-approve
-        input the ceiling (``_may_auto_approve``) has seen, so relaying a block
-        from the file would hand any editor of it a grant the ceiling never
-        reviewed. An auto-approved call never reaches Crew's permission callback,
-        so the deny-list and the audit trail would be skipped with it.
-        """
-        mine = {"rules": [{"capability": "shell", "effect": "allow"}]}
+    def test_an_authored_block_is_intersected_with_the_ceiling_not_dropped(self):
+        """The author's block is a second input, and it is wired to the same
+        ceiling. The merge itself is pinned in ``test_kas_permissions.py``; here we
+        pin only that the projection consults it. A scoped ``allow`` is used because
+        a bare one is the ``allowedTools`` list's own to make."""
+        mine = {
+            "rules": [{"capability": "web_search", "match": ["example.com"], "effect": "allow"}]
+        }
         out = to_client_custom_agent("a", _spec(allowedTools=["web_fetch"], permissions=mine), "p")
-        assert out["permissions"] == {"rules": [{"capability": "web_fetch", "effect": "allow"}]}
+        assert out["permissions"]["rules"] == [
+            {"capability": "web_search", "match": ["example.com"], "effect": "allow"},
+            {"capability": "web_fetch", "effect": "allow"},
+        ]
 
-    def test_a_hand_written_policy_cannot_smuggle_a_grant_past_the_allowlist(self):
-        """The sharp case: the block grants a capability the allowlist withholds."""
+    def test_a_stale_allow_the_allowlist_dropped_is_not_put_back(self):
+        """Crew's seeder preserves the block it wrote, so it can lag the list. The
+        list is re-derived every projection and owns a grant of that shape."""
+        stale = {"rules": [{"capability": "web_search", "effect": "allow"}]}
+        out = to_client_custom_agent("a", _spec(allowedTools=["web_fetch"], permissions=stale), "p")
+        assert out["permissions"]["rules"] == [{"capability": "web_fetch", "effect": "allow"}]
+
+    def test_a_pure_kas_agent_reaches_the_wire_with_its_own_policy(self):
+        """``permissions`` authored, no ``allowedTools``: nothing to derive from, so
+        an omitted field would resolve every request to ``ask`` and prompt for each
+        of the calls the author had just written a policy for."""
+        mine = {"rules": [{"capability": "mcp", "match": ["srv/*"], "effect": "allow"}]}
+        out = to_client_custom_agent("a", _spec(permissions=mine), "p")
+        assert out["permissions"] == mine
+
+    def test_an_authored_block_cannot_smuggle_a_shell_grant_past_the_allowlist(self):
+        """The sharp case: the block grants the one family the allowlist refuses."""
         mine = {"rules": [{"capability": "shell", "effect": "allow"}]}
         out = to_client_custom_agent("a", _spec(allowedTools=[], permissions=mine), "p")
         assert "permissions" not in out
 
-    def test_the_derivation_tracks_the_allowlist_not_the_stored_block(self):
-        """So a block that has gone stale on disk cannot resurrect an old grant."""
+    def test_an_authored_allow_is_put_to_the_projection_time_ceiling(self, monkeypatch):
+        """The same re-ask the derived rules get, for the same reason: projection
+        reads a file, and the file can predate the ceiling that now governs it."""
+        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: ref != "@denied-srv")
+        mine = {
+            "rules": [
+                {"capability": "mcp", "match": ["denied-srv/*"], "effect": "allow"},
+                {"capability": "mcp", "match": ["ok-srv/*"], "effect": "allow"},
+            ]
+        }
+        out = to_client_custom_agent("a", _spec(permissions=mine), "p")
+        assert out["permissions"]["rules"] == [
+            {"capability": "mcp", "match": ["ok-srv/*"], "effect": "allow"}
+        ]
+
+    def test_a_withheld_authored_allow_is_recorded_in_the_security_event_log(self, monkeypatch):
+        """The same trail the derived path emits, through the same writer, because
+        it is the same decision about the same ceiling."""
+        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: False)
+        events: list[dict] = []
+        monkeypatch.setattr(
+            kas_agents,
+            "sel",
+            lambda: types.SimpleNamespace(log_api_access=lambda **kw: events.append(kw)),
+        )
+        mine = {"rules": [{"capability": "mcp", "match": ["denied-srv/*"], "effect": "allow"}]}
+        assert "permissions" not in to_client_custom_agent("a", _spec(permissions=mine), "p")
+        assert [e["operation"] for e in events] == ["mcp_auto_approve_withheld"]
+        assert "@denied-srv" in events[0]["resources"]
+        assert "governance ceiling" in events[0]["resources"]
+
+    def test_a_relayed_authored_grant_is_recorded_under_its_own_operation(self, monkeypatch):
+        """A relay must never be counted as a withhold: it is the opposite decision,
+        and it is the half a log of refusals cannot answer."""
+        events: list[dict] = []
+        monkeypatch.setattr(
+            kas_agents,
+            "sel",
+            lambda: types.SimpleNamespace(log_api_access=lambda **kw: events.append(kw)),
+        )
+        mine = {"rules": [{"capability": "mcp", "match": ["ok-srv/*"], "effect": "allow"}]}
+        to_client_custom_agent("a", _spec(permissions=mine), "p")
+        assert [e["operation"] for e in events] == ["kas_authored_permissions_relayed"]
+        assert "projected with auto-approve" in events[0]["resources"]
+
+    def test_an_unparseable_block_does_not_abort_the_session(self):
+        """`effect: ["allow"]` is unhashable, and nothing between the projection and
+        session creation catches a ``TypeError``."""
         out = to_client_custom_agent(
             "a",
             _spec(
                 allowedTools=["web_fetch"],
-                permissions={"rules": [{"capability": "web_search", "effect": "allow"}]},
+                permissions={"rules": [{"capability": "shell", "effect": ["allow"]}]},
             ),
+            "p",
+        )
+        assert out["permissions"]["rules"] == [{"capability": "web_fetch", "effect": "allow"}]
+
+    def test_an_authored_deny_travels_even_where_the_ceiling_withholds(self, monkeypatch):
+        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: False)
+        mine = {"rules": [{"capability": "shell", "match": ["rm *"], "effect": "deny"}]}
+        out = to_client_custom_agent("a", _spec(allowedTools=["web_fetch"], permissions=mine), "p")
+        assert out["permissions"]["rules"] == mine["rules"]
+
+    def test_a_malformed_block_leaves_the_derivation_standing(self):
+        out = to_client_custom_agent(
+            "a",
+            _spec(allowedTools=["web_fetch"], permissions={"rules": "all of them"}),
             "p",
         )
         assert out["permissions"]["rules"] == [{"capability": "web_fetch", "effect": "allow"}]
