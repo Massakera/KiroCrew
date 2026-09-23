@@ -426,6 +426,40 @@ class TestContextBuilder:
         assert msg.index("[THEME PERSONA]") < msg.index(marker)
         assert msg.index(marker) < msg.index(header) < msg.index(request)
 
+    def test_request_prefix_without_trailing_newline_does_not_swallow_the_next_block(
+        self, tmp_path
+    ):
+        """A ``$skill`` body arrives ``.strip()``ed (no trailing newline). The
+        assembly must still open the next block on its own line, or the context
+        breakdown books that block's bytes to the skill."""
+        from kiro_crew.context_blocks import split_blocks
+
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        request = "hi"
+        generated = "\n\n[Skill: demo]\n\nloaded procedure with no newline at the end"
+        span: list[int] = []
+        msg, _ = builder.build_message(
+            request,
+            is_new_session=False,
+            interactive=True,
+            session_key="dashboard:chat-1",
+            project="/workspace/example",
+            request_prefix_context=generated,
+            user_text_range=(0, len(request)),
+            user_span_out=span,
+        )
+        assert "\n[REPLY FORMAT RULES]" in msg
+        out = split_blocks(msg, user_span=(span[0], span[1]))
+        assert "reply_format_rules" in out
+        assert out["loaded_skill"] == len(
+            "[Skill: demo]\n\nloaded procedure with no newline at the end\n"
+        )
+        assert sum(out.values()) == len(msg)
+
     def test_dashboard_tool_nudges_require_interactive(self, tmp_path):
         """A non-interactive turn (e.g. automation) gets neither the OPTIONS
         reminder nor either dashboard-card tool nudge."""
@@ -1593,7 +1627,7 @@ class TestMemoryGetContextQueryWiring:
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
             get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
@@ -1614,7 +1648,7 @@ class TestMemoryGetContextQueryWiring:
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
             get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: False,
         )
@@ -1659,7 +1693,7 @@ class TestMemoryGetContextQueryWiring:
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
             get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
@@ -1681,7 +1715,7 @@ class TestMemoryGetContextQueryWiring:
         store._vector_store = SimpleNamespace(
             get_episodic_context=_episodic,
             get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
@@ -1729,7 +1763,7 @@ class TestDurableModelVersionLessonContext:
         memory._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
             get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: False,
         )

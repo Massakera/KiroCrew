@@ -177,7 +177,7 @@ class TestEpisodicMemoryGate:
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
             get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "[PREFERENCE-SENTINEL]",
+            get_preferences_context=lambda query_text="", cap=0: "[PREFERENCE-SENTINEL]",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
