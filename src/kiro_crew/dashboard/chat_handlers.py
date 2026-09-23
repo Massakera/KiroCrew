@@ -48,6 +48,7 @@ from kiro_crew.dashboard.chat_delivery import (
     TURN_ACTOR_META_KEY,
     attachment_meta,
     normalize_send_id,
+    queue_entry_view,
     queue_for_next_turn,
     start_queue_persist,
     steer_into_running_turn,
@@ -984,7 +985,8 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         _hold_sid = normalize_send_id(user_meta.get("sendId")) if user_meta else None
         if _hold_sid:
             _hold_meta["sendId"] = _hold_sid
-        _hold_meta.update(attachment_meta(user_meta))
+        _hold_attachments = attachment_meta(user_meta)
+        _hold_meta.update(_hold_attachments)
         if request_app:
             # Same reason as the busy-slot queue above: this entry is drained
             # later, so only its meta can name the actor.
@@ -1007,15 +1009,16 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         # start from the same place. Same single-flight and same self-limiting
         # skip as the other caller.
         start_queue_persist(state, slot)
-        state.broadcast_ws(
-            "queue_push",
-            {
-                "slot": slot.key,
-                "content": _redacted,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "queue_id": qid,
-            },
-        )
+        _hold_push: dict[str, Any] = {
+            "slot": slot.key,
+            "content": _redacted,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "queue_id": qid,
+        }
+        if _hold_attachments:
+            # Same as the busy-slot frame: the card is a cancel's restore source.
+            _hold_push["meta"] = _hold_attachments
+        state.broadcast_ws("queue_push", _hold_push)
         # Same receipt contract as the busy-slot queue branch: `queue_id` binds
         # the sender's pre-send composer state to this exact entry. An entry the
         # durable bounds refuse is reported in the log by the call above, not on
@@ -2638,7 +2641,12 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     running = slot.running
     stopping = slot._stopping
     display_title = slot.display_title
-    queue_snapshot = [{"id": q["id"], "content": q["content"]} for q in slot._queue]
+    # Shallow copies, so the off-loop render below reads a frozen entry while
+    # the loop keeps editing the live one; the view helper does the redaction.
+    queue_snapshot = [
+        {"id": q["id"], "content": q["content"], "meta": dict(q.get("meta") or {})}
+        for q in slot._queue
+    ]
     context_fields = await _context_snapshot_fields(state, slot)
 
     def _render(live_child: str) -> str:
@@ -2659,10 +2667,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                 "running": running,
                 "stopping": stopping,
                 "messages": prepared,
-                "queue": [
-                    {"id": q["id"], "content": _redact_for_display(q["content"])}
-                    for q in queue_snapshot
-                ],
+                "queue": [queue_entry_view(q) for q in queue_snapshot],
                 "total": total,
                 "has_more": has_more,
                 "next_before": next_before,
@@ -10598,10 +10603,7 @@ async def _live_slot_resume_response(
                 "ok": True,
                 "key": existing.key,
                 "messages": prepared,
-                "queue": [
-                    {"id": q["id"], "content": _redact_for_display(q["content"])}
-                    for q in existing._queue
-                ],
+                "queue": [queue_entry_view(q) for q in existing._queue],
                 "total": total,
                 "has_more": next_before > 0,
                 "next_before": next_before,
@@ -11566,9 +11568,7 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             "messages": _prepare_messages(
                 recent, slot.running, live_child=_live_child_instance(state, slot)
             ),
-            "queue": [
-                {"id": q["id"], "content": _redact_for_display(q["content"])} for q in slot._queue
-            ],
+            "queue": [queue_entry_view(q) for q in slot._queue],
             "total": total,
             "has_more": total > len(recent),
             "memory_mode": slot.memory_mode,

@@ -148,6 +148,42 @@ describe('useQueuedMessageActions — cancel', () => {
     expect(restoreDraft).toHaveBeenCalledWith('summarize the report', ['/tmp/report.docx'])
   })
 
+  it('a foreign card carrying the entry\'s attachment list restores a spaced path whole', () => {
+    // After a reload (or on another tab) there is no stash, but the row's
+    // `meta.files` is the server's echo of the entry's own list — so the
+    // parser claims the own-line marker by exact text, spaces included, and
+    // the chip comes back instead of a truncated `/Users/me/Desktop/My` or
+    // the marker sitting in the composer verbatim.
+    const spaced = '/Users/me/Desktop/My Report.pdf'
+    const sent = `summarize this\n[attached_file 1] ${spaced}`
+    const restoreDraft = vi.fn()
+    const rows = [{ ...queued('q1', sent), meta: { queueId: 'q1', files: [spaced] } } as ChatMessage]
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('summarize this', [spaced])
+  })
+
+  it('the same foreign card WITHOUT the list keeps the marker verbatim (legacy entry)', () => {
+    const spaced = '/Users/me/Desktop/My Report.pdf'
+    const sent = `summarize this\n[attached_file 1] ${spaced}`
+    const restoreDraft = vi.fn()
+    const { get } = renderActions({ rows: [queued('q1', sent)], restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith(sent, [])
+  })
+
+  it('the stash still wins over the row list — it holds the typed text itself', () => {
+    const spaced = '/Users/me/Desktop/My Report.pdf'
+    const sent = `see @My Report.pdf please`
+    const wire = `see [attached_file 1] ${spaced} please`
+    const restoreDraft = vi.fn()
+    const rows = [{ ...queued('q1', wire), meta: { queueId: 'q1', files: [spaced] } } as ChatMessage]
+    queuedSendStash.set('q1', { raw: sent, files: [spaced], sent: wire })
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith(sent, [spaced])
+  })
+
   it('restores nothing when the host supplies no composer sink', () => {
     const { get, store } = renderActions({})
     act(() => { get().onCancel('q1') })

@@ -592,9 +592,30 @@ export const shouldResolveAskOnSend = (
   askAtSend: string | null,
 ): boolean => !!askAtSend && !!(accepted?.ok || accepted?.queued)
 
+/** The attachment lists a queue entry carries, as the server echoes them on
+ *  the slot-detail `queue[]` item, the `queue_push` frame and the cancel
+ *  reply (the same `meta` the `queue_pop` frame already uses). `files` is the
+ *  ORDERED non-image list an `[attached_file N]` marker indexes (`files[N-1]`),
+ *  `dirs` the folder list `[attached_dir N]` indexes. */
+export type QueueEntryAttachments = { files?: string[]; dirs?: string[] }
+
+/** Reduce a wire `meta` to its attachment lists. Only a non-empty list of
+ *  strings is kept: the lists are indexed by marker number, so a malformed
+ *  entry would shift every later marker onto the wrong path. Returns `{}` for
+ *  anything else, which is what an entry without attachments carries. */
+export function queueEntryAttachments(meta: unknown): QueueEntryAttachments {
+  const out: QueueEntryAttachments = {}
+  if (!meta || typeof meta !== 'object') return out
+  for (const key of ['files', 'dirs'] as const) {
+    const raw = (meta as Record<string, unknown>)[key]
+    if (Array.isArray(raw) && raw.length && raw.every((p) => typeof p === 'string' && p)) out[key] = [...raw] as string[]
+  }
+  return out
+}
+
 /** One queued-message entry as normalized by `fetchSlotDetail` from the backend
  *  slot-detail `queue` field. */
-type SlotQueueItem = { content: string; queueId: string; ts: string }
+type SlotQueueItem = { content: string; queueId: string; ts: string } & QueueEntryAttachments
 
 /** Field-for-field equality over every `ChatMessage` field a consumer can render. */
 function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
@@ -632,8 +653,11 @@ function hydrateQueuedBubbles(
   queue: SlotQueueItem[] | undefined,
 ): ChatMessage[] {
   const base = list.filter((m) => m.role !== 'queued')
-  for (const { content, queueId, ts } of queue ?? []) {
-    base.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId } })
+  for (const { content, queueId, ts, ...attachments } of queue ?? []) {
+    // The lists ride the row's meta under the same keys a user row carries
+    // them, so a cancel on THIS tab restores a spaced path exactly even
+    // though the send happened on another tab or before a reload.
+    base.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId, ...attachments } })
   }
   return base
 }
@@ -2134,8 +2158,8 @@ async function fetchSlotDetail(key: string, limit?: number) {
   // COUNT-MATCHED one instead, see REFRESH_LIMIT_CEILING. Omit the arg when
   // unbounded to keep the one-arg shape.
   const d = await (limit === undefined ? api.chatSlotDetail(key) : api.chatSlotDetail(key, limit))
-  type QueueItem = string | { content: string; id: string }
-  return { key, boundedRead: limit !== undefined, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString() }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
+  type QueueItem = string | { content: string; id: string; meta?: unknown }
+  return { key, boundedRead: limit !== undefined, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString(), ...queueEntryAttachments(q.meta) }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
 }
 
 /** SINGLE hydration path for the slot-detail context-meter fields — the one
@@ -6174,16 +6198,18 @@ const chatSlice = createSlice({
     },
     /** Add a queued message (from backend queue_push WS event). */
     appendQueuedMessage: {
-      reducer(state, action: PayloadAction<{ slot: string; content: string; ts: string; queueId: string }>) {
-        const { slot, content, ts, queueId } = action.payload
+      reducer(state, action: PayloadAction<{ slot: string; content: string; ts: string; queueId: string; meta?: unknown }>) {
+        const { slot, content, ts, queueId, meta } = action.payload
         const msgs = slot === state.activeSlot ? state.messages : (state.slotMessages[safeKey(slot)] ??= [])
         // A row with this queueId may ALREADY exist: slot-detail hydration
         // can land before a delayed `queue_push` for the same entry. Appending
         // blindly would duplicate the row; keep the existing one.
         if (msgs.some(m => m.role === 'queued' && (m.meta?.queueId as string) === queueId)) return
-        msgs.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId } })
+        // Same row shape as `hydrateQueuedBubbles`: the frame's attachment
+        // lists ride the row so a cancel restores from them.
+        msgs.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId, ...queueEntryAttachments(meta) } })
       },
-      prepare(payload: { slot: string; content: string; ts: string; queue_id?: string }) {
+      prepare(payload: { slot: string; content: string; ts: string; queue_id?: string; meta?: unknown }) {
         return { payload: { ...payload, queueId: payload.queue_id || crypto.randomUUID() } }
       },
     },

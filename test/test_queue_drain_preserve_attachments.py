@@ -177,6 +177,74 @@ class TestBusySlotQueueEntry:
         assert "dirs" not in entry["meta"]
 
 
+def _queue_push_frames(state) -> list[dict]:
+    return [c.args[1] for c in state.broadcast_ws.call_args_list if c.args[0] == "queue_push"]
+
+
+class TestQueuePushFrameCarriesTheLists:
+    """Every producer's ``queue_push`` frame names the entry's attachment lists.
+
+    The card that frame draws is what a cancel restores the composer from on a
+    tab that never held the send's own state (a reload, another tab). Without
+    the lists the client parses the marker text by whitespace and a spaced
+    path is truncated or left in the composer verbatim. The key is the
+    ``meta`` the ``queue_pop`` frame already uses; absent, not empty, for an
+    entry without attachments.
+    """
+
+    @pytest.mark.asyncio
+    async def test_busy_slot_frame(self, tmp_path, monkeypatch):
+        state, slot = _busy_state(tmp_path, monkeypatch)
+        receipt = await _post_busy(state, "busy-chat", _WIRE, {"files": [_PATH], "dirs": [_DIR]})
+        (frame,) = _queue_push_frames(state)
+        assert frame["queue_id"] == receipt["queue_id"]
+        assert frame["content"] == _WIRE
+        assert frame["meta"] == {"files": [_PATH], "dirs": [_DIR]}
+
+    @pytest.mark.asyncio
+    async def test_busy_slot_frame_without_attachments_has_no_meta_key(self, tmp_path, monkeypatch):
+        state, slot = _busy_state(tmp_path, monkeypatch)
+        await _post_busy(state, "busy-chat", "plain text", {"sendId": "s-2"})
+        (frame,) = _queue_push_frames(state)
+        assert "meta" not in frame
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_hold_frame(self, tmp_path, monkeypatch):
+        state, slot = _busy_state(tmp_path, monkeypatch)
+        # The idle-slot hold: no turn is running, but children are.
+        slot._in_stage_execution = False
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+        receipt = await _post_busy(state, "busy-chat", _WIRE, {"files": [_PATH]})
+        (frame,) = _queue_push_frames(state)
+        assert frame["queue_id"] == receipt["queue_id"]
+        assert frame["meta"] == {"files": [_PATH]}
+
+    @pytest.mark.asyncio
+    async def test_requeued_steer_frame(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard.chat_runner import _requeue_unconsumed_steers
+
+        state, slot = _busy_state(tmp_path, monkeypatch)
+        slot._acp_client = MagicMock(supports_steer=True, steer=AsyncMock(return_value=True))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat",
+                json={
+                    "slot": "busy-chat",
+                    "message": _WIRE,
+                    "steer": True,
+                    "meta": {"files": [_PATH], "dirs": [_DIR]},
+                },
+            )
+            assert resp.status == 200
+        state.broadcast_ws.reset_mock()
+
+        _requeue_unconsumed_steers(state, slot)
+        (frame,) = _queue_push_frames(state)
+        entry = next(i for i in slot._queue if i["content"] == _WIRE)
+        assert frame["queue_id"] == entry["id"]
+        assert frame["meta"] == {"files": [_PATH], "dirs": [_DIR]}
+
+
 class TestDrainedRow:
     @pytest.mark.asyncio
     async def test_drained_row_carries_the_attachment_lists(self, tmp_path, monkeypatch):

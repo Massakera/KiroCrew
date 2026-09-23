@@ -6884,15 +6884,18 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         try:
             content, _ = redact_exfiltration_urls(steer_msg)
             content, _ = redact_credentials(content)
-            state.broadcast_ws(
-                "queue_push",
-                {
-                    "slot": slot.key,
-                    "content": _redact_for_display(content),
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "queue_id": qid,
-                },
-            )
+            _push: dict = {
+                "slot": slot.key,
+                "content": _redact_for_display(content),
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "queue_id": qid,
+            }
+            # The requeued steer's attachment lists were folded into `_meta`
+            # above; the card drawn from this frame is what a cancel restores.
+            _push_attachments = attachment_meta(_meta)
+            if _push_attachments:
+                _push["meta"] = _push_attachments
+            state.broadcast_ws("queue_push", _push)
         except Exception:
             # Broadcast is best-effort — the message is already safely in the
             # queue; clients reconcile from slot detail on next fetch.
