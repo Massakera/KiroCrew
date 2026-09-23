@@ -151,15 +151,87 @@ def _ensure_prerequisites() -> bool:
             f"  ⚠️  node not found on PATH — install Node.js >= {MIN_NODE_MAJOR} from https://nodejs.org\n"
         )
 
-    # kiro-cli is the agent backend. Note its absence so the user can install it.
+    # kiro-cli is the default agent backend. Note its absence so the user can
+    # install it, or switch to another installed harness.
     if not shutil.which(KIRO_CLI_BIN):
         _header()
         print(
             "  ℹ️  kiro-cli not found on PATH — install it (the agent backend) "
             "and run 'kiro-cli login'.\n"
         )
+        _offer_non_kiro_default_backend()
 
     return True
+
+
+def _offer_non_kiro_default_backend() -> None:
+    """With kiro-cli absent, offer an installed codex/droid as the default backend.
+
+    Both ``agent.acp_backend`` and ``agent.member_acp_backend`` are switched: the
+    member default is KAS, which runs on kiro-cli too, so leaving it would keep
+    one kiro-cli dependency behind. Never writes without a yes from a terminal.
+    """
+    from kiro_crew.acp_backends import (
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_DROID,
+        resolve_selected_backend,
+    )
+    from kiro_crew.agent_sdk.backend_install import INSTALLED, probe_backend
+    from kiro_crew.agent_sdk.host_auth import backends_retired_by_host_logout
+
+    kiro_cli_backends = backends_retired_by_host_logout()
+    try:
+        agent_cfg = KiroCrewConfig.load().agent
+        configured = {
+            resolve_selected_backend(agent_cfg.acp_backend),
+            resolve_selected_backend(agent_cfg.member_acp_backend),
+        }
+    except Exception:
+        return
+    if not configured & kiro_cli_backends:
+        return
+    candidates = []
+    for backend in (ACP_BACKEND_CODEX, ACP_BACKEND_DROID):
+        try:
+            usable = (
+                resolve_selected_backend(backend) == backend
+                and probe_backend(backend).installed == INSTALLED
+            )
+        except Exception:
+            usable = False
+        if usable:
+            candidates.append(backend)
+    if not candidates:
+        return
+    choice = candidates[0]
+    commands = (
+        f"kirocrew config set agent.acp_backend {choice}\n"
+        f"     kirocrew config set agent.member_acp_backend {choice}"
+    )
+    if not _stdio_is_interactive():
+        print(f"  ℹ️  {choice} is installed. To run without kiro-cli:\n     {commands}\n")
+        return
+    answer = _input_or_skip(f"  Use {choice} as the default agent backend instead? [Y/n]: ")
+    if answer and answer.lower() not in ("y", "yes"):
+        print(f"  ⏭  Left on kiro-cli. Switch later with:\n     {commands}\n")
+        return
+
+    def _apply(data: dict) -> dict | None:
+        agent = data.get("agent")
+        if agent is None:
+            agent = data["agent"] = {}
+        if not isinstance(agent, dict):
+            return None
+        agent["acp_backend"] = choice
+        agent["member_acp_backend"] = choice
+        return data
+
+    try:
+        update_config_locked(config_path(), mutate=_apply, stamp_meta=False)
+    except (ConfigReadError, OSError) as exc:
+        print(f"  ⚠️  Could not update the config: {exc}\n     Run instead:\n     {commands}\n")
+        return
+    print(f"  ✅ Default agent backend set to {choice}.\n")
 
 
 def _find_electron_dir() -> Path | None:

@@ -331,8 +331,9 @@ EXPECTED_CAPABILITIES = {
     "kas": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False),
     "claude": (PROVIDER_CLAUDE_CODE, "claude_code", True, True, True),
     "codex": (PROVIDER_ACP, "codex", True, True, True),
-    # Its own namespace, and none of the three demonstrated capabilities yet.
-    "droid": (PROVIDER_ACP, "droid", False, False, False),
+    # Its own namespace; the model and effort selects are on its captured
+    # ``session/new``, and ``/compact`` reaches the model as a prompt.
+    "droid": (PROVIDER_ACP, "droid", True, True, False),
     "nope": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False),
 }
 

@@ -1,0 +1,24 @@
+[
+  {
+    "error": {
+      "code": -32601,
+      "data": {
+        "method": "session/steering"
+      },
+      "message": "\"Method not found\": session/steering"
+    },
+    "frame": "response",
+    "id": 3
+  },
+  {
+    "error": {
+      "code": -32601,
+      "data": {
+        "method": "session/steer"
+      },
+      "message": "\"Method not found\": session/steer"
+    },
+    "frame": "response",
+    "id": 4
+  }
+]

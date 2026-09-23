@@ -55,7 +55,7 @@ from kiro_crew.dashboard.handlers._shared import (
     guard_owner_surface_routes,
     internal_memory_scope,
 )
-from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
+from kiro_crew.dashboard.kiro_readiness import backend_needs_kiro_cli, reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
 from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key
 from kiro_crew.executors import subprocess_executor
@@ -1092,6 +1092,10 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
     # `kiro-cli chat --no-interactive ... /usage`, which auto-opens a browser
     # login while signed out. This endpoint is polled every 30s by the top-bar
     # credit pill, so an unauthenticated gateway spawned a browser every 30s.
+    # A codex/droid default never spends Kiro credits, so there is nothing to
+    # scrape: report "unavailable" (the pill hides) instead of a kiro-cli 503.
+    if not await asyncio.to_thread(backend_needs_kiro_cli):
+        return web.json_response({"usage": {"available": False, "reason": "non_kiro_backend"}})
     blocked = await reject_if_kiro_unverified(request)
     if blocked is not None:
         return blocked

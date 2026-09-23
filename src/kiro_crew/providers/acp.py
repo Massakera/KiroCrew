@@ -2204,6 +2204,17 @@ class AcpProvider(LLMProvider):
         """True when the inner client supports mid-turn steer."""
         return bool(getattr(self._client, "supports_steer", False))
 
+    @property
+    def supports_steering_extension(self) -> bool:
+        """True when the inner client takes ``_session/steering`` (subagent steer)."""
+        return bool(getattr(self._client, "supports_steering_extension", False))
+
+    async def inject_steering(self, message: str) -> str:
+        """Delegate a ``_session/steering`` injection; ``""`` when unsupported."""
+        if not self.supports_steering_extension:
+            return ""
+        return await self._client.inject_steering(message)
+
     def _inline_turn_finished_cleanly(self) -> bool:
         """Whether the last turn reached its own end boundary uncancelled.
 

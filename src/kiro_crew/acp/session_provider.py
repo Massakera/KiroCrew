@@ -409,6 +409,15 @@ class AcpSessionProvider(LLMProvider):
         """True when the backing handle supports mid-turn steer (kiro-cli)."""
         return self._handle.supports_steer
 
+    @property
+    def supports_steering_extension(self) -> bool:
+        """True when the backing handle takes ``_session/steering`` (subagent steer)."""
+        return bool(getattr(self._handle, "supports_steering_extension", False))
+
+    async def inject_steering(self, message: str) -> str:
+        """Forward a ``_session/steering`` injection; returns the harness outcome."""
+        return await self._guarded(self._handle.inject_steering(message))
+
     async def stream_command(self, command: str) -> AsyncIterator[LLMEvent]:
         """Execute a slash command natively via ``_kiro.dev/commands/execute``.
 

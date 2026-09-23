@@ -84,12 +84,18 @@ with no row here.
        accept being refused when a frame classifies as nothing)
    * - ``ACP_BACKENDS_SESSION_SHARING``
      - pre-session registry query (subagent session allocation)
+   * - ``ACP_BACKENDS_DEDICATED_SESSION_RESTORE``
+     - pre-session registry query (whether a one-process-per-session harness's
+       subagent chat can be continued, read by the backend card)
    * - ``ACP_BACKENDS_MEMBER_CAPABILITIES``
      - pre-session registry query (whether enrolled members can load a full saved spec)
    * - ``ACP_BACKENDS_MEMBER_DISPATCH``
      - driver-internal (whether a per-session tool set can be mounted)
    * - ``ACP_BACKENDS_STEER``
      - pre-session registry query (whether ``_session/steer`` exists)
+   * - ``ACP_BACKENDS_STEERING_EXTENSION``
+     - driver-internal (whether a subagent steer can ride ``_session/steering``
+       before falling back to a queued follow-up)
    * - ``ACP_BACKENDS_COMPACT``
      - pre-session registry query (whether manual ``/compact`` is offered at all)
    * - ``ACP_BACKENDS_INLINE_COMPACTION``
@@ -803,6 +809,26 @@ def resolve_selected_backend(value: object) -> str:
 # reach is recorded here rather than claimed.
 ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
 
+# Backends served one process per session whose subagent conversation a NEW process
+# restores by id after the old one is gone -- the route ``spawn_continue`` takes off
+# the shared runtime. The continuation seeds the session map from the run's
+# ``state.json`` under the harness's own provider label (so the map does not stat a
+# kiro transcript), and ``AcpClient`` answers the resume with ``session/load``.
+#
+# Membership asks for three things, each already its own fact:
+#
+#   * the harness keeps its own records and resolves a load from the id alone
+#     (``ACP_BACKENDS_HARNESS_OWNED_SESSIONS``);
+#   * its successful load is recognised as one -- a ``modes`` block, or membership
+#     of ``ACP_BACKENDS_LOAD_WITHOUT_MODES``;
+#   * a capture shows a SECOND process restoring what the first created, because
+#     that is the shape a continuation takes and the claim this set makes.
+#
+# droid is a member on ``test/fixtures/acp_frames/droid/session-load-live.jsonl``.
+# opencode and pi hold captures of the same shape and are not claimed here: H6 keeps
+# each membership its own decision, and theirs is not this change's to make.
+ACP_BACKENDS_DEDICATED_SESSION_RESTORE = frozenset({ACP_BACKEND_DROID})
+
 # Backends that can load an enrolled member's full saved agent spec at spawn.
 # Separate from session sharing and per-session dispatch (harness-parity H6):
 # support for either does not establish full-spec loading. Only kiro-cli has
@@ -956,7 +982,39 @@ ACP_BACKENDS_MEMBER_DISPATCH = frozenset(
 # ``sessionCapabilities`` of list and delete, and no steering extension.
 # deepseek is not a member: it advertises close, list and resume only, and permits
 # one in-flight prompt per session, so a mid-turn steer has no verb to travel on.
+# droid is not a member, and here the gap is the harness's ACP surface: its
+# ``initialize`` advertises no steering, and both ``_session/steer`` and
+# ``_session/steering`` are answered ``-32601`` on a live session
+# (``test/fixtures/acp_frames/droid/steer-refused-live.jsonl``). Its native
+# stream-jsonrpc protocol does queue a message into a running turn
+# (``droid.add_user_message``), which Crew does not speak.
+#
+# codex's ``_session/steering`` is still used, for the one caller whose contract it
+# meets -- a coordinator steering a SUBAGENT, where the answer is the injected
+# outcome itself -- through :data:`ACP_BACKENDS_STEERING_EXTENSION` below.
 ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends that inject a message into a RUNNING turn through the provider-neutral
+# ``_session/steering`` extension: ``{sessionId, prompt: [ContentBlock]}``, answered
+# with ``{outcome: injected|promptRequired|startedNewTurn|failed}`` and advertised as
+# ``initialize._meta.steering.supported``.
+#
+# A separate set from ``ACP_BACKENDS_STEER`` because the two channels promise
+# different things. ``_session/steer`` is fire-and-forget and confirmed later by a
+# ``steering_consumed`` echo, which is what the dashboard's pending-steer ledger
+# settles on; this one is confirmed by its own RESPONSE and emits no echo, so a
+# chat steer sent down it would be requeued as a second prompt when the turn ends.
+# Membership therefore lights only the subagent path
+# (``SubagentManager.steer_run``), which awaits the outcome and falls back to a
+# queued follow-up on anything but ``injected``.
+#
+# codex is a member: its live ``initialize`` result advertises
+# ``_meta.steering.supported: true`` (``test/fixtures/acp_frames/codex/session-live.jsonl``),
+# and the request shape and outcomes were measured against codex-acp 1.11.0 (see
+# ``ACP_BACKENDS_STEER`` above). A steer sent while a permission request is pending
+# is answered ``injected`` and then discarded with the turn, because codex's only
+# reject option cancels it; the refusal-recovery continuation still covers that case.
+ACP_BACKENDS_STEERING_EXTENSION = frozenset({ACP_BACKEND_CODEX})
 
 # Backends that can serve a MANUAL ``/compact`` (the user-typed slash command).
 # Every member acts on the ``/compact`` prompt that ``AcpProvider.compact()``
@@ -1018,6 +1076,15 @@ ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # held: they take the ``COMPACT_ARM_UNCLASSIFIED`` refusal, which promises nothing,
 # and the gate logs a WARNING naming the memberships they lack, instead of being
 # told their harness manages compaction itself on no evidence at all.
+#
+# droid is not a member on a live capture: its ``available_commands_update`` lists
+# no compact command (the header of ``droid/steer-refused-live.jsonl`` records the
+# frame, dropped as command inventory), and a ``/compact`` prompt is sent to Factory
+# as an ordinary
+# turn and persisted as the session's title
+# (``test/fixtures/acp_frames/droid/compact-as-prompt-live.jsonl``). Its TUI's
+# ``/compress`` (aliased ``/compact``) and the stream-jsonrpc
+# ``droid.compact_session`` are not on its ACP surface.
 #
 # kas and deepseek are the other two non-members, and none of the four is the same
 # case.
@@ -1462,6 +1529,13 @@ ACP_BACKENDS_SESSION_EVICTION = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, AC
 # ``[provider, model]`` pair -- ``["deepseek-official", "deepseek-v4-flash"]`` -- so
 # the value is passed through exactly as advertised rather than parsed. That is what
 # ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` membership is for.
+#
+# ``ACP_BACKEND_DROID`` is a member on the same kind of evidence: its ``session/new``
+# result advertises a ``model`` select (category ``model``) whose ``currentValue`` is
+# the Factory model id, and ``config_option_update`` re-sends it after a write
+# (``test/fixtures/acp_frames/droid/handshake-live.jsonl``). The ids are Factory's
+# own (``auto``, ``claude-sonnet-5``, ...), which is why it is also a member of
+# ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION``.
 ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -1470,6 +1544,7 @@ ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_DROID,
     }
 )
 
@@ -1501,8 +1576,19 @@ ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
 # effort one offering off, low, high and max. It advertises that option under its own
 # id, ``reasoning_effort``, which ``EFFORT_CONFIG_OPTION_IDS`` below records --
 # membership says the channel exists, the table says what to call it.
+#
+# droid IS a member: the same ``session/new`` result carries a ``reasoning_effort``
+# select (category ``thought_level``) offering none, low, medium, high, xhigh and
+# max -- every level Crew writes, so it needs no ``EFFORT_CONFIG_OPTION_VALUES`` row
+# (``test/fixtures/acp_frames/droid/handshake-live.jsonl``).
 ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION = frozenset(
-    {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_DEEPSEEK, ACP_BACKEND_PI}
+    {
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_PI,
+        ACP_BACKEND_DROID,
+    }
 )
 
 # Backends whose ADVERTISED model ids are ``<model>[<effort>]`` pairs that the
@@ -1536,6 +1622,7 @@ EFFORT_CONFIG_OPTION_IDS: Mapping[str, str] = {
     ACP_BACKEND_CODEX: "reasoning_effort",
     ACP_BACKEND_DEEPSEEK: "reasoning_effort",
     ACP_BACKEND_PI: "thought_level",
+    ACP_BACKEND_DROID: "reasoning_effort",
 }
 
 #: The spelling used by every backend without a row in
@@ -1578,7 +1665,15 @@ DEFAULT_EFFORT_CONFIG_OPTION_ID = "effort"
 # claude-agent-acp rebuilds its effort options per model from
 # ``supportedEffortLevels`` -- so the registry, which knows which model families
 # take a level, is the right authority for them.
-ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION = frozenset({ACP_BACKEND_PI})
+#
+# droid is a member: its ids are Factory's (``auto`` among them, which no name test
+# recognises), its ``reasoning_effort`` select sits on the ``session/new`` result
+# beside the ``model`` one, and it offers every level Crew writes, so the deepseek
+# vocabulary gap does not arise. The select describes its options as depending on
+# the selected model, and ``config_option_update`` re-advertises it after a write,
+# which is the per-session authority this set reads
+# (``test/fixtures/acp_frames/droid/handshake-live.jsonl``).
+ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION = frozenset({ACP_BACKEND_PI, ACP_BACKEND_DROID})
 
 
 def effort_config_option_id(backend: str) -> str:
@@ -1682,6 +1777,11 @@ def effort_config_option_value(backend: str, level: str) -> str:
 # values are JSON-encoded ``[provider, model]`` pairs drawn from the harness's live
 # service catalog. Nothing can spell one of those from a stored bare model name, so
 # a pick that did not come from the capture is a pick the session refuses.
+#
+# ``ACP_BACKEND_DROID`` is a member for the capture half: its ``model`` select names
+# Factory's catalog (``auto``, ``claude-sonnet-5``, ``gpt-5.6-sol`` in
+# ``test/fixtures/acp_frames/droid/handshake-live.jsonl``), which the static registry
+# does not carry, and it is served verbatim, so the spelling fold is a no-op.
 ACP_BACKENDS_ADVERTISED_MODEL_SELECTION = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -1690,6 +1790,7 @@ ACP_BACKENDS_ADVERTISED_MODEL_SELECTION = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_DROID,
     }
 )
 
@@ -1972,6 +2073,15 @@ ACP_BACKENDS_HOST_AUTH_CALLBACK = frozenset({ACP_BACKEND_KAS})
 # from the id alone through its own session map, replaying the conversation as
 # ``user_message_chunk`` / ``agent_message_chunk`` updates before answering
 # (``test/fixtures/acp_frames/pi/session-load-live.jsonl``).
+#
+# droid is a member on the same class of capture: it advertises ``loadSession`` and
+# keeps its sessions under ``~/.factory/sessions``, and a SECOND adapter process,
+# started after the first was killed, lists the session and resolves a
+# ``session/load`` from the id alone, replaying the conversation as
+# ``user_message_chunk`` updates before answering; an unknown id is refused with
+# ``-32602`` (``test/fixtures/acp_frames/droid/session-load-live.jsonl``). Without
+# membership the resume path stats a kiro transcript droid never writes, and every
+# ``spawn_continue`` on a droid subagent silently starts a fresh conversation.
 ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -1980,6 +2090,7 @@ ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_DROID,
     }
 )
 
@@ -2002,7 +2113,15 @@ ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
 # rejects modes across its whole surface, so it can never return one. Membership is
 # what keeps a restored conversation from being discarded by a check for a block this
 # harness has nothing to put in.
-ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset({ACP_BACKEND_OPENCODE, ACP_BACKEND_DEEPSEEK})
+#
+# droid is a member, OBSERVED: its successful ``session/load`` result carries
+# ``configOptions`` and nothing else, although its ``session/new`` result does carry
+# ``modes`` (``test/fixtures/acp_frames/droid/session-load-live.jsonl``). The
+# ``autonomy_level`` option rides in that ``configOptions``, so the SESSION_CONFIG
+# routing is re-armed on the restored session exactly as on a new one.
+ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset(
+    {ACP_BACKEND_OPENCODE, ACP_BACKEND_DEEPSEEK, ACP_BACKEND_DROID}
+)
 
 # Backends that restore a session with ``session/resume`` instead of
 # ``session/load``, and advertise it under ``sessionCapabilities.resume`` instead of

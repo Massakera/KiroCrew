@@ -859,11 +859,42 @@ class ContinuationCoordinator(ManagerComponent):
                     f"not registered within {_STEER_STARTUP_WAIT_SECS}s — "
                     "retry in a few seconds"
                 )
-        try:
-            ok = await provider.steer(message)
-        except Exception as exc:  # pragma: no cover - provider-specific
-            logger.warning("steer_run %s failed", agent_id, exc_info=True)
-            return False, f"steer failed: {exc}"
+        # ``_session/steer`` is fire-and-forget, so writing it to a harness that
+        # does not implement it would report a steer the model never sees. Only an
+        # explicit False routes elsewhere: a provider that predates the property
+        # keeps the historical path. Off that path a member of
+        # ``ACP_BACKENDS_STEERING_EXTENSION`` counts only on an ``injected``
+        # outcome; anything else is queued as a follow-up, and the detail says so.
+        fallback_reason = ""
+        if getattr(provider, "supports_steer", True) is False:
+            if getattr(provider, "supports_steering_extension", False) is True:
+                try:
+                    outcome = await provider.inject_steering(message)
+                except Exception:
+                    logger.warning(
+                        "steer_run %s: _session/steering failed", agent_id, exc_info=True
+                    )
+                    outcome = "failed"
+                ok = outcome == "injected"
+                fallback_reason = f"_session/steering answered {outcome or 'nothing'}"
+            else:
+                ok = False
+                backend = str(getattr(info, "acp_backend", "") or "") or "kiro"
+                fallback_reason = f"backend {backend} has no mid-turn steer channel"
+            if not ok:
+                queued, detail = await self.follow_up_run_impl(agent_id, message)
+                if not queued:
+                    return queued, detail
+                return True, (
+                    f"queued_follow_up: {fallback_reason}; the message will be delivered "
+                    "as a continuation after the current turn"
+                )
+        else:
+            try:
+                ok = await provider.steer(message)
+            except Exception as exc:  # pragma: no cover - provider-specific
+                logger.warning("steer_run %s failed", agent_id, exc_info=True)
+                return False, f"steer failed: {exc}"
         if ok:
             self._record_crew_log_steer(info, "interrupt")
             try:

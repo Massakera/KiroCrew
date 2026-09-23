@@ -34,6 +34,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_DROID,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -204,7 +205,8 @@ def test_membership_is_unchanged_by_the_move() -> None:
     # seen.
     # deepseek joins for that same capture reason, in its strongest form: its
     # select's values are JSON-encoded ``[provider, model]`` pairs from its own live
-    # catalog, which nothing can spell from a stored bare model name.
+    # catalog, which nothing can spell from a stored bare model name. droid joins
+    # for the capture reason too: its select names Factory's own catalog.
     assert ACP_BACKENDS_ADVERTISED_MODEL_SELECTION == frozenset(
         {
             ACP_BACKEND_CLAUDE,
@@ -213,6 +215,7 @@ def test_membership_is_unchanged_by_the_move() -> None:
             ACP_BACKEND_PI,
             ACP_BACKEND_GOOSE,
             ACP_BACKEND_DEEPSEEK,
+            ACP_BACKEND_DROID,
         }
     )
     assert ACP_BACKENDS_SEED_LOCAL_SETTINGS == frozenset({ACP_BACKEND_CLAUDE})

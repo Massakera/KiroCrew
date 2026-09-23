@@ -21,11 +21,13 @@ latched value can be arbitrarily stale. That splits the callers in two:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
 from aiohttp import web
 
+from kiro_crew.agent_sdk.host_auth import backends_retired_by_host_logout
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
 
 logger = logging.getLogger(__name__)
@@ -215,7 +217,32 @@ def _service(request: web.Request) -> object:
     return service
 
 
-async def reject_if_kiro_unverified(request: web.Request) -> web.Response | None:
+def backend_needs_kiro_cli(session_key: str | None = None) -> bool:
+    """Whether the session *session_key* (or the default session) runs on kiro-cli.
+
+    The backend is chosen by the same gate the provider factory uses, and "runs on
+    kiro-cli" is the harness's own declaration (kiro and KAS sign in from its
+    store). A host with only codex or droid configured never spawns kiro-cli, so
+    its readiness must not decide whether these endpoints answer. An unreadable
+    config fails closed: the gate stays on.
+    """
+    from kiro_crew.config import KiroCrewConfig
+    from kiro_crew.members import select_provider_backend
+
+    try:
+        agent_cfg = KiroCrewConfig.load().agent
+        backend = select_provider_backend(
+            session_key, agent_cfg.member_acp_backend, agent_cfg.acp_backend
+        )
+    except Exception:
+        logger.debug("backend lookup failed; keeping the kiro readiness gate", exc_info=True)
+        return True
+    return backend in backends_retired_by_host_logout()
+
+
+async def reject_if_kiro_unverified(
+    request: web.Request, *, session_key: str | None = None
+) -> web.Response | None:
     """Return 503 for the endpoints that must fail closed on a stale latch.
 
     Two classes qualify, both because the ACP attempt cannot be their authority:
@@ -245,8 +272,13 @@ async def reject_if_kiro_unverified(request: web.Request) -> web.Response | None
     :func:`kiro_verified_ready` — a stale ``ready=True`` is as dangerous as a
     stale ``ready=False`` here (it authorizes the history rewrite or the
     browser-opening spawn), and only these paths pay for the re-probe.
+
+    Only sessions that run on kiro-cli are gated: *session_key* names the slot a
+    rerun targets, and ``None`` means the default session.
     """
 
+    if not await asyncio.to_thread(backend_needs_kiro_cli, session_key):
+        return None
     if await kiro_verified_ready(_service(request)):
         _clear_refusal_warning()
         return None
