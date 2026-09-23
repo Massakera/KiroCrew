@@ -8,6 +8,9 @@ for what a fixture is and what the corpus does and does not prove.
 | `handshake-live.jsonl` | live | `initialize` answer with `agentInfo.version` and both auth methods, `session/new` with one stdio `mcpServers` element, the `autonomy_level=normal` write and its `current_mode_update` / `config_option_update`, `session/list` |
 | `auth-failure-live.jsonl` | live | a `session/prompt` rejected by Factory with a 401: an `agent_message_chunk` naming it and a `-32603` error carrying the status |
 | `turn-synthesized.jsonl` | **synthesized** | `tool_call`, `session/request_permission`, `tool_call_update`, `agent_message_chunk`, `stopReason` |
+| `session-load-live.jsonl` | live (0.225.2) | a second adapter process: `initialize`, `session/list`, `session/load` replaying the first process's session as `user_message_chunk` and answering with `configOptions` and no `modes`, an unknown id refused with `-32602` |
+| `steer-refused-live.jsonl` | live (0.225.2) | `_session/steering` and `_session/steer` both answered `-32601` |
+| `compact-as-prompt-live.jsonl` | live (0.225.2) | a `/compact` prompt sent to Factory as an ordinary turn (401 with the placeholder key), not handled as a command |
 
 ## What the live captures establish
 
