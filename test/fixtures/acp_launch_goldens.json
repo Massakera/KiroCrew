@@ -45,6 +45,23 @@
     "spawn_label": "dsh --profile acp",
     "stderr_label": "dsh"
   },
+  "droid": {
+    "argv": [
+      "/opt/bin/droid",
+      "exec",
+      "--output-format",
+      "acp"
+    ],
+    "env_added": {
+      "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
+      "KIROCREW_SESSION_KEY": "golden-session",
+      "KIROCREW_SPAWNED": "1",
+      "KIROCREW_STUB_SESSION_TOKEN": "<session-token>",
+      "PATH": "<augmented-path>"
+    },
+    "spawn_label": "droid exec --output-format acp",
+    "stderr_label": "droid"
+  },
   "goose": {
     "argv": [
       "/opt/bin/goose",

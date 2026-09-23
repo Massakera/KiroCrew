@@ -633,6 +633,26 @@ override root now. Expect this: the buckets are answered from the harnesses that
 existed when they were written, and a new one whose answer has a different shape
 finds the seam rather than the gap.
 
+## Worked example: Factory Droid
+
+A harness onboarded dormant on a CAPTURED routing, with the turn still owed. It is
+in `ACP_BACKENDS_KNOWN`, it is NOT in the selectable baseline, and this fork lets an
+operator opt into it with `KIROCREW_EXPERIMENTAL_BACKENDS=droid`
+(`agent_sdk.backends.opt_in_experimental_backends`, which goes THROUGH
+`register_selectable_backend` and so still refuses an `UNVERIFIED` routing).
+
+| Stage | State |
+|---|---|
+| 1 vocabulary | Done — `ACP_BACKEND_DROID`, `PROVIDER_LABEL_DROID`, policy name `droid`, its own model-registry namespace. |
+| 2 capability sets | In the session MCP array only (ACP v1 requires stdio entries, and a captured `session/new` with an unstartable stdio element still returned a session). Out of every other set: nothing else was observed. Listed in the compaction test's `UNCLASSIFIED`. |
+| 3 spawn path | Done — `droid exec --output-format acp` from its `ACP_BACKEND_LAUNCH` row, `DROID_BIN` override. No `--auto`: headless droid is read-only without it. |
+| 4 handshake | Done — integer `1`, `loadSession: true`, `sessionCapabilities.resume` and `list`, captured off droid 0.225.1. |
+| 5 auth declaration | Done — `own_credential_file`; `~/.factory/auth.v2.file` + `auth.v2.key` and the `mcp-oauth` pair (read out of its bundle), `FACTORY_HOME_OVERRIDE` standing in for `$HOME`, all four spared from the mask. `FACTORY_API_KEY` in the environment needs no file and no `authenticate` call; a bad key is rejected only at the first turn (401, `auth-failure-live.jsonl`). |
+| 6 install probe | Done — `_probe_self_served` reads its record: `droid`, `curl -fsSL https://app.factory.ai/cli | sh`. |
+| routing | `SESSION_CONFIG`, `("autonomy_level", "normal")`, captured: the option is advertised on `session/new` and the write is accepted and echoed (`current_mode_update`, `config_option_update`). ENFORCED, so the spawn arm runs the refuse-then-mask preflight. |
+| 7 selectability | **Not selectable by default.** Named in `NOT_SHIPPED_SELECTABLE`: no recorded turn yet shows a write under `normal` raised as `session/request_permission`. |
+| 8 live spill | Owed. `turn-synthesized.jsonl` stands in; `test/fixtures/acp_frames/droid/README.md` has the recording steps for a signed-in host. |
+
 ## Worked example: the Pi harness
 
 The second run through every gate, and the one to read for what a harness with NO

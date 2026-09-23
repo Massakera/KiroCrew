@@ -1,0 +1,150 @@
+[
+  {
+    "agent_capabilities": {
+      "_meta": {
+        "terminal-auth": true,
+        "terminal_output": true
+      },
+      "loadSession": true,
+      "promptCapabilities": {
+        "embeddedContext": true,
+        "image": true
+      },
+      "sessionCapabilities": {
+        "list": {},
+        "resume": {}
+      }
+    },
+    "agent_version": "0.225.1",
+    "frame": "response",
+    "id": 1,
+    "protocol_version": 1
+  },
+  {
+    "config_options": [
+      {
+        "category": "mode",
+        "currentValue": "normal",
+        "description": "Which tool actions the agent may run without confirmation.",
+        "id": "autonomy_level",
+        "name": "Autonomy Level",
+        "options": [
+          {
+            "name": "Auto (Off)",
+            "value": "normal"
+          },
+          {
+            "name": "Spec",
+            "value": "spec"
+          },
+          {
+            "name": "Auto (Low)",
+            "value": "auto-low"
+          },
+          {
+            "name": "Auto (Medium)",
+            "value": "auto-medium"
+          },
+          {
+            "name": "Auto (High)",
+            "value": "auto-high"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model",
+        "currentValue": "gpt-5.6-sol",
+        "description": "The model used for this session. Changing this may also change the available Reasoning Effort options.",
+        "id": "model",
+        "name": "Model",
+        "options": [
+          {
+            "description": "1x Factory token rate",
+            "name": "Auto Model",
+            "value": "auto"
+          },
+          {
+            "description": "0.8x Factory token rate",
+            "name": "Sonnet 5",
+            "value": "claude-sonnet-5"
+          },
+          {
+            "description": "1.6x Factory token rate",
+            "name": "GPT-5.6 Sol",
+            "value": "gpt-5.6-sol"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "thought_level",
+        "currentValue": "high",
+        "description": "Controls how much thinking the model performs before responding. The available options depend on the selected model.",
+        "id": "reasoning_effort",
+        "name": "Reasoning Effort",
+        "options": [
+          {
+            "name": "None",
+            "value": "none"
+          },
+          {
+            "name": "Low",
+            "value": "low"
+          },
+          {
+            "name": "Medium",
+            "value": "medium"
+          },
+          {
+            "name": "High",
+            "value": "high"
+          },
+          {
+            "name": "Extra High",
+            "value": "xhigh"
+          },
+          {
+            "name": "Maximum",
+            "value": "max"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "frame": "response",
+    "id": 2,
+    "modes": {
+      "advertised": true,
+      "current": "normal",
+      "ids": [
+        "normal",
+        "spec",
+        "auto-low",
+        "auto-medium",
+        "auto-high"
+      ]
+    },
+    "session_id": "sess-droid-live-a"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "current_mode_update"
+  },
+  {
+    "frame": "response",
+    "id": 3
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "config_option_update"
+  },
+  {
+    "frame": "response",
+    "id": 4
+  }
+]

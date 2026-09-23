@@ -1,0 +1,93 @@
+[
+  {
+    "action": "update",
+    "events": [
+      {
+        "is_shell": true,
+        "kind": "tool_call",
+        "raw_tool_params": {
+          "command": "touch probe.txt"
+        },
+        "title": "touch probe.txt",
+        "tool_call_id": "call_synthetic_exec",
+        "tool_input": "{\n  \"command\": \"touch probe.txt\"\n}",
+        "tool_kind": "execute",
+        "wire_title": "Execute"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call"
+  },
+  {
+    "action": "permission",
+    "events": [
+      {
+        "is_shell": true,
+        "kind": "permission_request",
+        "mcp_identity_trusted": true,
+        "options": [
+          {
+            "id": "proceed_once",
+            "label": "Allow once"
+          },
+          {
+            "id": "cancel",
+            "label": "Reject"
+          }
+        ],
+        "raw_params_trusted": true,
+        "raw_tool_params": {
+          "command": "touch probe.txt"
+        },
+        "request_id": 7,
+        "shell_classified": true,
+        "title": "Execute",
+        "tool_call_id": "call_synthetic_exec",
+        "tool_input": "{\n  \"command\": \"touch probe.txt\"\n}",
+        "tool_kind": "execute"
+      }
+    ],
+    "frame": "session/request_permission",
+    "recorded_options": {
+      "always": "proceed_once",
+      "once": "proceed_once",
+      "reject": "cancel"
+    }
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "tool_result",
+        "tool_call_id": "call_synthetic_exec",
+        "tool_final": true,
+        "tool_output": "(no output)",
+        "tool_output_bytes": 11,
+        "tool_output_digest": "efefc15c24ee8645a3f5f6958389db729c1577eb6b32aeac4caab2a86d90daa3",
+        "tool_status": "completed"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "tool_call_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "Created probe.txt."
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "Created probe.txt.",
+      "thinking": false
+    }
+  },
+  {
+    "frame": "response",
+    "id": 99,
+    "stop_reason": "end_turn"
+  }
+]

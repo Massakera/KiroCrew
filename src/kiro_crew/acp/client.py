@@ -101,6 +101,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_DROID,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
@@ -5360,6 +5361,10 @@ class AcpClient:
         return self.backend == ACP_BACKEND_DEEPSEEK
 
     @property
+    def _is_droid(self) -> bool:
+        return self.backend == ACP_BACKEND_DROID
+
+    @property
     def _model_registry_namespace(self) -> str:
         """The model_registry namespace key for this backend (``claude_code`` /
         ``acp``). A registry index selector, NOT a provider-identity check — see
@@ -8013,6 +8018,23 @@ class AcpClient:
                     )
                 except acp_tool_gate.ToolGateUnroutable as exc:
                     raise AcpToolGateUnroutable(str(exc)) from None
+        elif self._is_droid:
+            # Droid's headless mode serves ACP itself (``droid exec --output-format
+            # acp``), so the whole argv comes from its ``ACP_BACKEND_LAUNCH`` row. The
+            # row passes no ``--auto``; the routing that makes it ask is the
+            # ``autonomy_level`` session option, armed after ``session/new`` by the
+            # shared SESSION_CONFIG step. No mirror to warm: its projection is
+            # broker-only (``providers/mirrors/registry``).
+            _droid_bin, argv, spawn_label, stderr_label = await self._resolve_self_served_launch()
+            # The same refuse-then-mask preflight every ENFORCED arm runs: the OS
+            # credential mask is the compensating control for the reads its
+            # ``normal`` autonomy level runs unasked. Its own sign-in store is the one
+            # carve-out (``host_auth``), so a device-paired login still works; an
+            # operator on ``FACTORY_API_KEY`` needs no file at all.
+            adapter_hidden_dirs = await _run_preflight_bounded(
+                _sandbox_preflight, self.backend, self._sandbox_mode
+            )
+            adapter_expose = acp_tool_gate.adapter_expose_files(self.backend, adapter_hidden_dirs)
         elif self._is_deepseek:
             # This harness is a plugin host and ACP is one of the profiles it boots,
             # so the argv is its own binary plus the profile selector: no adapter

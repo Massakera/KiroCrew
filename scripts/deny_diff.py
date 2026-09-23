@@ -165,6 +165,9 @@ _INHERITED_HOME_OVERRIDE_ENV_VARS = (
     # variable. Same reasoning as the entry above, and the source test pins this tuple
     # against the harness declarations so a new override cannot be forgotten here.
     "DSH_HOME",
+    # Factory Droid reads this BEFORE ``$HOME``, so it relocates ``~/.factory`` and the
+    # sign-in store inside it.
+    "FACTORY_HOME_OVERRIDE",
 )
 
 
