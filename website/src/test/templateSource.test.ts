@@ -52,7 +52,7 @@ describe('templateSourceBadge', () => {
 
   it('shows the category word for non-package sources', () => {
     expect(templateSourceBadge({ source: 'kirocrew' })).toBe('Built-in')
-    expect(templateSourceBadge({ source: 'builtin' })).toBe('Custom')
+    expect(templateSourceBadge({ source: 'builtin' })).toBe('Yours')
     expect(templateSourceBadge(undefined)).toBe('')
   })
 })

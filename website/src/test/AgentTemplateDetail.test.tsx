@@ -128,7 +128,7 @@ beforeEach(() => {
 describe('the header bar is the template selector', () => {
   it('labels the selector "Template" and shows the bound template as its value', async () => {
     renderPane()
-    expect(await screen.findByText('Template')).toBeInTheDocument()
+    expect(await screen.findByText('Built from')).toBeInTheDocument()
     const selector = screen.getByRole('combobox', { name: FIELD_LABEL })
     expect(selector).toHaveTextContent('atlas')
   })
@@ -173,11 +173,11 @@ describe('shared (non-copy) template bound', () => {
     renderPane({ crew: 'crewA' })
     // The source badge names where it came from; 'custom' is the fallback the
     // filename-guessed provenance reports for a plain builtin spec.
-    expect(await screen.findByText('Custom')).toBeInTheDocument()
+    expect(await screen.findByText('Yours')).toBeInTheDocument()
     // Two crews point at it, so the reach is stated rather than implied.
-    expect(screen.getByText(/used by 2 agents/i)).toBeInTheDocument()
+    expect(screen.getByText(/used by 2 crewmates/i)).toBeInTheDocument()
     // The helper line warns that the first edit branches a private copy.
-    expect(screen.getByText(/its own copy of the template/i)).toBeInTheDocument()
+    expect(screen.getByText(/its own copy of the custom agent/i)).toBeInTheDocument()
 
     // None of the own-copy affordances exist on a shared template.
     expect(screen.queryByText('Customized')).not.toBeInTheDocument()
@@ -225,8 +225,8 @@ describe('the crew\'s own copy bound', () => {
     expect(selector).toHaveTextContent('atlas')
     expect(selector).not.toHaveTextContent('atlas-crewA')
     // The own copy is nobody else's, so the shared-template lines are suppressed.
-    expect(screen.queryByText(/used by 2 agents/i)).not.toBeInTheDocument()
-    expect(screen.queryByText(/its own copy of the template/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/used by 2 crewmates/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/its own copy of the custom agent/i)).not.toBeInTheDocument()
     expect(screen.getByText(/Based on the atlas template/i)).toBeInTheDocument()
   })
 

@@ -7,6 +7,9 @@ import ErrorNotice from '../../components/ErrorNotice'
 import InfoTip from '../../components/InfoTip'
 import SimpleSelect from '../../components/SimpleSelect'
 import { useProvider } from '../../providers'
+import { DEFAULT_CREWMATE_HIGHLIGHT_ANCHOR } from '../../hooks/useSettingHighlight'
+import { useAppDispatch } from '../../store'
+import { triggerRefresh } from '../../store/dashboardSlice'
 
 import type { KiroCrewAgent } from '../../components/AgentSelector'
 
@@ -127,6 +130,7 @@ function CfgToggle({ label, path, value, hint, onSave }: { label: string; path: 
 export default function KiroCrewCfgTab() {
   const provider = useProvider()
   const queryClient = useQueryClient()
+  const dispatch = useAppDispatch()
   const { data: cfg = null, error: queryErr } = useQuery<KiroCrewCfg>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
@@ -153,6 +157,48 @@ export default function KiroCrewCfgTab() {
     patchMut.mutate({ path, value })
   }
 
+  /** Which crewmate a new session starts as. Its own write through
+   *  `PUT /api/config/default-agent` (owner-gated, refuses an unknown name)
+   *  rather than a raw config PATCH, and its own notice: the row commits on
+   *  change, so there is no draft the hand-off could lose. */
+  const [defaultErr, setDefaultErr] = useState('')
+  // Its own remount counter, not the page-wide `rev`: bumping `rev` here would
+  // remount every control on the page when the default-crewmate request
+  // settles, and a CfgNumber keeps its typed-but-uncommitted draft in local
+  // state — so a value being typed into Pool size or Session timeout while the
+  // request was in flight would silently revert to the stored one.
+  const [defaultRev, setDefaultRev] = useState(0)
+  const defaultMut = useMutation({
+    mutationFn: (name: string) => api.setDefaultAgent(name),
+    onSuccess: (r: { error?: string } | undefined) => {
+      // Lead with what failed in the page's own words; the server's reason
+      // ("unknown agent: …") follows, since on its own it names neither the
+      // control nor the thing the page calls a crewmate.
+      if (r?.error) { setDefaultErr(i18nT('pages.overview.kiroCrewCfgTab.default_crewmate_failed_because', { reason: r.error })); return }
+      setDefaultErr('')
+      // The default is read by more than this table: the chat composer's
+      // catalog (`useAgents`, keyed on the store's refreshTrigger) decides which
+      // crewmate a NEW session binds to, and the shared ['default-agent'] /
+      // ['kirocrew-agents'] queries feed the roster and the sidebar marker.
+      // Refresh all of them here, as the roster's old picker did, so a session
+      // opened right after the change starts as the crewmate just chosen rather
+      // than the one the catalog still remembers.
+      queryClient.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['kirocrew-agents'] })
+      queryClient.invalidateQueries({ queryKey: ['default-agent'] })
+      dispatch(triggerRefresh())
+    },
+    onError: (e: Error) => setDefaultErr(e.message
+      ? i18nT('pages.overview.kiroCrewCfgTab.default_crewmate_failed_because', { reason: e.message })
+      : i18nT('pages.overview.kiroCrewCfgTab.default_crewmate_failed')),
+    // Success or refusal, the select must show what the config SAYS, not what
+    // was picked: a refused pick would otherwise sit selected next to a table
+    // still badging the old default. The bumped key remounts CfgSelect on the
+    // server's value (invalidation carries the accepted one). Only THIS select
+    // remounts.
+    onSettled: () => setDefaultRev(r => r + 1),
+  })
+
   if (err) return <Card><ErrorNotice message={err} askAgent /></Card>
   if (!cfg) return <Card><div className="skeleton h-40 rounded" /></Card>
 
@@ -164,7 +210,7 @@ export default function KiroCrewCfgTab() {
     <>
       {/* Agents */}
       <Card>
-        <CardTitle><Bot className="lucide-inline" /> {i18nT('pages.overview.kiroCrewCfgTab.kirocrew_agents')} <InfoTip text={i18nT('pages.overview.kiroCrewCfgTab.named_agent_definitions', { label: provider.labels.agentTemplateField.toLowerCase() })} /></CardTitle>
+        <CardTitle><Bot className="lucide-inline" /> {i18nT('pages.overview.kiroCrewCfgTab.kirocrew_agents')} <InfoTip text={i18nT('pages.overview.kiroCrewCfgTab.named_agent_definitions', { label: i18nT('pages.kiroCrewAgentsPage.custom_agent').toLowerCase() })} /></CardTitle>
         {agents.length === 0 ? (
           <EmptyState icon={<Bot className="lucide-inline" />} title={i18nT('pages.overview.kiroCrewCfgTab.no_agents_defined')} subtitle={i18nT('pages.overview.kiroCrewCfgTab.using_legacy_mode_agent_default_agent_as_agent_t')} />
         ) : (
@@ -172,7 +218,7 @@ export default function KiroCrewCfgTab() {
             <thead>
               <tr>
                 <th className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium">{i18nT('pages.overview.kiroCrewCfgTab.name')}</th>
-                <th className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium">{provider.labels.agentTemplateField}</th>
+                <th className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium">{i18nT('pages.kiroCrewAgentsPage.built_from')}</th>
                 <th className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium">{i18nT('pages.overview.kiroCrewCfgTab.workspace')}</th>
                 <th className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium">{i18nT('pages.overview.kiroCrewCfgTab.memory_store')}</th>
               </tr>
@@ -190,6 +236,31 @@ export default function KiroCrewCfgTab() {
               ))}
             </tbody>
           </table>
+        )}
+        {/* The one place that CHANGES the default crewmate. The Crewmates tab
+            only marks it with a badge, and the chat picker withholds crewmates
+            while HIDE_CREWMATE_CHOICES is on, so without this row a user with
+            several crewmates could not change which one new sessions start as.
+            Rendered whenever any crewmate exists — the roster badge deep-links
+            here even with one, so the anchor must be on the page for the ring
+            to land (a one-option select is a true statement, not a trap). */}
+        {agents.length > 0 && (
+          <div
+            className="mt-3 grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1"
+            data-setting-key={DEFAULT_CREWMATE_HIGHLIGHT_ANCHOR}
+            data-testid="cfg-default-crewmate-row"
+          >
+            <CfgSelect
+              key={`defaultagent-${defaultRev}-${cfg.default_agent}`}
+              label={i18nT('pages.overview.kiroCrewCfgTab.default_crewmate')}
+              path="agent.default_agent"
+              value={cfg.default_agent}
+              options={agents.map(([name]) => name)}
+              hint={i18nT('pages.overview.kiroCrewCfgTab.default_crewmate_hint')}
+              onSave={(_path, name) => { setDefaultErr(''); defaultMut.mutate(name) }}
+            />
+            <ErrorNotice message={defaultErr} variant="inline" askAgent testId="cfg-default-crewmate-error" />
+          </div>
         )}
       </Card>
 

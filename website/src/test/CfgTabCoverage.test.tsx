@@ -100,7 +100,7 @@ function seed(cfg: Cfg = CFG, patched: Cfg = CFG) {
 /** Render and wait for the first table to replace the skeleton. */
 async function renderTab() {
   const view = renderWithProviders(<KiroCrewCfgTab />)
-  expect(await screen.findByText('Kiro Crew Agents')).toBeInTheDocument()
+  expect(await screen.findByRole('heading', { name: /Crewmates/ })).toBeInTheDocument()
   return view
 }
 
@@ -145,11 +145,11 @@ describe('KiroCrewCfgTab — query boundaries', () => {
 
     const { container } = renderWithProviders(<KiroCrewCfgTab />)
     expect(container.querySelector('.skeleton')).not.toBeNull()
-    expect(screen.queryByText('Kiro Crew Agents')).toBeNull()
+    expect(screen.queryByRole('heading', { name: /Crewmates/ })).toBeNull()
 
     // Settle it before the test ends so the query never resolves after teardown.
     await act(async () => { release(CFG) })
-    expect(await screen.findByText('Kiro Crew Agents')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: /Crewmates/ })).toBeInTheDocument()
   })
 
   it('renders an Error rejection by its message', async () => {
@@ -219,7 +219,7 @@ describe('KiroCrewCfgTab — tables', () => {
     seed(bare)
 
     await renderTab()
-    expect(screen.getByText('No agents defined')).toBeInTheDocument()
+    expect(screen.getByText('No crewmates defined')).toBeInTheDocument()
     expect(screen.getByText('Using legacy mode — agent.default_agent as agent template')).toBeInTheDocument()
     expect(screen.getByText('No memory stores')).toBeInTheDocument()
     expect(screen.getByText('Using global memory settings')).toBeInTheDocument()
@@ -348,6 +348,90 @@ describe('KiroCrewCfgTab — select and toggle rows', () => {
     await waitFor(() => {
       expect(vi.mocked(api).patchConfig).toHaveBeenCalledWith('session.pool_agent', 'crew-beta')
     })
+  })
+
+  it('changes the default crewmate through its own endpoint, then refetches', async () => {
+    const m = seed()
+    m.setDefaultAgent = vi.fn().mockResolvedValue({ ok: true })
+
+    const view = await renderTab()
+    const before = view.store.getState().dashboard.refreshTrigger
+    const invalidate = vi.spyOn(view.queryClient, 'invalidateQueries')
+    expect(optionIn('Default crewmate', 'crew-alpha')).toHaveAttribute('aria-selected', 'true')
+    fireEvent.click(optionIn('Default crewmate', 'crew-beta'))
+
+    await waitFor(() => expect(m.setDefaultAgent).toHaveBeenCalledWith('crew-beta'))
+    // Not a raw config PATCH: the default-agent route validates the name.
+    expect(m.patchConfig).not.toHaveBeenCalled()
+    await waitFor(() => expect(m.kirocrewConfig).toHaveBeenCalledTimes(2))
+    expect(screen.queryByTestId('cfg-default-crewmate-error')).not.toBeInTheDocument()
+    // The composer's catalog and the shared roster/default queries must learn
+    // the new default too, or the next new session still binds to the old one.
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['kirocrew-agents'] })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['default-agent'] })
+    expect(view.store.getState().dashboard.refreshTrigger).toBe(before + 1)
+  })
+
+  it('reports a refused default-crewmate change beside the row', async () => {
+    const m = seed()
+    m.setDefaultAgent = vi.fn().mockResolvedValue({ error: 'unknown agent: crew-beta' })
+
+    await renderTab()
+    fireEvent.click(optionIn('Default crewmate', 'crew-beta'))
+
+    // Leads with the page's own sentence, then the server's reason.
+    expect(await screen.findByTestId('cfg-default-crewmate-error')).toHaveTextContent('Could not change the default crewmate — unknown agent: crew-beta')
+    // A refused write does not refetch; the table keeps the previous default —
+    // and so does the select, remounted on the config's value rather than
+    // left showing the pick the server refused.
+    expect(m.kirocrewConfig).toHaveBeenCalledTimes(1)
+    expect(optionIn('Default crewmate', 'crew-alpha')).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('keeps a numeric draft typed elsewhere while the default-crewmate change settles', async () => {
+    // The select remounts on its own counter, not the page-wide one: a value
+    // being typed into another card while the request is in flight must not
+    // revert to the stored value when the request settles.
+    const m = seed()
+    m.setDefaultAgent = vi.fn().mockResolvedValue({ ok: true })
+
+    await renderTab()
+    const poolSize = screen.getByRole('spinbutton', { name: 'Pool Size' })
+    fireEvent.change(poolSize, { target: { value: '7' } })
+    expect(poolSize).toHaveValue(7)
+    fireEvent.click(optionIn('Default crewmate', 'crew-beta'))
+
+    await waitFor(() => expect(m.setDefaultAgent).toHaveBeenCalledWith('crew-beta'))
+    await waitFor(() => expect(m.kirocrewConfig).toHaveBeenCalledTimes(2))
+    // Uncommitted (no Enter, no blur): still the typed draft, never PATCHed.
+    expect(screen.getByRole('spinbutton', { name: 'Pool Size' })).toHaveValue(7)
+    expect(m.patchConfig).not.toHaveBeenCalled()
+  })
+
+  it('reports a rejected default-crewmate request by its message', async () => {
+    const m = seed()
+    m.setDefaultAgent = vi.fn().mockRejectedValue(new Error('config is read-only'))
+
+    await renderTab()
+    fireEvent.click(optionIn('Default crewmate', 'crew-beta'))
+
+    expect(await screen.findByTestId('cfg-default-crewmate-error')).toHaveTextContent('Could not change the default crewmate — config is read-only')
+  })
+
+  it('anchors the default-crewmate row for the roster badge deep link', async () => {
+    await renderTab()
+    // `key:default-crewmate` is what the Crewmates roster's badge links to.
+    expect(screen.getByTestId('cfg-default-crewmate-row')).toHaveAttribute('data-setting-key', 'default-crewmate')
+  })
+
+  it('keeps the default-crewmate row with a single crewmate, so the roster badge link lands', async () => {
+    const solo = clone() as Cfg
+    solo.agents = { 'crew-alpha': (CFG.agents as Record<string, unknown>)['crew-alpha'] }
+    seed(solo)
+
+    await renderTab()
+    expect(optionIn('Default crewmate', 'crew-alpha')).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByTestId('cfg-default-crewmate-row')).toBeInTheDocument()
   })
 
   it('flips a boolean row and patches the negated value', async () => {

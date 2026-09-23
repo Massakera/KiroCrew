@@ -1,5 +1,5 @@
 /**
- * AgentTemplatesTab — the Agent templates tab under Agent Capabilities.
+ * AgentTemplatesTab — the Custom agents tab under Customize.
  *
  * Pins what a management page must not get wrong: the roster groups by origin
  * (Mine / Private copies / From packages / Built-in), a read-only row explains
@@ -7,7 +7,7 @@
  * definition keys through the detail PATCH and refuses to leave a dirty draft
  * silently (including under a background refetch), a delete that the server
  * refuses as referenced opens the reference list instead of a bare error, create
- * sends `from` only for a duplicate, and "Chat with this template" creates a
+ * sends `from` only for a duplicate, and "Chat with this custom agent" creates a
  * slot in the TEMPLATE namespace. The secondary actions live in one overflow
  * menu (the row holds two controls), so the tests open it the way Radix lets
  * jsdom: keyboard activation of the trigger.
@@ -124,8 +124,8 @@ describe('AgentTemplatesTab roster', () => {
     renderTab()
     await screen.findByRole('option', { name: /^reviewer/ })
     const groups = screen.getAllByRole('group').map(g => g.getAttribute('aria-label'))
-    expect(groups).toEqual(['Mine', 'Crewmate overrides', 'From packages', 'Built-in'])
-    expect(within(screen.getByRole('group', { name: 'Mine' })).getByRole('option', { name: /^reviewer/ })).toBeInTheDocument()
+    expect(groups).toEqual(['Yours', 'Crewmate overrides', 'From packages', 'Built-in'])
+    expect(within(screen.getByRole('group', { name: 'Yours' })).getByRole('option', { name: /^reviewer/ })).toBeInTheDocument()
     // The overrides group is glossed, and its row is described in the tab's
     // own word rather than the fork-written "private copy" sentence.
     const overrides = screen.getByRole('group', { name: 'Crewmate overrides' })
@@ -133,7 +133,7 @@ describe('AgentTemplatesTab roster', () => {
     expect(within(overrides).getByRole('option', { name: /^pr-bot/ })).toHaveTextContent('Crewmate pr-bot’s override of reviewer')
     // One fact, one word: the count badge on the source row says "override"
     // the way the group heading and the banner do, not "Overridden by".
-    expect(within(screen.getByRole('group', { name: 'Mine' })).getByText('1 crewmate override')).toBeInTheDocument()
+    expect(within(screen.getByRole('group', { name: 'Yours' })).getByText('1 crewmate override')).toBeInTheDocument()
     expect(within(screen.getByRole('group', { name: 'From packages' })).getByRole('option', { name: /atlas/ })).toBeInTheDocument()
     // The first row is auto-selected and its detail read fires.
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
@@ -252,7 +252,7 @@ describe('AgentTemplatesTab editing', () => {
     fireEvent.click(screen.getByRole('button', { name: 'fs_read: asks first', pressed: false }))
     expect(screen.getByRole('button', { name: 'fs_read: auto-approve ✓', pressed: true })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Remove fs_read' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Save template' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save custom agent' }))
     // Only the keys that changed travel: tools and their marks together, the
     // prompt, and NOT the untouched description or model.
     await waitFor(() => expect(mockApi.agentPatch).toHaveBeenCalledWith('reviewer', {
@@ -261,7 +261,7 @@ describe('AgentTemplatesTab editing', () => {
       allowedTools: ['@docs/search', 'fs_read'],
     }))
     await waitFor(() => expect(screen.queryByText(/Unsaved changes/)).toBeNull())
-    expect(screen.getByRole('status')).toHaveTextContent('Template saved.')
+    expect(screen.getByRole('status')).toHaveTextContent('Custom agent saved.')
   })
 
   it('never resends an unchanged model, which the server would read as a pin', async () => {
@@ -273,7 +273,7 @@ describe('AgentTemplatesTab editing', () => {
     const prompt = await screen.findByRole('textbox', { name: 'Prompt' })
     await waitFor(() => expect(prompt).toHaveValue('prompt of reviewer'))
     fireEvent.change(prompt, { target: { value: 'prompt only' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Save template' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save custom agent' }))
     await waitFor(() => expect(mockApi.agentPatch).toHaveBeenCalledTimes(1))
     expect(mockApi.agentPatch).toHaveBeenCalledWith('reviewer', { prompt: 'prompt only' })
     expect(mockApi.agentPatch.mock.calls[0][1]).not.toHaveProperty('model')
@@ -320,7 +320,9 @@ describe('AgentTemplatesTab editing', () => {
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledTimes(2))
     expect(screen.getByRole('textbox', { name: 'Prompt' })).toHaveValue('still typing')
     expect(screen.getByText(/Unsaved changes · affects 1 crewmate/)).toBeInTheDocument()
-    expect(screen.getByText(/new chats use them at once; chats already running pick them up after Apply & Restart/)).toBeInTheDocument()
+    // The hint no longer points at a header restart: nothing on Customize needs one.
+    expect(screen.getByText(/New chats use them at once; chats already running keep what they started with/)).toBeInTheDocument()
+    expect(screen.queryByText(/Apply & Restart/)).not.toBeInTheDocument()
   })
 
   it('asks before a row switch discards a dirty draft', async () => {
@@ -343,7 +345,7 @@ describe('AgentTemplatesTab editing', () => {
     const prompt = await screen.findByRole('textbox', { name: 'Prompt' })
     await waitFor(() => expect(prompt).toHaveValue('prompt of reviewer'))
     fireEvent.change(prompt, { target: { value: 'x' } })
-    const saveBtn = screen.getByRole('button', { name: 'Save template' })
+    const saveBtn = screen.getByRole('button', { name: 'Save custom agent' })
     fireEvent.click(saveBtn)
     // The pane above scrolls and the bar does not: the error must share the
     // bar with the button that produced it, not sit at the top of the pane.
@@ -381,7 +383,7 @@ describe('AgentTemplatesTab detail robustness', () => {
     mockApi.agentDetail.mockRejectedValue(new StubApiError(500, 'boom'))
     renderTab()
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
-    await screen.findByText('This template could not be read.')
+    await screen.findByText('This custom agent could not be read.')
     expect(screen.queryByText('Loading…')).toBeNull()
   })
 
@@ -426,7 +428,7 @@ describe('AgentTemplatesTab actions', () => {
   it('starts a chat in the template namespace', async () => {
     renderTab()
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
-    fireEvent.click(screen.getByRole('button', { name: /Chat with this template/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Chat with this custom agent/ }))
     await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/chat'))
     expect(mockCreateSlot).toHaveBeenCalledWith({ agent: 'reviewer', agent_kind: 'template' })
   })
@@ -437,7 +439,7 @@ describe('AgentTemplatesTab actions', () => {
     const prompt = await screen.findByRole('textbox', { name: 'Prompt' })
     await waitFor(() => expect(prompt).toHaveValue('prompt of reviewer'))
     fireEvent.change(prompt, { target: { value: 'dirty' } })
-    const chat = screen.getByRole('button', { name: /Chat with this template/ })
+    const chat = screen.getByRole('button', { name: /Chat with this custom agent/ })
     expect(chat).toBeEnabled()
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
     fireEvent.click(chat)
@@ -481,8 +483,8 @@ describe('AgentTemplatesTab actions', () => {
       mockApi.agentTemplates.mockResolvedValue({ templates: [MINE, CREATED, PKG, RUNTIME, COPY] })
       return { ok: true, name: 'pr-summarizer', filename: 'pr-summarizer.json' }
     })
-    fireEvent.click(screen.getByRole('button', { name: /New template/ }))
-    const dialog = await screen.findByRole('dialog', { name: 'New template' })
+    fireEvent.click(screen.getByRole('button', { name: /New custom agent/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'New custom agent' })
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), { target: { value: 'pr-summarizer' } })
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Description' }), { target: { value: 'Sums up PRs' } })
     fireEvent.click(within(dialog).getByRole('button', { name: 'Create and edit' }))
@@ -510,7 +512,7 @@ describe('AgentTemplatesTab actions', () => {
     fireEvent.change(prompt, { target: { value: 'edited reviewer prompt' } })
     // New template is a row switch: the dirty guard asks first.
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    fireEvent.click(screen.getByRole('button', { name: /New template/ }))
+    fireEvent.click(screen.getByRole('button', { name: /New custom agent/ }))
     expect(screen.queryByRole('dialog')).toBeNull()
     expect(confirmSpy).toHaveBeenCalled()
     confirmSpy.mockReturnValue(true)
@@ -519,15 +521,15 @@ describe('AgentTemplatesTab actions', () => {
       mockApi.agentTemplates.mockResolvedValue({ templates: [MINE, CREATED, PKG, RUNTIME, COPY] })
       return { ok: true, name: 'fresh', filename: 'fresh.json' }
     })
-    fireEvent.click(screen.getByRole('button', { name: /New template/ }))
-    const dialog = await screen.findByRole('dialog', { name: 'New template' })
+    fireEvent.click(screen.getByRole('button', { name: /New custom agent/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'New custom agent' })
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), { target: { value: 'fresh' } })
     fireEvent.click(within(dialog).getByRole('button', { name: 'Create and edit' }))
     await waitFor(() => expect(option('fresh')).toHaveAttribute('aria-selected', 'true'))
     // The editor reseeds from the NEW template; the abandoned draft is gone and
     // nothing is dirty, so a Save here could not write reviewer's edits as fresh.
     await waitFor(() => expect(screen.getByRole('textbox', { name: 'Prompt' })).toHaveValue('prompt of fresh'))
-    expect(screen.queryByRole('button', { name: 'Save template' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Save custom agent' })).toBeNull()
   })
 
   it('confirms a save where the bar stood, and the Add tool label stays visible while typing', async () => {
@@ -536,11 +538,11 @@ describe('AgentTemplatesTab actions', () => {
     const prompt = await screen.findByRole('textbox', { name: 'Prompt' })
     await waitFor(() => expect(prompt).toHaveValue('prompt of reviewer'))
     fireEvent.change(prompt, { target: { value: 'edited' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Save template' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save custom agent' }))
     // The bar unmounts on success; the confirmation takes its place rather
     // than landing at the top of the scrolling pane.
     const status = await screen.findByRole('status')
-    expect(status).toHaveTextContent('Template saved.')
+    expect(status).toHaveTextContent('Custom agent saved.')
     expect(status.className).toContain('bottom-4')
     // Opening the Add tool input keeps its words on screen.
     fireEvent.click(screen.getByRole('button', { name: /Add tool/ }))
@@ -617,8 +619,8 @@ describe('AgentTemplatesTab actions', () => {
   it('refuses a name the server would refuse before sending it', async () => {
     renderTab()
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
-    fireEvent.click(screen.getByRole('button', { name: /New template/ }))
-    const dialog = await screen.findByRole('dialog', { name: 'New template' })
+    fireEvent.click(screen.getByRole('button', { name: /New custom agent/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'New custom agent' })
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), { target: { value: 'has space' } })
     expect(within(dialog).getByRole('button', { name: 'Create and edit' })).toBeDisabled()
   })
