@@ -586,4 +586,166 @@ describe('FollowUpBar', () => {
       expect(onSelect).not.toHaveBeenCalled()
     })
   })
+  /* Dispatch states (#6056). A plan chip dispatches a state-changing action, so
+   * the bar has to say the click landed: without this a slow or failed dispatch
+   * is a dead button, and the held-until-ack latch makes a re-click silently
+   * refused on top of that.
+   *
+   * Four states, one visual vocabulary: idle, in-flight, latched-awaiting-ack
+   * (deliberately the SAME spinner as in-flight — the two differ in duration,
+   * not in what the user can do), and failed. */
+  describe('dispatch states (#6056)', () => {
+    const PLAN = ['Go', 'Go All', 'Cancel']
+    const FAILED = 'Could not send that plan action.'
+    const bar = (extra: Record<string, unknown> = {}) =>
+      render(<FollowUpBar options={PLAN} picked={new Set()} onSelect={() => {}} {...extra} />)
+
+    it('idle: a bar given neither prop is exactly what it was', () => {
+      // This is also the SideChat / ChatEmbed contract: those surfaces render
+      // chips but dispatch no plan action, so they pass nothing and draw nothing.
+      const { container } = bar()
+      expect(container.querySelector('.animate-spin')).toBeNull()
+      expect(screen.queryByRole('alert')).toBeNull()
+      for (const o of PLAN) {
+        const b = screen.getByRole('button', { name: o })
+        expect(b).not.toHaveAttribute('aria-disabled')
+        expect(b.className).not.toContain('opacity-70')
+      }
+    })
+
+    it('in-flight: the clicked chip spins and stops taking clicks', () => {
+      bar({ pendingOptions: new Set(['Go']) })
+      const go = screen.getByRole('button', { name: 'Go' })
+      expect(go.querySelector('.animate-spin')).toBeTruthy()
+      expect(go).toHaveAttribute('aria-disabled', 'true')
+      expect(go).toHaveAttribute('aria-busy', 'true')
+    })
+
+    it('in-flight: sibling chips DIM but stay clickable', () => {
+      // The stop control is the point: a user who clicked Go and meant Cancel
+      // must still be able to reach Cancel, so siblings must not be disabled.
+      const onSelect = vi.fn()
+      render(<FollowUpBar options={PLAN} picked={new Set()} onSelect={onSelect} pendingOptions={new Set(['Go'])} />)
+      const cancel = screen.getByRole('button', { name: 'Cancel' })
+      expect(cancel.className).toContain('opacity-70')
+      expect(cancel).not.toHaveAttribute('aria-disabled')
+      fireEvent.click(cancel)
+      expect(onSelect).toHaveBeenCalledWith('Cancel', expect.any(Object))
+      // ...and the busy chip is the only one wearing the spinner.
+      expect(cancel.querySelector('.animate-spin')).toBeNull()
+    })
+
+    it('latched-awaiting-ack reuses the in-flight visual: exactly one spinner, no second affordance', () => {
+      // `pendingOptions` is the bar's ONLY busy input. The host drives it from
+      // the latch, which outlives the HTTP response, so the spinner covers the
+      // silent window too — there is no third state for the user to decode.
+      const { container } = bar({ pendingOptions: new Set(['Go All']) })
+      expect(container.querySelectorAll('.animate-spin')).toHaveLength(1)
+      expect(screen.getByRole('button', { name: 'Go All' }).querySelector('.animate-spin')).toBeTruthy()
+    })
+
+    it('two chips can spin at once, because Go and Cancel latch independently', () => {
+      // Cancel is deliberately never blocked by a pending Go, so both classes can
+      // be outstanding together. One busy LABEL could not say that: whichever
+      // dispatch came second would un-spin the first chip, and an idle-looking
+      // chip over a held latch is the dead button this whole affordance removes.
+      const { container } = bar({ pendingOptions: new Set(['Go', 'Cancel']) })
+      expect(container.querySelectorAll('.animate-spin')).toHaveLength(2)
+      expect(screen.getByRole('button', { name: 'Go' })).toHaveAttribute('aria-disabled', 'true')
+      expect(screen.getByRole('button', { name: 'Cancel' })).toHaveAttribute('aria-disabled', 'true')
+      // The one chip nobody dispatched is the only one dimmed.
+      expect(screen.getByRole('button', { name: 'Go All' }).className).toContain('opacity-70')
+      expect(screen.getByRole('button', { name: 'Go All' })).not.toHaveAttribute('aria-disabled')
+    })
+
+    it('a busy chip refuses clicks WITHOUT the disabled attribute, so its tooltip can still dismiss', () => {
+      // A disabled control dispatches no mouse or focus events, so `InstantTip`'s
+      // onMouseLeave / onBlur — its only pointer and keyboard dismissals — would
+      // never fire, and a chip hovered then clicked would strand its tooltip over
+      // the strip for as long as the latch is held.
+      // BOTH chip shapes: without `onSend` the chip is a plain button, with it the
+      // chip is a split button on a different code path — and the split one is
+      // what both chat hosts actually render, so an attribute check that covered
+      // only the plain shape would leave production unpinned.
+      vi.useFakeTimers()
+      for (const onSend of [undefined, vi.fn()]) {
+        const onSelect = vi.fn()
+        const { unmount } = render(
+          <FollowUpBar options={PLAN} picked={new Set()} onSelect={onSelect} onSend={onSend} pendingOptions={new Set(['Go'])} />,
+        )
+        const go = screen.getByRole('button', { name: 'Go' })
+        expect(go).toHaveAttribute('aria-disabled', 'true')
+        expect(go).not.toBeDisabled()
+        if (onSend) expect(screen.getByRole('button', { name: 'Send now: Go' })).not.toBeDisabled()
+        // Still inert: the refusal lives in the handler, not the attribute.
+        fireEvent.click(go)
+        act(() => { vi.advanceTimersByTime(FOLLOWUP_CHIP_DEBOUNCE_MS + 30) })
+        expect(onSelect).not.toHaveBeenCalled()
+        if (onSend) { fireEvent.dblClick(go); expect(onSend).not.toHaveBeenCalled() }
+        unmount()
+      }
+      vi.useRealTimers()
+    })
+
+    it('failed: the row renders through ErrorNotice, with the agent hand-off', () => {
+      // A hand-rolled red div is banned by AUTOSDE `errors-use-error-notice`:
+      // ErrorNotice is the one place that recovers the structured context and
+      // offers it to the agent, so a bare role="alert" box is a dead end.
+      bar({ error: 'bad action' })
+      const row = screen.getByRole('alert')
+      // The detail is the journal lookup key, so it must arrive UNPREFIXED.
+      expect(row.querySelector('strong')).toHaveTextContent(FAILED)
+      expect(row).toHaveTextContent('bad action')
+      expect(screen.getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+    })
+
+    it('failed: one error row carries the sentence and the detail, and every chip is idle again', () => {
+      bar({ error: 'bad action' })
+      const row = screen.getByRole('alert')
+      expect(row).toHaveTextContent(FAILED)
+      expect(row).toHaveTextContent('bad action')
+      for (const o of PLAN) {
+        expect(screen.getByRole('button', { name: o })).not.toHaveAttribute('aria-disabled')
+        expect(screen.getByRole('button', { name: o }).className).not.toContain('opacity-70')
+      }
+    })
+
+    it('failed with no readable message still draws the row', () => {
+      // `''` is a failure that said nothing, not the absence of a failure. It has
+      // no structured context to look up, so the bar's sentence becomes the
+      // message — ErrorNotice renders nothing at all for a falsy one.
+      bar({ error: '' })
+      const row = screen.getByRole('alert')
+      expect(row).toHaveTextContent(FAILED)
+      expect(row.querySelector('strong')).toBeNull()
+    })
+
+    it('draws at most ONE error row, and none without an error', () => {
+      const { unmount } = bar({ error: 'bad action' })
+      expect(screen.getAllByRole('alert')).toHaveLength(1)
+      unmount()
+      bar({ error: null })
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+
+    it('the scroll layout draws the same states as the multiline one', () => {
+      const { container } = bar({ layout: 'scroll', pendingOptions: new Set(['Go']), error: 'bad action' })
+      expect(screen.getByRole('button', { name: 'Go' }).querySelector('.animate-spin')).toBeTruthy()
+      expect(screen.getByRole('alert')).toHaveTextContent(FAILED)
+      expect(container.querySelector('.opacity-70')).toBeTruthy()
+    })
+
+    it('a split chip dims as one piece and its Send-now segment goes inert', () => {
+      // With onSend the WRAPPER is the flex item, so the dim has to sit there or
+      // the arrow segment would stay bright beside a faded label.
+      render(<FollowUpBar options={PLAN} picked={new Set()} onSelect={() => {}} onSend={() => {}} pendingOptions={new Set(['Go'])} />)
+      const go = screen.getByRole('button', { name: 'Go' })
+      expect(go).toHaveAttribute('aria-disabled', 'true')
+      expect(screen.getByRole('button', { name: 'Send now: Go' })).toHaveAttribute('aria-disabled', 'true')
+      const cancelWrapper = screen.getByRole('button', { name: 'Cancel' }).parentElement
+      expect(cancelWrapper?.className).toContain('opacity-70')
+      expect(screen.getByRole('button', { name: 'Cancel' })).not.toHaveAttribute('aria-disabled')
+      expect(go.parentElement?.className).not.toContain('opacity-70')
+    })
+  })
 })

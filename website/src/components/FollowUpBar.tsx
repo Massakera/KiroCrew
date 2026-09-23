@@ -1,7 +1,8 @@
 import { memo, useRef, useState, useEffect, useCallback } from 'react'
 import { useScrollEdges } from '../hooks/useScrollEdges'
-import { ChevronLeft, ChevronRight, ArrowUp } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ArrowUp, Loader2 } from 'lucide-react'
 import { InstantTip, useInstantTip as useSharedInstantTip } from './InstantTip'
+import ErrorNotice from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
@@ -38,6 +39,19 @@ interface FollowUpBarProps {
    * mismatch — see `usePlanActionMutation`.
    */
   sourceKey?: string | null
+  /**
+   * Labels whose dispatch is outstanding: each spins and stops taking clicks,
+   * every other chip dims. Held while the action is UNACKNOWLEDGED, which
+   * outlasts the request — the plan latch survives the HTTP response. A set, not
+   * one label: Cancel is never blocked by a pending Go, so both can be
+   * outstanding and a single label would un-spin whichever came first. A surface
+   * that dispatches nothing (SideChat, ChatEmbed) passes neither prop.
+   */
+  pendingOptions?: ReadonlySet<string> | null
+  /** Detail of the last failed dispatch, `null` when none failed. Any non-null
+   *  value draws ONE error row, `''` included — a rejection carrying no readable
+   *  message is still a failure to show. */
+  error?: string | null
 }
 
 /**
@@ -182,8 +196,47 @@ function splitMainChipClassName(isPicked: boolean) {
  * is recoverable. One line keeps every chip the same height by construction
  * rather than by an alignment rule.
  */
-function ChipLabel({ option }: { option: string }) {
-  return <span className="block truncate">{option}</span>
+function ChipLabel({ option, busy }: { option: string, busy?: boolean }) {
+  const label = <span className="block truncate">{option}</span>
+  if (!busy) return label
+  // Beside the label, not instead of it: the label is WHICH action is running.
+  return (
+    <span className="flex items-center gap-1.5 min-w-0">
+      <Loader2 size={13} aria-hidden="true" className="lucide-inline animate-spin shrink-0" />
+      {label}
+    </span>
+  )
+}
+
+/** Dimmed, never `disabled`, and `opacity-70` rather than the 30-50 band this repo
+ *  dims DISABLED controls to: a user who clicked Go and needs Cancel must not read
+ *  a live chip as locked. Only the busy chip is disabled — a second click on that
+ *  one is what the dispatch's own single-flight refuses anyway. */
+function chipStateClass(pending: boolean, dimmed: boolean): string {
+  if (pending) return ' cursor-default'
+  return dimmed ? ' opacity-70' : ''
+}
+
+/**
+ * Retired by the next dispatch, not by a timer (which races the reading) or a
+ * dismiss button. The detail goes in `message` UNPREFIXED, because that is the
+ * key `ErrorNotice` looks the structured context up by; a detail-less rejection
+ * has nothing to look up, so the sentence becomes the message rather than
+ * rendering nothing. `askAgent` ON: a wedged dispatch is the agent's to act on,
+ * and the hand-off loses no draft — both hosts park the composer in their
+ * slot-draft store.
+ */
+function ChipError({ error }: { error: string }) {
+  const sentence = i18nT('components.followUpBar.plan_action_failed')
+  return (
+    <ErrorNotice
+      variant="inline"
+      className="pt-1"
+      title={error ? sentence : undefined}
+      message={error || sentence}
+      askAgent
+    />
+  )
 }
 
 /**
@@ -255,6 +308,13 @@ interface ChipProps {
   animating: boolean
   /** Current source-row identity, snapshotted at click time (see FollowUpBarProps). */
   sourceKey?: string | null
+  /** THIS chip's dispatch is outstanding (spinner, no clicks) vs another chip's (dim).
+   *  Refused in the handlers behind `aria-disabled`, never `disabled`: a disabled
+   *  control fires no mouse or focus events, so the tooltip would never get the
+   *  `onMouseLeave`/`onBlur` that are its only dismissals, and a focused chip
+   *  being disabled drops focus to `<body>`. */
+  pending?: boolean
+  dimmed?: boolean
 }
 
 /**
@@ -266,7 +326,7 @@ interface ChipProps {
  *   double-click to fire `onSend(text)` directly without going through setInput (which would
  *   race with the React state update and cause send() to read a stale inputRef.current).
  */
-function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className, index, animating, sourceKey }: ChipProps) {
+function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className, index, animating, sourceKey, pending, dimmed }: ChipProps) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // First-click row identity for the in-flight gesture. A double-click is
   // click(detail=1) then dblclick; the footer can be replaced on the reused
@@ -295,12 +355,15 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
   // sends — so it's suppressed there to avoid two controls doing the same
   // thing side by side.
   const showSendSegment = useDebouncedClick
+  const stateClass = chipStateClass(!!pending, !!dimmed)
 
   if (!useDebouncedClick) {
     return (
       <>
         <button
           type="button"
+          aria-disabled={pending || undefined}
+          aria-busy={pending || undefined}
           onMouseDown={(e) => e.preventDefault()}
           // No third argument here on purpose: this path calls onSelect
           // SYNCHRONOUSLY from the click, so there is no window in which the row
@@ -308,12 +371,12 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
           // `undefined` (i.e. "no key supplied") keeps this path's behaviour
           // exactly as it was — see `sourceKeyAtClick` in the debounced handler,
           // which is where the race actually lives.
-          onClick={(e) => onSelect(option, e)}
-          className={`${className} ${entrance.className}`}
+          onClick={(e) => { if (pending) return; onSelect(option, e) }}
+          className={`${className} ${entrance.className}${stateClass}`}
           style={entrance.style}
           {...tipHandlers}
         >
-          <ChipLabel option={option} />
+          <ChipLabel option={option} busy={pending} />
         </button>
         {tipNode}
       </>
@@ -321,6 +384,7 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
   }
 
   const handleClick = (e: React.MouseEvent) => {
+    if (pending) return
     // detail >= 2 means this click is part of a double-click sequence — let
     // onDoubleClick handle it so we don't start a timer that races with it.
     if (e.detail >= 2) return
@@ -345,6 +409,7 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
   }
 
   const handleImmediateSend = () => {
+    if (pending) return
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
     const clickedKey = armedSourceKeyRef.current !== undefined ? armedSourceKeyRef.current : sourceKey
     armedSourceKeyRef.current = undefined
@@ -357,7 +422,7 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
   // flex item; the button flexes to fill it (see splitMainChipClassName). The
   // plain-button path (no send segment) is the standalone chip, so it keeps the
   // passed-in `className` (cap + rounding + per-layout shrink) unchanged.
-  const mainChipClassName = showSendSegment ? splitMainChipClassName(isPicked) : `${className} ${entrance.className}`
+  const mainChipClassName = showSendSegment ? splitMainChipClassName(isPicked) : `${className} ${entrance.className}${stateClass}`
 
   const mainChip = (
     <button
@@ -366,6 +431,8 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
       // takes focus, and a follow-up Enter re-activates this (now picked) chip,
       // running the toggle-off branch that deletes the composed input ("the
       // prompt clears"). Deliberate keyboard (tab) activation still toggles.
+      aria-disabled={pending || undefined}
+      aria-busy={pending || undefined}
       onMouseDown={(e) => e.preventDefault()}
       onClick={handleClick}
       onDoubleClick={handleImmediateSend}
@@ -373,7 +440,7 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
       style={showSendSegment ? undefined : entrance.style}
       {...tipHandlers}
     >
-      <ChipLabel option={option} />
+      <ChipLabel option={option} busy={pending} />
     </button>
   )
 
@@ -386,12 +453,13 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
     // cannot resolve against an indefinite wrapper), leaving a wide empty gap
     // before the next chip. On the flex item the percentage resolves against
     // the strip's definite width.
-    <span className={`inline-flex items-stretch shrink-0 ${CHIP_MAX_WIDTH} ${entrance.className}`} style={entrance.style}>
+    <span className={`inline-flex items-stretch shrink-0 ${CHIP_MAX_WIDTH} ${entrance.className}${stateClass}`} style={entrance.style}>
       {mainChip}
       <button
         type="button"
         aria-label={i18nT('components.followUpBar.send_now_2', { option })}
         title={i18nT('components.followUpBar.send_now')}
+        aria-disabled={pending || undefined}
         onMouseDown={(e) => e.preventDefault()}
         onClick={(e) => { e.stopPropagation(); handleImmediateSend() }}
         className={sendSegmentClassName(isPicked)}
@@ -407,7 +475,7 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
  *  layout switch cannot restart an entrance that already played. */
 type LayoutProps = Omit<FollowUpBarProps, 'layout'> & { animating: boolean }
 
-function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating, sourceKey }: LayoutProps) {
+function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating, sourceKey, pendingOptions, error }: LayoutProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
 
@@ -490,6 +558,7 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating,
       <div ref={setScroller} data-tip-boundary className={`flex ${CHIP_ROW_GAP} overflow-x-auto items-end`} style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
         {options.map((o, i) => {
           const isPicked = picked.has(o)
+          const chipPending = !!pendingOptions?.has(o)
           return (
             <Chip
               key={o}
@@ -503,16 +572,19 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating,
               index={i}
               animating={animating}
               sourceKey={sourceKey}
+              pending={chipPending}
+              dimmed={!!pendingOptions?.size && !chipPending}
             />
           )
         })}
       </div>
       </div>
+      {error != null && <ChipError error={error} />}
     </div>
   )
 }
 
-function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animating, sourceKey }: LayoutProps) {
+function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animating, sourceKey, pendingOptions, error }: LayoutProps) {
   return (
     // Bottom-aligned for the same reason as the scroll layout: with the
     // one-line clamp every chip is already the same height, so this only
@@ -521,9 +593,12 @@ function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animati
     // data-tip-boundary: the tooltip lifts above this whole wrap, so hovering
     // a chip in row 2+ never hides the row above it (the rows are exactly
     // what the user is scanning; the message area above is transient-safe).
+    // A fragment, not a wrapper: with no error the rendered tree is unchanged.
+    <>
     <div data-tip-boundary className={`flex ${CHIP_ROW_GAP} flex-wrap pt-1 items-end`}>
       {options.map((o, i) => {
         const isPicked = picked.has(o)
+        const chipPending = !!pendingOptions?.has(o)
         return (
           <Chip
             key={o}
@@ -537,23 +612,27 @@ function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animati
             index={i}
             animating={animating}
             sourceKey={sourceKey}
+            pending={chipPending}
+            dimmed={!!pendingOptions?.size && !chipPending}
           />
         )
       })}
     </div>
+    {error != null && <ChipError error={error} />}
+    </>
   )
 }
 
-function FollowUpBar({ options, picked, onSelect, onSend, quickSend, layout = 'multiline', sourceKey }: FollowUpBarProps) {
+function FollowUpBar({ options, picked, onSelect, onSend, quickSend, layout = 'multiline', sourceKey, pendingOptions, error }: FollowUpBarProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Content-keyed, not identity-keyed: the caller rebuilds the array on every
   // render, so an identity comparison would restart the entrance constantly.
   // \u0000 cannot occur inside an option label.
   const animating = useChipEntrance(options.join('\u0000'))
   if (layout === 'scroll') {
-    return <ScrollLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} animating={animating} sourceKey={sourceKey} />
+    return <ScrollLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} animating={animating} sourceKey={sourceKey} pendingOptions={pendingOptions} error={error} />
   }
-  return <MultilineLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} animating={animating} sourceKey={sourceKey} />
+  return <MultilineLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} animating={animating} sourceKey={sourceKey} pendingOptions={pendingOptions} error={error} />
 }
 
 export default memo(FollowUpBar)

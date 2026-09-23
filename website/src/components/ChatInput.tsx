@@ -669,6 +669,11 @@ interface ChatInputProps {
   /** Identity of the transcript row the follow-up options were derived from.
    *  Forwarded to FollowUpBar so a chip click carries the row it acted on. */
   followUpSourceKey?: string | null
+  /** Labels whose follow-up dispatch is outstanding. Only a host that actually
+   *  dispatches a chip passes this. */
+  followUpPendingOptions?: ReadonlySet<string> | null
+  /** Detail of the last failed chip dispatch, or null when none failed. */
+  followUpError?: string | null
   /** Collapsed paste blocks backing `⌜🗒 Pasted …⌟` tokens in `value`. */
   pasteBlocks?: PasteBlock[]
   /** Replace the current list of paste blocks (add/remove). */
@@ -994,6 +999,8 @@ function ChatInput({
   quickSend,
   followUpLayout,
   followUpSourceKey,
+  followUpPendingOptions,
+  followUpError,
   pasteBlocks = [],
   onPasteBlocksChange,
   showFullPastes = false,
@@ -3572,7 +3579,7 @@ function ChatInput({
 
       {/* Ghost follow-up bubbles floating above input */}
       {!showGhost && followUpOptions && followUpOptions.length > 0 && onFollowUpSelect && (
-          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} sourceKey={followUpSourceKey} />
+          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} sourceKey={followUpSourceKey} pendingOptions={followUpPendingOptions} error={followUpError} />
       )}
 
       {/* Tip / folder-suggestion band — LAST above the composer so it always
