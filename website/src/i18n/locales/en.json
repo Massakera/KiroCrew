@@ -475,6 +475,7 @@
           "approve": "Approve",
           "approve_is_unavailable_because_this_base_branch_": "Approve is unavailable because this pull request's base branch does not dismiss approvals when new commits are pushed (or its protection is not readable from here). Without that, an approval could outlive the commit it reviewed. Approve on GitHub instead.",
           "approve_is_unavailable_while_auto_merge_is_armed": "Approve is unavailable while auto-merge is armed: an approval could merge this pull request before a stale-head check could take it back. Disarm auto-merge, or approve on GitHub.",
+          "ask_agent_about_this_failure": "Ask the agent about this failure",
           "cancel": "Cancel",
           "confirm_approve": "Approve this pull request?",
           "confirm_request_changes": "Publish this review requesting changes?",
