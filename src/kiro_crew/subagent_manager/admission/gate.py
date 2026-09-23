@@ -788,6 +788,18 @@ class _GateMixin(ManagerComponent):
             and not self._manager._admission.root_may_start()
         ):
             should_queue, slot_free = True, False
+        # Per-backend cap (agent.subagent_backend_limits): the global cap has a slot,
+        # but this spawn's backend is full. Queued like capacity, with no slot free
+        # for it, so it drains when a run on that backend ends (the pick skips it
+        # until then -- ``fairness.pick_window_index``).
+        at_cap = getattr(type(self._manager), "_backend_at_cap", None)
+        if (
+            not should_queue
+            and not _dispatch_now
+            and callable(at_cap)
+            and at_cap(self._manager, acp_backend)
+        ):
+            should_queue, slot_free = True, False
         if should_queue:
             # A prevalidated app spawn does not carry its prevalidation INTO the
             # queue. `_agent_prevalidated` skips the agent-directory ownership

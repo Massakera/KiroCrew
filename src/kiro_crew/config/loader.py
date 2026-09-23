@@ -2567,6 +2567,12 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         ),
         acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
         member_acp_backend=_normalize_acp_backend(agent_data.get("member_acp_backend", "kas")),
+        subagent_backend_fallback=_sections.coerce_backend_fallback(
+            agent_data.get("subagent_backend_fallback")
+        ),
+        subagent_backend_limits=_sections.coerce_backend_limits(
+            agent_data.get("subagent_backend_limits")
+        ),
         default_agent=agent_data.get("default_agent", ""),
         sweep_agents_backups=_safe_bool(agent_data.get("sweep_agents_backups", False), False),
         sandbox=agent_data.get("sandbox", "auto"),

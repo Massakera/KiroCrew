@@ -3944,6 +3944,22 @@ class SubagentManager:
     async def _safe_announce(self, info: SubagentInfo) -> None:
         return await self._admission._safe_announce_impl(info)
 
+    def _backend_at_cap(self, requested: str) -> bool:
+        """Whether a spawn on *requested* (``""`` = default) waits for its backend's cap."""
+        from kiro_crew.subagent_backend import backend_at_cap
+
+        return backend_at_cap(list(self._agents.values()), requested)
+
+    async def _maybe_fail_over(self, info: SubagentInfo) -> str | None:
+        """Re-dispatch a rate-limited run to a fallback backend; see ``subagent_backend``."""
+        from kiro_crew.subagent_backend import fail_over
+
+        try:
+            return await fail_over(self, info)
+        except Exception:
+            logger.warning("subagent %s: backend failover failed", info.id, exc_info=True)
+            return None
+
     def _announce_rejection(self, info: SubagentInfo) -> SubagentInfo:
         return self._admission._announce_rejection_impl(info)
 

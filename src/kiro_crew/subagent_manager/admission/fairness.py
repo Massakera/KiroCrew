@@ -350,9 +350,16 @@ class _FairnessMixin(ManagerComponent):
                 return idx
         roots_ok = view.root_slot
 
+        # Looked up on the CLASS: a manager double answers any attribute truthily.
+        at_cap = getattr(type(self._manager), "_backend_at_cap", None)
+
         def eligible(params: Mapping[str, Any]) -> bool:
-            return not self._manager._boundary_cancellation_pending(params) and (
-                roots_ok or self.entry_is_child(params)
+            return (
+                not self._manager._boundary_cancellation_pending(params)
+                and (roots_ok or self.entry_is_child(params))
+                and not (
+                    callable(at_cap) and at_cap(self._manager, str(params.get("acp_backend") or ""))
+                )
             )
 
         def lane_of(params: Mapping[str, Any]) -> str:

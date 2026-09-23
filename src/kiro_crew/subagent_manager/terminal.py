@@ -198,6 +198,12 @@ class TerminalCoordinator(ManagerComponent):
         # closer is handed to the writer. This flip stays ahead of the event for
         # the paths that reach a terminal without the run loop.
         self._record_crew_log_terminal(info)
+        # Before the report, so the failed run's completion can name the run that
+        # took its task over. Looked up on the CLASS: a manager double answers any
+        # attribute, and must report exactly as before.
+        fail_over = getattr(type(self._manager), "_maybe_fail_over", None)
+        if info.error and callable(fail_over):
+            await fail_over(self._manager, info)
         info.done = True
         await self._manager._fire_event(
             "subagent_done",

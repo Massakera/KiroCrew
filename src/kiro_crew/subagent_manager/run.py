@@ -499,6 +499,12 @@ class RunEventCoordinator(ManagerComponent):
                 info.error = append_fallback_story(
                     _describe_exception(exc), exc, budget=_MAX_ERROR_DETAIL_LEN
                 )
+                # Before ``done``, so a caller polling for it (``spawn_sub_agents``)
+                # already reads the failover pointer; the terminal report's own call
+                # is then a no-op. On the CLASS, for the reason terminal.py states.
+                _fail_over = getattr(type(self._manager), "_maybe_fail_over", None)
+                if callable(_fail_over):
+                    await _fail_over(self._manager, info)
                 info.done = True
                 Stats().inc_subagent_failed()
                 self._manager._write_tombstone(info, "error")
