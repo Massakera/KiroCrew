@@ -3044,7 +3044,7 @@ class GatewayOrchestrator:
             dep_err = (stderr or b"").decode(errors="replace")
             dep_err, _ = redact_exfiltration_urls(dep_err)
             dep_err, _ = redact_credentials(dep_err)
-            logger.error("Dep repair failed: %s", dep_err[:500])
+            logger.error("Dep repair failed: %s", dep_err[-500:])
 
     async def _check_console_script(self) -> None:
         """Repair a venv whose ``kirocrew`` console script went missing.
@@ -13043,7 +13043,10 @@ class GatewayOrchestrator:
                     logger.error(
                         "Auto-update: core dep repair also failed (rc=%d): %s",
                         fallback.returncode,
-                        fb_err.decode(errors="replace")[:300],
+                        # Redact the whole stream (pip can echo an index URL
+                        # with credentials), then keep the tail where pip
+                        # prints its error.
+                        redact(fb_err.decode(errors="replace"))[-300:],
                     )
                 # Repair or not, do NOT restart after a sync that did not come back
                 # clean. The tree is already on the new revision (the reset ran

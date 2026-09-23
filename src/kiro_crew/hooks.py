@@ -4754,7 +4754,11 @@ async def run_script_hook(
         stderr_text = _decode_capped(stderr_b, stderr_trunc).strip()
         stdout_safe = redact_via_context(stdout_text) if stdout_text else ""
         stderr_safe_full = redact_via_context(stderr_text) if stderr_text else ""
-        stderr_safe = stderr_safe_full[:500]
+        # An exit-2 deny reason is authored text and reads from the head; any
+        # other failure is a crash whose diagnosis is printed last, so its
+        # last_error excerpt keeps the tail. Redaction already ran on the full
+        # stream above, so neither cut can sever a secret.
+        stderr_safe = stderr_safe_full[:500] if exit_code == 2 else stderr_safe_full[-500:]
         hook.last_run = time.time()
         if exit_code == 2:
             hook.last_status = "blocked"

@@ -48,6 +48,7 @@ from kiro_crew.platform.governance_profiles import (
 )
 from kiro_crew.platform_compat import IS_POSIX
 from kiro_crew.sandbox import scrub_env
+from kiro_crew.security import redact
 
 if TYPE_CHECKING:
     from aiohttp import web
@@ -218,7 +219,9 @@ def _run_json_detail(args: list[str]) -> tuple[Any | None, bool]:
             "tailscale %s exited %d: %s",
             " ".join(args),
             proc.returncode,
-            (proc.stderr or "").strip()[:200],
+            # Whole stream redacted first (an auth-key URL can appear in
+            # tailscale's stderr), then the tail where the error is printed.
+            redact((proc.stderr or "").strip())[-200:],
         )
         return None, False
     try:

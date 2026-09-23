@@ -44,6 +44,7 @@ from kiro_crew.sandbox import (
     sandboxed_spawn_argv,
     sandboxed_spawn_argv_async,
 )
+from kiro_crew.security import redact
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +155,10 @@ class GitHubIssuesAdapter:
 
         rc, stdout, stderr = await _run_gh(args)
         if rc != 0:
-            raise RuntimeError(f"gh issue list failed: {stderr.strip()[:200]}")
+            # Redact the FULL stream, then keep the TAIL: `gh` prints its error
+            # last, and a bound applied before redaction can cut a credential
+            # into a fragment no redaction regex matches.
+            raise RuntimeError(f"gh issue list failed: {redact(stderr.strip())[-200:]}")
         try:
             issues = json.loads(stdout or "[]")
         except json.JSONDecodeError as exc:
@@ -231,5 +235,5 @@ class GitHubIssuesAdapter:
 
         rc, _stdout, stderr = await _run_gh(args)
         if rc != 0:
-            return ActionResult(ok=False, action=action, error=stderr.strip()[:200])
+            return ActionResult(ok=False, action=action, error=redact(stderr.strip())[-200:])
         return ActionResult(ok=True, action=action, detail=f"github {action} {repo}#{number}")

@@ -8496,6 +8496,13 @@ async def _run_chat(
                 hook_continuation_count=hook_continuation_count,
             )
             for r in results:
+                # Anchoring rule for the bounded hook excerpts below: text the
+                # hook AUTHORED for a reader (its stdout, the exit-2 deny reason
+                # -- "STDERR returned to the LLM") starts at the head, so those
+                # keep ``[:N]``; a hook that CRASHED (any other non-zero exit)
+                # prints its diagnosis last, so its stderr excerpt is ``[-N:]``.
+                # ``r.stdout``/``r.stderr`` are already redacted over the full
+                # stream by run_script_hook, so slicing here cannot cut a secret.
                 if r.exit_code == 0 and r.stdout:
                     injected.append(r.stdout)
                     logger.info("Hook %s stdout: %s", r.hook_name, r.stdout[:200])
@@ -8525,7 +8532,11 @@ async def _run_chat(
                         },
                     )
                 elif r.exit_code not in (0, 2):
-                    detail = (r.error or r.stderr or f"exited with code {r.exit_code}")[:200]
+                    detail = (
+                        r.error[:200]
+                        if r.error
+                        else (r.stderr[-200:] if r.stderr else f"exited with code {r.exit_code}")
+                    )
                     if event == HOOK_EVENT_PRE_TOOL_USE:
                         # Fail closed. A PreToolUse hook has a two-valued
                         # contract — exit 0 is a delivered allow, exit 2 a
@@ -8565,7 +8576,7 @@ async def _run_chat(
                         )
                     elif r.stderr:
                         # Non-zero, non-block on a non-gating event: warn only.
-                        logger.warning("Hook %s warning: %s", r.hook_name, r.stderr[:200])
+                        logger.warning("Hook %s warning: %s", r.hook_name, r.stderr[-200:])
         except Exception as exc:
             if event == HOOK_EVENT_PRE_TOOL_USE:
                 logger.warning("Hook fire error during blocking event %s: %s", event, exc)
