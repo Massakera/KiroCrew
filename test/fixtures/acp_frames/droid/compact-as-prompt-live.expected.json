@@ -1,0 +1,38 @@
+[
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "current_mode_update"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "config_option_update"
+  },
+  {
+    "action": "update",
+    "events": [
+      {
+        "kind": "text_chunk",
+        "text": "Error: 401 status code (no body)"
+      }
+    ],
+    "frame": "session/update",
+    "session_update": "agent_message_chunk",
+    "text_chunk": {
+      "text": "Error: 401 status code (no body)",
+      "thinking": false
+    }
+  },
+  {
+    "error": {
+      "code": -32603,
+      "data": "401 status code (no body)",
+      "message": "Internal error: Agent error"
+    },
+    "frame": "response",
+    "id": 8
+  }
+]

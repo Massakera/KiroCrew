@@ -117,7 +117,7 @@ loses nothing:
   would be false for exactly those two, so the card states the CHANNEL as a note
   and claims nothing about a harness that carries its own.
 
-A set may also inform a line it does not decide alone. Two lines are unions,
+A set may also inform a line it does not decide alone. Three lines are unions,
 because no single set answers the question a user asks; a set that is a union
 INPUT is not thereby classified, and no set decides more than one line on its own.
 
@@ -238,7 +238,7 @@ class _LineSpec:
     """One card line and the memberships that decide it.
 
     ``sets`` is a UNION: a line is available when the harness is in any of them.
-    Two lines need one, and the union is a human judgement rather than a
+    Three lines need one, and the union is a human judgement rather than a
     mechanical join, so it is written down here with its reason on the entry.
     """
 
@@ -269,7 +269,14 @@ USER_FACING_LINES: Tuple[_LineSpec, ...] = (
     _LineSpec(LINE_MEMBER_THREAD_TOOLS, ("ACP_BACKENDS_MEMBER_DISPATCH",)),
     _LineSpec(LINE_MEMBER_SAVED_AGENT, ("ACP_BACKENDS_MEMBER_CAPABILITIES",)),
     _LineSpec(LINE_SIDE_CHAT_TOOLS, ("ACP_BACKENDS_SIDE_READONLY",)),
-    _LineSpec(LINE_SUBAGENT_CONTINUATION, ("ACP_BACKENDS_SESSION_SHARING",)),
+    # Two routes reach a continued subagent chat. On the shared runtime the thread
+    # outlives the resident session (session sharing); on a one-process-per-session
+    # harness a new process restores it by id. Either one answers the user's
+    # question, and a harness needs only one.
+    _LineSpec(
+        LINE_SUBAGENT_CONTINUATION,
+        ("ACP_BACKENDS_SESSION_SHARING", "ACP_BACKENDS_DEDICATED_SESSION_RESTORE"),
+    ),
     _LineSpec(LINE_MID_TURN_STEER, ("ACP_BACKENDS_STEER",)),
     _LineSpec(LINE_MANUAL_COMPACT, ("ACP_BACKENDS_COMPACT",)),
     # Effort travels down one of two channels, and neither set alone answers the
@@ -383,6 +390,15 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "asking the registry about a harness whose model ids it does not carry hides a "
         "control that works, and asking the option on a harness whose level rides the "
         "model offers one the model will refuse"
+    ),
+    "ACP_BACKENDS_STEERING_EXTENSION": (
+        "which verb a coordinator's spawn_steer rides into a running SUBAGENT turn. A "
+        "non-member's steer is still delivered, as a follow-up queued behind the turn, "
+        "so the difference is when the message lands rather than whether. The chat's "
+        "own mid-turn steer is the card line, and ACP_BACKENDS_STEER decides it, "
+        "because its echo contract is one this channel does not meet. A wrong "
+        "membership is a steer reported injected that never reached the model, which "
+        "is a defect"
     ),
     "ACP_BACKENDS_SEED_LOCAL_SETTINGS": (
         "whether a settings file is re-seeded on a model switch. Invisible when "
