@@ -161,6 +161,11 @@ from kiro_crew.dashboard.handlers.usage import (
     read_effective_agent,
     read_turn_model,
 )
+from kiro_crew.dashboard.pi_child_usage import (
+    close_pi_children_async,
+    observe_pi_children_async,
+    provider_for_completed_turn,
+)
 from kiro_crew.dashboard.session_directive_apply import (
     QUESTION_CARD_SHOWN_PREFIX,
     apply_session_directive,
@@ -3207,6 +3212,26 @@ def _native_card_feed(card_output, card_id: str) -> str:
         feed, _ = redact_exfiltration_urls(feed)
         feed, _ = redact_credentials(feed)
     return feed
+
+
+async def _note_pi_children(state, slot, session_key: str, event) -> None:
+    """Record pi-subagents children carried on a tool update.
+
+    Failures stay off the turn path: a child ledger write must not drop the
+    tool result the parent is still reading.
+    """
+    children = getattr(event, "pi_children", None)
+    if not children:
+        return
+    try:
+        await observe_pi_children_async(
+            state,
+            slot_key=slot.key,
+            session_key=session_key,
+            children=children,
+        )
+    except Exception:
+        logger.debug("pi-subagent usage ingest failed", exc_info=True)
 
 
 def _native_subagent_sync(state, slot, subagents, tracker, card_output=None) -> None:
@@ -12028,6 +12053,7 @@ async def _run_chat(
                     except Exception:
                         logger.debug("Mirror tool task failed", exc_info=True)
             elif event.kind == EVENT_TOOL_CALL_UPDATE:
+                await _note_pi_children(state, slot, session_key, event)
                 # claude-agent-acp emits an initial `tool_call` with empty
                 # input (title falls back to generic name like "Terminal" or
                 # "grep") followed by a `tool_call_update` carrying the
@@ -12185,7 +12211,10 @@ async def _run_chat(
                         event.tool_call_id,
                         exc_info=True,
                     )
+            elif event.kind == "pi_child_usage":
+                await _note_pi_children(state, slot, session_key, event)
             elif event.kind == EVENT_TOOL_RESULT:
+                await _note_pi_children(state, slot, session_key, event)
                 if event.tool_final and event.tool_call_id:
                     _turn_successful_tool_call_ids.add(event.tool_call_id)
                 _out = _redact_tool_field(event.tool_output)
@@ -14620,6 +14649,12 @@ async def _run_chat(
                         {"id": _card_id, "slot": slot.key, "text": _txt},
                     )
             elif event.kind == EVENT_COMPLETE:
+                try:
+                    await close_pi_children_async(
+                        state, slot_key=slot.key, session_key=session_key
+                    )
+                except Exception:
+                    logger.debug("pi-subagent usage close failed", exc_info=True)
                 # A turn that ran to a real END OF TURN processed this prompt, so it
                 # was consumed even if it produced nothing at all -- an empty
                 # response re-queues a CONTINUATION, not a replay, so whoever armed
@@ -14857,7 +14892,10 @@ async def _run_chat(
                 # An unreadable provider still yields `""` and falls through to
                 # the `model_source` walk — no worse than the blank it would
                 # write anyway.
-                _provider_name = capabilities_of(client).provider_seam
+                _caps = capabilities_of(client)
+                _provider_name = provider_for_completed_turn(
+                    _caps.provider_seam, _caps.backend
+                )
                 _record_model = slot.model
                 if slot._active_fallback_model or slot._refusal_fallback_primary:
                     # Either fallback mechanism active ⇒ the model that SERVED

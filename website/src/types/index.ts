@@ -1386,6 +1386,16 @@ export interface SubagentActivity {
    *  `started`, and `subagent_done` carries `elapsed`. */
   startedAtAssumed?: boolean
   toolCount?: number      // observed tool calls (incl. auto-approved) — running-card progress
+  /** Token counts a pi-subagents child already reported. Absent when that
+   *  child did not publish the dimension — a missing count is not zero. */
+  inputTokens?: number
+  outputTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  totalTokens?: number
+  /** Published dollar cost. `0` is a real published zero (factory children);
+   *  omitted when the child did not publish a cost. */
+  costUsd?: number
   stalled?: boolean       // reaper flagged this subagent as idle/stalled
   /** Seconds of no stream activity measured when the reaper raised `stalled`
    *  (the `idle_secs` the backend already sends with `subagent_stalled`).

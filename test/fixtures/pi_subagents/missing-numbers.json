@@ -1,0 +1,18 @@
+{
+  "sessionUpdate": "tool_call_update",
+  "toolCallId": "call-missing",
+  "status": "completed",
+  "rawOutput": {
+    "toolName": "subagent",
+    "details": {
+      "results": [
+        {
+          "agent": "explorer",
+          "model": "opencode-go/mimo-v2.6-pro",
+          "sessionFile": "/tmp/not-a-secret/explorer.jsonl",
+          "usage": {"output": 15}
+        }
+      ]
+    }
+  }
+}

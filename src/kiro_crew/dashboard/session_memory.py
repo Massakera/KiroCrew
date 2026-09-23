@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from kiro_crew.acp.runtime import _get_rss_tree_mb, _iter_descendant_pids
 from kiro_crew.dashboard.handlers_system import _get_static_system_info
+from kiro_crew.dashboard.pi_child_usage import live_task_rows
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway import STUB_MODULE
@@ -588,6 +589,10 @@ class SessionMemorySampler:
                 total_mb += rss
 
         tasks_out = subagents.task_memory_rows() if subagents is not None else []
+        # Pi children run inside the parent process, so they are not
+        # SubagentManager tasks. Merge the live ones; a finished child is
+        # already gone from this registry and lives on the usage ledger.
+        tasks_out = [*tasks_out, *live_task_rows()]
         self.record_total(total_mb, now=now_wall)
 
         host_total_gb = _get_static_system_info().get("mem_total_gb")

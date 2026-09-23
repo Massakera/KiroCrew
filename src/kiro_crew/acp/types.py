@@ -114,6 +114,9 @@ EVENT_STEER_CLEARED = "steer_cleared"
 #: see :meth:`StructuredStatus.from_meta` and the origin rule in
 #: ``AcpSessionHandle._handle_update``.
 EVENT_STRUCTURED_STATUS = "structured_status"
+#: Pi-subagents child usage parsed off a tool update that had no transcript
+#: event of its own. The chat runner records it and does not render a tool row.
+EVENT_PI_CHILD_USAGE = "pi_child_usage"
 
 # ── ACP Protocol Methods ──
 
@@ -878,6 +881,10 @@ class AcpEvent:
     #: text chunk — so a consumer may trust ``wait_reason`` without re-checking
     #: provenance.
     status: "StructuredStatus | None" = None
+    #: Pi-subagents children parsed from this tool update's ``rawOutput``.
+    #: ``None`` when the frame was not a subagent result. Absent counts are
+    #: ``None`` inside each child; the transcript text is a different field.
+    pi_children: list[Any] | None = None
 
     @property
     def shell_command(self) -> str | None:

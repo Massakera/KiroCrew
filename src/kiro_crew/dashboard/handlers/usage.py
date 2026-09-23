@@ -591,6 +591,9 @@ TURN_USAGE_FIELDS: tuple[str, ...] = (
     "duration_ms",
     "context_used",
     "context_window",
+    # Async pi-subagents children publish one total and no input/output split.
+    # Absent on every other row; the reader omits the key when the shard did.
+    "total_tokens",
 )
 
 
@@ -1579,6 +1582,24 @@ async def persist_token_record_async(
         await asyncio.to_thread(_write_token_record, record, now)
     except Exception:
         logger.debug("Failed to persist token record for slot %s", slot_key, exc_info=True)
+
+
+async def append_usage_record_async(record: dict[str, Any]) -> None:
+    """Append a prebuilt usage row, keeping only the keys the caller set.
+
+    :func:`_build_token_record` zero-fills every dimension. A pi-subagents
+    child does not have every dimension, and a missing count is not a
+    measured zero. ``None`` values are dropped before the write. This path
+    does not emit the turn histogram: a child is not a dashboard turn.
+    """
+    now = datetime.now().astimezone()
+    row = {key: value for key, value in record.items() if value is not None}
+    row["_type"] = "tokens"
+    row["ts"] = now.isoformat()
+    try:
+        await asyncio.to_thread(_write_token_record, row, now)
+    except Exception:
+        logger.debug("Failed to append usage record", exc_info=True)
 
 
 def _emit_turn_histogram(

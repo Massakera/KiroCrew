@@ -3759,6 +3759,37 @@ function getSlotSub(state: ChatState, slot: string, id: string): SubagentActivit
  *  one to an inert own-property if it ever slips past. A hostile
  *  `__proto__`/`constructor`/`prototype` id therefore creates nothing and
  *  returns `undefined`, so the frame is dropped exactly as before. */
+type ChildUsageFrame = {
+  input_tokens?: number
+  output_tokens?: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+  total_tokens?: number
+  cost_usd?: number
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/** Copy published child counts onto a card. A later frame that omits a
+ *  dimension must not wipe a number already seen, and a published `0` cost
+ *  is a number, so it sticks. */
+function applyChildUsage(row: SubagentActivity, payload: ChildUsageFrame): void {
+  const input = finiteNumber(payload.input_tokens)
+  const output = finiteNumber(payload.output_tokens)
+  const cacheRead = finiteNumber(payload.cache_read_tokens)
+  const cacheWrite = finiteNumber(payload.cache_write_tokens)
+  const total = finiteNumber(payload.total_tokens)
+  const cost = finiteNumber(payload.cost_usd)
+  if (input !== undefined) row.inputTokens = input
+  if (output !== undefined) row.outputTokens = output
+  if (cacheRead !== undefined) row.cacheReadTokens = cacheRead
+  if (cacheWrite !== undefined) row.cacheWriteTokens = cacheWrite
+  if (total !== undefined) row.totalTokens = total
+  if (cost !== undefined) row.costUsd = cost
+}
+
 function upsertSlotSub(state: ChatState, slot: string, id: string): SubagentActivity | undefined {
   if (isUnsafeKey(slot) || isUnsafeKey(id)) return undefined
   const existing = getSlotSub(state, slot, id)
@@ -5050,7 +5081,7 @@ const chatSlice = createSlice({
         if (b) { b.approving = action.payload.approving; return }
       }
     },
-    sseSubagentSpawn(state, action: PayloadAction<{ slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string }>) {
+    sseSubagentSpawn(state, action: PayloadAction<{ slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; total_tokens?: number; cost_usd?: number }>) {
       if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
       const subs = action.payload.slot !== state.activeSlot
         ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).subagents
@@ -5065,6 +5096,7 @@ const chatSlice = createSlice({
         // Same guard for requestedModel: only set when the frame carries a value.
         if (action.payload.requested_model) existing.requestedModel = action.payload.requested_model
         if (action.payload.child_session) existing.childSession = action.payload.child_session
+        applyChildUsage(existing, action.payload)
         // The spawn event carries the authoritative task text (the pending
         // card's task is derived from the approval title, which may be empty
         // or just "spawn_run") — always prefer the spawn payload's task.
@@ -5084,6 +5116,8 @@ const chatSlice = createSlice({
         startedAtAssumed: existing?.startedAt ? existing.startedAtAssumed : undefined,
         toolCount: 0, stalled: false,
       }
+      const created = subs[safeKey(action.payload.id)]
+      if (created) applyChildUsage(created, action.payload)
     },
     sseSubagentTool(state, action: PayloadAction<{ slot: string; id: string; tool: string; turns?: number; tool_count?: number }>) {
       const { slot, id } = action.payload
@@ -5176,7 +5210,7 @@ const chatSlice = createSlice({
         if (st === 'done' || st === 'error' || st === 'stopped') delete subs[id]
       }
     },
-    sseSubagentDone(state, action: PayloadAction<{ slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; requested_model?: string; child_session?: string; result?: string }>) {
+    sseSubagentDone(state, action: PayloadAction<{ slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; requested_model?: string; child_session?: string; result?: string; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; total_tokens?: number; cost_usd?: number }>) {
       if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
       const subs = action.payload.slot !== state.activeSlot
         ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).subagents
@@ -5218,6 +5252,7 @@ const chatSlice = createSlice({
         // keeps the live-downgrade amber chip. Never clobber a known value to ''.
         if (action.payload.requested_model) a.requestedModel = action.payload.requested_model
         if (action.payload.child_session && !a.childSession) a.childSession = action.payload.child_session
+        applyChildUsage(a, action.payload)
         if (isNative && action.payload.result !== undefined) a.result = action.payload.result
         // A done frame carries authoritative `elapsed`, which reconstructs the
         // real start for an entry whose start was only ASSUMED -- the same
@@ -5245,6 +5280,8 @@ const chatSlice = createSlice({
           error: doneStatus === 'stopped' ? undefined : action.payload.error,
           result: isNative ? action.payload.result : undefined,
         }
+        const rebuilt = subs[action.payload.id]
+        if (rebuilt) applyChildUsage(rebuilt, action.payload)
       }
     },
     sseSideResult(state, action: PayloadAction<{ slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; is_error?: boolean; final?: boolean; steer?: boolean }>) {

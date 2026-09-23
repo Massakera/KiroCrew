@@ -111,6 +111,17 @@ function Trace({ segs }: { segs: MiniSeg[] }) {
   )
 }
 
+/** Tokens the child published. Input and output when either was reported;
+ *  otherwise the async total. Missing stays missing. */
+export function reportedTokens(node: SubagentActivity): number | null {
+  const parts = [node.inputTokens, node.outputTokens].filter(
+    (n): n is number => typeof n === 'number',
+  )
+  if (parts.length > 0) return parts.reduce((sum, n) => sum + n, 0)
+  if (typeof node.totalTokens === 'number') return node.totalTokens
+  return null
+}
+
 function Gauge({ frac }: { frac: number }) {
   return (
     <span
@@ -141,6 +152,8 @@ function SubNode({
   const status = nodeStatus(node.status)
   const segs = trace ? nodeSegments(trace.totals) : []
   const total = trace ? trace.injected_chars : 0
+  const billed = reportedTokens(node)
+  const figure = total > 0 ? total : billed
   const turns = trace?.turns ?? []
   const maxTurn = Math.max(1, ...turns.map(t => t.total_chars))
   // Only offer expansion when there is a trace to show; a node whose child
@@ -171,6 +184,14 @@ function SubNode({
         </span>
         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${DOT_CLASS[status]}`} style={{ boxShadow: '0 0 8px currentColor' }} aria-hidden="true" />
         <span className="text-[12.5px] font-semibold text-text truncate min-w-0">{node.agent || i18nT('pages.sessionBreakdown.unknown_agent')}</span>
+        {!expandable && node.model ? (
+          <span className="font-mono text-[10px] text-muted truncate max-w-[180px]" title={node.model}>{node.model}</span>
+        ) : null}
+        {typeof node.costUsd === 'number' ? (
+          <span className="font-mono text-[10px] text-muted tabular-nums shrink-0">
+            {fmtNumber(node.costUsd, { maximumFractionDigits: 4 })}
+          </span>
+        ) : null}
         {node.stalled ? <span className="font-mono text-[10px] text-[var(--warn)]">{i18nT('pages.sessionBreakdown.stalled')}</span> : null}
         <span className="flex-1 min-w-0" />
         {!open && segs.length > 0 ? <Trace segs={segs} /> : null}
@@ -187,7 +208,7 @@ function SubNode({
           {i18nT(STATUS_KEY[status])}
         </span>
         {trace ? <Gauge frac={occupancy(trace)} /> : null}
-        <span className="font-mono text-[11px] text-text text-right tabular-nums shrink-0 min-w-[44px]">{total > 0 ? fmtTok(total) : '\u2014'}</span>
+        <span className="font-mono text-[11px] text-text text-right tabular-nums shrink-0 min-w-[44px]">{figure != null ? fmtTok(figure) : '\u2014'}</span>
       </div>
       {open && expandable ? (
         <div className="pl-11 pr-3.5 pb-3 bg-bg-elevated">
