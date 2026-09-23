@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Review executor — one shared, batch-scoped ``AcpRuntime``, one session per task.
+"""Review executor — one session per task, on the configured agent backend.
 
-Every code review multiplexes onto a SINGLE kiro-cli subprocess (``AcpRuntime``)
-rather than a pool of per-worker ``AcpClient`` processes. Design:
+kiro-cli, kas, and codex multiplex onto one shared ``AcpRuntime`` (one subprocess,
+one session per task). pi, and droid when ``KIROCREW_EXPERIMENTAL_BACKENDS``
+includes it, have no shared runtime: each task gets its own ``AcpClient`` on
+``agent.acp_backend`` and that process is shut down when the turn ends. Design
+of the shared runtime:
 
   * **One runtime per batch** — lazily ``spawn()``ed on the first task of a batch
     and ``kill()``ed when the batch drains (see ``_BatchRuntimeHolder``). One
@@ -117,32 +120,99 @@ from sage_lib import followup, store  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def configured_review_backend() -> str:
+    """The backend a review session should spawn.
+
+    ``agent.acp_backend`` after the same selectability filter the rest of Crew
+    applies on load, so droid is used only when it was opted in. A config that
+    cannot be read stays on kiro-cli, which is what the shared runtime expects.
+    """
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return KiroCrewConfig.load().agent.acp_backend or ""
+    except Exception:
+        logger.debug("review backend: config unreadable, using kiro-cli", exc_info=True)
+        return ""
+
+
+def review_uses_shared_runtime(backend: str | None = None) -> bool:
+    """True when *backend* is one of the harnesses ``AcpRuntime`` can drive.
+
+    pi and droid are one process per session (``AcpClient``). Passing them into
+    ``AcpRuntime`` raises, because that runtime only has a kiro, kas, or codex
+    harness.
+    """
+    if backend is None:
+        backend = configured_review_backend()
+    try:
+        from kiro_crew.agent_sdk.backends import ACP_BACKENDS_ACP_RUNTIME
+    except Exception:
+        return True
+    return backend in ACP_BACKENDS_ACP_RUNTIME
+
+
+def _kiro_cli_backends() -> tuple[str, ...]:
+    try:
+        from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
+    except Exception:
+        return ("", "kas")
+    return (ACP_BACKEND_KIRO, ACP_BACKEND_KAS)
+
+
+def _preflight_installed(backend: str) -> str:
+    """"" when *backend*'s own binaries resolve, else a message naming them."""
+    label = backend or "kiro-cli"
+    try:
+        from kiro_crew.agent_sdk.backend_install import INSTALLED, probe_backend
+
+        state = probe_backend(backend)
+    except Exception as exc:
+        return (
+            f"the reviewer cannot run: backend {label!r} could not be checked "
+            f"({exc})"
+        )
+    if state.installed == INSTALLED:
+        return ""
+    missing = ", ".join(state.missing_components) or label
+    msg = (
+        f"the reviewer cannot run: backend {label!r} is not installed "
+        f"(missing {missing})"
+    )
+    if state.install_command:
+        msg += f". Install with: {state.install_command}"
+    return msg
+
+
 def runtime_preflight() -> str:
     """Cheap, read-only check that a reviewer session could actually be spawned.
 
-    Returns ``""`` when the runtime looks usable, else a message naming exactly
-    what is missing. Mirrors what ``_ensure_runtime_locked`` needs to spawn the
-    shared runtime — an importable ``AcpRuntime`` driving a ``kiro-cli``
-    subprocess — using the same resolver (``resolve_kiro_cli``) the runtime's
-    own spawn path goes through, so the answer here matches what a real spawn
-    would find. Without this check a review on a host with no usable agent CLI
-    completes with nothing written and reports an undiscriminated "no result
-    record", which cannot be triaged.
+    Returns ``""`` when the configured backend looks usable, else a message
+    naming exactly what is missing. kiro-cli and kas still go through
+    ``resolve_kiro_cli`` — the same resolver the shared runtime's spawn path
+    uses. Every other backend is probed by ``probe_backend``, so a host whose
+    default is pi is not rejected for a missing kiro-cli. Without this check a
+    review on a host with no usable agent CLI completes with nothing written
+    and reports an undiscriminated "no result record", which cannot be triaged.
 
-    Deliberately does NOT spawn anything or touch the filesystem beyond the
-    executable lookup. That lookup still stats candidates under every ``PATH``
-    entry, so callers on the gateway event loop MUST offload this to a thread
-    (``asyncio.to_thread``) — one stale network mount in ``PATH`` would
-    otherwise stall the whole loop.
+    Deliberately does NOT spawn anything. The lookup still stats candidates
+    under every ``PATH`` entry, so callers on the gateway event loop MUST
+    offload this to a thread (``asyncio.to_thread``) — one stale network mount
+    in ``PATH`` would otherwise stall the whole loop.
     """
-    if AcpRuntime is None:
-        return ("the reviewer cannot run: the ACP runtime "
-                "(kiro_crew.acp.runtime) is not importable in this install")
-    if resolve_kiro_cli is not None and resolve_kiro_cli() is None:
-        return ("the reviewer cannot run: no kiro-cli executable was found on "
-                "this host (the reviewer session is driven by kiro-cli — "
-                "install it or add it to PATH)")
-    return ""
+    backend = configured_review_backend()
+    if review_uses_shared_runtime(backend):
+        if AcpRuntime is None:
+            return ("the reviewer cannot run: the ACP runtime "
+                    "(kiro_crew.acp.runtime) is not importable in this install")
+        if backend in _kiro_cli_backends():
+            if resolve_kiro_cli is not None and resolve_kiro_cli() is None:
+                return ("the reviewer cannot run: no kiro-cli executable was found on "
+                        "this host (the reviewer session is driven by kiro-cli — "
+                        "install it or add it to PATH)")
+            return ""
+        return _preflight_installed(backend)
+    return _preflight_installed(backend)
 
 
 def _is_windows() -> bool:
@@ -428,6 +498,11 @@ class _BatchRuntimeHolder:
 
     async def begin_batch(self) -> None:
         async with self._lock:
+            # A client backend (pi, droid) has no shared subprocess to spawn.
+            # The counter still has to move so end_batch stays balanced.
+            if not review_uses_shared_runtime():
+                self._batches += 1
+                return
             # Ensure the runtime FIRST, then count the batch. If the spawn raises
             # (unimportable AcpRuntime / transient kiro-cli launch failure), we must
             # NOT leave _batches incremented — otherwise it can never drain back to
@@ -480,7 +555,13 @@ class _BatchRuntimeHolder:
         # OS sandbox scrubs credential paths/env for this LLM-directed subprocess
         # (GitHub fetch/post run via the `gh` CLI's own auth; the worker only
         # writes data/results and runs `python3 sage_lib/pipeline.py`).
-        rt = AcpRuntime(agent=self._agent, work_dir=self._work_dir, sandbox_mode="auto")
+        backend = configured_review_backend()
+        rt = AcpRuntime(
+            agent=self._agent,
+            work_dir=self._work_dir,
+            sandbox_mode="auto",
+            acp_backend=backend,
+        )
         try:
             await rt.spawn()
         except _SANDBOX_UNAVAILABLE as exc:
@@ -492,8 +573,10 @@ class _BatchRuntimeHolder:
             # caught to retry unsandboxed: the refusal is the correct outcome.
             raise ReviewRuntimeUnavailable(sandbox_unavailable_message(exc)) from exc
         self._runtime = rt
-        logger.info("code-review-sage runtime spawned (agent=%s, cwd=%s)",
-                    self._agent, self._work_dir)
+        logger.info(
+            "code-review-sage runtime spawned (agent=%s, backend=%s, cwd=%s)",
+            self._agent, backend or "kiro", self._work_dir,
+        )
         return rt
 
     async def _kill(self, rt: "AcpRuntime") -> None:
@@ -594,76 +677,148 @@ class ReviewPool:
         if self._closed:
             raise RuntimeError("ReviewPool is shut down")
         async with self._sema:
+            if not review_uses_shared_runtime():
+                return await self._send_client(
+                    task, timeout, on_activity, keep_session_key)
             runtime = await self._holder.acquire()
             handle = None
             try:
                 # agent=None -> inherit the runtime's agent (spawned with --agent);
                 # cwd=app root so relative prompt paths + the effort overlay resolve.
                 handle = await runtime.create_session(cwd=self._work_dir, agent=None)
-                gen = handle.prompt(task, timeout=timeout)
-                parts: list[str] = []
-                stop_reason = ""
-                steps = 0
-                try:
-                    async for ev in gen:
-                        kind = getattr(ev, "kind", None)
-                        if kind == EVENT_TEXT_CHUNK:
-                            parts.append(getattr(ev, "text", "") or "")
-                        elif kind == EVENT_TOOL_CALL:
-                            await self._audit_tool(handle, ev)
-                            steps += 1
-                            if on_activity is not None:
-                                try:
-                                    on_activity(
-                                        str(getattr(ev, "title", "") or ""), steps)
-                                except Exception:
-                                    logger.debug("activity callback failed",
-                                                 exc_info=True)
-                        elif kind == EVENT_PERMISSION_REQUEST:
-                            # Auto-approve (the reviewer needs `gh` + shell) AND record
-                            # the permission DECISION in the security ledger, tagged with
-                            # its request id. The blocking backend-security-controls rule
-                            # requires every permission decision to emit an SEL event, and
-                            # the EVENT_TOOL_CALL audit carries no decision/request id.
-                            req_id = getattr(ev, "request_id", "")
-                            try:
-                                await handle.approve_tool(req_id)
-                            except Exception:
-                                logger.debug("tool approve failed", exc_info=True)
-                            else:
-                                await self._audit_tool(
-                                    handle, ev, request_id=req_id,
-                                    outcome="auto_approved")
-                        elif kind == EVENT_COMPLETE:
-                            stop_reason = getattr(ev, "stop_reason", "") or ""
-                            break
-                finally:
-                    # Deterministically close the async generator instead of leaving
-                    # it suspended-until-GC after the EVENT_COMPLETE break. prompt()
-                    # is typed AsyncIterator (no aclose in the protocol) but is an
-                    # async generator at runtime — close it if it supports it.
-                    aclose = getattr(gen, "aclose", None)
-                    if aclose is not None:
-                        await aclose()
-                # An abnormal completion (timeout / tool-stall / stale-recovery /
-                # error:*) means the review did NOT finish — surface it as a failure
-                # so make_sync_dispatch reports ok=False and the driver never marks
-                # the PR reviewed or posts on partial output.
-                if _is_abnormal_stop(stop_reason):
-                    raise RuntimeError(
-                        f"review turn ended abnormally (stop_reason={stop_reason!r})")
-                # Keep the transcript AFTER the health gate above: a session whose
-                # turn died has no findings to be asked about, and recording it
-                # would leave a file nothing will ever load.
-                if keep_session_key:
-                    self._keep_resumable(handle, keep_session_key)
-                return "".join(parts)
+
+                async def _approve(req_id: object) -> None:
+                    await handle.approve_tool(req_id)
+
+                return await self._drive_turn(
+                    handle.prompt(task, timeout=timeout),
+                    _approve,
+                    handle,
+                    on_activity,
+                    keep_session_key,
+                )
             finally:
                 if handle is not None:
                     try:
                         await handle.destroy()
                     except Exception:
                         logger.debug("session destroy error", exc_info=True)
+
+    async def _send_client(
+        self,
+        task: str,
+        timeout: float,
+        on_activity: Callable[[str, int], None] | None,
+        keep_session_key: str | None,
+    ) -> str:
+        """One ``AcpClient`` process for a backend ``AcpRuntime`` cannot drive.
+
+        pi and droid auto-approve tool permissions inside the client when the
+        caller answers ``session/request_permission``. The review still approves
+        here, the same way the shared runtime does, so ``gh`` and the shell run
+        unattended. The process is shut down when the turn ends: these backends
+        do not multiplex sessions onto one subprocess.
+
+        ``keep_session_key`` is ignored. That record points at a kiro-cli
+        transcript, and a pi/droid process has none to resume.
+        """
+        del keep_session_key
+        backend = configured_review_backend()
+        try:
+            from kiro_crew.acp.client import AcpClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "the reviewer cannot run: AcpClient is not importable"
+            ) from exc
+        client = AcpClient(
+            work_dir=self._work_dir,
+            agent=self._agent,
+            sandbox_mode="auto",
+            acp_backend=backend,
+            audit_source="subagent",
+        )
+        try:
+            try:
+                return await self._drive_turn(
+                    client.stream_events(task, timeout=timeout),
+                    client.approve_tool,
+                    client,
+                    on_activity,
+                    None,
+                )
+            except _SANDBOX_UNAVAILABLE as exc:
+                raise ReviewRuntimeUnavailable(sandbox_unavailable_message(exc)) from exc
+        finally:
+            try:
+                await client.shutdown()
+            except Exception:
+                logger.debug("review client shutdown error", exc_info=True)
+
+    async def _drive_turn(
+        self,
+        gen: object,
+        approve: Callable[..., object],
+        session: object,
+        on_activity: Callable[[str, int], None] | None,
+        keep_session_key: str | None,
+    ) -> str:
+        """Read one prompt to completion, auto-approving every tool request."""
+        parts: list[str] = []
+        stop_reason = ""
+        steps = 0
+        try:
+            async for ev in gen:  # type: ignore[attr-defined]
+                kind = getattr(ev, "kind", None)
+                if kind == EVENT_TEXT_CHUNK:
+                    parts.append(getattr(ev, "text", "") or "")
+                elif kind == EVENT_TOOL_CALL:
+                    await self._audit_tool(session, ev)
+                    steps += 1
+                    if on_activity is not None:
+                        try:
+                            on_activity(
+                                str(getattr(ev, "title", "") or ""), steps)
+                        except Exception:
+                            logger.debug("activity callback failed", exc_info=True)
+                elif kind == EVENT_PERMISSION_REQUEST:
+                    # Auto-approve (the reviewer needs `gh` + shell) AND record
+                    # the permission DECISION in the security ledger, tagged with
+                    # its request id. The blocking backend-security-controls rule
+                    # requires every permission decision to emit an SEL event, and
+                    # the EVENT_TOOL_CALL audit carries no decision/request id.
+                    req_id = getattr(ev, "request_id", "")
+                    try:
+                        await approve(req_id)
+                    except Exception:
+                        logger.debug("tool approve failed", exc_info=True)
+                    else:
+                        await self._audit_tool(
+                            session, ev, request_id=req_id,
+                            outcome="auto_approved")
+                elif kind == EVENT_COMPLETE:
+                    stop_reason = getattr(ev, "stop_reason", "") or ""
+                    break
+        finally:
+            # Deterministically close the async generator instead of leaving
+            # it suspended-until-GC after the EVENT_COMPLETE break. prompt()
+            # is typed AsyncIterator (no aclose in the protocol) but is an
+            # async generator at runtime — close it if it supports it.
+            aclose = getattr(gen, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        # An abnormal completion (timeout / tool-stall / stale-recovery /
+        # error:*) means the review did NOT finish — surface it as a failure
+        # so make_sync_dispatch reports ok=False and the driver never marks
+        # the PR reviewed or posts on partial output.
+        if _is_abnormal_stop(stop_reason):
+            raise RuntimeError(
+                f"review turn ended abnormally (stop_reason={stop_reason!r})")
+        # Keep the transcript AFTER the health gate above: a session whose
+        # turn died has no findings to be asked about, and recording it
+        # would leave a file nothing will ever load.
+        if keep_session_key:
+            self._keep_resumable(session, keep_session_key)
+        return "".join(parts)
 
     def _keep_resumable(self, handle: object, key: str) -> None:
         """Mark this session's transcript to survive teardown and record it.
@@ -713,7 +868,11 @@ class ReviewPool:
                 loop.run_in_executor(
                     None,
                     lambda: _sel().log_tool_invocation(
-                        session_key=getattr(handle, "session_id", "") or "",
+                        session_key=(
+                            getattr(handle, "session_id", None)
+                            or getattr(handle, "_session_id", None)
+                            or ""
+                        ),
                         agent=self._agent,
                         source="subagent",
                         tool_name=getattr(ev, "title", None) or "unknown",

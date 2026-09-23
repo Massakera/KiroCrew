@@ -112,8 +112,21 @@ class FakeRuntime:
         return h
 
 
+def _pin_kiro_review_backend(test) -> None:
+    """Keep these tests on the shared kiro-cli runtime.
+
+    The executor follows ``agent.acp_backend``. A developer machine whose
+    config is pi would otherwise take the AcpClient path and never touch the
+    fake runtime these tests install.
+    """
+    orig = rp.configured_review_backend
+    rp.configured_review_backend = lambda: ""  # type: ignore[method-assign]
+    test.addCleanup(lambda: setattr(rp, "configured_review_backend", orig))
+
+
 def _install_fake_runtime(test, script=None, gate=None):
     """Patch review_pool.AcpRuntime with FakeRuntime for the duration of a test."""
+    _pin_kiro_review_backend(test)
     FakeRuntime.instances = []
 
     def factory(agent=None, work_dir=None, sandbox_mode="auto", **kw):
@@ -241,6 +254,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         orig = rp.AcpRuntime
         rp.AcpRuntime = factory  # type: ignore[assignment]
         self.addCleanup(lambda: setattr(rp, "AcpRuntime", orig))
+        _pin_kiro_review_backend(self)
         FakeRuntime.instances = []
         pool = ReviewPool(work_dir=_work_dir(self))
         with self.assertRaises(RuntimeError):
@@ -372,6 +386,7 @@ class TestSyncDispatchBridge(unittest.TestCase):
     """make_sync_dispatch bridges the threaded driver to the async executor."""
 
     def setUp(self):
+        _pin_kiro_review_backend(self)
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self.thread.start()
@@ -501,21 +516,34 @@ class TestRuntimePreflight(unittest.TestCase):
 
     def test_available_runtime_returns_empty(self):
         with unittest.mock.patch.object(rp, "AcpRuntime", object()), \
+                unittest.mock.patch.object(rp, "configured_review_backend", lambda: ""), \
                 unittest.mock.patch.object(rp, "resolve_kiro_cli",
                                            lambda: "/usr/local/bin/kiro-cli"):
             self.assertEqual(rp.runtime_preflight(), "")
 
     def test_missing_cli_names_the_runtime(self):
         with unittest.mock.patch.object(rp, "AcpRuntime", object()), \
+                unittest.mock.patch.object(rp, "configured_review_backend", lambda: ""), \
                 unittest.mock.patch.object(rp, "resolve_kiro_cli", lambda: None):
             msg = rp.runtime_preflight()
             self.assertIn("kiro-cli", msg)
 
     def test_unimportable_acp_runtime_is_reported(self):
-        with unittest.mock.patch.object(rp, "AcpRuntime", None):
+        with unittest.mock.patch.object(rp, "AcpRuntime", None), \
+                unittest.mock.patch.object(rp, "configured_review_backend", lambda: ""):
             msg = rp.runtime_preflight()
             self.assertTrue(msg)
             self.assertIn("runtime", msg.lower())
+
+    def test_pi_does_not_require_kiro_cli(self):
+        def _forbid_kiro() -> None:
+            raise AssertionError("pi preflight must not look for kiro-cli")
+
+        with unittest.mock.patch.object(rp, "configured_review_backend", lambda: "pi"), \
+                unittest.mock.patch.object(rp, "resolve_kiro_cli", _forbid_kiro), \
+                unittest.mock.patch.object(
+                    rp, "_preflight_installed", lambda backend: "" if backend == "pi" else "no"):
+            self.assertEqual(rp.runtime_preflight(), "")
 
     def test_check_is_read_only(self):
         # The preflight runs (off the event loop) before every review run — it
@@ -527,6 +555,63 @@ class TestRuntimePreflight(unittest.TestCase):
             return "/bin/kiro-cli"
 
         with unittest.mock.patch.object(rp, "AcpRuntime", object()), \
+                unittest.mock.patch.object(rp, "configured_review_backend", lambda: ""), \
                 unittest.mock.patch.object(rp, "resolve_kiro_cli", _resolver):
             rp.runtime_preflight()
         self.assertEqual(calls, ["resolve"])
+
+
+class TestClientBackend(unittest.IsolatedAsyncioTestCase):
+    """pi (and droid) review on one AcpClient, not the kiro-cli runtime."""
+
+    async def test_pi_send_approves_tools_and_skips_the_shared_runtime(self):
+        orig_backend = rp.configured_review_backend
+        rp.configured_review_backend = lambda: "pi"  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(rp, "configured_review_backend", orig_backend))
+        FakeRuntime.instances = []
+        orig_rt = rp.AcpRuntime
+        rp.AcpRuntime = FakeRuntime  # type: ignore[assignment]
+        self.addCleanup(lambda: setattr(rp, "AcpRuntime", orig_rt))
+
+        created: list[object] = []
+
+        class FakeClient:
+            def __init__(self, **kw):
+                self.kw = kw
+                self.approved: list[object] = []
+                self.shutdowns = 0
+                self._session_id = "sess-pi"
+                created.append(self)
+
+            async def stream_events(self, message, timeout=None):
+                del message, timeout
+                yield _ev(rp.EVENT_TEXT_CHUNK, text="reviewed")
+                yield _ev(rp.EVENT_PERMISSION_REQUEST, request_id="p1", title="gh")
+                yield _ev(rp.EVENT_COMPLETE, stop_reason="end_turn")
+
+            async def approve_tool(self, request_id, option_id=None, always=False):
+                del option_id, always
+                self.approved.append(request_id)
+
+            async def shutdown(self):
+                self.shutdowns += 1
+
+        import kiro_crew.acp.client as acp_client
+
+        orig_client = acp_client.AcpClient
+        acp_client.AcpClient = FakeClient  # type: ignore[misc, assignment]
+        self.addCleanup(lambda: setattr(acp_client, "AcpClient", orig_client))
+
+        pool = ReviewPool(work_dir=_work_dir(self))
+        await pool.begin_batch()
+        self.assertEqual(FakeRuntime.instances, [])
+        out = await pool.send("review this")
+        await pool.end_batch()
+
+        self.assertEqual(out, "reviewed")
+        self.assertEqual(len(created), 1)
+        client = created[0]
+        self.assertEqual(client.kw["acp_backend"], "pi")  # type: ignore[attr-defined]
+        self.assertEqual(client.approved, ["p1"])  # type: ignore[attr-defined]
+        self.assertEqual(client.shutdowns, 1)  # type: ignore[attr-defined]
+        self.assertEqual(FakeRuntime.instances, [])

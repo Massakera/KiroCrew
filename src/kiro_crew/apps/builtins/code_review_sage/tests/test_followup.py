@@ -520,6 +520,10 @@ class PoolHandoffTests(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.recorded: list[tuple] = []
         self._real_write = FU.write_descriptor
+        # These sends fake the shared runtime. Pin kiro so a machine whose
+        # agent.acp_backend is pi does not take the AcpClient path instead.
+        self._real_backend = RP.configured_review_backend
+        RP.configured_review_backend = lambda: ""  # type: ignore[method-assign]
 
         def _spy(run_id, change_id, *, sid, agent="", cwd="",
                  provider="acp", root=None):
@@ -530,6 +534,7 @@ class PoolHandoffTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self):
         FU.write_descriptor = self._real_write
+        RP.configured_review_backend = self._real_backend
         self._tmp.cleanup()
 
     async def _send(self, handle, *, keep, stop="end_turn"):
