@@ -28,6 +28,24 @@ server's message rather than reading a period key that is not there. The zeros
 on that path are a shape, not a measurement, which is what the `error` field
 says.
 
+Each `daily_history` row also carries `credits`: the plan credits billed on that
+local calendar day, summed from the per-turn usage shards with the same row
+guard the Spend tab applies (a `tokens` row inside the per-row epoch cutoff with
+a finite numeric `credits`) and no slot filter, so background slots count too.
+It is the rolling 30-day local shard spend the table already covers, not a
+billing-cycle figure: the Billing card's total comes from the account, over the
+account's period, and the two are not expected to sum to each other. A day with
+credits but no transcript (a background slot, a refused file) still gets a row,
+with zero sessions, rather than losing its spend. A row whose `credits` cannot
+be read as a finite number, or whose addition would push a day past the finite
+range, is dropped, so the payload never carries `Infinity`. The Usage tab's
+Daily History table shows the figure as "Credits used" and, beside it, "Credits
+used (%)": that day's credits over the CURRENT billing period's plan allowance
+-- the same `credits_plan` the Billing card divides by -- not clamped, and an
+em dash rather than 0% when no plan parsed, the allowance is zero or absent, or
+the row has no figure. On a phone the two columns fold onto one second line
+under each day so the table never scrolls sideways.
+
 The Overview usage summary and Usage report share a per-provider browser-memory
 cache for the dashboard lifetime. Opening either view shows the last successful
 report immediately. Data is fresh for five minutes; an older report refreshes
