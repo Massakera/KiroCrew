@@ -41,7 +41,8 @@ import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
-import { useAvailableModels } from '../hooks/useAvailableModels'
+import { useAvailableModelsQuery } from '../hooks/useAvailableModels'
+import { isModelCatalogUnavailable } from '../api/apiError'
 import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
 import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
@@ -485,7 +486,7 @@ export default function ChatPane({
   // This pane takes no project prop, so read THIS slot's project from the store:
   // it scopes which project-local agents exist, so a project change must refetch.
   const paneProject = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.project || undefined)
-  const { agents: installedAgents, choices: catalogChoices, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
+  const { agents: installedAgents, choices: catalogChoices, defaultAgent, error: agentsCatalogError, reload: reloadAgents, reloading: agentsReloading } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
   // The picker lists every catalog row (a member and a template of one name
   // are two rows). A roster source that exposes only the folded list -- one
   // row per name -- is still a complete, if namespace-blind, catalog.
@@ -516,7 +517,9 @@ export default function ChatPane({
   // The pop-up lists the full catalog (a same-name member and template are
   // two rows); every other reader of the roster keeps the name-folded list.
   const agentDD = useFilteredDropdown(agentChoices)
-  const localModels = useAvailableModels()
+  const localModelsQuery = useAvailableModelsQuery()
+  const localModels = localModelsQuery.data
+  const localCatalogMissing = !paneRemoteCrew.isRemote && isModelCatalogUnavailable(localModelsQuery.error)
   const effectiveModels = useMemo<ModelInfo[]>(() => {
     if (!paneRemoteCrew.isRemote) return localModels
     return (paneRemoteCrew.capabilities?.models ?? []).map(model => ({
@@ -1837,7 +1840,7 @@ export default function ChatPane({
               />
             </div>
             <div role="listbox" aria-label={i18nT('components.chatPane.agent_list')} className="overflow-y-auto max-h-[280px]">
-              <AgentDropdownList agents={agentDD.filtered} activeAgent={paneAgentName} activeKind={paneSlot?.agent_kind} defaultAgent={defaultAgent} onSelect={(name, kind) => { switchAgent(name, kind); agentDD.setOpen(false) }} />
+              <AgentDropdownList agents={agentDD.filtered} activeAgent={paneAgentName} activeKind={paneSlot?.agent_kind} defaultAgent={defaultAgent} onSelect={(name, kind) => { switchAgent(name, kind); agentDD.setOpen(false) }} loadFailed={!paneRemoteCrew.isRemote && agentsCatalogError && catalogChoices.length === 0} onRetry={reloadAgents} retrying={agentsReloading} />
             </div>
             <DefaultAgentRow agentName={paneAgentName} isDefault={paneAgentName === defaultAgent} onSetDefault={() => toggleDefaultAgent(paneAgentName)} />
             <ManageAgentsFooter error={defaultAgentFailed} onManage={() => { agentDD.setOpen(false); navigate('/capabilities?tab=crews') }} />
@@ -1887,7 +1890,7 @@ export default function ChatPane({
                 </Btn>
               </div>
             )}
-            {paneRemoteCrew.failed && (
+            {(paneRemoteCrew.failed || localCatalogMissing) && (
               <div className="flex items-center gap-2 px-1.5 py-1">
                 {/* No hand-off: this pane's composer may hold an unsent draft.
                     Retry keeps the user in the owning chat. */}
@@ -1896,14 +1899,14 @@ export default function ChatPane({
                   variant="inline"
                   message={i18nT('components.modelEffortDropdown.models_failed')}
                 />
-                <Btn type="button" className="shrink-0" onClick={() => paneRemoteCrew.refetch()} disabled={paneRemoteCrew.retrying}>
-                  {paneRemoteCrew.retrying && <LoaderCircle className="lucide-inline animate-spin" aria-hidden />}
+                <Btn type="button" className="shrink-0" onClick={() => { if (paneRemoteCrew.isRemote) paneRemoteCrew.refetch(); else void localModelsQuery.refetch() }} disabled={paneRemoteCrew.retrying || (localCatalogMissing && localModelsQuery.isFetching)}>
+                  {(paneRemoteCrew.retrying || (localCatalogMissing && localModelsQuery.isFetching)) && <LoaderCircle className="lucide-inline animate-spin" aria-hidden />}
                   {i18nT('pages.settings.chatPanel.retry')}
                 </Btn>
               </div>
             )}
             <div role="listbox" aria-label={i18nT('components.chatPane.model_list')} className="overflow-y-auto max-h-[280px]">
-              <ModelDropdownList models={modelDD.filtered} activeModel={jevRouteShownModel(shownModel, paneSlot)} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
+              <ModelDropdownList models={modelDD.filtered} activeModel={jevRouteShownModel(shownModel, paneSlot)} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed || localCatalogMissing} />
             </div>
             {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
               modelDD.setOpen(false)

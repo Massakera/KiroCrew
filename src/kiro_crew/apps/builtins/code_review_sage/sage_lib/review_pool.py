@@ -728,13 +728,23 @@ class ReviewPool:
             raise RuntimeError(
                 "the reviewer cannot run: AcpClient is not importable"
             ) from exc
-        client = AcpClient(
-            work_dir=self._work_dir,
-            agent=self._agent,
-            sandbox_mode="auto",
-            acp_backend=backend,
-            audit_source="subagent",
-        )
+        model = _reviewer_model(self._agent)
+        effort = str(_get_review_settings().get("effort") or "")
+        client_kwargs = {
+            "work_dir": self._work_dir,
+            "agent": self._agent,
+            "sandbox_mode": "auto",
+            "acp_backend": backend,
+            "audit_source": "subagent",
+        }
+        # "auto" inherits Pi's own default. A saved review.model is the id
+        # session/set_config_option("model") accepts. Effort is thought_level
+        # on Pi (max folds to xhigh inside AcpClient).
+        if model and model != "auto":
+            client_kwargs["model"] = model
+        if effort:
+            client_kwargs["reasoning_effort"] = effort
+        client = AcpClient(**client_kwargs)
         try:
             try:
                 return await self._drive_turn(

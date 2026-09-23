@@ -77,6 +77,12 @@ export default function SettingsView() {
 
         {data && s && (
           <div className="mt-6 rounded-xl border border-border bg-card px-4 py-4">
+            {data.models_unavailable && (
+              <ErrorNotice
+                message={i18nT('components.modelEffortDropdown.models_failed')}
+                className="mb-3"
+              />
+            )}
             <Field
               label={i18nT('apps.codeReviewSage.views.settingsView.model')}
               hint={i18nT('apps.codeReviewSage.views.settingsView.which_model_performs_the_review_default_inherits')}

@@ -10,6 +10,7 @@ from pathlib import Path
 from aiohttp import web
 
 from kiro_crew import agent_state
+from kiro_crew.acp_backends import ACP_BACKEND_PI
 from kiro_crew.agent_discovery import AgentInfo, list_agents
 from kiro_crew.agent_files import AGENT_FILENAME, LITE_AGENT_FILENAME
 from kiro_crew.config.loader import KiroCrewConfig
@@ -21,6 +22,7 @@ from kiro_crew.dashboard.handlers.agents import (
 )
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.executors import discovery_executor
+from kiro_crew.pi_agents import list_pi_agent_profiles
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,51 @@ def _template_row(agent: AgentInfo) -> dict[str, object]:
     }
 
 
+def _catalog_unavailable() -> web.Response:
+    return web.json_response(
+        {
+            "error": "Agent choices could not be loaded. Retry the catalog.",
+            "code": "agent_catalog_unavailable",
+        },
+        status=503,
+    )
+
+
+async def _pi_agent_catalog(config: KiroCrewConfig, redact: bool) -> web.Response:
+    """Profiles from ``~/.pi/agent/agents``, and nothing from the Kiro roster.
+
+    A missing or unreadable directory is the same 503 the Kiro catalog uses
+    when discovery fails. An empty directory is a real empty list: the picker
+    must not fill that hole with KiroCrew agents.
+    """
+    try:
+        profiles = await asyncio.get_running_loop().run_in_executor(
+            discovery_executor(), list_pi_agent_profiles
+        )
+    except OSError:
+        logger.warning("Pi agent profiles could not be loaded", exc_info=True)
+        return _catalog_unavailable()
+    names = {profile["name"] for profile in profiles}
+    default = config.default_agent if config.default_agent in names else ""
+    rows = [
+        {
+            "name": profile["name"],
+            "selection_kind": "template",
+            "scope": "pi",
+            "kiro_agent": profile["name"],
+            "description": _roster_mask(profile["description"]),
+            "source": _roster_mask("pi"),
+        }
+        for profile in profiles
+    ]
+    return web.json_response(
+        {
+            "agents": rows,
+            "default_agent": _roster_mask(default) if redact and default else default,
+        }
+    )
+
+
 async def api_agent_catalog(request: web.Request) -> web.Response:
     """GET /api/agents/catalog — members and templates in separate namespaces.
 
@@ -112,18 +159,20 @@ async def api_agent_catalog(request: web.Request) -> web.Response:
 
     try:
         config = await asyncio.to_thread(KiroCrewConfig.load)
+    except Exception:
+        logger.warning("Agent execution catalog could not be loaded", exc_info=True)
+        return _catalog_unavailable()
+    if getattr(config.agent, "acp_backend", "") == ACP_BACKEND_PI:
+        redact = state is None or not is_owner_dashboard_request(request)
+        return await _pi_agent_catalog(config, redact)
+
+    try:
         templates = await asyncio.get_running_loop().run_in_executor(
             discovery_executor(), functools.partial(_templates, project_dir)
         )
     except Exception:
         logger.warning("Agent execution catalog could not be loaded", exc_info=True)
-        return web.json_response(
-            {
-                "error": "Agent choices could not be loaded. Retry the catalog.",
-                "code": "agent_catalog_unavailable",
-            },
-            status=503,
-        )
+        return _catalog_unavailable()
 
     redact = state is None or not is_owner_dashboard_request(request)
     rows = []

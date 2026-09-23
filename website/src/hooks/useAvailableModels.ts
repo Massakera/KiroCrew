@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 
+import { isModelCatalogUnavailable } from '../api/apiError'
 import { useProvider } from '../providers'
 import { modelListRefetchInterval, useModelsDegraded } from '../providers/modelListHealth'
 import { withAutoFirst } from '../providers/modelList'
@@ -54,7 +55,17 @@ export function useAvailableModelsQuery({ enabled }: AvailableModelsOptions = {}
     refetchInterval: modelListRefetchInterval,
     ...(enabled === undefined ? {} : { enabled }),
   })
-  return { ...query, data: query.data ?? PLACEHOLDER, isDegraded }
+  // A missing catalog is an empty list, not the auto placeholder. Every other
+  // failure still falls through to PLACEHOLDER until a live list arrives,
+  // because those failures are the cold-start window where auto is the only
+  // id the wire accepts.
+  const catalogMissing = isModelCatalogUnavailable(query.error)
+  return {
+    ...query,
+    data: catalogMissing ? [] : (query.data ?? PLACEHOLDER),
+    isDegraded,
+    catalogMissing,
+  }
 }
 
 export function useAvailableModels(options: AvailableModelsOptions = {}): ModelInfo[] {

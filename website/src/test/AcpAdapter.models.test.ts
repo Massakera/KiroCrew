@@ -143,6 +143,22 @@ describe('AcpAdapter.fetchAvailableModels', () => {
     expect(cached.models).toHaveLength(2)
   })
 
+  it('does not collapse a missing backend catalog to auto or a cached list', async () => {
+    const err = Object.assign(new Error('catalog missing'), {
+      body: JSON.stringify({ code: 'model_catalog_unavailable', error: 'Pi has not advertised a model catalog for this install.' }),
+    })
+    localStorage.setItem(
+      'kc.acp.models.v1',
+      JSON.stringify({
+        ts: Date.now(),
+        models: [{ name: 'auto' }, { name: 'claude-opus-4.8' }],
+      }),
+    )
+    ;(api.models as ModelsMock).mockRejectedValue(err)
+    await expect(new AcpAdapter().fetchAvailableModels()).rejects.toBe(err)
+    expect(modelsDegraded('acp')).toBe(true)
+  })
+
   it('ignores a cache older than the TTL (bounds -32603 exposure)', async () => {
     // Write a stale cache (25h old) directly.
     localStorage.setItem(

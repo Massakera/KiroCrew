@@ -585,6 +585,37 @@ class TestSettingsModelValidation(unittest.TestCase):
         review = self.mod._write_review_section({"model": None})
         self.assertIsNone(review["model"])
 
+    def test_slash_model_rejected_unless_pi_advertised_it(self):
+        """Kiro stays on the claude_code allowlist. Pi accepts a provider/model
+        id only when that id is in the advertised Pi catalog."""
+        with self.assertRaises(ValueError):
+            self.mod._write_review_section({"model": "factory/claude-opus-5-5"})
+        from kiro_crew import model_registry
+        from kiro_crew.acp_backends import ACP_BACKEND_PI, model_registry_namespace
+
+        namespace = model_registry_namespace(ACP_BACKEND_PI)
+        saved = dict(model_registry._ADVERTISED_MODELS)
+        orig = self.mod.review_pool.configured_review_backend
+        try:
+            model_registry._ADVERTISED_MODELS[namespace] = [
+                "factory/claude-opus-5-5",
+                "ollama/llama3.2:3b",
+            ]
+            self.mod.review_pool.configured_review_backend = lambda: "pi"
+            review = self.mod._write_review_section({"model": "factory/claude-opus-5-5"})
+            self.assertEqual(review["model"], "factory/claude-opus-5-5")
+            self.assertIn("ollama/llama3.2:3b", self.mod._known_models())
+            with self.assertRaises(ValueError):
+                self.mod._write_review_section({"model": "evil/not-advertised"})
+            with self.assertRaises(ValueError):
+                self.mod._write_review_section({"model": "../../etc/passwd"})
+            model_registry._ADVERTISED_MODELS[namespace] = []
+            self.assertEqual(self.mod._known_models(), [])
+        finally:
+            model_registry._ADVERTISED_MODELS.clear()
+            model_registry._ADVERTISED_MODELS.update(saved)
+            self.mod.review_pool.configured_review_backend = orig
+
 
 class TestLearningsEndpoint(unittest.IsolatedAsyncioTestCase):
     """GET /learnings surfaces a namespace's consolidated patterns AND the pending

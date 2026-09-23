@@ -50,6 +50,25 @@ export const isNotFoundError = (e: unknown): boolean =>
   typeof e === 'object' && e !== null && (e as { status?: unknown }).status === 404
 
 /**
+ * True when `/api/models` refused because this backend has no catalog yet.
+ *
+ * Pi returns 503 `model_catalog_unavailable` until a session has advertised
+ * ids. That must stay an error: collapsing it to the auto row is what made
+ * the picker show only Default.
+ */
+export function isModelCatalogUnavailable(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false
+  const body = (err as { body?: unknown }).body
+  if (typeof body !== 'string' || body === '') return false
+  try {
+    const parsed = JSON.parse(body) as { code?: unknown }
+    return parsed.code === 'model_catalog_unavailable'
+  } catch {
+    return false
+  }
+}
+
+/**
  * A body whose first markup is a document type: both doctype spellings, plus a
  * bare `<html>` from a proxy that emits none. Deliberately does NOT match every
  * `<`-leading body, so an XML error envelope still reaches the caller whole.

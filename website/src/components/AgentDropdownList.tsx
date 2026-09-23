@@ -2,7 +2,7 @@ import { useRef, useEffect } from 'react'
 import { Trans } from 'react-i18next'
 import { SourceBadge } from './SourceBadge'
 import ErrorNotice from './ErrorNotice'
-import { PanelSectionHeader } from './ui'
+import { Btn, PanelSectionHeader } from './ui'
 import CrewAvatar from './CrewAvatar'
 import { Star, Check, Users } from 'lucide-react'
 
@@ -182,13 +182,18 @@ export function ManageAgentsFooter({ onManage, error }: { onManage: () => void; 
  *  it, a same-name member and template light up separately; without it (a
  *  slot restored from history, an older gateway) the match falls back to the
  *  name alone rather than guessing a namespace the backend never recorded. */
-export default function AgentDropdownList({ agents, activeAgent, activeKind, defaultAgent, onSelect, filter }: {
+export default function AgentDropdownList({ agents, activeAgent, activeKind, defaultAgent, onSelect, filter, loadFailed = false, onRetry, retrying = false }: {
   agents: AgentItem[]
   activeAgent: string
   activeKind?: AgentItemKind | ''
   defaultAgent: string
   onSelect: (name: string, kind?: AgentItemKind) => void
   filter?: string
+  /** The catalog request failed and this list is empty because of that, not
+   *  because the filter matched nothing. */
+  loadFailed?: boolean
+  onRetry?: () => void
+  retrying?: boolean
 }) {
   const activeRef = useRef<HTMLButtonElement>(null)
   useEffect(() => {
@@ -196,6 +201,31 @@ export default function AgentDropdownList({ agents, activeAgent, activeKind, def
   }, [])
 
   if (agents.length === 0) {
+    if (loadFailed) {
+      return (
+        <div className="px-3 py-2 flex items-center justify-between gap-2">
+          <ErrorNotice
+            variant="inline"
+            askAgent
+            testId="agent-dropdown-load-error"
+            message={i18nT('components.agentSelector.roster_load_failed')}
+          />
+          {onRetry && (
+            <Btn
+              type="button"
+              onClick={onRetry}
+              disabled={retrying}
+              aria-busy={retrying}
+              className="text-[12px] px-2 py-1 shrink-0"
+            >
+              {retrying
+                ? i18nT('components.agentSelector.retrying')
+                : i18nT('components.agentSelector.retry')}
+            </Btn>
+          )}
+        </div>
+      )
+    }
     return <div className="px-3 py-2 text-[13px] text-muted italic">{i18nT('components.agentDropdownList.no_matches')}</div>
   }
 

@@ -4929,6 +4929,7 @@ class AcpClient:
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
         shared_scratch: Path | None = None,
+        reasoning_effort: str | None = None,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -4943,6 +4944,11 @@ class AcpClient:
         # no filesystem syscall at all.
         self._work_dir_ready = False
         self._model = model or DEFAULT_MODEL
+        # Applied once session/new has advertised the effort option. Empty means
+        # inherit the backend's own level. Kiro still writes effort through its
+        # cli.json overlay; this value is only pushed for harnesses whose effort
+        # travels as a session config option.
+        self._startup_effort = (reasoning_effort or "").strip()
         self._agent = agent
         self._sandbox_mode = sandbox_mode
         self.memory_mode = "persistent"
@@ -7313,6 +7319,31 @@ class AcpClient:
         self._resolved_model_id = self._last_substitution_model or self._model
         logger.info("ACP model: %s", self._model)
 
+    async def _apply_startup_effort(self) -> None:
+        """Write a requested reasoning level once the session exists.
+
+        Pi spells the option ``thought_level`` and spells Crew's ``max`` as
+        ``xhigh``. A refused write propagates: silently keeping the backend
+        default would run the review at a level the settings did not ask for.
+        Backends that do not take effort as a config option (kiro-cli) no-op;
+        their level is a cli.json overlay written before spawn.
+        """
+        level = self._startup_effort
+        if not level:
+            return
+        from kiro_crew.agent_sdk.backends import (
+            ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+            effort_config_option_id,
+            effort_config_option_value,
+        )
+
+        if self.backend not in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION:
+            return
+        await self.set_config_option(
+            effort_config_option_id(self.backend),
+            effort_config_option_value(self.backend, level),
+        )
+
     async def _reseed_after_capture(self) -> None:
         """Re-seed settings.local.json once the backend's model list is known.
 
@@ -9449,6 +9480,11 @@ class AcpClient:
 
         # 5. Set model — override if KiroCrew config specifies non-default.
         await self._apply_startup_model()
+        # Effort rides a session config option on pi (thought_level) and the
+        # other members of ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION. Empty on every
+        # caller that did not ask, so the kiro path does not enter the method.
+        if self._startup_effort:
+            await self._apply_startup_effort()
 
         # 6. Arm permission routing for harnesses whose asking is a session
         #    config option. AFTER the model apply (both write config options, and

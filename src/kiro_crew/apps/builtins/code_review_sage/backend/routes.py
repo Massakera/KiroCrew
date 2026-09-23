@@ -1593,15 +1593,73 @@ def _load_known_models() -> list[str]:
 _KNOWN_MODELS: list[str] = _load_known_models()
 
 
+def _review_backend_is_pi() -> bool:
+    try:
+        return review_pool.configured_review_backend() == "pi"
+    except Exception:
+        return False
+
+
+def _pi_model_token(m: str) -> bool:
+    """A Pi ``provider/model`` id safe to persist and send as a config option.
+
+    Pi's wire ids contain a slash (``factory/claude-opus-5-5``) and may contain
+    a tag colon (``ollama/llama3.2:3b``). The kiro allowlist rejects both.
+    ``..`` and a leading slash are still rejected so the value cannot be a path.
+    """
+    if (
+        not m
+        or len(m) > 128
+        or ".." in m
+        or "/" not in m
+        or m[0] in "/\\"
+        or "\\" in m
+        or any(c.isspace() for c in m)
+    ):
+        return False
+    return all(c.isalnum() or c in "._-/: " for c in m)
+
+
+def _pi_advertised_model_ids() -> list[str]:
+    """Ids the last Pi ``session/new`` advertised. Empty until one has run."""
+    try:
+        from kiro_crew.acp_backends import ACP_BACKEND_PI, model_registry_namespace
+
+        raw = model_registry.advertised_models(model_registry_namespace(ACP_BACKEND_PI))
+    except Exception:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        mid = str(item).strip()
+        if not mid or mid in seen or mid in ("auto", "default") or not _pi_model_token(mid):
+            continue
+        seen.add(mid)
+        out.append(mid)
+    return out
+
+
 def _known_models() -> list[str]:
-    """Back-compat accessor for the known-model allowlist (the constant above)."""
-    return _KNOWN_MODELS
+    """Models the settings dropdown may offer for the review backend in use.
+
+    Kiro keeps the claude_code registry. Pi offers only what Pi advertised.
+    An empty Pi cache is not filled with Kiro models.
+    """
+    if _review_backend_is_pi():
+        return _pi_advertised_model_ids()
+    return list(_KNOWN_MODELS)
 
 
 def _valid_model(m: str) -> bool:
     """A model id is acceptable if it is a safe token (it becomes a cli.json
     overlay key for the worker subprocess) and, when the registry is available,
-    is one it knows."""
+    is one it knows.
+
+    On Pi the token is a ``provider/model`` id from the advertised catalog.
+    The kiro checks stay as they are when the review backend is not Pi.
+    """
+    if _review_backend_is_pi():
+        return _pi_model_token(m) and m in _pi_advertised_model_ids()
     if not m or len(m) > 64 or not all(c.isalnum() or c in "._-" for c in m):
         return False
     known = _KNOWN_MODELS
@@ -1698,14 +1756,18 @@ async def _handle_settings(request: web.Request) -> web.Response:
                     reviewer = review_pool.reviewer_info()
                 except Exception:
                     reviewer = None
-            return {
+            models = _known_models()
+            payload = {
                 "settings": _load_review_section(),
-                "models": _known_models(),
+                "models": models,
                 "efforts": list(review_pool.VALID_EFFORTS),
                 "namespaces": namespaces,
                 "reviewer": reviewer,
                 "max_concurrent_max": review_pool.MAX_CONCURRENT_CEIL,
             }
+            if _review_backend_is_pi() and not models:
+                payload["models_unavailable"] = True
+            return payload
         return web.json_response(await asyncio.to_thread(_build_settings_response))
     # PUT
     try:
