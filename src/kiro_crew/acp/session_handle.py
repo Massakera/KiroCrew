@@ -2294,7 +2294,10 @@ class AcpSessionHandle:
             timeout=timeout,
         )
         outcome = str(resp.get("outcome") or "")
-        if outcome == "injected":
+        # ``startedNewTurn`` has already been accepted as its own turn. Stamp it
+        # the same way as ``injected``: both are delivery, and a sleeping wait
+        # ends by comparing this clock.
+        if outcome in ("injected", "startedNewTurn"):
             self._last_steer_monotonic = time.monotonic()
         return outcome
 

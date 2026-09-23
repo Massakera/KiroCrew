@@ -833,6 +833,10 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
         if mode != "follow_up":
             body["detail"] = detail
         return web.json_response(body)
+    if detail == "started_new_turn":
+        # The harness already opened a turn for this message. Reporting it as
+        # a plain mid-turn inject, or queueing it again, would run it twice.
+        return web.json_response({"id": agent_id, "status": "started_new_turn"})
     return web.json_response({"id": agent_id, "status": "steered"})
 
 

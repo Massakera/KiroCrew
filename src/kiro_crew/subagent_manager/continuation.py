@@ -694,14 +694,18 @@ class ContinuationCoordinator(ManagerComponent):
         # The harness owns the conversation's session record (kiro-cli's
         # transcript, the thread under CODEX_HOME), so a follow-up must resume on
         # the backend the conversation was created on -- never the current default.
-        acp_backend = str(
-            original.acp_backend
-            if original is not None
-            else ((read_state(conv_id) or {}) if _captured_state is ... else _captured_state).get(
-                "acp_backend", ""
-            )
-            or ""
-        )
+        # An empty live field is "the spawn did not pin a harness", not kiro: the
+        # name frozen into state.json when the provider started is what a
+        # default-routed run actually used.
+        from kiro_crew.subagent_backend import resume_backend_name
+
+        live_backend = original.acp_backend if original is not None else ""
+        recorded_backend = ""
+        if not live_backend:
+            recorded = (read_state(conv_id) or {}) if _captured_state is ... else _captured_state
+            if isinstance(recorded, dict):
+                recorded_backend = str(recorded.get("acp_backend") or "")
+        acp_backend = resume_backend_name(live_backend, recorded_backend)
         # A continuation has to run WHERE THE RUN RAN. `spawn` resolves an empty
         # cwd to the pool project before it validates the agent name, so a run
         # spawned against a project-local agent (defined under that project's
@@ -862,12 +866,15 @@ class ContinuationCoordinator(ManagerComponent):
         # ``_session/steer`` is fire-and-forget, so writing it to a harness that
         # does not implement it would report a steer the model never sees. Only an
         # explicit False routes elsewhere: a provider that predates the property
-        # keeps the historical path. Off that path a member of
-        # ``ACP_BACKENDS_STEERING_EXTENSION`` counts only on an ``injected``
-        # outcome; anything else is queued as a follow-up, and the detail says so.
+        # keeps the historical path. Off that path the steering extension (declared
+        # on ``LLMProvider``, H14) counts ``injected`` and ``startedNewTurn`` as
+        # delivered — the latter already opened a turn, so queueing it again would
+        # run the instruction twice. Anything else is a follow-up, and the detail
+        # names the harness that is actually live.
+        detail = ""
         fallback_reason = ""
         if getattr(provider, "supports_steer", True) is False:
-            if getattr(provider, "supports_steering_extension", False) is True:
+            if provider.supports_steering_extension is True:
                 try:
                     outcome = await provider.inject_steering(message)
                 except Exception:
@@ -875,16 +882,23 @@ class ContinuationCoordinator(ManagerComponent):
                         "steer_run %s: _session/steering failed", agent_id, exc_info=True
                     )
                     outcome = "failed"
-                ok = outcome == "injected"
-                fallback_reason = f"_session/steering answered {outcome or 'nothing'}"
+                if outcome == "injected":
+                    ok, detail = True, "ok"
+                elif outcome == "startedNewTurn":
+                    ok, detail = True, "started_new_turn"
+                else:
+                    ok = False
+                    fallback_reason = f"_session/steering answered {outcome or 'nothing'}"
             else:
                 ok = False
-                backend = str(getattr(info, "acp_backend", "") or "") or "kiro"
-                fallback_reason = f"backend {backend} has no mid-turn steer channel"
+                fallback_reason = (
+                    f"backend {self._steer_backend_label(info, provider)} "
+                    "has no mid-turn steer channel"
+                )
             if not ok:
-                queued, detail = await self.follow_up_run_impl(agent_id, message)
+                queued, queued_detail = await self.follow_up_run_impl(agent_id, message)
                 if not queued:
-                    return queued, detail
+                    return queued, queued_detail
                 return True, (
                     f"queued_follow_up: {fallback_reason}; the message will be delivered "
                     "as a continuation after the current turn"
@@ -895,6 +909,7 @@ class ContinuationCoordinator(ManagerComponent):
             except Exception as exc:  # pragma: no cover - provider-specific
                 logger.warning("steer_run %s failed", agent_id, exc_info=True)
                 return False, f"steer failed: {exc}"
+            detail = "ok" if ok else "steer rejected by provider"
         if ok:
             self._record_crew_log_steer(info, "interrupt")
             try:
@@ -907,7 +922,32 @@ class ContinuationCoordinator(ManagerComponent):
                 )
             except Exception:
                 logger.debug("steer_run: SEL audit failed", exc_info=True)
-        return ok, "ok" if ok else "steer rejected by provider"
+        return ok, detail if ok else "steer rejected by provider"
+
+    @staticmethod
+    def _steer_backend_label(info: Any, provider: Any) -> str:
+        """Wire name of the harness a steer fallback should name.
+
+        A per-spawn pin wins. Otherwise the live provider's backend, then the
+        label captured when the session started. An absent pin is not kiro —
+        that guess labelled every inherited Droid run as Kiro.
+        """
+        from kiro_crew.acp.types import PROVIDER_LABEL_BY_BACKEND
+        from kiro_crew.subagent_backend import backend_name, provider_wire_backend
+
+        pinned = str(getattr(info, "acp_backend", "") or "")
+        if pinned:
+            return pinned
+        wire = provider_wire_backend(provider)
+        if wire:
+            return wire
+        label = str(getattr(info, "_session_provider", "") or "")
+        if not label:
+            return "unknown"
+        for backend_id, provider_label in PROVIDER_LABEL_BY_BACKEND.items():
+            if provider_label == label:
+                return backend_name(backend_id)
+        return label
 
     async def follow_up_run_impl(self, agent_id: str, message: str) -> tuple[bool, str]:
         """Queue *message* for delivery AFTER run *agent_id*'s turn completes.

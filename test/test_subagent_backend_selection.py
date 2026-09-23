@@ -400,8 +400,79 @@ class TestRunPath:
         shared.assert_awaited()
         assert "acp_backend_override" not in captured
 
+    def test_a_default_routed_run_freezes_the_backend_the_provider_started(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew import subagent_persistence as sp
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+        from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        sessions = MagicMock()
+        sessions.get_pid = MagicMock(return_value=None)
+        sessions.get_approval_policy = MagicMock(return_value="")
+        sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
+        ctx_builder = MagicMock()
+        ctx_builder.build_message = MagicMock(return_value=("msg", None))
+        ctx_builder.hooks.auto_approve_subagent_tools = False
+        captured: dict = {}
+        client = MagicMock()
+        client.backend = "codex"
+
+        async def fake_get_or_create(key, agent=None, approval_policy="", **kwargs):
+            captured.update(kwargs)
+            return client, True, False
+
+        async def fake_stream(msg):
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        sessions.get_or_create = fake_get_or_create
+        client.stream = fake_stream
+        runner = SubagentManager(sessions=sessions, ctx_builder=ctx_builder)
+        shared = AsyncMock(return_value=client)
+        info = SubagentInfo(
+            execution_context=execution_for_store(""),
+            id="sub-default",
+            task="test",
+            parent_session_key="parent-key",
+            acp_backend="",
+        )
+        runner._log_spawned(info)
+        cfg = KiroCrewConfig()
+        with (
+            patch.object(runner, "_create_shared_session", shared),
+            patch.object(runner, "_should_use_session_sharing", return_value=True),
+            patch("kiro_crew.config.loader.KiroCrewConfig.load", classmethod(lambda c: cfg)),
+        ):
+            asyncio.run(runner._run_inner(info, "subagent:sub-default"))
+        # The first start still took the default path (shared runtime, no override).
+        shared.assert_awaited()
+        assert "acp_backend_override" not in captured
+        # What that provider actually served is now frozen for retry and resume.
+        assert info.acp_backend == "codex"
+        assert sp.read_state("sub-default")["acp_backend"] == "codex"
+
 
 # ── persistence, meta ──
+
+
+class TestEffectiveBackend:
+    def test_the_wire_name_comes_from_the_live_provider(self):
+        assert sb.provider_wire_backend(SimpleNamespace(backend="codex")) == "codex"
+        assert sb.provider_wire_backend(SimpleNamespace(backend="")) == "kiro"
+        assert (
+            sb.provider_wire_backend(SimpleNamespace(client=SimpleNamespace(backend="droid")))
+            == "droid"
+        )
+        assert sb.provider_wire_backend(SimpleNamespace(backend="not-a-harness")) == ""
+        assert sb.provider_wire_backend(MagicMock()) == ""
+
+    def test_an_empty_live_pin_resumes_the_recorded_backend(self):
+        assert sb.resume_backend_name("", "codex") == "codex"
+        assert sb.resume_backend_name("kiro", "codex") == "kiro"
+        assert sb.resume_backend_name("", "") == ""
 
 
 class TestPersistence:
@@ -618,25 +689,26 @@ class TestFailOver:
 
     def _manager(self):
         manager = MagicMock()
-        manager.spawn.return_value = SimpleNamespace(id="r9", error="")
+        manager.spawn_async = AsyncMock(return_value=SimpleNamespace(id="r9", error=""))
         return manager
 
     def test_a_rate_limited_run_is_re_dispatched_on_the_next_backend(self):
         manager, info = self._manager(), _failed()
         assert asyncio.run(sb.fail_over(manager, info)) == "r9"
-        args, kwargs = manager.spawn.call_args
+        args, kwargs = manager.spawn_async.call_args
         assert args == ("raw t",)
         assert kwargs["acp_backend"] == "kiro"
         assert kwargs["include_lessons"] is False
         assert "batch_id" not in kwargs and "keep" not in kwargs
         assert "subagent `r9`" in info.error and "backend 'kiro'" in info.error
         assert sb.in_cooldown("codex")
+        manager.spawn.assert_not_called()
 
     def test_it_is_decided_once(self):
         manager, info = self._manager(), _failed()
         asyncio.run(sb.fail_over(manager, info))
         assert asyncio.run(sb.fail_over(manager, info)) is None
-        assert manager.spawn.call_count == 1
+        assert manager.spawn_async.call_count == 1
 
     @pytest.mark.parametrize(
         "field,value",
@@ -654,14 +726,14 @@ class TestFailOver:
         manager, info = self._manager(), _failed(**{field: value})
         before = info.error
         assert asyncio.run(sb.fail_over(manager, info)) is None
-        manager.spawn.assert_not_called()
+        manager.spawn_async.assert_not_called()
         assert info.error == before
 
     def test_no_chain_no_failover(self, _chain):
         _chain.agent.subagent_backend_fallback = []
         manager = self._manager()
         assert asyncio.run(sb.fail_over(manager, _failed())) is None
-        manager.spawn.assert_not_called()
+        manager.spawn_async.assert_not_called()
 
     def test_every_fallback_cooling_down_reports_the_failure(self):
         sb.cool_down("kiro", "usage limit")
@@ -671,9 +743,16 @@ class TestFailOver:
 
     def test_a_refused_replacement_leaves_the_error_alone(self):
         manager, info = self._manager(), _failed()
-        manager.spawn.return_value = SimpleNamespace(id="r9", error="capacity")
+        manager.spawn_async = AsyncMock(return_value=SimpleNamespace(id="r9", error="capacity"))
         assert asyncio.run(sb.fail_over(manager, info)) is None
         assert "failed over" not in info.error
+
+    def test_a_frozen_backend_cools_down_even_after_the_default_changes(self, _chain):
+        _chain.agent.acp_backend = ""
+        manager, info = self._manager(), _failed(acp_backend="codex")
+        assert asyncio.run(sb.fail_over(manager, info)) == "r9"
+        assert sb.in_cooldown("codex")
+        assert not sb.in_cooldown("kiro")
 
 
 # ── a real manager: failover and the per-backend cap ──

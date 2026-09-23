@@ -262,10 +262,10 @@ ACP_BACKEND_DEEPSEEK = "deepseek"
 # Factory Droid: a single binary whose headless mode serves ACP itself
 # (``droid exec --output-format acp``, the launch Zed and JetBrains use). No npm
 # adapter and no Node floor, so it takes the self-served launch row. Onboarded
-# DORMANT: only its handshake and ``session/new`` are captured so far, so every
-# capability decision below is the conservative one and it is not in the selectable
-# baseline. An operator may opt into it explicitly -- see
-# :data:`EXPERIMENTAL_OPT_IN_ENV`.
+# DORMANT: handshake, ``session/load``, steer refusal and ``/compact``-as-prompt
+# are captured, but a live write that raises ``session/request_permission`` is
+# still synthesized, so it stays out of the selectable baseline. An operator may
+# opt into it explicitly -- see :data:`EXPERIMENTAL_OPT_IN_ENV`.
 ACP_BACKEND_DROID = "droid"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".

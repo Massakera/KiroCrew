@@ -52,6 +52,33 @@ def backend_name(backend: str) -> str:
     return str(POLICY_ID_BY_BACKEND.get(backend, backend))
 
 
+def provider_wire_backend(provider: object) -> str:
+    """Wire name of the harness *provider* is actually serving, or ``""``.
+
+    Reads the backend id the live client reports (``""`` is kiro) and refuses
+    anything this build does not know, so a test double's auto-created attribute
+    cannot be persisted as a harness. A dedicated ``AcpProvider`` answers through
+    its client; a shared-session provider answers through its own ``backend``.
+    """
+    backend = getattr(provider, "backend", None)
+    if not isinstance(backend, str):
+        inner = getattr(provider, "client", None)
+        backend = getattr(inner, "backend", None) if inner is not None else None
+    if not isinstance(backend, str) or backend not in ACP_BACKENDS_KNOWN:
+        return ""
+    return backend_name(backend)
+
+
+def resume_backend_name(live: str, recorded: str) -> str:
+    """Wire name a continuation must resume on.
+
+    A live per-spawn pin wins. Empty is "the spawn did not pin a harness", not
+    kiro: the name frozen into ``state.json`` when the run started is the
+    harness a default-routed conversation actually belongs to.
+    """
+    return (live or recorded or "").strip()
+
+
 def backend_from_name(name: str) -> str | None:
     """The internal backend id for a wire name, or None when no build spells it."""
     backend = _BACKEND_BY_NAME.get(name.strip().lower())
@@ -280,7 +307,11 @@ async def fail_over(manager: Any, info: Any) -> str | None:
         )
         return None
     execution = getattr(info, "execution_context", None)
-    replacement = manager.spawn(
+    # ``spawn_async`` keeps the durable queue's accept/claim off this loop.
+    # The sync ``spawn`` path does those SQLite writes inline, and a busy
+    # store holds the gateway — chats and heartbeats included — for the
+    # whole busy timeout, which is exactly when a failover is recovering.
+    replacement = await manager.spawn_async(
         getattr(info, "_raw_task", "") or info.task,
         parent_session_key=info.parent_session_key,
         agent=info.agent,
