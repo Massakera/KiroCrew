@@ -656,7 +656,6 @@ test/test_lesson_contradiction.py
 test/test_lesson_ranking.py
 test/test_lifecycle_hooks.py
 test/test_link_dashboard.py
-test/test_llm_pool.py
 test/test_local_gate.py
 test/test_loopback_proxy.py
 test/test_manifest_hooks.py

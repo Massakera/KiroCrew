@@ -137,12 +137,51 @@ from kiro_crew.publish_governance import DEPLOY_WEB_PROVIDER_ID, publish_denied_
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
+    scrub_env,
     wrap_argv,
     wrap_argv_async,
 )
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
+
+#: Variables an ``openCommand`` launcher needs in order to reach the running
+#: desktop session, copied through on top of the :func:`minimal_env` allowlist
+#: (which has none of them). Every name here is a LOCATION HINT -- a display
+#: number, an X authority file path, a bus address, a session flavour -- so
+#: copying them widens what the child can FIND, never what it can
+#: authenticate as. Enumerated rather than pattern-matched: a prefix rule over
+#: the parent environment is how a credential reaches an app-authored shell by
+#: accident. ``XDG_RUNTIME_DIR`` is absent because the allowlist already
+#: carries it.
+#:
+#: ``DBUS_SESSION_BUS_ADDRESS`` belongs here, and withholding it would buy
+#: nothing. Three things decide that.
+#:
+#: The sandbox owns it, not this list. ``sandbox._CGROUP_SCOPE_BUS_ENV_KEYS``
+#: pairs it with ``XDG_RUNTIME_DIR`` as the ``systemd-run --user`` wrapper's
+#: OWN dependency: the cgroup ceiling needs the caller's session bus to place
+#: the child in a scope, so both are restored after the credential scrub and
+#: then dropped again INSIDE the scope with an ``env -u`` shim. A sandboxed
+#: child therefore never keeps either one, whatever this list says.
+#:
+#: Dropping the address closes no door anyway. libdbus falls back to
+#: ``$XDG_RUNTIME_DIR/bus``, and ``XDG_RUNTIME_DIR`` is in ``minimal_env``'s
+#: allowlist because it is also where the Wayland socket lives -- so removing
+#: it to close the fallback would break every Wayland launch, which is the
+#: legitimate use this endpoint exists for.
+#:
+#: What is left reaches only the operator's opt-in unconfined mode, where the
+#: same shell can already run any program it likes. Withholding a bus address
+#: from a process that can spawn anything is not a control.
+_OPEN_COMMAND_DESKTOP_ENV_KEYS = (
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1928,10 +1967,35 @@ async def handle_open_app(request: web.Request) -> web.Response:
             base_cmd, mode="standard", _prepare=wrap_argv
         )
         sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
+        # The manifest's own shell string runs here, and an installed app is
+        # untrusted content, so this child gets the same ALLOWLIST the install
+        # and build commands from that same manifest get. An allowlist rather
+        # than a denied-key scrub because the set to withhold is open-ended: the
+        # gateway's own model credential is not a channel token and is not named
+        # by any scrub list, so a subtract-the-known-bad environment handed it
+        # straight to the app.
+        #
+        # The allowlist alone cannot launch a desktop app -- it carries no
+        # display, authority-file or bus address -- and this endpoint only
+        # reaches the spawn on a host that HAS a display, so the location hints
+        # in ``_OPEN_COMMAND_DESKTOP_ENV_KEYS`` are copied on top, each only
+        # when the parent actually defines it.
+        # The allowlist is shared with the install and build commands, which run
+        # git against the owner's own repositories, so it carries the SSH agent
+        # socket. A launcher does not need it, and an app-authored shell holding
+        # it authenticates as the operator wherever their keys reach. ``scrub_env``
+        # takes it back out, together with the AWS secret/session pair, the GPG
+        # home and the askpass hook.
+        launch_env = scrub_env(minimal_env())
+        for desktop_key in _OPEN_COMMAND_DESKTOP_ENV_KEYS:
+            desktop_value = os.environ.get(desktop_key)
+            if desktop_value is not None:
+                launch_env[desktop_key] = desktop_value
         proc = await create_subprocess_limited(
             *sandboxed_cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=launch_env,
         )
         # Don't wait — launch is fire-and-forget
         sel().log_api_access(
