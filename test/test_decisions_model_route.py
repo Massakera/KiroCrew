@@ -177,6 +177,17 @@ class TestTheQuestion:
         for forbidden in ("claude", "haiku", "opus", "cheap", "expensive", "cost", "$"):
             assert forbidden not in prose
 
+    def test_the_prompt_states_which_direction_an_error_costs_more(self):
+        """Without it the oracle weighs the two mistakes equally, and a short message
+        naming long work reads as the cheapest tier. It names no model and no price
+        either: the asymmetry is a property of the WORK's outcome."""
+        assert mr.TIER_ASYMMETRY in mr.questions()[0].prompt
+        assert "however short it is" in mr.TIER_ASYMMETRY
+        prose = mr.TIER_ASYMMETRY.lower()
+        for forbidden in ("claude", "haiku", "opus", "sonnet", "gpt", "token", "$"):
+            assert forbidden not in prose
+        assert not any(ch.isdigit() for ch in prose)
+
     def test_the_message_excerpt_is_bounded_like_skills_select(self):
         """The same text answering a question about the same turn, so two different
         excerpt sizes would mean the consent text describes one of them."""
@@ -554,3 +565,120 @@ class TestTheOutcome:
         serialized = json.dumps(log_home()).lower()
         for forbidden in ("message", 'history"', "scheduler"):
             assert forbidden not in serialized
+
+
+# ---------------------------------------------------------------------------
+# The two window rules
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def registry_windows(monkeypatch):
+    """Pin what the registry KNOWS, as a ``{model id: window}`` map.
+
+    An id absent from the map is one the registry has not met: ``has_known_window``
+    is False for it while ``model_window`` still answers its guessed reference,
+    which is the pair :func:`known_window` exists to tell apart.
+    """
+    from kiro_crew import model_registry
+
+    def _set(windows: dict[str, int]) -> None:
+        monkeypatch.setattr(model_registry, "has_known_window", lambda name: name in windows)
+        monkeypatch.setattr(
+            model_registry, "model_window", lambda name, **_kw: windows.get(name, 1_000_000)
+        )
+
+    return _set
+
+
+class TestTheConfidenceRule:
+    def test_a_window_that_does_not_shrink_is_permitted_at_any_probability(self):
+        """The harm is one-directional: room that grows or holds changes nothing
+        about what fits, so the probability is not asked to carry the move."""
+        assert mr.permits_smaller_window(0.0, current=200_000, target=1_000_000) is True
+        assert mr.permits_smaller_window(None, current=200_000, target=200_000) is True
+
+    def test_a_smaller_window_needs_the_floor_and_the_bound_is_inclusive(self):
+        """Both sides of the constant, so a value that stops sitting in the gap the
+        reading found is a failing test rather than a silent widening."""
+        assert 0.75 <= mr.MIN_DOWNGRADE_P <= 0.85
+        floor = mr.MIN_DOWNGRADE_P
+        assert mr.permits_smaller_window(floor, current=1_000_000, target=200_000) is True
+        assert mr.permits_smaller_window(floor - 1e-9, current=1_000_000, target=200_000) is False
+        # A row with no number carries nothing, and ``True`` is an int in Python:
+        # without the type check a producer bug would read as maximum confidence.
+        assert mr.permits_smaller_window(None, current=1_000_000, target=200_000) is False
+        assert mr.permits_smaller_window(True, current=1_000_000, target=200_000) is False
+
+    def test_an_unknown_window_on_either_side_refuses_nothing(self, registry_windows):
+        """``model_window`` answers a guessed reference for an id it has never met.
+        Vetoing on a guess would pin routing to whatever model a session happens to
+        be on for every model nothing is known about."""
+        registry_windows({"small": 200_000})
+        assert mr.is_smaller_window(current=1_000_000, target=200_000) is True
+        assert mr.is_smaller_window(current=None, target=200_000) is False
+        assert mr.is_smaller_window(current=1_000_000, target=None) is False
+        assert mr.known_window("small") == 200_000
+        assert mr.known_window("a-model-nobody-listed") is None
+        assert mr.known_window("") is None
+        assert mr.permits_smaller_window(0.1, current=None, target=200_000) is True
+        assert mr.permits_smaller_window(0.1, current=1_000_000, target=None) is True
+
+    def test_the_floor_is_a_constant_and_not_a_config_knob(self):
+        """It is the meaning of the answer rather than a setting: a configurable
+        floor is a second, undocumented way to turn the rule into a no-op."""
+        names = [n for n in dir(DecisionsConfig()) if not n.startswith("__")]
+        assert not [n for n in names if "threshold" in n or "downgrade" in n]
+
+
+class TestTheWindowLookupSpelling:
+    def test_a_pin_the_owner_cased_differently_is_still_sized(self):
+        """The registry's own lookup is spelling-sensitive while a pin is accepted on a
+        lossless fold, so an id the owner wrote differently must not read as a window
+        nothing knows -- that answer refuses nothing, and the pin would carry the
+        shrink. The registry PAIR is used rather than a placeholder, because a fake id
+        has no entry and would exercise nothing."""
+        plain = mr.known_window("claude-haiku-4.5")
+        assert plain, "the registry pair under test must be listed"
+        assert mr.known_window("Claude-Haiku-4.5") == plain
+        assert mr.known_window("  CLAUDE-HAIKU-4.5  ") == plain
+        # The dotted and dashed entries stay DISTINCT: two entries, two windows, so
+        # folding them together here would size a pin against the wrong one.
+        assert mr.known_window("claude-haiku-4-5") != plain
+
+
+class TestTheMessageInTheFitReading:
+    def test_the_estimate_is_the_shared_divisor_and_an_empty_message_adds_nothing(self):
+        """The same rough divisor the sibling points estimate with, so a reader does
+        not have to learn a second one. Over-estimating costs one downgrade."""
+        from kiro_crew.decisions.points import skills_select as sel
+
+        assert mr.CHARS_PER_TOKEN == sel.CHARS_PER_TOKEN == 4
+        assert mr.prompt_tokens("x" * 400) == 100
+        assert mr.prompt_tokens("") == 0
+
+
+class TestWhereARefusedDowngradeLands:
+    def test_it_lands_on_the_medium_pin(self, registry_windows):
+        registry_windows({"model-b": 1_000_000})
+        landing = mr.downgrade_landing(
+            TIER_MAP, ["model-a", "model-b"], current_window=1_000_000, baseline="model-z"
+        )
+        assert landing == "model-b"
+
+    def test_a_medium_that_cannot_be_taken_falls_to_the_baseline(self, registry_windows):
+        """Pinned to the refused window, or unpinned. The baseline's own window is
+        not read: it is the model the turn would have used with routing off, so
+        keeping room the owner's own choice does not have is not this point's call."""
+        registry_windows({"model-b": 200_000, "model-z": 100_000})
+        assert (
+            mr.downgrade_landing(
+                TIER_MAP, ["model-b"], current_window=1_000_000, baseline="model-z"
+            )
+            == "model-z"
+        )
+        assert (
+            mr.downgrade_landing({"medium": ""}, [], current_window=1_000_000, baseline="model-z")
+            == "model-z"
+        )
+        assert mr.downgrade_landing({"medium": ""}, [], current_window=1_000_000, baseline="") == ""
