@@ -31,6 +31,7 @@ from kiro_crew.config.loader import (
     _resolve_stub_roster,
 )
 from kiro_crew.config.paths import data_home, kiro_agents_dir
+from kiro_crew.dashboard.chat_utils import run_to_completion
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.env import emit_env
@@ -3085,7 +3086,11 @@ async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
     denied = await require_owner_dashboard_request(request, "mcp_gateway_enable")
     if denied is not None:
         return denied
-    from kiro_crew.config.loader import config_path  # circular import
+    from kiro_crew.config.loader import (  # circular import
+        ConfigReadError,
+        config_path,
+        update_config_locked,
+    )
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # circular import
 
     body, body_err = await read_bounded_json(request)
@@ -3115,65 +3120,89 @@ async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
     if apply is None:
         return web.json_response({"error": "gateway apply unavailable"}, status=503)
 
-    # Serialize the whole persist+apply under the apply lock so two racing
-    # toggles cannot interleave (write A, write B, apply B, apply A) and leave
-    # persisted config.json diverged from live broker state. The config lock is
-    # nested inside only for the read-modify-write of config.json itself.
-    async with _MCP_GATEWAY_APPLY_LOCK:
-        async with _get_config_lock():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-            except (OSError, json.JSONDecodeError):
-                return web.json_response({"error": "config.json is corrupt"}, status=500)
-            section = data.setdefault("mcp_gateway", {})
-            if not isinstance(section, dict):
-                return web.json_response({"error": "mcp_gateway is not an object"}, status=500)
-            # Freeze the alias BEFORE reassigning `enabled` — the resolver reads
-            # `enabled`, so doing this afterwards would resolve against the new
-            # value and bake in the stub set this call must not change.
-            overlay = _local_overlay_section()
-            shadowed = _overlay_shadowed_keys(overlay, ("enabled",))
-            if shadowed:
-                return web.json_response(
-                    {
-                        "error": (
-                            "config.local.json defines "
-                            f"mcp_gateway.{', mcp_gateway.'.join(shadowed)}, which "
-                            "overrides config.json. Edit that file instead — writing "
-                            "here would not change anything the gateway reads."
-                        ),
-                        "code": "overlay_owns_enabled",
-                    },
-                    status=409,
-                )
-            _freeze_stub_servers(section, overlay)
-            section["enabled"] = enabled
-            path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_json_write(path, data)
-        try:
-            result = await apply(enabled)
-        except Exception as exc:
-            sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="mcp_gateway_enable",
-                outcome="error",
-                source="dashboard",
-                resources=f"enabled={enabled} error={exc}",
-            )
-            # The exception detail is in the SEL log above; the client body
-            # (rendered verbatim into a localized UI) gets a generic message.
-            return web.json_response(
-                {"error": "apply failed", "code": "mcp_apply_failed"}, status=500
-            )
+    async def _persist_and_apply() -> web.Response:
+        # Serialize the whole persist+apply under the apply lock so two racing
+        # toggles cannot interleave (write A, write B, apply B, apply A) and leave
+        # persisted config.json diverged from live broker state. The config lock is
+        # nested inside only for the read-modify-write of config.json itself.
+        async with _MCP_GATEWAY_APPLY_LOCK:
+            async with _get_config_lock():
+                # The overlay is user-owned and read-only here; its verdict does not
+                # depend on config.json, so it is taken before the locked write.
+                overlay = await asyncio.to_thread(_local_overlay_section)
+                shadowed = _overlay_shadowed_keys(overlay, ("enabled",))
+                if shadowed:
+                    return web.json_response(
+                        {
+                            "error": (
+                                "config.local.json defines "
+                                f"mcp_gateway.{', mcp_gateway.'.join(shadowed)}, which "
+                                "overrides config.json. Edit that file instead — writing "
+                                "here would not change anything the gateway reads."
+                            ),
+                            "code": "overlay_owns_enabled",
+                        },
+                        status=409,
+                    )
 
-    sel().log_api_access(
-        caller=request.get("user", "dashboard"),
-        operation="mcp_gateway_enable",
-        outcome="ok",
-        source="dashboard",
-        resources=f"enabled={enabled}",
-    )
-    return web.json_response({"ok": True, **result})
+                section_not_object = False
+
+                def _set_enabled(fresh: dict) -> dict | None:
+                    nonlocal section_not_object
+                    section = fresh.setdefault("mcp_gateway", {})
+                    if not isinstance(section, dict):
+                        # ``None`` skips the write; the 500 is answered outside.
+                        section_not_object = True
+                        return None
+                    # Freeze the alias BEFORE reassigning `enabled` — the resolver
+                    # reads `enabled`, so doing this afterwards would resolve against
+                    # the new value and bake in the stub set this call must not change.
+                    _freeze_stub_servers(section, overlay)
+                    section["enabled"] = enabled
+                    return fresh
+
+                # Through ``update_config_locked``: it holds the advisory lock on the
+                # sidecar ``<path>.lock`` across the whole read-modify-write, so a
+                # writer in ANOTHER PROCESS cannot land between the read and the
+                # write, and the mutation is applied to the file as read under that
+                # lock. Off-loop and drained: file IO that may wait on another holder,
+                # and a cancelled request must not unwind past the apply below while
+                # the thread is still persisting ``enabled``.
+                try:
+                    await _offload_config_write(update_config_locked, path, mutate=_set_enabled)
+                except ConfigReadError:
+                    return web.json_response({"error": "config.json is corrupt"}, status=500)
+                if section_not_object:
+                    return web.json_response({"error": "mcp_gateway is not an object"}, status=500)
+            try:
+                result = await apply(enabled)
+            except Exception as exc:
+                sel().log_api_access(
+                    caller=request.get("user", "dashboard"),
+                    operation="mcp_gateway_enable",
+                    outcome="error",
+                    source="dashboard",
+                    resources=f"enabled={enabled} error={exc}",
+                )
+                # The exception detail is in the SEL log above; the client body
+                # (rendered verbatim into a localized UI) gets a generic message.
+                return web.json_response(
+                    {"error": "apply failed", "code": "mcp_apply_failed"}, status=500
+                )
+
+        sel().log_api_access(
+            caller=request.get("user", "dashboard"),
+            operation="mcp_gateway_enable",
+            outcome="ok",
+            source="dashboard",
+            resources=f"enabled={enabled}",
+        )
+        return web.json_response({"ok": True, **result})
+
+    # Persist + apply is one transaction: a cancelled request (client gone,
+    # gateway shutting down) must not persist ``enabled`` and then skip the
+    # live apply, leaving config.json and the broker disagreeing.
+    return await run_to_completion(_persist_and_apply())
 
 
 # ─── Per-server poolability management ──────────────────────────────────

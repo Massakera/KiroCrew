@@ -1557,23 +1557,21 @@ def update_config_locked(
     a stale snapshot saved after a locked update overwrites it with older
     values.  The lock fixes interleaving, not staleness.
 
-    A SECOND family of writers still bypasses this lock: writers that reach
-    ``config_path()`` through ``kiro_crew.agent._atomic_json_write``
-    (``messaging.py``'s per-channel savers, ``core.py``'s STT PUT, ``mcp.py``'s
-    gateway-enable). ``TestEveryConfigWriterIsLocked`` does not reach them --
-    it matches calls to :func:`write_config_atomically`, and these make none --
-    so they have their own ratchet,
-    ``TestTheAtomicJsonWriteConfigFamilyIsRatcheted`` in the same file, which
-    pins that family to a baseline that may only SHRINK.
+    A SECOND way to bypass this lock is to reach ``config_path()`` through
+    ``kiro_crew.agent._atomic_json_write``, which takes no sidecar lock at all.
+    ``TestEveryConfigWriterIsLocked`` does not see such a writer -- it matches
+    calls to :func:`write_config_atomically`, and that one makes none -- so
+    ``TestTheAtomicJsonWriteConfigFamilyIsRatcheted`` in the same file scans for
+    that spelling separately and pins its population to an EMPTY baseline: the
+    dashboard's per-channel savers (``messaging._LockedSectionWrite``), the STT
+    PUT and the MCP gateway-enable toggle all come through here.
 
-    That family relies on the in-process asyncio ``_get_config_lock()`` only,
-    which serializes same-loop callers and nothing else, so it can still
-    interleave with a holder of this lock.  Converting the remaining members is
-    follow-up work (``api_feishu_config_save`` and ``api_imessage_config_save``
-    are already through here and are the shape to copy); do not read either
-    ratchet's green as meaning the family is converted, only that it cannot
-    grow, and note that an ALIASED import of :func:`write_config_atomically`
-    would evade the sibling ratchet for the same matching reason.
+    Such a writer would rely on the in-process asyncio ``_get_config_lock()``
+    only, which serializes same-loop callers and nothing else, so it could still
+    interleave with a holder of this lock; ``api_feishu_config_save`` is the
+    shape to copy for a new handler.  Note that an ALIASED import of
+    :func:`write_config_atomically` would evade the sibling ratchet for the same
+    matching reason.
 
     Contract:
 

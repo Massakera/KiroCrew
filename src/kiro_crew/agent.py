@@ -232,9 +232,12 @@ def _atomic_json_write(path: Path, data: dict) -> None:
 def _notify_if_config_write(path: Path) -> None:
     """Drop the loader cache and wake the config watcher when *path* is ``config.json``.
 
-    This writer bypasses the loader's own writers (the per-channel savers and
-    the STT PUT reach ``config_path()`` through here), so without this hook a
-    write from them would be the one path a running gateway never hot-applies.
+    This writer bypasses the loader's own writers, so a ``config.json`` write
+    through it would otherwise be the one path a running gateway never
+    hot-applies. No dashboard handler takes that path -- the per-channel savers,
+    the STT PUT and the MCP gateway toggle go through ``update_config_locked``,
+    and ``TestTheAtomicJsonWriteConfigFamilyIsRatcheted`` holds that population
+    at zero -- so this is the safety net for a writer the ratchet does not see.
     Any other target (an agent spec) is untouched. Best-effort: a resolution
     error must not fail the write that already landed.
     """
