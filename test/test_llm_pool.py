@@ -9,7 +9,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO, ACP_BACKEND_PI
+from kiro_crew.acp_backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_PI,
+)
 from kiro_crew.knowledge.llm_pool import (
     DEFAULT_IDLE_TTL_SECS,
     WORKER_RECYCLE_CALLS,
@@ -548,6 +554,73 @@ class TestReadConfig:
             worker = AcpWorker(acp_backend=ACP_BACKEND_PI)
             await worker.start()
         assert mk.call_args.kwargs["acp_backend"] == ACP_BACKEND_PI
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_KAS, ACP_BACKEND_CODEX])
+    async def test_runtime_backend_starts_on_acp_runtime_not_acp_client(
+        self, tmp_path, backend
+    ):
+        """KAS and codex have no AcpClient spawn arm; the label must not hide kiro-cli."""
+        runtime = MagicMock()
+        runtime.spawn = AsyncMock()
+        runtime.create_session = AsyncMock(return_value=object())
+        runtime.kill = AsyncMock()
+
+        class _RuntimeProvider:
+            """No ``send_message``: a MagicMock would invent one and skip the stream."""
+
+            def __init__(self) -> None:
+                self.backend = backend
+                self._pid = 4242
+
+            def is_process_alive(self) -> bool:
+                return True
+
+            async def stream(self, message: str):
+                assert message == "ping"
+                yield MagicMock(kind="text_chunk", text="ab")
+                yield MagicMock(kind="tool_call", text="ignored")
+                yield MagicMock(kind="text_chunk", text="c")
+
+        provider = _RuntimeProvider()
+        registered: list[int] = []
+        runtime_cls = "kiro_crew.acp.runtime.AcpRuntime"
+        provider_cls = "kiro_crew.acp.session_provider.AcpSessionProvider"
+        shield = "kiro_crew.knowledge.llm_pool.register_protected_pid"
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch(runtime_cls, return_value=runtime) as rt, \
+             patch(provider_cls, return_value=provider), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient") as client, \
+             patch(shield, side_effect=registered.append):
+            worker = AcpWorker(acp_backend=backend)
+            await worker.start()
+            text = await worker.send_message("ping", timeout=5)
+        client.assert_not_called()
+        assert rt.call_args.kwargs["acp_backend"] == backend
+        assert rt.call_args.kwargs["agent"] == "kirocrew-knowledge"
+        runtime.spawn.assert_awaited_once()
+        runtime.create_session.assert_awaited_once()
+        assert runtime.create_session.await_args.kwargs["agent"] == "kirocrew-knowledge"
+        runtime.kill.assert_not_awaited()
+        assert text == "abc"
+        assert registered == [4242]
+
+    @pytest.mark.asyncio
+    async def test_failed_runtime_session_kills_the_process_it_spawned(self, tmp_path):
+        runtime = MagicMock()
+        runtime.spawn = AsyncMock()
+        runtime.create_session = AsyncMock(side_effect=RuntimeError("session refused"))
+        runtime.kill = AsyncMock()
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.acp.runtime.AcpRuntime", return_value=runtime), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient") as client:
+            worker = AcpWorker(acp_backend=ACP_BACKEND_KAS)
+            with pytest.raises(RuntimeError, match="session refused"):
+                await worker.start()
+        client.assert_not_called()
+        runtime.spawn.assert_awaited_once()
+        runtime.kill.assert_awaited_once()
+        assert runtime.kill.await_args.kwargs["expected"] is True
 
 
 # ---------------------------------------------------------------------------

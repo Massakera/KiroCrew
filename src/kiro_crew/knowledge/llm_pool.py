@@ -18,6 +18,7 @@ from typing import Optional
 from kiro_crew import platform_compat
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_ACP_RUNTIME,
     effort_config_option_id,
     effort_config_option_value,
     resolve_selected_backend,
@@ -185,6 +186,37 @@ def _get_acp_backend(config: Optional[dict] = None) -> str:
     return resolve_selected_backend(raw)
 
 
+def _served_by_acp_runtime(backend: str) -> bool:
+    """True when this id must be started on ``AcpRuntime``, not ``AcpClient``.
+
+    ``ACP_BACKENDS_ACP_RUNTIME`` is the transport chat uses. kiro is a member
+    and is also ``AcpClient``'s default spawn, so the knowledge pool keeps
+    driving it with ``AcpClient``. Every other member (KAS, codex) has no arm
+    in ``AcpClient._spawn``: passing the id there launches kiro-cli while
+    ``client.backend`` still reports the configured harness (harness-parity
+    H8). A later member of the runtime set takes this path too; kiro is the
+    one member ``AcpClient`` already launches, so it stays on that client.
+    """
+    if backend == ACP_BACKEND_KIRO:
+        return False
+    return backend in ACP_BACKENDS_ACP_RUNTIME
+
+
+def _client_is_ready(client: object) -> bool:
+    """Whether *client* can take a prompt.
+
+    ``AcpClient.is_ready`` is a bool. ``AcpSessionProvider`` has no such
+    property; a live runtime process is the same fact for that transport.
+    """
+    ready = getattr(client, "is_ready", None)
+    if isinstance(ready, bool):
+        return ready
+    alive = getattr(client, "is_process_alive", None)
+    if callable(alive):
+        return bool(alive())
+    return False
+
+
 def _get_idle_ttl(config: Optional[dict] = None) -> float:
     """Seconds the pool may sit fully idle before scaling to zero.
 
@@ -300,7 +332,9 @@ class AcpWorker(Worker):
         effort: Optional[str] = None,
         acp_backend: Optional[str] = None,
     ) -> None:
-        self._client: Optional[AcpClient] = None
+        # AcpClient for harnesses it can spawn; AcpSessionProvider when the
+        # configured id is a runtime-only member of ACP_BACKENDS_ACP_RUNTIME.
+        self._client: Optional[object] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
         # ``""`` is a real backend (kiro-cli), so it must not be treated as unset.
@@ -312,8 +346,6 @@ class AcpWorker(Worker):
         self._protected_pid: Optional[int] = None
 
     async def start(self) -> None:
-        if AcpClient is None:
-            raise RuntimeError("AcpClient not available (kiro_crew.acp.client not installed)")
         # Drop any prior client before respawning. send_message re-runs start()
         # when the client is not ready (e.g. a stalled handshake left _session_id
         # None); without this the previous subprocess would be orphaned.
@@ -346,14 +378,21 @@ class AcpWorker(Worker):
             AGENT_NAME,
             acp_backend,
         )
-        self._client = AcpClient(
-            agent=AGENT_NAME,
-            sandbox_mode=sandbox_mode,
-            audit_source="subagent",
-            acp_backend=acp_backend,
-        )
+        if _served_by_acp_runtime(acp_backend):
+            self._client = await self._open_runtime_client(sandbox_mode, acp_backend)
+        else:
+            if AcpClient is None:
+                raise RuntimeError(
+                    "AcpClient not available (kiro_crew.acp.client not installed)"
+                )
+            self._client = AcpClient(
+                agent=AGENT_NAME,
+                sandbox_mode=sandbox_mode,
+                audit_source="subagent",
+                acp_backend=acp_backend,
+            )
+            await self._client.ensure_ready()
         self._effective_effort = None
-        await self._client.ensure_ready()
         await self._apply_effort()
         # Shield the live worker PID from the periodic orphan sweep for as long
         # as it runs. Paired with unregister in shutdown() and on respawn above.
@@ -364,6 +403,39 @@ class AcpWorker(Worker):
         else:
             self._protected_pid = None
         logger.info("AcpWorker: ready (agent=%s, pid=%s)", AGENT_NAME, getattr(self._client, '_pid', 'unknown'))
+
+    async def _open_runtime_client(self, sandbox_mode: str, acp_backend: str) -> object:
+        """Start KAS or codex on ``AcpRuntime``, the transport chat uses.
+
+        ``AcpClient._spawn`` has no arm for these ids and would fall through to
+        kiro-cli under their label. The session provider owns the runtime, so
+        ``shutdown`` kills the process the sweep shield is watching. A session
+        that fails to open kills that process before the error propagates —
+        nothing else holds it yet.
+        """
+        from kiro_crew.acp.runtime import AcpRuntime
+        from kiro_crew.acp.session_provider import AcpSessionProvider
+
+        runtime = AcpRuntime(
+            agent=AGENT_NAME,
+            sandbox_mode=sandbox_mode,
+            acp_backend=acp_backend,
+        )
+        await runtime.spawn()
+        try:
+            handle = await runtime.create_session(agent=AGENT_NAME)
+        except BaseException:
+            try:
+                await runtime.kill(
+                    expected=True, reason="knowledge worker session start failed"
+                )
+            except Exception:
+                logger.debug(
+                    "AcpWorker: runtime cleanup after failed start failed",
+                    exc_info=True,
+                )
+            raise
+        return AcpSessionProvider(handle, runtime, owns_runtime=True)
 
     async def _apply_effort(self) -> None:
         """Apply the requested effort without breaking provider-default fallback.
@@ -436,10 +508,35 @@ class AcpWorker(Worker):
             )
 
     async def send_message(self, prompt: str, timeout: float = DEFAULT_TIMEOUT) -> str:
-        if self._client is None or not self._client.is_ready:
+        if self._client is None or not _client_is_ready(self._client):
             await self.start()
         assert self._client is not None
-        return await self._client.send_message(prompt, timeout=timeout)
+        send = getattr(self._client, "send_message", None)
+        if callable(send):
+            return await send(prompt, timeout=timeout)
+        return await self._collect_runtime_response(prompt, timeout)
+
+    async def _collect_runtime_response(self, prompt: str, timeout: float) -> str:
+        """Join text chunks from an ``AcpSessionProvider`` stream.
+
+        That provider speaks ``stream()``, not ``AcpClient.send_message``. The
+        pool's callers want the finished string either way.
+        """
+        from kiro_crew.acp.types import EVENT_TEXT_CHUNK
+
+        client = self._client
+        assert client is not None
+        chunks: list[str] = []
+
+        async def _read() -> None:
+            async for event in client.stream(prompt):
+                if getattr(event, "kind", "") == EVENT_TEXT_CHUNK:
+                    text = getattr(event, "text", "")
+                    if isinstance(text, str) and text:
+                        chunks.append(text)
+
+        await asyncio.wait_for(_read(), timeout)
+        return "".join(chunks)
 
     async def shutdown(self) -> None:
         if self._protected_pid is not None:
