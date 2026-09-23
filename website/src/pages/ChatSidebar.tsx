@@ -5867,6 +5867,62 @@ function ChatSidebar({
   }, [persistConductorExpanded])
 
   /**
+   * The creator each row cited on the PREVIOUS frame, so a row that MOVED can be told
+   * from a row that is merely new.
+   *
+   * Holds `parent.slot`, the child's own citation, and not the placed parent: the
+   * citation is a fact from that session's crew log, so it does not move when a search
+   * or a folder filter changes which rows are in the payload. The placed parent does,
+   * and diffing it would read a cleared search -- which restores every row's creator at
+   * once -- as a whole sidebar's worth of moves.
+   */
+  const citedCreatorRef = useRef<Map<string, string | null>>(new Map())
+
+  /**
+   * A row whose creator CHANGED opens the row it moved under.
+   *
+   * Collapsed-by-default is right for a session the user opened, and wrong for one that
+   * moves on its own: `session_adopt` re-parents a session that is already on screen, so
+   * under a collapsed new parent the rows the person was watching unmount and leave a
+   * child count behind. They did not collapse anything, so nothing tells them where the
+   * sessions went. The primary flow of the feature would hide its own result.
+   *
+   * A CHANGED citation is what separates the two. A row absent from the last frame is a
+   * creation -- `session_create`, which keeps the collapsed default and is untouched
+   * here -- while a row that was already listed under one creator and now names another
+   * was moved by someone other than the person looking at it. A citation that went to
+   * null is a release: the row returns to the top level, where nothing needs opening.
+   *
+   * Expands the whole ancestor chain, not just the new parent: an adopter nested under a
+   * collapsed conductor of its own would otherwise be as invisible as before. That is
+   * `expandConductorAncestors`, the same walk a reveal uses, applied to the row that
+   * moved.
+   *
+   * Runs only while the lane is rendering. The map is dropped when it is not, so the
+   * frame that turns the lane back on seeds a baseline instead of reading a stale
+   * citation as a move.
+   */
+  useEffect(() => {
+    if (!conductorLaneActive || lineage == null) {
+      citedCreatorRef.current = new Map()
+      return
+    }
+    const previous = citedCreatorRef.current
+    const current = new Map<string, string | null>()
+    const moved: string[] = []
+    for (const slot of flatSlots) {
+      const identity = sessionRowIdentity(slot)
+      const cited = slot.parent?.slot ?? null
+      current.set(identity, cited)
+      if (!previous.has(identity)) continue
+      if (previous.get(identity) === cited || cited == null) continue
+      moved.push(identity)
+    }
+    citedCreatorRef.current = current
+    for (const identity of moved) expandConductorAncestors(identity)
+  }, [conductorLaneActive, lineage, flatSlots, expandConductorAncestors])
+
+  /**
    * The lanes that can actually render something, in cycle order.
    *
    * `tree` always can. `conductor` needs at least one edge -- the crew log can be off,
