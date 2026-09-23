@@ -717,12 +717,10 @@ class ReviewPool:
         caller answers ``session/request_permission``. The review still approves
         here, the same way the shared runtime does, so ``gh`` and the shell run
         unattended. The process is shut down when the turn ends: these backends
-        do not multiplex sessions onto one subprocess.
-
-        ``keep_session_key`` is ignored. That record points at a kiro-cli
-        transcript, and a pi/droid process has none to resume.
+        do not multiplex sessions onto one subprocess. The session id is kept
+        when ``keep_session_key`` is set, because pi and droid resume from that
+        id alone (``session/load``) after the process is gone.
         """
-        del keep_session_key
         backend = configured_review_backend()
         try:
             from kiro_crew.acp.client import AcpClient
@@ -744,7 +742,7 @@ class ReviewPool:
                     client.approve_tool,
                     client,
                     on_activity,
-                    None,
+                    keep_session_key,
                 )
             except _SANDBOX_UNAVAILABLE as exc:
                 raise ReviewRuntimeUnavailable(sandbox_unavailable_message(exc)) from exc
@@ -828,17 +826,30 @@ class ReviewPool:
         whereas the reverse order can point a descriptor at a transcript that
         ``destroy()`` has already unlinked.
         """
-        sid = str(getattr(handle, "session_id", "") or "")
+        sid = str(
+            getattr(handle, "session_id", "")
+            or getattr(handle, "_session_id", "")
+            or ""
+        )
         if not sid:
             return
         run_id, _, change_id = key.partition(":")
         if not run_id or not change_id:
             return
         try:
+            from kiro_crew.acp.types import (
+                PROVIDER_LABEL_BY_BACKEND,
+                PROVIDER_LABEL_DEFAULT,
+            )
+            provider = PROVIDER_LABEL_BY_BACKEND.get(
+                configured_review_backend(), PROVIDER_LABEL_DEFAULT)
+        except Exception:
+            provider = ""
+        try:
             handle.keep_transcript = True  # type: ignore[attr-defined]
             followup.write_descriptor(
                 run_id, change_id, sid=sid, agent=self._agent,
-                cwd=self._work_dir or "")
+                cwd=self._work_dir or "", provider=provider or "acp")
         except Exception:
             logger.debug("could not keep the review session resumable",
                          exc_info=True)

@@ -385,6 +385,19 @@ class ResumableTests(_SessionsDirCase):
         self.assertEqual(desc["sid"], "sid-1")
         self.assertEqual(desc["agent"], "rev")
 
+    def test_a_pi_session_is_resumable_without_a_kiro_transcript(self):
+        """pi keeps the session itself. The id is enough; there is no file
+        under the kiro sessions dir to stat."""
+        self.assertTrue(FU.write_descriptor(
+            "run1", "c1", sid="01a0930b-df0c-7617-bb53-08f68dad287f",
+            agent="rev", provider="pi", root=self.root))
+        desc, reason = FU.resumable("run1", "c1", self.root)
+        self.assertEqual(reason, "")
+        assert desc is not None
+        self.assertEqual(desc["provider"], "pi")
+        self.assertFalse(
+            (self.sessions / "01a0930b-df0c-7617-bb53-08f68dad287f.json").exists())
+
 
 class ForgetTests(_SessionsDirCase):
     def test_forget_stops_the_offer_without_deleting_the_session(self):

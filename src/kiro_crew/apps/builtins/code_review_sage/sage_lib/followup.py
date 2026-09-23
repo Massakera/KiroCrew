@@ -363,6 +363,12 @@ def resumable(run_id: str, change_id: str,
     desc = read_descriptor(run_id, change_id, root)
     if desc is None:
         return None, ERR_NO_DESCRIPTOR
+    # kiro-cli is the only backend whose transcript this process can stat.
+    # pi and droid keep the session themselves and resume from the id; a
+    # missing file under the kiro sessions dir is normal for them, and
+    # refusing here is what left the ask button off after a pi review.
+    if desc["provider"] and desc["provider"] != PROVIDER_LABEL_DEFAULT:
+        return desc, ""
     path = session_file(desc["sid"])
     if path is None or not path.exists():
         return None, ERR_TRANSCRIPT_GONE

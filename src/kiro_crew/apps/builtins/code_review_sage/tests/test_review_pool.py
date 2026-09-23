@@ -615,3 +615,50 @@ class TestClientBackend(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.approved, ["p1"])  # type: ignore[attr-defined]
         self.assertEqual(client.shutdowns, 1)  # type: ignore[attr-defined]
         self.assertEqual(FakeRuntime.instances, [])
+
+    async def test_pi_send_records_the_session_id_for_a_later_question(self):
+        orig_backend = rp.configured_review_backend
+        rp.configured_review_backend = lambda: "pi"  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(rp, "configured_review_backend", orig_backend))
+        FakeRuntime.instances = []
+        orig_rt = rp.AcpRuntime
+        rp.AcpRuntime = FakeRuntime  # type: ignore[assignment]
+        self.addCleanup(lambda: setattr(rp, "AcpRuntime", orig_rt))
+
+        class FakeClient:
+            def __init__(self, **kw):
+                del kw
+                self._session_id = "sess-pi"
+                self.shutdowns = 0
+
+            async def stream_events(self, message, timeout=None):
+                del message, timeout
+                yield _ev(rp.EVENT_TEXT_CHUNK, text="reviewed")
+                yield _ev(rp.EVENT_COMPLETE, stop_reason="end_turn")
+
+            async def approve_tool(self, request_id, option_id=None, always=False):
+                del request_id, option_id, always
+
+            async def shutdown(self):
+                self.shutdowns += 1
+
+        import kiro_crew.acp.client as acp_client
+
+        orig_client = acp_client.AcpClient
+        acp_client.AcpClient = FakeClient  # type: ignore[misc, assignment]
+        self.addCleanup(lambda: setattr(acp_client, "AcpClient", orig_client))
+
+        recorded: list[tuple] = []
+
+        def _spy(run_id, change_id, *, sid, agent="", cwd="", provider="acp", root=None):
+            del agent, cwd, root
+            recorded.append((run_id, change_id, sid, provider))
+            return True
+
+        orig_write = rp.followup.write_descriptor
+        rp.followup.write_descriptor = _spy  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(rp.followup, "write_descriptor", orig_write))
+
+        pool = ReviewPool(work_dir=_work_dir(self))
+        await pool.send("review this", keep_session_key="run1:c1")
+        self.assertEqual(recorded, [("run1", "c1", "sess-pi", "pi")])
