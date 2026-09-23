@@ -305,31 +305,151 @@ def fetch_spec(platform: str, host: str = "github.com") -> str:
     return spec
 
 
-def _comment_body(finding: dict) -> str:
-    """Build the platform-neutral comment body (redacted). Shared across platforms.
+def _published_prose(text: str) -> str:
+    """Prose for a pull-request comment, in the voice those comments use.
 
-    When the finding carries a ``headline`` it leads the body in bold, and the
-    observation follows as its own paragraph. The headline is the one line a
-    reader on a busy pull request is guaranteed to see, so it belongs above the
-    evidence rather than buried as the first sentence of it. A record without a
-    headline (any review predating the field) renders exactly as before — the
-    observation leads — so old records keep posting unchanged.
+    Lowercase, no backticks, no apostrophes. The file path and the code snippet
+    are evidence and do not pass through here.
     """
-    sev = "🔴" if finding.get("severity") == "red" else "🟡"
-    lang = finding.get("lang", "")
-    snippet = finding.get("snippet", "")
-    headline = str(finding.get("headline", "") or "").strip()
-    observation = str(finding.get("observation", "") or "").strip()
-    lead = f"{sev} **{headline}**\n\n{observation}" if headline else f"{sev} {observation}"
-    body = (
-        f"{lead}\n\n"
-        f"```{lang}\n{snippet}\n```\n\n"
-        f"**Why it matters:** {finding.get('consequence', '').strip()}\n\n"
-        f"**Suggestion:** {finding.get('suggestion', '').strip()}\n\n"
-        f"_{DRAFT_MARKER}_"
+    s = " ".join(text.strip().lower().split())
+    s = s.replace("`", "")
+    s = s.replace("n't", " not")
+    s = s.replace("'", "")
+    return s
+
+
+_ALREADY_SOFT = (
+    "could we ", "can we ", "maybe ", "maybe we ", "worth ",
+    "any chance ", "mind ", "what if ", "i think ", "im not ",
+)
+# Verbs a model uses when it is handing out a test plan. The published line
+# asks or suggests instead.
+_ORDER_VERBS = frozenset({
+    "add", "assert", "avoid", "call", "change", "check", "commit", "confirm",
+    "cover", "delete", "document", "drop", "ensure", "extract", "fix",
+    "handle", "include", "keep", "make", "move", "observe", "pass", "prefer",
+    "process", "remove", "rename", "replace", "require", "return", "revoke",
+    "run", "set", "split", "stop", "supply", "test", "update", "use",
+    "validate", "verify",
+})
+_HARSH_VERBS = {
+    "observe": "look at",
+    "assert": "check",
+    "verify": "check",
+    "ensure": "keep",
+    "confirm": "check",
+    "validate": "check",
+}
+
+
+def _inline_orders(text: str) -> str:
+    text = re.sub(r", and (?:verify|assert|ensure|confirm|validate) that ", ", and ", text)
+    text = re.sub(r" and (?:verify|assert|ensure|confirm|validate) that ", " and ", text)
+    text = re.sub(r"\bor process a ", "or a ", text)
+    return text
+
+
+def _should_clause(clause: str) -> str:
+    """Turn 'assert no X remains' / 'X makes Y fail' into a suggestion."""
+    clause = clause.strip().rstrip(".")
+    clause = re.sub(r"^(?:that|no that)\s+", "", clause)
+    match = re.match(
+        r"^(no(?:t)?\s+.+?)\s+(remains|remain|stays|stay|is|are|gets|get|fails|fail|leaks|leak)\b\s*(.*)$",
+        clause,
     )
-    # Redact LLM-generated content before it leaves for an external surface.
-    return _redact(body)
+    if match:
+        verb = {
+            "remains": "remain", "stays": "stay", "fails": "fail", "leaks": "leak",
+        }.get(match.group(2), match.group(2))
+        return f"{match.group(1)} should {verb} {match.group(3)}".strip()
+    match = re.match(
+        r"^(.+?)\s+(makes|make|causes|cause|breaks|break|leaves|leave)\b\s*(.*)$",
+        clause,
+    )
+    if match:
+        verb = {
+            "makes": "make", "causes": "cause", "breaks": "break", "leaves": "leave",
+        }.get(match.group(2), match.group(2))
+        return f"{match.group(1)} should {verb} {match.group(3)}".strip()
+    return "check " + clause
+
+
+def _expectation(rest: str) -> str:
+    parts = [p.strip() for p in rest.split(", and ") if p.strip()]
+    done = [_should_clause(p) for p in parts]
+    return ", and ".join(done)
+
+
+def _published_suggestion(text: str, *, blocking: bool) -> str:
+    """The line that lands on the pull request.
+
+    A blocking finding asks one question. Anything else suggests, and says
+    what should happen. A chain of orders (`observe`, then `assert`, then
+    `verify`) is the shape this exists to retire. A suggestion that is already
+    a question or already hedged is left alone.
+    """
+    s = _inline_orders(_published_prose(text))
+    if not s or s.startswith(_ALREADY_SOFT) or s.endswith("?"):
+        return s
+    sentences = [p.strip() for p in re.split(r"(?<=[.])\s+", s) if p.strip()]
+    out: list[str] = []
+    for index, sentence in enumerate(sentences):
+        match = re.match(r"^([a-z]+)\b\s*(.*)$", sentence.rstrip("."))
+        if match is None or match.group(1) not in _ORDER_VERBS:
+            out.append(sentence if sentence.endswith(".") or sentence.endswith("?") else sentence + ".")
+            continue
+        verb, rest = match.group(1), match.group(2).strip()
+        lead = index == 0
+        if verb in ("assert", "verify", "confirm", "validate", "ensure") and not lead:
+            text_out = _expectation(rest)
+            if not text_out.endswith("."):
+                text_out += "."
+            out.append(text_out)
+            continue
+        verb_out = _HARSH_VERBS.get(verb, verb)
+        body = f"{verb_out} {rest}".strip() if rest else verb_out
+        if lead and blocking:
+            out.append(f"could we {body}?")
+        elif lead:
+            out.append(f"maybe we {body}.")
+        elif body.startswith("check "):
+            out.append(f"worth checking {body[len('check '):]}.")
+        else:
+            out.append(f"maybe {body}.")
+    return " ".join(out)
+
+
+def _comment_body(finding: dict) -> str:
+    """The pending-review body for one finding. The card is a different surface.
+
+    Observation, consequence, and suggestion stay on the review card. What
+    GitHub receives is the location, the failure in one sentence, the code
+    line as written, and the suggestion in lowercase prose. A yellow finding
+    is marked non-blocking. No fences, no severity emoji, no labelled sections.
+    """
+    file = str(finding.get("file", "") or "").strip()
+    line = finding.get("line") or ""
+    where = f"{file}:{line}" if file and line else file
+    headline = str(finding.get("headline", "") or "").strip()
+    if not headline:
+        headline = str(finding.get("observation", "") or "").strip()
+    snippet = str(finding.get("snippet", "") or "").strip()
+    blocking = str(finding.get("severity", "") or "").lower() == "red"
+    suggestion = _published_suggestion(
+        str(finding.get("suggestion", "") or ""), blocking=blocking)
+    parts: list[str] = []
+    if where:
+        parts.append(where)
+    if headline:
+        parts.append(_published_prose(headline))
+    if snippet:
+        parts.append(snippet)
+    if str(finding.get("severity", "") or "").lower() != "red":
+        parts.append("non-blocking.")
+    if suggestion:
+        parts.append(suggestion)
+    parts.append(f"_{DRAFT_MARKER}_")
+    return _redact("\n\n".join(p for p in parts if p))
 
 
 def build_comment_payload(finding: dict, change_id: str, revision: str,

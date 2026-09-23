@@ -58,26 +58,49 @@ class TestPromptAsksForHeadline(unittest.TestCase):
 class TestCommentBodyLead(unittest.TestCase):
     def test_headline_leads_the_body_in_bold(self):
         body = PL._comment_body(_finding())
-        first = body.splitlines()[0]
-        self.assertEqual(
-            first,
-            "🔴 **Revoking the blob URL blanks every image already in scrollback.**")
-        # The observation is still there, as its own paragraph below the lead.
-        self.assertIn("\n\ncleanup() calls revokeObjectURL on a shared blob.\n", body)
+        self.assertTrue(body.startswith("a/b.ts:42\n"))
+        self.assertIn(
+            "revoking the blob url blanks every image already in scrollback.",
+            body)
+        self.assertIn("could we revoke on unmount, not on effect cleanup?", body)
+        self.assertIn("URL.revokeObjectURL(src)", body)
+        self.assertNotIn("```", body)
+        self.assertNotIn("wdyt", body)
+        self.assertNotIn("🔴", body)
+        self.assertNotIn("**Why it matters:**", body)
+        self.assertNotIn("cleanup() calls revokeObjectURL", body)
+
+    def test_yellow_orders_become_a_suggestion(self):
+        body = PL._comment_body(_finding(
+            severity="yellow",
+            suggestion=(
+                "Observe context from inside the consumer task after processing, "
+                "or process a second message. Assert no stale context remains, "
+                "and verify that disabling cleanup makes the tests fail."
+            ),
+        ))
+        self.assertIn("maybe we look at context from inside the consumer task", body)
+        self.assertIn("or a second message", body)
+        self.assertIn("no stale context should remain", body)
+        self.assertIn("disabling cleanup should make the tests fail", body)
+        self.assertNotIn("observe ", body)
+        self.assertNotIn("assert ", body)
+        self.assertNotIn("verify ", body)
+        self.assertNotIn("wdyt", body)
 
     def test_body_without_headline_is_unchanged(self):
-        """A record predating the field must post exactly as it did before: the
-        observation leads, with no empty bold wrapper where the headline would be."""
+        """A record predating the field still posts: the observation is the
+        failure sentence, and the location still leads."""
         body = PL._comment_body(_finding(headline=""))
-        self.assertEqual(body.splitlines()[0],
-                         "🔴 cleanup() calls revokeObjectURL on a shared blob.")
+        self.assertTrue(body.startswith("a/b.ts:42\n"))
+        self.assertIn("cleanup() calls revokeobjecturl on a shared blob.", body)
         self.assertNotIn("****", body)
 
     def test_missing_headline_key_behaves_like_an_empty_one(self):
         f = _finding()
         del f["headline"]
-        self.assertEqual(PL._comment_body(f).splitlines()[0],
-                         "🔴 cleanup() calls revokeObjectURL on a shared blob.")
+        body = PL._comment_body(f)
+        self.assertIn("cleanup() calls revokeobjecturl on a shared blob.", body)
 
     def test_headline_is_redacted_like_every_other_llm_field(self):
         """The headline is model-authored text reaching an external surface, so it

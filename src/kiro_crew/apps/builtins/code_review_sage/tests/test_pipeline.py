@@ -94,14 +94,17 @@ class TestCommentPayload(unittest.TestCase):
              "suggestion": "fix"}
         p = P.build_comment_payload(f, "GH-o-r-9", "sha", platform="github")
         self.assertIs(p["publish"], False)
-        self.assertIn("🔴", p["content"])
+        self.assertIn("could we fix?", p["content"])
+        self.assertNotIn("```", p["content"])
         self.assertIn("x = 1", p["content"])
         self.assertIn("[code-review-sage]", p["content"])
+        self.assertNotIn("🔴", p["content"])
         self.assertEqual(p["path"], "a.py")
 
     def test_yellow_severity(self):
         p = P.build_comment_payload({"severity": "yellow", "observation": "o"}, "GH-o-r-1", "s")
-        self.assertIn("🟡", p["content"])
+        self.assertIn("non-blocking.", p["content"])
+        self.assertNotIn("🟡", p["content"])
         self.assertIs(p["publish"], False)
 
     def test_posting_spec_is_platform_keyed(self):
@@ -117,7 +120,8 @@ class TestCommentPayload(unittest.TestCase):
         self.assertEqual(p["line"], 12)
         self.assertEqual(p["side"], "RIGHT")
         self.assertEqual(p["commit_id"], "deadbeef")  # head SHA
-        self.assertIn("🔴", p["content"])
+        self.assertIn("src/a.rs:12", p["content"])
+        self.assertNotIn("🔴", p["content"])
 
     def test_unsupported_posting_platform_raises(self):
         with self.assertRaises(ValueError):
@@ -321,10 +325,10 @@ class TestCommentBuilders(unittest.TestCase):
         self.assertEqual([e["kind"] for e in P.build_pending_comments(rec)], ["finding", "design"])
 
     def test_build_pending_comments_redacts_all_bodies(self):
-        rec = {"phase1": {"gate_verdict": "BLOCK", "solution_assessment": "XSECRETX"},
+        rec = {"phase1": {"gate_verdict": "BLOCK", "design_headline": "XSECRETX"},
                "findings": [{"file": "a.py", "line": 1, "severity": "red",
-                             "observation": "XSECRETX", "consequence": "c",
-                             "suggestion": "s", "snippet": "y"}]}
+                             "headline": "XSECRETX", "observation": "kept on the card",
+                             "consequence": "c", "suggestion": "s", "snippet": "y"}]}
         with mock.patch("sage_lib.pipeline._redact",
                         lambda s: s.replace("XSECRETX", "[redacted]")):
             pend = P.build_pending_comments(rec)
