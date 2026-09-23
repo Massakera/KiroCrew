@@ -5825,7 +5825,17 @@
       "cancel": "取消",
       "clear_goal_question": "要永久删除这个目标吗？",
       "stop_file_help": "每次发送推动消息时会填入 {{token}}：它会变成本会话停止文件的路径。创建该文件即可终止循环，或点击“停止循环”——循环运行期间它会取代“启动循环”。",
-      "stop_file_help_none": "此循环启动时没有设置停止文件，因此 {{token}} 会以空白发送。点击下方的“停止循环”来终止它。"
+      "stop_file_help_none": "此循环启动时没有设置停止文件，因此 {{token}} 会以空白发送。点击下方的“停止循环”来终止它。",
+      "judge_wake_when": "判定：当 {{criterion}} 时唤醒",
+      "judge_quiet_while": "判定：当 {{criterion}} 时保持安静",
+      "judge_verdict_other": "最近：{{outcome}} · {{count}} 项 · {{time}}",
+      "judge_verdict_untimed_other": "最近：{{outcome}} · {{count}} 项",
+      "judge_outcome_quiet": "平静",
+      "judge_outcome_wake": "唤醒",
+      "judge_outcome_terminal": "已完成",
+      "judge_outcome_fallback": "无法判定",
+      "judge_outcome_unknown": "未知",
+      "judge_no_verdict": "尚无判定"
     },
     "bottomTerminalPanel": {
       "close_terminal": "关闭终端",
@@ -11178,7 +11188,7 @@
         "crew_members_desc": "团队成员（Crew Members）页面：列出你拥有的每个代理，各有自己的话题。仍在建设中，开启后才会提供。",
         "decisions": "决策（Jev）",
         "decisions_desc": "Jev 是一个小而快的决策模型。开启后，{{productName}} 会就你刚发出的消息问 Jev：哪一个技能最合适，或者都不合适；并在开关下方所示比例的会话里直接采用 Jev 所选，其余会话仍按本版本自带词语匹配规则处理。如果 Jev 太慢、连不上或没有给出可用答案，这条消息就回退到同一条规则，所以决策不会拖住你的回复。每次调用还会在运行 {{productName}} 的机器上记入一份日志，供排查使用。这个开关保存在运行 {{productName}} 的机器上，而不是这个浏览器里，所以你在任何设备上打开都生效。",
-        "decisions_egress": "开启期间，你输入的消息正文，还有技能名称和说明，都会离开这台机器，经互联网发给这个 {{productName}} 指定的决策服务 Jev。另外三类内容各有下面自己的开关，在你打开之前不会发送。一是工具调用的名称和参数；二是 {{productName}} 自动压缩会话时的对话和工具调用输入；三是为你这条消息召回的记忆片段。关闭期间什么都不发送。",
+        "decisions_egress": "开启期间，你输入的消息正文，还有技能名称和说明，都会离开这台机器，经互联网发给这个 {{productName}} 指定的决策服务 Jev。另外四类内容各有下面自己的开关，在你打开之前不会发送。一是工具调用的名称和参数；二是 {{productName}} 自动压缩会话时的对话和工具调用输入；三是为你这条消息召回的记忆片段。四是等待中的循环所观察会话的最近消息。关闭期间什么都不发送。",
         "decisions_backend_required": "运行这个面板的 {{productName}} 比这个功能旧，因此暂时无法开启。请先在设置 › Releases 中更新 {{productName}}。",
         "decisions_sent_to": "发送到",
         "decisions_endpoint_moved": "你同意发送的地址和现在设置里的地址不一样，所以什么都没有发送。请关掉再打开这个开关，以同意新地址。",
@@ -11242,7 +11252,9 @@
         "decisions_api_key_remove": "删除密钥",
         "decisions_api_key_remove_confirm": "删除密钥无法撤销：保险库不会返回值，你得重新粘贴一个新的。",
         "decisions_api_key_remove_cancel": "保留",
-        "decisions_api_key_delete": "永久删除密钥"
+        "decisions_api_key_delete": "永久删除密钥",
+        "decisions_nudge_evidence": "同时发送等待中的循环正在观察的内容，让 Jev 可以跳过一轮",
+        "decisions_nudge_evidence_desc": "每隔几分钟检查一次循环，即使什么都没变也会每次唤醒助手。此项会把它正在观察内容——那些会话最近几条助手消息，以及它提到任何拉取请求状态——发送给 Jev，并询问这一轮是否值得唤醒任何人。Jev 只能等待或唤醒，永远无法结束循环；如果它很慢或无法访问，循环会像现在一样唤醒。密码和密钥在发送前会被替换。它读取是循环观察会话，而不是你正在对话会话。默认关闭。"
       },
       "kiroSignInCard": {
         "title": "Kiro 登录",

@@ -6013,7 +6013,21 @@
       "cancel": "Cancelar",
       "clear_goal_question": "¿Eliminar este objetivo definitivamente?",
       "stop_file_help": "{{token}} se rellena al enviar cada empujón: pasa a ser la ruta del archivo de parada de esta sesión. Crea ese archivo para detener el bucle, o pulsa “Detener el bucle”, que sustituye a “Iniciar el bucle” mientras el bucle está en marcha.",
-      "stop_file_help_none": "Este bucle se activó sin archivo de parada, así que {{token}} se envía vacío. Pulsa “Detener el bucle” abajo para detenerlo."
+      "stop_file_help_none": "Este bucle se activó sin archivo de parada, así que {{token}} se envía vacío. Pulsa “Detener el bucle” abajo para detenerlo.",
+      "judge_wake_when": "Juez: despertar cuando {{criterion}}",
+      "judge_quiet_while": "Juez: quedarse en silencio mientras {{criterion}}",
+      "judge_verdict_one": "último: {{outcome}} · {{count}} elemento · {{time}}",
+      "judge_verdict_untimed_one": "último: {{outcome}} · {{count}} elemento",
+      "judge_verdict_many": "último: {{outcome}} · {{count}} elementos · {{time}}",
+      "judge_verdict_untimed_many": "último: {{outcome}} · {{count}} elementos",
+      "judge_verdict_other": "último: {{outcome}} · {{count}} elementos · {{time}}",
+      "judge_verdict_untimed_other": "último: {{outcome}} · {{count}} elementos",
+      "judge_outcome_quiet": "en calma",
+      "judge_outcome_wake": "despertando",
+      "judge_outcome_terminal": "terminado",
+      "judge_outcome_fallback": "sin veredicto",
+      "judge_outcome_unknown": "desconocido",
+      "judge_no_verdict": "aún sin veredicto"
     },
     "bottomTerminalPanel": {
       "close_terminal": "Cerrar la terminal",
@@ -11498,7 +11512,7 @@
         "crew_members_desc": "La página Crew Members: todos tus agentes, cada uno con su propio hilo. Aún en construcción, así que no se ofrece hasta que actives esto.",
         "decisions": "Decisiones (Jev)",
         "decisions_desc": "Jev es un modelo de decisión pequeño y rápido. Con esto activado, {{productName}} le pregunta cuál de tus habilidades encaja con el mensaje que acabas de enviar — o si no encaja ninguna — y usa la elección de Jev en la parte de tus sesiones que se muestra bajo el interruptor; el resto conserva la regla de coincidencia de palabras que trae esta versión. Si Jev va lento, no responde o no da una respuesta utilizable, ese mensaje vuelve a la misma regla, así que ninguna decisión retrasa tu respuesta. Cada llamada también se anota en un registro de la máquina que ejecuta {{productName}}, para diagnóstico. Este interruptor no se guarda en el navegador, sino en la máquina que ejecuta {{productName}}, así que se aplica en todos los dispositivos desde los que lo abras.",
-        "decisions_egress": "Mientras esto esté activado, el texto de tus mensajes y los nombres y descripciones de tus habilidades salen de esta máquina. Se envían por internet a Jev, el servicio de decisión para el que está configurado este {{productName}}. Tres categorías más tienen cada una su propio interruptor abajo y siguen apagadas hasta que enciendas una: el nombre y los argumentos de tus llamadas a herramientas, la conversación y las entradas de las llamadas a herramientas de una sesión que {{productName}} compacta por su cuenta, y fragmentos cortos de las memorias recuperadas para tu mensaje. Nada se envía mientras esto esté apagado.",
+        "decisions_egress": "Mientras esto esté activado, el texto de tus mensajes y los nombres y descripciones de tus habilidades salen de esta máquina. Se envían por internet a Jev, el servicio de decisión para el que está configurado este {{productName}}. Cuatro categorías más tienen cada una su propio interruptor abajo y siguen apagadas hasta que enciendas una: el nombre y los argumentos de tus llamadas a herramientas, la conversación y las entradas de las llamadas a herramientas de una sesión que {{productName}} compacta por su cuenta, y fragmentos cortos de las memorias recuperadas para tu mensaje. A ello se suman los mensajes recientes de las sesiones que observa un bucle en espera. Nada se envía mientras esto esté apagado.",
         "decisions_backend_required": "El {{productName}} que ejecuta este panel es más antiguo que esta función, así que todavía no hay nada que activar. Actualiza {{productName}} primero, desde Ajustes › Releases.",
         "decisions_sent_to": "Se envía a",
         "decisions_endpoint_moved": "Aceptaste enviar a una dirección distinta de la que hay ahora en los ajustes, así que no se envía nada. Apaga y vuelve a encender esto para aceptar la nueva dirección.",
@@ -11562,7 +11576,9 @@
         "decisions_api_key_remove": "Quitar la clave",
         "decisions_api_key_remove_confirm": "Quitar la clave no se puede deshacer: la bóveda no devuelve ningún valor, así que tendrías que pegar una nueva.",
         "decisions_api_key_remove_cancel": "Conservarla",
-        "decisions_api_key_delete": "Eliminar la clave"
+        "decisions_api_key_delete": "Eliminar la clave",
+        "decisions_nudge_evidence": "Enviar también lo que observa un bucle en espera para que Jev pueda omitir un turno",
+        "decisions_nudge_evidence_desc": "Un bucle que comprueba algo cada pocos minutos despierta al asistente siempre, incluso cuando nada ha cambiado. Esto envía lo que observa — los últimos mensajes del asistente de esas sesiones y el estado de cualquier pull request que nombre — a Jev, y pregunta si esta ronda merece despertar a alguien. Jev solo puede esperar o despertar: nunca puede terminar el bucle, y si va lento o no responde, el bucle despierta como hoy. Las contraseñas y claves se sustituyen antes de enviar nada. Lee las sesiones que el bucle observa, no la que tú tienes abierta. Desactivado por defecto."
       },
       "kiroSignInCard": {
         "title": "Inicio de sesión en Kiro",

@@ -434,6 +434,10 @@ async def _monitor_start(
         # rather than erroring. The authorizer owns the cap and both redaction
         # passes, so nothing is validated twice by routing through it.
         banner=str(args.get("banner") or ""),
+        # Named explicitly for the reason the comment above gives: this call has no
+        # splat, so a brief the tool accepted and this line omitted would be dropped
+        # without a word -- the loop would arm with no judge and nothing would say so.
+        judge=args.get("judge") if isinstance(args.get("judge"), dict) else None,
         source="mcp-directive",
         caller="session-directive",
         gate=gate,
@@ -784,6 +788,9 @@ async def _monitor_update(
         # as "leave unchanged", while an explicit "" reaches it as a clear -- the
         # distinction the handler preserved by keeping a blank banner in the patch.
         banner=patch.get("banner"),
+        # Absent leaves the brief alone; ``{}`` clears it. Same absent-vs-explicit
+        # distinction as ``banner`` above, preserved by the tool surface.
+        judge=patch.get("judge"),
         # A message write with NO baseline SKIPS the stale check rather than failing it, so
         # hand it the token read above -- scoped to the message case, as the handler's 409 is.
         expect_fingerprint=(baseline_token if patch.get("message") is not None else None),

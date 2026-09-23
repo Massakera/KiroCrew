@@ -38,11 +38,11 @@ import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
-from kiro_crew import irq, platform_compat, probes, shutdown_event
+from kiro_crew import irq, platform_compat, probes, shutdown_event, validation
 from kiro_crew.atomic_write import fsync_dir, replace_with_retry
 from kiro_crew.config.loader import config_dir, data_home
 from kiro_crew.config.paths import legacy_home
@@ -119,6 +119,132 @@ _WAKE_FOLLOWUP_TICKS = 1
 #: Lower wastes the saving on loops that had nothing to do; higher starts to
 #: look like silence to whoever armed the watch.
 _MAX_QUIET_STREAK = 10
+
+#: Consecutive judge QUIET verdicts before a tick fires anyway, and the default for
+#: ``decisions.nudge_wake.quiet_streak_floor``. Bound to the probe's own floor rather
+#: than spelled as a second number: both answer the same question -- how long may a
+#: watch go undelivered -- so two literals would be two things to keep in step, and
+#: the one that drifted would be the one nobody reads.
+_JUDGE_QUIET_STREAK_FLOOR_DEFAULT = _MAX_QUIET_STREAK
+
+#: The hard ceiling on that floor, whatever the config says. ``config.json`` is
+#: agent-writable, so without this a prompt-injected shell could raise the floor to
+#: a number no loop ever reaches and -- on a machine that has granted the evidence
+#: scope -- keep a watch silent indefinitely. Clamped rather than rejected, the way
+#: ``decisions.gate.in_bucket`` clamps its sample: a typo'd floor must not become a
+#: second, undocumented way to disable a loop.
+_JUDGE_QUIET_STREAK_FLOOR_MAX = 50
+
+
+#: Bounds on what a PERSISTED judge brief may hold once loaded. The store is
+#: agent-writable, so these are what make the loader's retention bounded by this
+#: code rather than by the file: an oversized nested map would otherwise be kept in
+#: memory and rewritten on every persist for the life of the loop.
+_JUDGE_SPEC_KEYS = ("targets", "wake_when", "quiet_when")
+#: The brief's shape bounds have ONE spelling, in ``validation``, because that is
+#: where the arming surface refuses an oversized brief. A copied literal here would
+#: be a second number to keep in step, and the two would disagree silently: the
+#: arming call would accept a brief this loader then trimmed.
+_JUDGE_MAX_TARGETS = validation.MAX_JUDGE_TARGETS
+_JUDGE_MAX_TARGET_CHARS = validation.MAX_JUDGE_TARGET_CHARS
+_JUDGE_MAX_CRITERION_CHARS = validation.MAX_JUDGE_CRITERION_CHARS
+_JUDGE_MAX_CURSORS = 16
+_JUDGE_VERDICT_KEYS = ("outcome", "evidence_items", "at")
+_JUDGE_MAX_OUTCOME_CHARS = 32
+
+
+def _bounded_judge_spec(raw: object, loop_id: object = None) -> dict:
+    """A stored judge brief rebuilt from allowlisted keys with clipped values.
+
+    Rebuilt rather than validated in place, so a key this code does not know is
+    dropped instead of retained: that is what makes the size of what the loader
+    keeps a property of this function rather than of the file it read.
+    """
+    if not isinstance(raw, dict):
+        if raw not in (None, {}):
+            logger.warning("AutoNudge: loop %s stored a non-object judge; ignoring it", loop_id)
+        return {}
+    out: dict = {}
+    targets = raw.get("targets")
+    if isinstance(targets, (list, tuple)):
+        clean = [t for t in targets if isinstance(t, str) and t.strip()][:_JUDGE_MAX_TARGETS]
+        if clean:
+            out["targets"] = clean
+    for key in ("wake_when", "quiet_when"):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            out[key] = value
+    return scrubbed_judge_spec(out)
+
+
+def scrubbed_judge_spec(spec: dict) -> dict:
+    """A judge brief with every operator-authored string scrubbed, then clipped.
+
+    The brief is free text somebody writes at arm time, and it reaches two places a
+    credential must not: the loop store on disk, and the loop serialization the
+    dashboard reads. Bounding a SHAPE is not scrubbing a VALUE -- an allowlist of keys
+    with a length limit keeps a criterion naming a bearer token verbatim, merely
+    shorter -- so the scrub is its own step and this is where it lives.
+
+    Called at EVERY entrance, not once at the store boundary, because the entrances are
+    independent: a brief that arrives on a tool call is serialized to the dashboard
+    without passing the decode path, so a scrub applied only on decode covers the one
+    entrance that already survived a round trip.
+
+    Scrub BEFORE clip, in that order: a redaction marker can be longer than the secret
+    it replaces, so clipping first lets a scrubbed value land over the bound.
+
+    ``targets`` are scrubbed on the same rule. A clean forge URL passes
+    ``redact_via_context`` unchanged, so no watch can be broken by this, and a target
+    this alters is one carrying the credential the scrub exists for.
+    """
+    out: dict = dict(spec)
+    for key in ("wake_when", "quiet_when"):
+        value = out.get(key)
+        if isinstance(value, str) and value:
+            out[key] = scrub_loop_text(value)[:_JUDGE_MAX_CRITERION_CHARS]
+    targets = out.get("targets")
+    if isinstance(targets, (list, tuple)):
+        out["targets"] = [
+            (scrub_loop_text(t)[:_JUDGE_MAX_TARGET_CHARS] if isinstance(t, str) and t else t)
+            for t in targets
+        ]
+    return out
+
+
+def _bounded_judge_cursors(raw: object) -> dict:
+    """Stored read cursors, keyed by bounded target name with whole-number values."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key, value in raw.items():
+        if len(out) >= _JUDGE_MAX_CURSORS:
+            break
+        if not isinstance(key, str) or not key.strip():
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            continue
+        out[key[:_JUDGE_MAX_TARGET_CHARS]] = value
+    return out
+
+
+def _bounded_judge_verdict(raw: object) -> dict:
+    """The stored previous verdict, reduced to its three bounded fields."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    outcome = raw.get("outcome")
+    if isinstance(outcome, str) and outcome:
+        out["outcome"] = outcome[:_JUDGE_MAX_OUTCOME_CHARS]
+    for key in ("evidence_items", "at"):
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(float(value)):
+            continue
+        out[key] = value
+    return out
+
 
 _NUDGES_FILE = "autonudge.json"
 # A build predating the ``quarantined`` key writes only ``autonudge.json``, so an
@@ -719,6 +845,29 @@ class NudgeLoop:
     #: change -- exactly the harm the opt-out exists to prevent, arriving through
     #: the documented way to revise a loop.
     gate: bool = False
+    #: The owner's judge brief: ``targets``, ``wake_when``, ``quiet_when``. Empty
+    #: means no judge, which is what a record written before this field existed
+    #: decodes to and what an unreadable value normalises to -- the tick then
+    #: behaves exactly as it does today.
+    #:
+    #: Stored even while the consent scope is off, deliberately: an armed loop has
+    #: to survive the switch being turned on later, and re-arming every watch after
+    #: a consent change would be a worse answer than storing a brief nobody reads
+    #: yet. Nothing is COLLECTED or sent until ``nudge_evidence`` is granted.
+    judge: dict = field(default_factory=dict)
+    #: Per-target read cursor, ``target -> next_since``, so each tick reads only the
+    #: rows that arrived since the last one. Advanced only on a successful read, so
+    #: a refused or failing target does not silently skip its own rows.
+    judge_cursors: dict = field(default_factory=dict)
+    #: Consecutive judge QUIET verdicts, and the counter the judge's streak floor is
+    #: measured against. Its OWN field rather than ``MonitorState.quiet_streak``:
+    #: that record requires a probe ``kind`` and ``target``, and a loop watching
+    #: sibling sessions has no honest value for either, so a judge-only loop must be
+    #: able to hold a streak without one.
+    judge_quiet_streak: int = 0
+    #: The previous verdict, summarised and text-free, carried into the next tick's
+    #: state so a judge can see it already passed on comparable evidence once.
+    judge_last_verdict: dict = field(default_factory=dict)
     # WHY the loop was last deactivated: "" (active / never stopped),
     # "manual" (user pause / any caller that didn't say otherwise),
     # "autonudge_stop" (deliberate directive), "cycle_cap",
@@ -998,12 +1147,28 @@ class AutoNudgeService:
         base_dir: Path | None = None,
         on_fire: Callable[[NudgeLoop], Awaitable[bool]] | None = None,
         on_monitor_tick: Callable[[NudgeLoop], Awaitable[None]] | None = None,
+        collect_judge_evidence: Callable[[NudgeLoop], Awaitable[Any]] | None = None,
+        emit_judge_notice: Callable[[NudgeLoop, str], Awaitable[None]] | None = None,
     ) -> None:
         self._base_dir = base_dir or config_dir()
         self._path = self._base_dir / _NUDGES_FILE
         self._quarantine_path = self._base_dir / _QUARANTINE_FILE
         self._on_fire = on_fire
         self._on_monitor_tick = on_monitor_tick
+        #: Reads the wake judge's evidence for one loop. Injected rather than called
+        #: directly because authorizing a session read needs ``DashboardState``,
+        #: which this service does not hold -- the same reason ``on_fire`` and
+        #: ``owner_session_id`` are closures the gateway supplies. ``None`` means this
+        #: build collects nothing, so every judge verdict is a fail-open FALLBACK and
+        #: the tick behaves exactly as it does today.
+        self._collect_judge_evidence = collect_judge_evidence
+        #: Writes ONE transcript notice row on the owning session, so a verdict that
+        #: spent no turn is still visible to whoever is reading the tab. Injected for
+        #: the same reason the reader above is: appending a row needs
+        #: ``DashboardState``. ``None`` means this build renders no notice, which
+        #: costs the verdict nothing -- it is already on the loop record and in the
+        #: decisions log.
+        self._emit_judge_notice = emit_judge_notice
         self._loops: dict[str, NudgeLoop] = {}
         # Rows withheld from the live map but preserved on disk for repair. Kept off
         # every egress path because ADDRESSING_FIELDS are exempt from the scrub.
@@ -1220,6 +1385,37 @@ class AutoNudgeService:
                         loop_values["gate"],
                     )
                     loop_values["gate"] = False
+                # The judge fields come out of the same agent-writable store, so they
+                # are normalised HERE rather than at each read site, for the reason
+                # ``gate`` is: a stored ``"judge": "yes"`` would otherwise reach a
+                # collector as a string, and a non-numeric streak would defeat the
+                # floor that bounds how long a judge may keep a loop quiet. Every
+                # unreadable value resolves to the shape that behaves as today.
+                #
+                # Bounded, not merely type-checked. A row in this store can be written
+                # by an auto-approved agent shell, so an oversized nested map would be
+                # RETAINED and re-serialized on every persist -- unbounded memory and
+                # write work for the life of the loop. Each map is rebuilt from
+                # allowlisted keys with clipped values, so what the loader keeps is
+                # bounded by this code rather than by whatever the file holds.
+                if "judge" in loop_values:
+                    loop_values["judge"] = _bounded_judge_spec(loop_values["judge"], raw.get("id"))
+                if "judge_cursors" in loop_values:
+                    loop_values["judge_cursors"] = _bounded_judge_cursors(
+                        loop_values["judge_cursors"]
+                    )
+                if "judge_last_verdict" in loop_values:
+                    loop_values["judge_last_verdict"] = _bounded_judge_verdict(
+                        loop_values["judge_last_verdict"]
+                    )
+                if "judge_quiet_streak" in loop_values:
+                    _streak = loop_values["judge_quiet_streak"]
+                    if isinstance(_streak, bool) or not isinstance(_streak, int) or _streak < 0:
+                        logger.warning(
+                            "AutoNudge: loop %s stored a non-count judge streak; resetting it",
+                            raw.get("id"),
+                        )
+                        loop_values["judge_quiet_streak"] = 0
                 # ``self_armed`` is the ONE bit that relaxes the crew/member
                 # fire-time guard, and this store is agent-writable. A persisted
                 # non-boolean (the string "false" is truthy) must therefore
@@ -1953,6 +2149,7 @@ class AutoNudgeService:
         # any message that merely MENTIONED one PR, which throttles such a loop and,
         # if that PR is already merged, deactivates it before its first turn.
         gate: bool = False,
+        judge: dict | None = None,
         replace_existing: bool = True,
         replace_stopped: bool = False,
         self_armed: bool = False,
@@ -1982,6 +2179,7 @@ class AutoNudgeService:
                 banner=banner,
                 admission_check=admission_check,
                 gate=gate,
+                judge=judge,
                 replace_existing=replace_existing,
                 replace_stopped=replace_stopped,
                 self_armed=self_armed,
@@ -2302,6 +2500,7 @@ class AutoNudgeService:
         banner: str = "",
         admission_check: Callable[[], bool] | None = None,
         gate: bool = False,
+        judge: dict | None = None,
         replace_existing: bool = True,
         replace_stopped: bool = False,
         self_armed: bool = False,
@@ -2319,6 +2518,7 @@ class AutoNudgeService:
                 banner=banner,
                 admission_check=admission_check,
                 gate=gate,
+                judge=judge,
                 replace_existing=replace_existing,
                 replace_stopped=replace_stopped,
                 self_armed=self_armed,
@@ -2338,6 +2538,7 @@ class AutoNudgeService:
         banner: str = "",
         admission_check: Callable[[], bool] | None = None,
         gate: bool = False,
+        judge: dict | None = None,
         replace_existing: bool = True,
         replace_stopped: bool = False,
         self_armed: bool = False,
@@ -2423,6 +2624,14 @@ class AutoNudgeService:
                 goal_token=new_goal_token(),
                 stop_sentinel_path=stop_sentinel_path,
                 max_runtime_secs=max(0, int(max_runtime_secs)),
+                # The judge brief the caller supplied, or nothing. Scrubbed and bounded
+                # HERE as well as at the decode boundary, because the two entrances are
+                # independent: a store row comes off disk, and this one comes from a
+                # tool call and is serialized to the dashboard without ever passing the
+                # decode path. Stored whatever the consent scope says, so a loop armed
+                # today is judged once the scope is granted -- the tick, not the arm, is
+                # where that is decided.
+                judge=scrubbed_judge_spec(judge) if isinstance(judge, dict) else {},
                 # Anchor the first deadline at arm time (set BEFORE the
                 # snapshot below so it persists): the countdown starts the
                 # moment the loop is armed, and user turns from here on only
@@ -2519,6 +2728,7 @@ class AutoNudgeService:
         max_runtime_secs: int | None = None,
         stopped_reason: str | None = None,
         banner: str | None = None,
+        judge: dict | None = None,
         expected_generation: int | None = None,
         expect_fingerprint: str | None = None,
     ) -> NudgeLoop | None:
@@ -2537,6 +2747,7 @@ class AutoNudgeService:
                 max_runtime_secs=max_runtime_secs,
                 stopped_reason=stopped_reason,
                 banner=banner,
+                judge=judge,
                 expected_generation=expected_generation,
                 expect_fingerprint=expect_fingerprint,
             )
@@ -2620,6 +2831,7 @@ class AutoNudgeService:
         max_runtime_secs: int | None = None,
         stopped_reason: str | None = None,
         banner: str | None = None,
+        judge: dict | None = None,
         expected_generation: int | None = None,
         expect_fingerprint: str | None = None,
     ) -> NudgeLoop | None:
@@ -2636,6 +2848,7 @@ class AutoNudgeService:
                 max_runtime_secs=max_runtime_secs,
                 stopped_reason=stopped_reason,
                 banner=banner,
+                judge=judge,
                 expected_generation=expected_generation,
                 expect_fingerprint=expect_fingerprint,
             )
@@ -2653,6 +2866,7 @@ class AutoNudgeService:
         max_runtime_secs: int | None = None,
         stopped_reason: str | None = None,
         banner: str | None = None,
+        judge: dict | None = None,
         expected_generation: int | None = None,
         expect_fingerprint: str | None = None,
     ) -> NudgeLoop | None:
@@ -2790,6 +3004,21 @@ class AutoNudgeService:
                 # ``idle_secs`` below, quieting a running loop must not restart
                 # its countdown. "" clears it back to the verbose default.
                 loop.banner = banner
+            if judge is not None:
+                # ``{}`` CLEARS the brief, which is how a judge is taken off a live
+                # loop; any other object replaces it. Absent leaves it alone, so an
+                # update that only changes the interval does not disarm the judge.
+                #
+                # Both the streak and the read cursors are reset with it, because they
+                # are facts about the OLD brief: a streak earned under one set of
+                # criteria must not count toward the floor under another, and a cursor
+                # belongs to a target list that may have just changed. Resetting costs
+                # at most one re-read; keeping them could hold a loop quiet on a brief
+                # nobody armed.
+                loop.judge = scrubbed_judge_spec(judge)
+                loop.judge_quiet_streak = 0
+                loop.judge_cursors = {}
+                loop.judge_last_verdict = {}
             interval_changed = False
             if idle_secs is not None:
                 new_idle = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
@@ -4904,6 +5133,245 @@ class AutoNudgeService:
             self._arm_from_deadline(loop)
         self._reconcile_candidates = eligible
 
+    def _judge_quiet_streak_floor(self) -> int:
+        """Consecutive judge QUIET verdicts allowed before a tick fires anyway.
+
+        Clamped into ``1 .. _JUDGE_QUIET_STREAK_FLOOR_MAX`` whatever the config
+        holds, because the config is agent-writable and this number bounds how long
+        a judge may keep a loop silent. An unreadable value is the default, not an
+        error: a broken knob must not change whether a loop is delivered.
+        """
+        try:
+            from kiro_crew.config import live
+
+            snapshot = live.snapshot()
+            section = getattr(getattr(snapshot, "decisions", None), "nudge_wake", None)
+            raw = getattr(section, "quiet_streak_floor", _JUDGE_QUIET_STREAK_FLOOR_DEFAULT)
+            floor = int(raw)
+        except Exception:
+            return _JUDGE_QUIET_STREAK_FLOOR_DEFAULT
+        if floor < 1:
+            return _JUDGE_QUIET_STREAK_FLOOR_DEFAULT
+        return min(floor, _JUDGE_QUIET_STREAK_FLOOR_MAX)
+
+    async def _judge_tick_is_quiet(self, loop: NudgeLoop) -> bool | None:
+        """The wake judge's answer for this tick, or ``None`` when no judge applies.
+
+        ``None`` -- not ``False`` -- for "this loop has no judge", so the caller
+        falls through to the typed probe path unchanged. That is what keeps a loop
+        without a ``judge`` spec, and every loop on a machine that has not granted
+        the evidence scope, behaving exactly as it does today.
+
+        ``True`` skips the turn. Only a QUIET verdict under the streak floor
+        produces it; WAKE, TERMINAL and FALLBACK all return ``False`` and spend the
+        tick, which is why a provider outage, a scrub that dropped everything and an
+        answer outside its own domain are all indistinguishable from the ungated
+        timer.
+
+        The judge runs BEFORE the probe guard on purpose: a conductor watching
+        sibling sessions has no ``MonitorState`` at all, so anything gated behind
+        ``monitor is not None`` would never reach it.
+        """
+        if not loop.judge or self._collect_judge_evidence is None:
+            # The cheapest possible exit, and the one almost every tick takes: a plain
+            # attribute read, before any import. The modules below pull the whole
+            # decisions graph, so a build or a loop with no judge must not pay for it.
+            return None
+        from kiro_crew import autonudge_judge as judge
+        from kiro_crew import decisions as core_decisions
+        from kiro_crew.decisions.points import nudge_wake as point_nudge_wake
+
+        spec = judge.spec_of(loop)
+        if not spec:
+            return None
+        # The seam's OWN authority, and the only reading of it: ``is_enabled`` routes
+        # this point through ``gate._judge_authority``, which picks the lane and says
+        # whether that lane is armed in one answer -- the Jev lane on the main switch
+        # plus the ``nudge_evidence`` scope, the small-model lane on its runner being
+        # installed. A second resolution here is a second rule, and it can only differ:
+        # one that arms Jev on endpoint consent alone picks that lane on a machine which
+        # consented without granting the scope, the gate refuses it, and the tick is
+        # skipped where the gate itself picks the lane that needs neither.
+        #
+        # Threaded because the keystone is a file and this coroutine runs on the
+        # gateway's event loop, where a per-tick synchronous read would stall chat and
+        # every channel transport behind it. ``is_enabled`` documents itself as running
+        # on the caller's thread for exactly this reason.
+        if not await asyncio.to_thread(
+            core_decisions.is_enabled, point_nudge_wake.POINT, session_key=loop.slot_key
+        ):
+            # No lane can serve this tick. Deliberately NOT a FALLBACK verdict: nothing
+            # was asked, so recording a provider failure would put rows in the
+            # calibration log for a call that never happened. Returning ``None`` leaves
+            # the tick exactly as it found it, which for a judge-only loop means it
+            # fires as it would without a brief and for a gated pull-request loop means
+            # the typed probe still gets its say. The spec stays stored, so granting the
+            # scope later arms every loop already carrying one.
+            return None
+        wake_when, quiet_when = judge.criteria_of(spec)
+        targets_wanted = judge.parse_targets(spec, loop.message)
+        if not targets_wanted:
+            logger.debug("AutoNudge: loop %s has a judge spec naming no usable target", loop.id)
+            return False
+        verdict_trace: dict[str, Any] = {}
+        try:
+            evidence, dropped = await self._collect_judge_evidence(loop)
+        except Exception:
+            logger.debug(
+                "AutoNudge: judge evidence collection failed for loop %s -- firing as usual",
+                loop.id,
+                exc_info=True,
+            )
+            return False
+        verdict = await point_nudge_wake.judge_tick(
+            loop.message,
+            wake_when=wake_when,
+            quiet_when=quiet_when,
+            evidence=evidence,
+            dropped=dropped,
+            last_verdict=loop.judge_last_verdict or None,
+            session_key=loop.slot_key,
+            extra={
+                "loop": loop.id,
+                "targets": len(targets_wanted),
+                "dropped_targets": dropped,
+            },
+            trace=verdict_trace,
+        )
+        if judge.spec_of(loop) != spec:
+            # The brief was REPLACED while this tick was reading and judging, and the
+            # reads and the decision both happen outside the service lock. Every fact
+            # staged here belongs to the brief that is gone: the streak was earned
+            # under criteria nobody is asking about any more, the verdict record
+            # answers a question that was withdrawn, and the cursors say rows were
+            # consumed on a target list that may have changed. The update path clears
+            # all three for exactly that reason, so committing them here reinstates
+            # state nobody armed and can hold the loop quiet on a withdrawn criterion.
+            # Cursors go back to the empty map that path installs, which costs one
+            # re-read and lets the next tick judge those rows under the brief that now
+            # applies. Firing is the safe direction: a turn nobody needed is cheap, and
+            # a suppressed turn on a stale question is not recoverable.
+            loop.judge_cursors = {}
+            logger.info(
+                "AutoNudge: loop %s had its judge brief replaced mid-tick -- "
+                "discarding the verdict and firing",
+                loop.id,
+            )
+            return False
+        # The count the judge actually received, which the point publishes on every
+        # return path. The length of ``evidence`` is the pre-scrub input, so a
+        # notice or a verdict record built from it credits the judge with rows the
+        # scrub rejected and reads as a calmer tick than the one that happened.
+        screened_items = int(verdict_trace.get("evidence_items") or 0)
+        # One line on the owning session, for EVERY verdict including a quiet one:
+        # a tick that spent no turn is otherwise indistinguishable from a loop that
+        # died, which is the failure this feature must not introduce. Guarded and
+        # awaited before the branch below so the notice cannot be skipped by an
+        # early return, and so a broken renderer costs a notice rather than a tick.
+        if self._emit_judge_notice is not None:
+            try:
+                await self._emit_judge_notice(
+                    loop,
+                    point_nudge_wake.notice_line(
+                        verdict,
+                        verdict_trace.get("answers"),
+                        screened_items,
+                    ),
+                )
+            except Exception:
+                logger.debug(
+                    "AutoNudge: could not render the judge notice for loop %s",
+                    loop.id,
+                    exc_info=True,
+                )
+        loop.judge_last_verdict = judge.verdict_record(verdict, screened_items)
+        # Every path below writes durably before it answers. The collector may have
+        # advanced a read cursor, and rows it consumed must not be re-read on the
+        # next tick even if this process stops before the verdict is acted on:
+        # re-reading them is harmless for a fire and wrong for a quiet, because the
+        # same evidence would be judged twice and could hold a loop quiet on rows it
+        # had already passed on.
+        if verdict.outcome is irq.Outcome.QUIET:
+            loop.judge_quiet_streak += 1
+            floor = self._judge_quiet_streak_floor()
+            if loop.judge_quiet_streak >= floor:
+                # Floor reached: deliver anyway. The judge can only read the
+                # evidence it was given, and a loop whose duty is to act while its
+                # subjects are quiet is invisible to it. Reset before the persist so
+                # a restart cannot re-read a streak that was already spent.
+                loop.judge_quiet_streak = 0
+                await self._persist_judge_state(loop)
+                logger.info(
+                    "AutoNudge: loop %s hit the judge quiet-streak floor after %d quiet verdicts",
+                    loop.id,
+                    floor,
+                )
+                return False
+            if not await self._persist_judge_state(loop):
+                logger.warning(
+                    "AutoNudge: loop %s judged quiet but its state did not persist -- firing",
+                    loop.id,
+                )
+                return False
+            logger.debug("AutoNudge: loop %s judge quiet (%s)", loop.id, verdict.body)
+            return True
+        loop.judge_quiet_streak = 0
+        await self._persist_judge_state(loop)
+        logger.info("AutoNudge: loop %s judge verdict %s", loop.id, verdict.outcome.value)
+        return False
+
+    async def _persist_judge_state(self, loop: NudgeLoop) -> bool:
+        """Write this tick's judge state durably. ``True`` when it landed.
+
+        Awaited rather than scheduled, because by the time this runs the read
+        cursors, the quiet streak and the verdict record are already published in
+        memory. A scheduled write that has not landed when the process stops leaves
+        a restart re-reading the rows this tick consumed and recounting a streak it
+        had already spent.
+
+        The one answer this gate may not give on state that has not landed is
+        "quiet": suppressing a turn is the irreversible direction, since nothing
+        later says the turn was owed. A caller that suppresses checks the result and
+        fires when it is ``False``; a caller already firing does not need to, and
+        gets the durable write anyway.
+
+        CANCELLATION SAFETY: same contract as :meth:`update`, and it is needed here
+        for the same reason. This runs on the timer BEFORE the loop enters
+        ``_firing``, so ``notify_user_input``'s guard does not cover it and ordinary
+        user input cancels this task mid-write. ``_persist_locked`` releases
+        ``_lock`` when its awaiting task is cancelled, which would let a later write
+        land first and then be clobbered by this one's stale snapshot. So the write
+        runs as a SHIELDED supervised task: the cancellation reaches this frame while
+        the write keeps the lock and drains through ``_inflight_adds``.
+        ``CancelledError`` is not caught -- the caller going away is not a
+        persistence failure, and swallowing it would break cancellation.
+        """
+        inner: "asyncio.Task[None]" = asyncio.ensure_future(self._persist_locked())
+        self._inflight_adds.add(inner)
+
+        def _finish(t: "asyncio.Task[None]") -> None:
+            self._inflight_adds.discard(t)
+            if t.cancelled():
+                return
+            if t.exception() is not None:
+                logger.warning(
+                    "AutoNudge: detached judge-state persist failed for loop %s",
+                    loop.id,
+                    exc_info=t.exception(),
+                )
+
+        inner.add_done_callback(_finish)
+        try:
+            await asyncio.shield(inner)
+        except Exception:
+            logger.warning(
+                "AutoNudge: could not persist judge state for loop %s",
+                loop.id,
+                exc_info=True,
+            )
+            return False
+        return True
+
     async def _monitor_tick_is_quiet(self, loop: NudgeLoop) -> bool:
         """Observe this loop's subject cheaply; say whether to skip the turn.
 
@@ -4924,6 +5392,20 @@ class AutoNudgeService:
         slow GitHub call takes.
         """
         monitor = loop.monitor
+        # Whether the typed probe below will actually observe this tick -- and so
+        # whether a TERMINAL can still be detected for it. Only a loop whose probe
+        # runs defers its judge to the quiet return at the end of this method. The
+        # probe is the only thing that notices a merged or closed subject and
+        # DEACTIVATES the watch; a judge answering ahead of it returns before that
+        # runs and never emits a terminal itself, so a judged pull-request loop would
+        # keep watching a finished subject until its cycle cap ran out. A loop
+        # watching sibling sessions carries no monitor at all, so for that one the
+        # judge is the only screen there is and it has to run here or nowhere.
+        probe_will_run = monitor is not None and monitor.outcome is None and loop.gate
+        if not probe_will_run:
+            judged = await self._judge_tick_is_quiet(loop)
+            if judged is not None:
+                return judged
         if monitor is None or monitor.outcome is not None:
             return False
         if not loop.gate:
@@ -5295,6 +5777,28 @@ class AutoNudgeService:
                 )
 
         if verdict.outcome is irq.Outcome.QUIET:
+            # The ONE tick a judge screens on a monitor-backed loop. The typed probe
+            # has already spoken and found nothing, so asking now cannot suppress a
+            # typed signal: every outcome that MEANS something -- a terminal, a wake,
+            # a fallback, an interrupted poll, a drifted target -- has returned above
+            # this line. What the judge adds here is the evidence the probe cannot
+            # read: a review left in prose, a comment thread, a watched session's
+            # transcript tail. ``None`` means this loop carries no judge, which leaves
+            # the probe's own quiet verdict standing exactly as it did before.
+            #
+            # ASKED BEFORE the quiet counters are charged. A judge that answers wake
+            # or fallback makes this a DELIVERED tick, and charging first would book
+            # it as a free one -- overstating the very saving this feature exists to
+            # report -- while also walking a loop that keeps delivering toward a
+            # forced floor tick it never earned.
+            judged = await self._judge_tick_is_quiet(loop)
+            if judged is False:
+                # The judge overrides the probe's quiet on evidence the probe cannot
+                # read, so this tick spends a turn and is accounted for as one.
+                monitor.quiet_streak = 0
+                monitor.last_observed_at = time.time()
+                self._persist_soon()
+                return False
             monitor.quiet_ticks += 1
             monitor.quiet_streak += 1
             monitor.last_observed_at = time.time()

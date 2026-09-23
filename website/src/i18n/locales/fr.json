@@ -6013,7 +6013,21 @@
       "cancel": "Annuler",
       "clear_goal_question": "Supprimer définitivement cet objectif ?",
       "stop_file_help": "{{token}} est rempli à l’envoi de chaque relance : il devient le chemin du fichier d’arrêt de cette session. Créez ce fichier pour arrêter la boucle, ou appuyez sur « Arrêter la boucle », qui remplace « Démarrer la boucle » pendant que la boucle tourne.",
-      "stop_file_help_none": "Cette boucle a été armée sans fichier d’arrêt, donc {{token}} est envoyé vide. Appuyez sur « Arrêter la boucle » ci-dessous pour l’arrêter."
+      "stop_file_help_none": "Cette boucle a été armée sans fichier d’arrêt, donc {{token}} est envoyé vide. Appuyez sur « Arrêter la boucle » ci-dessous pour l’arrêter.",
+      "judge_wake_when": "Juge : réveiller quand {{criterion}}",
+      "judge_quiet_while": "Juge : rester silencieux tant que {{criterion}}",
+      "judge_verdict_one": "dernier : {{outcome}} · {{count}} élément · {{time}}",
+      "judge_verdict_untimed_one": "dernier : {{outcome}} · {{count}} élément",
+      "judge_verdict_many": "dernier : {{outcome}} · {{count}} éléments · {{time}}",
+      "judge_verdict_untimed_many": "dernier : {{outcome}} · {{count}} éléments",
+      "judge_verdict_other": "dernier : {{outcome}} · {{count}} éléments · {{time}}",
+      "judge_verdict_untimed_other": "dernier : {{outcome}} · {{count}} éléments",
+      "judge_outcome_quiet": "calme",
+      "judge_outcome_wake": "réveil",
+      "judge_outcome_terminal": "terminé",
+      "judge_outcome_fallback": "sans verdict",
+      "judge_outcome_unknown": "inconnu",
+      "judge_no_verdict": "pas encore de verdict"
     },
     "bottomTerminalPanel": {
       "close_terminal": "Fermer le terminal",
@@ -10886,7 +10900,7 @@
       "collapse_sessions_this_one_opened": "Replier les sessions ouvertes par celle-ci",
       "expand_sessions_this_one_opened": "Déplier les sessions ouvertes par celle-ci",
       "sessions_this_one_opened": "Sessions ouvertes par celle-ci",
-      "nesting_depth": "Profondeur d'imbrication\u202f: {{depth}}",
+      "nesting_depth": "Profondeur d'imbrication : {{depth}}",
       "opened_by_session": "Ouverte par {{slot}}",
       "opened_by_closed_session": "Ouverte par {{slot}} (fermée)",
       "no_conductor_sessions_yet": "Aucune session chef d'orchestre pour l'instant",
@@ -11498,7 +11512,7 @@
         "crew_members_desc": "La page Crew Members : tous vos agents, chacun avec son propre fil. Encore en construction, donc non proposée tant que ceci n’est pas activé.",
         "decisions": "Décisions (Jev)",
         "decisions_desc": "Jev est un petit modèle de décision rapide. Lorsque c'est activé, {{productName}} lui demande laquelle de vos compétences correspond au message que vous venez d'envoyer — ou si aucune ne convient — et utilise le choix de Jev pour la part de vos sessions indiquée sous le commutateur ; les autres conservent la règle de correspondance de mots livrée avec cette version. Si Jev est lent, injoignable ou ne renvoie rien d'exploitable, ce message revient à la même règle : une décision ne retarde donc jamais votre réponse. Chaque appel est également consigné dans un journal sur la machine qui exécute {{productName}}, à des fins de diagnostic. Ce commutateur n'est pas enregistré dans le navigateur mais sur la machine qui exécute {{productName}} : il vaut donc sur chaque appareil depuis lequel vous l'ouvrez.",
-        "decisions_egress": "Quand ceci est activé, le texte de tes messages et les noms et descriptions de tes compétences quittent cette machine. Ils sont envoyés par internet à Jev, le service de décision configuré pour ce {{productName}}. Trois autres catégories ont chacune leur propre interrupteur ci-dessous et restent désactivées jusqu'à ce que tu en actives une : le nom et les arguments de tes appels d'outils, la conversation et les entrées des appels d'outil d'une session que {{productName}} compacte de lui-même, et de courts extraits des mémoires rappelées pour ton message. Rien n'est envoyé quand ceci est désactivé.",
+        "decisions_egress": "Quand ceci est activé, le texte de tes messages et les noms et descriptions de tes compétences quittent cette machine. Ils sont envoyés par internet à Jev, le service de décision configuré pour ce {{productName}}. Quatre autres catégories ont chacune leur propre interrupteur ci-dessous et restent désactivées jusqu'à ce que tu en actives une : le nom et les arguments de tes appels d'outils, la conversation et les entrées des appels d'outil d'une session que {{productName}} compacte de lui-même, et de courts extraits des mémoires rappelées pour ton message. S’y ajoutent les messages récents des sessions qu’une boucle en attente surveille. Rien n'est envoyé quand ceci est désactivé.",
         "decisions_backend_required": "Le {{productName}} qui exécute ce tableau de bord est plus ancien que cette fonction, il n'y a donc encore rien à activer. Mettez d'abord {{productName}} à jour, depuis Réglages › Releases.",
         "decisions_sent_to": "Envoyé à",
         "decisions_endpoint_moved": "Tu as accepté l'envoi vers une adresse différente de celle indiquée maintenant dans les réglages ; rien n'est donc envoyé. Désactive puis réactive ceci pour accepter la nouvelle adresse.",
@@ -11562,7 +11576,9 @@
         "decisions_api_key_remove": "Retirer la clé",
         "decisions_api_key_remove_confirm": "Retirer la clé est irréversible : le coffre ne rend aucune valeur, il faudrait donc en coller une nouvelle.",
         "decisions_api_key_remove_cancel": "La garder",
-        "decisions_api_key_delete": "Supprimer la clé"
+        "decisions_api_key_delete": "Supprimer la clé",
+        "decisions_nudge_evidence": "Envoyer aussi ce qu’une boucle en attente surveille, pour que Jev puisse sauter un tour",
+        "decisions_nudge_evidence_desc": "Une boucle qui vérifie quelque chose toutes les quelques minutes réveille l’assistant chaque fois, même quand rien n’a changé. Ceci envoie ce qu’elle surveille — les derniers messages de l’assistant de ces sessions et l’état de toute pull request qu’elle nomme — à Jev, et demande si ce tour vaut la peine de réveiller quelqu’un. Jev ne peut que patienter ou réveiller : il ne peut jamais mettre fin à la boucle, et s’il est lent ou injoignable, la boucle réveille comme aujourd’hui. Les mots de passe et les clés sont remplacés avant tout envoi. Il lit les sessions que la boucle surveille, pas celle où tu écris. Désactivé par défaut."
       },
       "kiroSignInCard": {
         "title": "Connexion Kiro",

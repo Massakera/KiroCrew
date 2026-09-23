@@ -6013,7 +6013,21 @@
       "cancel": "Annulla",
       "clear_goal_question": "Eliminare definitivamente questo obiettivo?",
       "stop_file_help": "{{token}} viene compilato all’invio di ogni sollecito: diventa il percorso del file di arresto di questa sessione. Crea quel file per fermare il ciclo, o premi «Arresta il ciclo», che sostituisce «Avvia il ciclo» mentre il ciclo è in esecuzione.",
-      "stop_file_help_none": "Questo ciclo è stato avviato senza file di arresto, quindi {{token}} viene inviato vuoto. Premi «Arresta il ciclo» qui sotto per fermarlo."
+      "stop_file_help_none": "Questo ciclo è stato avviato senza file di arresto, quindi {{token}} viene inviato vuoto. Premi «Arresta il ciclo» qui sotto per fermarlo.",
+      "judge_wake_when": "Giudice: sveglia quando {{criterion}}",
+      "judge_quiet_while": "Giudice: resta in silenzio finché {{criterion}}",
+      "judge_verdict_one": "ultimo: {{outcome}} · {{count}} elemento · {{time}}",
+      "judge_verdict_untimed_one": "ultimo: {{outcome}} · {{count}} elemento",
+      "judge_verdict_many": "ultimo: {{outcome}} · {{count}} elementi · {{time}}",
+      "judge_verdict_untimed_many": "ultimo: {{outcome}} · {{count}} elementi",
+      "judge_verdict_other": "ultimo: {{outcome}} · {{count}} elementi · {{time}}",
+      "judge_verdict_untimed_other": "ultimo: {{outcome}} · {{count}} elementi",
+      "judge_outcome_quiet": "calmo",
+      "judge_outcome_wake": "risveglio",
+      "judge_outcome_terminal": "terminato",
+      "judge_outcome_fallback": "nessun verdetto",
+      "judge_outcome_unknown": "sconosciuto",
+      "judge_no_verdict": "nessun verdetto ancora"
     },
     "bottomTerminalPanel": {
       "close_terminal": "Chiudi il terminale",
@@ -11498,7 +11512,7 @@
         "crew_members_desc": "La pagina Crew Members: tutti i tuoi agenti, ognuno con il proprio thread. Ancora in costruzione, quindi non viene offerta finché non attivi questo.",
         "decisions": "Decisioni (Jev)",
         "decisions_desc": "Jev è un modello di decisione piccolo e veloce. Con questo attivo, {{productName}} gli chiede quale delle tue skill corrisponde al messaggio che hai appena inviato — o se non ne corrisponde nessuna — e usa la scelta di Jev per la quota delle tue sessioni mostrata sotto l'interruttore; le altre mantengono la regola di corrispondenza delle parole inclusa in questa versione. Se Jev è lento, non raggiungibile o non restituisce nulla di utilizzabile, quel messaggio torna alla stessa regola, quindi nessuna decisione rallenta la tua risposta. Ogni chiamata viene anche annotata in un log sulla macchina che esegue {{productName}}, per diagnostica. Questo interruttore non viene salvato nel browser ma sulla macchina che esegue {{productName}}, quindi vale su ogni dispositivo da cui lo apri.",
-        "decisions_egress": "Mentre questo è attivo, il testo dei tuoi messaggi e i nomi e le descrizioni delle tue skill lasciano questa macchina. Vengono inviati via internet a Jev, il servizio di decisione per cui questo {{productName}} è configurato. Altre tre categorie hanno ciascuna il proprio interruttore qui sotto e restano spente finché non ne accendi una: il nome e gli argomenti delle tue chiamate agli strumenti, la conversazione e gli input delle chiamate di strumento di una sessione che {{productName}} compatta da sé, e brevi estratti delle memorie richiamate per il tuo messaggio. Niente viene inviato mentre questo è spento.",
+        "decisions_egress": "Mentre questo è attivo, il testo dei tuoi messaggi e i nomi e le descrizioni delle tue skill lasciano questa macchina. Vengono inviati via internet a Jev, il servizio di decisione per cui questo {{productName}} è configurato. Altre quattro categorie hanno ciascuna il proprio interruttore qui sotto e restano spente finché non ne accendi una: il nome e gli argomenti delle tue chiamate agli strumenti, la conversazione e gli input delle chiamate di strumento di una sessione che {{productName}} compatta da sé, e brevi estratti delle memorie richiamate per il tuo messaggio. Si aggiungono i messaggi recenti delle sessioni che un ciclo in attesa osserva. Niente viene inviato mentre questo è spento.",
         "decisions_backend_required": "Il {{productName}} che esegue questa dashboard è più vecchio di questa funzione, quindi non c'è ancora nulla da attivare. Aggiorna prima {{productName}}, da Impostazioni › Releases.",
         "decisions_sent_to": "Inviato a",
         "decisions_endpoint_moved": "Hai accettato l'invio a un indirizzo diverso da quello ora presente nelle impostazioni, quindi non viene inviato nulla. Spegni e riaccendi questo per accettare il nuovo indirizzo.",
@@ -11562,7 +11576,9 @@
         "decisions_api_key_remove": "Rimuovi la chiave",
         "decisions_api_key_remove_confirm": "Rimuovere la chiave non si può annullare: la cassaforte non restituisce alcun valore, quindi dovresti incollarne una nuova.",
         "decisions_api_key_remove_cancel": "Tienila",
-        "decisions_api_key_delete": "Elimina la chiave"
+        "decisions_api_key_delete": "Elimina la chiave",
+        "decisions_nudge_evidence": "Invia anche ciò che osserva un ciclo in attesa, così Jev può saltare un turno",
+        "decisions_nudge_evidence_desc": "Un ciclo che controlla qualcosa ogni pochi minuti sveglia l’assistente ogni volta, anche quando non è cambiato nulla. Questo invia ciò che osserva — gli ultimi messaggi dell’assistente di quelle sessioni e lo stato di qualsiasi pull request che nomina — a Jev, e chiede se questo giro merita di svegliare qualcuno. Jev può solo attendere o svegliare: non può mai terminare il ciclo, e se è lento o irraggiungibile il ciclo sveglia come oggi. Password e chiavi vengono sostituite prima di ogni invio. Legge le sessioni che il ciclo osserva, non quella in cui stai scrivendo. Disattivato per impostazione predefinita."
       },
       "kiroSignInCard": {
         "title": "Accesso a Kiro",

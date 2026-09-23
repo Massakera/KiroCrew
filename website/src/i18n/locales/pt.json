@@ -6013,7 +6013,21 @@
       "cancel": "Cancelar",
       "clear_goal_question": "Excluir este objetivo definitivamente?",
       "stop_file_help": "{{token}} é preenchido ao enviar cada empurrão: passa a ser o caminho do arquivo de parada desta sessão. Crie esse arquivo para interromper o loop, ou pressione “Parar o loop”, que substitui “Iniciar loop” enquanto o loop roda.",
-      "stop_file_help_none": "Este loop foi armado sem arquivo de parada, então {{token}} é enviado em branco. Pressione “Parar o loop” abaixo para interrompê-lo."
+      "stop_file_help_none": "Este loop foi armado sem arquivo de parada, então {{token}} é enviado em branco. Pressione “Parar o loop” abaixo para interrompê-lo.",
+      "judge_wake_when": "Juiz: acordar quando {{criterion}}",
+      "judge_quiet_while": "Juiz: ficar em silêncio enquanto {{criterion}}",
+      "judge_verdict_one": "último: {{outcome}} · {{count}} item · {{time}}",
+      "judge_verdict_untimed_one": "último: {{outcome}} · {{count}} item",
+      "judge_verdict_many": "último: {{outcome}} · {{count}} itens · {{time}}",
+      "judge_verdict_untimed_many": "último: {{outcome}} · {{count}} itens",
+      "judge_verdict_other": "último: {{outcome}} · {{count}} itens · {{time}}",
+      "judge_verdict_untimed_other": "último: {{outcome}} · {{count}} itens",
+      "judge_outcome_quiet": "calmo",
+      "judge_outcome_wake": "acordando",
+      "judge_outcome_terminal": "concluído",
+      "judge_outcome_fallback": "sem veredicto",
+      "judge_outcome_unknown": "desconhecido",
+      "judge_no_verdict": "ainda sem veredicto"
     },
     "bottomTerminalPanel": {
       "close_terminal": "Fechar terminal",
@@ -11498,7 +11512,7 @@
         "crew_members_desc": "A página Crew Members: todos os seus agentes, cada um com o próprio tópico. Ainda em construção, por isso não é oferecida até você ligar isto.",
         "decisions": "Decisões (Jev)",
         "decisions_desc": "Jev é um modelo de decisão pequeno e rápido. Com isto ligado, o {{productName}} pergunta a ele qual das suas habilidades combina com a mensagem que você acabou de enviar — ou se nenhuma combina — e usa a escolha do Jev na parte das suas sessões mostrada sob o botão; as demais continuam com a regra de correspondência de palavras que vem nesta versão. Se o Jev estiver lento, fora do ar ou não devolver nada aproveitável, essa mensagem volta para a mesma regra, então nenhuma decisão atrasa a sua resposta. Cada chamada também é registrada em um log na máquina que executa o {{productName}}, para diagnóstico. Este botão não é salvo no navegador, mas na máquina que executa o {{productName}}, então vale em todos os aparelhos de onde você o abrir.",
-        "decisions_egress": "Enquanto isto estiver ligado, o texto das tuas mensagens e os nomes e descrições das tuas habilidades saem desta máquina. São enviados pela internet ao Jev, o serviço de decisão para o qual este {{productName}} está configurado. Outras três categorias têm cada uma o seu próprio interruptor abaixo e ficam desligadas até ligares uma: o nome e os argumentos das tuas chamadas de ferramenta, a conversa e as entradas das chamadas de ferramenta de uma sessão que o {{productName}} compacta por si, e trechos curtos das memórias trazidas para a tua mensagem. Nada é enviado enquanto isto estiver desligado.",
+        "decisions_egress": "Enquanto isto estiver ligado, o texto das tuas mensagens e os nomes e descrições das tuas habilidades saem desta máquina. São enviados pela internet ao Jev, o serviço de decisão para o qual este {{productName}} está configurado. Outras quatro categorias têm cada uma o seu próprio interruptor abaixo e ficam desligadas até ligares uma: o nome e os argumentos das tuas chamadas de ferramenta, a conversa e as entradas das chamadas de ferramenta de uma sessão que o {{productName}} compacta por si, e trechos curtos das memórias trazidas para a tua mensagem. Juntam-se as mensagens recentes das sessões que um laço em espera observa. Nada é enviado enquanto isto estiver desligado.",
         "decisions_backend_required": "O {{productName}} que executa este painel é mais antigo que este recurso, então ainda não há nada para ligar. Atualize o {{productName}} primeiro, em Configurações › Releases.",
         "decisions_sent_to": "Enviado para",
         "decisions_endpoint_moved": "Você concordou em enviar para um endereço diferente do que está agora nas configurações, então nada está sendo enviado. Desligue e ligue isto de novo para concordar com o novo endereço.",
@@ -11562,7 +11576,9 @@
         "decisions_api_key_remove": "Remover a chave",
         "decisions_api_key_remove_confirm": "Remover a chave não pode ser desfeito: o cofre não devolve nenhum valor, então você teria de colar uma nova.",
         "decisions_api_key_remove_cancel": "Manter",
-        "decisions_api_key_delete": "Excluir a chave"
+        "decisions_api_key_delete": "Excluir a chave",
+        "decisions_nudge_evidence": "Enviar também o que um laço em espera observa, para que o Jev possa pular um turno",
+        "decisions_nudge_evidence_desc": "Um laço que verifica algo a cada poucos minutos acorda o assistente sempre, mesmo quando nada mudou. Isto envia o que ele observa — as últimas mensagens do assistente dessas sessões e o estado de qualquer pull request que ele nomeie — ao Jev, e pergunta se esta rodada vale a pena acordar alguém. O Jev só pode esperar ou acordar: nunca pode encerrar o laço, e se estiver lento ou inacessível o laço acorda como hoje. Senhas e chaves são substituídas antes de qualquer envio. Ele lê as sessões que o laço observa, não aquela em que você está escrevendo. Desligado por padrão."
       },
       "kiroSignInCard": {
         "title": "Login do Kiro",

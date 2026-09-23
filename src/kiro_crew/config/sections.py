@@ -5899,6 +5899,21 @@ class NudgeWakeConfig:
         ),
     )
 
+    quiet_streak_floor: int = field(
+        default=0,
+        metadata=_meta(
+            "Quiet ticks before firing anyway",
+            "How many QUIET verdicts in a row a loop may collect before the next "
+            "tick fires regardless, so a judge that is wrong about a subject costs a "
+            "late turn rather than silence. 0, the default, means inherit the shipped "
+            "floor -- the same number the typed probe path uses, spelled once in the "
+            "loop engine so the two cannot drift. A negative value also reads as "
+            "inherit, and a value above the engine's ceiling is clamped down to it: "
+            "config.json is writable by an auto-approved agent shell, so a floor no "
+            "one chose must not be able to keep a loop quiet for long.",
+        ),
+    )
+
     @classmethod
     def from_raw(cls, section: object) -> "NudgeWakeConfig":
         """Normalize rather than reject, the posture the whole section takes.
@@ -5921,6 +5936,12 @@ class NudgeWakeConfig:
             # cannot use would make the saved config disagree with what the operator
             # wrote, and the bound that matters is at the call that names a model.
             llm_model=raw_model.strip() if isinstance(raw_model, str) else "",
+            # Absent, malformed and negative all read as 0, which the engine resolves
+            # to its shipped floor. The ceiling is NOT clamped here: it is the engine's
+            # own constant, and importing it would invert this module's dependency on
+            # the loop engine (which imports ``config.loader`` at module scope). The
+            # engine clamps on every read, so an over-large value never takes effect.
+            quiet_streak_floor=_safe_int(section.get("quiet_streak_floor", 0), 0, 0),
         )
 
 
@@ -6048,8 +6069,9 @@ class DecisionsConfig:
         default_factory=NudgeWakeConfig,
         metadata=_meta(
             "Wake judge",
-            "Per-point settings for nudge.wake: which judge answers, and the model "
-            "id for the small-model lane. The Jev lane still needs this point's "
+            "Per-point settings for nudge.wake: which judge answers, the model "
+            "id for the small-model lane, and how long a judge may keep a loop "
+            "quiet before one fires anyway. The Jev lane still needs this point's "
             "consent scope on the Decisions card; the small-model lane needs no "
             "consent row, because it sends to the model provider your sessions "
             "already use, so picking it here is what runs it.",

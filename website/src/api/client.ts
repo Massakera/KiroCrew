@@ -463,6 +463,14 @@ export interface DecisionsConsentData {
    */
   memory_text?: boolean
   /**
+   * Whether the owner consented to sending WAKE EVIDENCE — the transcript tail and
+   * pull-request readings the `nudge.wake` judge screens a tick against. Absent reads
+   * as not consented, on the same terms as the three above: this evidence comes from
+   * sessions the loop WATCHES rather than the one the owner is talking in, so none of
+   * the narrower yeses stands for it.
+   */
+  nudge_evidence?: boolean
+  /**
    * One row per decision point this GATEWAY ships, projected from the seam's own
    * registry (`decisions/gate.py`). The card lists these rather than an array
    * written here, so a build that ships another point lights up a row with no

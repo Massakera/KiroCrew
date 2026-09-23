@@ -4128,7 +4128,8 @@
         },
         "nudge_wake": {
           "provider": "auto",
-          "llm_model": ""
+          "llm_model": "",
+          "quiet_streak_floor": 0
         }
       }
     },
@@ -4276,12 +4277,13 @@
       "sensitive": false,
       "tags": [],
       "label": "Wake judge",
-      "help": "Per-point settings for nudge.wake: which judge answers, and the model id for the small-model lane. The Jev lane still needs this point's consent scope on the Decisions card; the small-model lane needs no consent row, because it sends to the model provider your sessions already use, so picking it here is what runs it.",
+      "help": "Per-point settings for nudge.wake: which judge answers, the model id for the small-model lane, and how long a judge may keep a loop quiet before one fires anyway. The Jev lane still needs this point's consent scope on the Decisions card; the small-model lane needs no consent row, because it sends to the model provider your sessions already use, so picking it here is what runs it.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {
         "provider": "auto",
-        "llm_model": ""
+        "llm_model": "",
+        "quiet_streak_floor": 0
       }
     },
     {
@@ -4311,6 +4313,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "decisions.nudge_wake.quiet_streak_floor",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Quiet ticks before firing anyway",
+      "help": "How many QUIET verdicts in a row a loop may collect before the next tick fires regardless, so a judge that is wrong about a subject costs a late turn rather than silence. 0, the default, means inherit the shipped floor -- the same number the typed probe path uses, spelled once in the loop engine so the two cannot drift. A negative value also reads as inherit, and a value above the engine's ceiling is clamped down to it: config.json is writable by an auto-approved agent shell, so a floor no one chose must not be able to keep a loop quiet for long.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0
     },
     {
       "path": "watchdog",
