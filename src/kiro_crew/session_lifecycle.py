@@ -20,6 +20,7 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from kiro_crew.kiro_prerequisite import identity_stamp_mismatch
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.metrics.sessions import (
     END_REASON_DESTROYED,
@@ -1173,6 +1174,110 @@ class SessionLifecycleService:
             # is the observable that contract names.
             await owner.release_subagent_runtime(key)
             self._deps.logger.info("Removed session (map preserved): %s", key)
+
+    async def flag_identity_stamp_mismatches(self, live: str) -> list[str]:
+        """Mark sessions -- and retire idle companion runtimes -- whose child
+        PROVABLY spawned under a different account.
+
+        The consumer of the spawn-identity stamp
+        (``kiro_prerequisite.stamp_spawn_identity``): each kiro-backed provider
+        records the account the store held as its process started, and this
+        compares those records against *live* -- the fresh fingerprint the turn
+        gate just read. A mismatch means the child authenticated as an account
+        other than the one the store currently names, even when the baseline and the interim
+        latch both compare equal because no read ever observed the interim
+        (the A->B->A round trip a gateway-wide baseline is inherently blind
+        to).
+
+        Flag-only for sessions: it sets the existing ``retire_on_identity_change``
+        eviction flag -- the next acquire on that key reports the session
+        invalid and the stale-provider path recycles it -- and never touches
+        the sweep baseline, and never records anything sticky. That is the
+        loop guard: a wrong observation
+        here costs one targeted recycle of one session, not a
+        retire-until-complete sweep, and on a healthy host every stamp equals
+        *live* so this is a no-op per turn. Sessions with no stamp are skipped
+        (``identity_stamp_mismatch`` refuses them), keeping every unstamped
+        child on the pre-stamping protections rather than guessing.
+
+        Companion runtimes are not sessions: the background runtime and the
+        per-parent subagent runtimes hold their own kiro-backed processes,
+        carry the same spawn stamp, and never appear in ``owner._sessions``,
+        so the session scan cannot reach them. They have no per-session
+        eviction flag either, so a PROVEN mismatch retires an idle one
+        directly -- the same treatment the identity sweep gives these
+        registries. A busy runtime is never killed mid-turn (killing live
+        work is the defect this change exists to remove); the gate runs
+        every turn, so it is caught on a later pass once idle.
+        """
+
+        if not live:
+            return []
+        owner = self._owner
+        flagged: list[str] = []
+        async with owner._lock:
+            for key, sess in owner._sessions.items():
+                if sess.retire_on_identity_change:
+                    continue
+                provider = sess.provider
+                if not self._deps.provider_uses_kiro_identity_store(provider):
+                    continue
+                stamp = getattr(provider, "spawn_identity", "") or getattr(
+                    getattr(provider, "_runtime", None), "spawn_identity", ""
+                )
+                if identity_stamp_mismatch(stamp, live):
+                    sess.retire_on_identity_change = True
+                    flagged.append(key)
+        # Companion runtimes, outside ``owner._lock`` like the sweep's own
+        # registry passes: ``release_subagent_runtime`` serializes on the
+        # per-parent spawn lock, the background retire on ``_bg_runtime_lock``.
+        for parent_key in list(owner._subagent_runtimes):
+            runtime = owner._subagent_runtimes.get(parent_key)
+            if runtime is None or not self._deps.provider_uses_kiro_identity_store(runtime):
+                continue
+            if not identity_stamp_mismatch(getattr(runtime, "spawn_identity", ""), live):
+                continue
+            if runtime.has_active_or_initializing_sessions():
+                continue
+            try:
+                await owner.release_subagent_runtime(parent_key)
+                flagged.append(f"subagent-runtime:{parent_key}")
+            except Exception:
+                self._deps.logger.warning(
+                    "Failed to retire the subagent runtime for %s after a spawn "
+                    "identity mismatch",
+                    parent_key,
+                    exc_info=True,
+                )
+        async with owner._bg_runtime_lock:
+            runtime = owner._bg_runtime
+            if (
+                runtime is not None
+                and self._deps.provider_uses_kiro_identity_store(runtime)
+                and identity_stamp_mismatch(getattr(runtime, "spawn_identity", ""), live)
+                and not runtime.has_active_or_initializing_sessions()
+            ):
+                try:
+                    await runtime.kill(expected=True, reason="spawn identity mismatch retirement")
+                    # Clear only after kill succeeds, mirroring the sweep:
+                    # otherwise retain the live-process reference for the next
+                    # attempt.
+                    owner._bg_runtime = None
+                    flagged.append("background-runtime")
+                except Exception:
+                    self._deps.logger.warning(
+                        "Failed to retire the background runtime after a spawn "
+                        "identity mismatch",
+                        exc_info=True,
+                    )
+        if flagged:
+            self._deps.logger.info(
+                "Flagged %d holder(s) whose child spawned under a different "
+                "account than the live one: %s",
+                len(flagged),
+                ", ".join(sorted(flagged)),
+            )
+        return flagged
 
     async def retire_kiro_identity_sessions(self, fingerprint: str = "") -> tuple[list[str], bool]:
         """Retire idle Kiro-backed processes after an identity-store change.

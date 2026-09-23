@@ -7308,6 +7308,10 @@ class TestParentEndCancelsItsChildren:
         companion runtimes — it skips any runtime answering
         ``has_active_or_initializing_sessions()`` — so it has no running child to
         end, and the parent conversation it belongs to continues.
+        ``flag_identity_stamp_mismatches`` is exempt for the same fact as the
+        sweep: its registry pass releases a companion runtime only when it is
+        idle AND its spawn stamp proves a wrong account, so there is no
+        running child to end there either.
 
         ``reset`` is NOT exempt: it calls both halves, under
         ``ends_conversation``. That keyword defaults to False because almost every one of
@@ -7349,7 +7353,11 @@ class TestParentEndCancelsItsChildren:
             f"thing after a rename; found {sorted(releasing)}"
         )
 
-        exempt = {"close_all", "_retire_kiro_subagent_runtimes"}
+        exempt = {
+            "close_all",
+            "_retire_kiro_subagent_runtimes",
+            "flag_identity_stamp_mismatches",
+        }
         assert exempt <= set(releasing), (
             "an exempt method no longer releases a companion runtime, so its "
             f"exemption is now unchecked: {sorted(exempt - set(releasing))}"

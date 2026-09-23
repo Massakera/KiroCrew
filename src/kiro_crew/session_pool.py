@@ -21,6 +21,8 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.kiro_prerequisite import pre_spawn_identity, stamp_spawn_identity
+
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
 else:
@@ -302,7 +304,19 @@ class WarmSessionPool:
                         # the warm-pool TTL is 1800 seconds; more importantly, a
                         # start spanning an identity epoch stays pre-epoch.
                         spawn_time = time.monotonic()
+                        pre_spawn = await pre_spawn_identity(
+                            getattr(self._owner, "spawn_identity_reader", None)
+                        )
                         await provider.start()
+                    # Fill-time is authentication time for a pooled provider --
+                    # a claim months of seconds later must compare against THIS
+                    # account, not the claim-time one (first-stamp-wins in the
+                    # helper keeps later starts from relabeling it).
+                    await stamp_spawn_identity(
+                        getattr(self._owner, "spawn_identity_reader", None),
+                        provider,
+                        pre_spawn=pre_spawn,
+                    )
                     self._warm_pool.put_nowait((provider, spawn_time))
                     provider = None
                     self._deps.logger.info(

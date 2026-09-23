@@ -4460,6 +4460,21 @@ async def start_dashboard(
         assume_ready=assume_kiro_ready,
     )
     state.kiro_prerequisite_service = app["kiro_prerequisite_service"]
+    # Seed the retirement baseline with the account on disk RIGHT NOW, before
+    # anything can spawn a kiro-backed child. Every child postdates this read,
+    # so the once-per-lifetime unset-baseline boot sweep -- which on a live
+    # gateway can never satisfy its completion precondition and degenerates
+    # into a retire/respawn loop -- is unnecessary: a real account change after
+    # this still compares unequal and sweeps. A store that cannot be
+    # fingerprinted refuses the seed and keeps the fail-safe sweep.
+    await app["kiro_prerequisite_service"].seed_sessions_baseline()
+    # Stamp every kiro-backed spawn with the account the store holds at that
+    # moment: the turn gate compares those stamps against its fresh read, so a
+    # child from an account round trip NO read ever observed -- the one case
+    # the seeded baseline and the interim latch are both blind to -- is still
+    # retired before reuse (see flag_identity_stamp_mismatches). Unwired (the
+    # CLI, tests), spawns stay unstamped and keep the pre-stamping behavior.
+    state.sessions.spawn_identity_reader = app["kiro_prerequisite_service"].read_spawn_identity
     # Probe Kiro readiness during boot rather than on the dashboard's first
     # status request: the cold probe spawns sandboxed CLI subprocesses and can
     # take seconds, which is what made the first-run setup chrome visible to
@@ -5791,6 +5806,21 @@ async def start_api_server(
         assume_ready=assume_kiro_ready,
     )
     state.kiro_prerequisite_service = app["kiro_prerequisite_service"]
+    # Seed the retirement baseline with the account on disk RIGHT NOW, before
+    # anything can spawn a kiro-backed child. Every child postdates this read,
+    # so the once-per-lifetime unset-baseline boot sweep -- which on a live
+    # gateway can never satisfy its completion precondition and degenerates
+    # into a retire/respawn loop -- is unnecessary: a real account change after
+    # this still compares unequal and sweeps. A store that cannot be
+    # fingerprinted refuses the seed and keeps the fail-safe sweep.
+    await app["kiro_prerequisite_service"].seed_sessions_baseline()
+    # Stamp every kiro-backed spawn with the account the store holds at that
+    # moment: the turn gate compares those stamps against its fresh read, so a
+    # child from an account round trip NO read ever observed -- the one case
+    # the seeded baseline and the interim latch are both blind to -- is still
+    # retired before reuse (see flag_identity_stamp_mismatches). Unwired (the
+    # CLI, tests), spawns stay unstamped and keep the pre-stamping behavior.
+    state.sessions.spawn_identity_reader = app["kiro_prerequisite_service"].read_spawn_identity
     # Probe Kiro readiness during boot rather than on the dashboard's first
     # status request: the cold probe spawns sandboxed CLI subprocesses and can
     # take seconds, which is what made the first-run setup chrome visible to

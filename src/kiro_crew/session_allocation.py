@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from kiro_crew.agent_spec_format import iter_agent_spec_files
+from kiro_crew.kiro_prerequisite import pre_spawn_identity, stamp_spawn_identity
 from kiro_crew.metrics.sessions import (
     END_REASON_EVICTED,
     discard_session_start,
@@ -530,6 +531,15 @@ class SessionAllocationService:
                 )
                 kwargs = self._owner._parent_runtime_kwargs(parent_session_key)
                 runtime = runtime_type(agent=selected_agent, **kwargs)
+                # Bracket the spawn with identity reads so this runtime carries
+                # a spawn stamp: every subagent session demuxed onto it
+                # inherits its credential, and the registry pass in
+                # ``flag_identity_stamp_mismatches`` can only compare a stamp
+                # that was recorded. The stamp lands on the runtime object
+                # itself (the gate reads ``runtime.spawn_identity`` directly).
+                pre_spawn = await pre_spawn_identity(
+                    getattr(self._owner, "spawn_identity_reader", None)
+                )
                 try:
                     await runtime.spawn()
                 except runtime_dead:
@@ -544,6 +554,12 @@ class SessionAllocationService:
                         exc_info=True,
                     )
                     continue
+                # Best-effort spawn-account record; see flag_identity_stamp_mismatches.
+                await stamp_spawn_identity(
+                    getattr(self._owner, "spawn_identity_reader", None),
+                    runtime,
+                    pre_spawn=pre_spawn,
+                )
                 self._subagent_runtimes[parent_session_key] = runtime
                 return runtime
 
@@ -590,10 +606,32 @@ class SessionAllocationService:
             if existing is not None and existing.is_alive():
                 return existing
             provider = owner._provider_factory(parent_session_key, agent=agent, cwd=cwd)
+            pre_spawn = await pre_spawn_identity(getattr(owner, "spawn_identity_reader", None))
             await provider.start()
+            # Record which account the store held as this runtime spawned:
+            # every session later demuxed onto it inherits this credential, so
+            # the stamp lives on the runtime's wrapping provider and is read
+            # back through the ``_runtime`` fallback in
+            # ``flag_identity_stamp_mismatches``. Best-effort; an unstamped
+            # runtime keeps the pre-stamping protections.
+            await stamp_spawn_identity(
+                getattr(owner, "spawn_identity_reader", None), provider, pre_spawn=pre_spawn
+            )
             session_provider = getattr(provider, "_client", None)
             runtime = getattr(session_provider, "_runtime", None)
             if session_provider is not None and runtime is not None:
+                # Sessions demuxed onto this runtime wrap it as ``_runtime``
+                # on their own providers, so the stamp must live on the
+                # runtime object itself for the ``_runtime`` fallback in
+                # ``flag_identity_stamp_mismatches`` to find it.
+                spawn_stamp = getattr(provider, "spawn_identity", "")
+                if spawn_stamp:
+                    try:
+                        runtime.spawn_identity = spawn_stamp
+                    except Exception:
+                        self._deps.logger.debug(
+                            "run runtime refused the spawn identity stamp", exc_info=True
+                        )
                 try:
                     session_provider._owns_runtime = False
                 except Exception:
@@ -1803,12 +1841,22 @@ class SessionAllocationService:
                         if provider.process_instance:
                             raise CapabilityStartupError("capability_runtime_not_fresh")
                         await asyncio.to_thread(verify_saved, preparation, provider.cwd)
+                    pre_spawn = await pre_spawn_identity(
+                        getattr(owner, "spawn_identity_reader", None)
+                    )
                     await provider.start()
                 except (asyncio.CancelledError, Exception):
                     if preparation.revision:
                         self._remember_capability_failure(key, preparation)
                     owner._dispatch_hard_kill(provider)
                     raise
+                # Record which account the store held as this child spawned
+                # (first-stamp-wins, so a warm-pool claim keeps its fill-time
+                # stamp). Best-effort: an unstamped child keeps the
+                # pre-stamping protections.
+                await stamp_spawn_identity(
+                    getattr(owner, "spawn_identity_reader", None), provider, pre_spawn=pre_spawn
+                )
 
         # start() has published the PID, but registry ownership is not visible
         # until the lock section below. Shield this narrow orphan-sweep window.

@@ -225,6 +225,9 @@ def _neutralise_outside_process_work(monkeypatch) -> dict[str, Any]:
     # Probes Kiro readiness by spawning sandboxed CLI subprocesses.
     prereq = MagicMock()
     prereq.close = AsyncMock()
+    # start_dashboard awaits the boot-time identity-baseline seed; a bare
+    # MagicMock attribute is not awaitable.
+    prereq.seed_sessions_baseline = AsyncMock(return_value=True)
     monkeypatch.setattr(kiro_prereq, "KiroPrerequisiteService", MagicMock(return_value=prereq))
     spies["kiro_prerequisite"] = prereq
 

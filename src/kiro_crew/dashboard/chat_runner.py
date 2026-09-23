@@ -3862,6 +3862,19 @@ async def _retire_sessions_on_identity_change(state: Any) -> None:
         return
     try:
         changed, live = await service.identity_changed_since_sessions()
+        # BEFORE the unchanged early-return: the stamp check exists precisely
+        # for the case where the baseline (and the interim latch) compare
+        # equal -- an A->B->A round trip no read ever observed -- while a
+        # child's own spawn-time stamp still proves it authenticated as the
+        # interim account. Flag-only: the existing eviction machinery recycles
+        # the flagged session at its next acquire, nothing global or sticky is
+        # touched, and on a healthy host every stamp equals ``live`` so this
+        # is a per-turn no-op. Looked up defensively like the pending
+        # fingerprint below: a holder that does not declare the surface is
+        # left alone rather than aborting the whole best-effort gate.
+        flag_stamp_mismatches = getattr(sessions, "flag_identity_stamp_mismatches", None)
+        if flag_stamp_mismatches is not None:
+            await flag_stamp_mismatches(live)
         if not changed:
             # An INCOMPLETE sweep is its own trigger, independent of the baseline.
             # The baseline advances only on a complete sweep, so after an A->B
