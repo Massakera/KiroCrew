@@ -1075,6 +1075,14 @@ def spawn_steer(name: str, args: dict[str, Any]) -> str:
     d = mcp_core._post(f"/api/spawn/{agent_id}/steer", {"message": message, "mode": mode})
     if d.get("error"):
         return f"Error: {d['error']}"
+    if mode != "follow_up" and d.get("status") == "follow_up_queued":
+        return (
+            f"Run {agent_id} could not be steered mid-turn ({d.get('detail', '')}). "
+            "The message was queued instead and will be delivered as a continuation "
+            "on the run's conversation after its current turn completes; that "
+            "continuation's result arrives as a separate [Subagent completion event] "
+            "after this run's own."
+        )
     if mode == "follow_up":
         return (
             f"Queued follow-up for run {agent_id}: it will be delivered as "

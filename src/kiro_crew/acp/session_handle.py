@@ -104,6 +104,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEERING_EXTENSION,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
@@ -2262,6 +2263,40 @@ class AcpSessionHandle:
         ``-32601``.
         """
         return self._runtime.acp_backend in ACP_BACKENDS_STEER
+
+    @property
+    def supports_steering_extension(self) -> bool:
+        """True when this session's host takes ``_session/steering``.
+
+        Membership in ``ACP_BACKENDS_STEERING_EXTENSION``. Read only by the
+        subagent steer path: the channel is confirmed by its own response and
+        emits no ``steering_consumed`` echo, so :attr:`supports_steer` (which the
+        chat's pending-steer ledger settles on) stays a separate answer.
+        """
+        return self._runtime.acp_backend in ACP_BACKENDS_STEERING_EXTENSION
+
+    async def inject_steering(self, message: str, *, timeout: float = 15.0) -> str:
+        """Inject *message* into the running turn via ``_session/steering``.
+
+        Returns the harness's ``outcome`` (``injected``, ``promptRequired``,
+        ``startedNewTurn`` or ``failed``), or ``""`` when nothing was sent. Awaited
+        on the control-plane path rather than routed to the session queue, so the
+        answer reaches the caller instead of the turn's reader. A JSON-RPC error
+        raises the runtime's error.
+        """
+        text = (message or "").strip()
+        if not text or not self._session_id or not self.supports_steering_extension:
+            return ""
+        wrapped = f"<user_message>\n{text}\n</user_message>"
+        resp = await self._runtime._send_and_await(
+            "_session/steering",
+            {"sessionId": self._session_id, "prompt": [{"type": "text", "text": wrapped}]},
+            timeout=timeout,
+        )
+        outcome = str(resp.get("outcome") or "")
+        if outcome == "injected":
+            self._last_steer_monotonic = time.monotonic()
+        return outcome
 
     # ── Commands & Config ──
 
