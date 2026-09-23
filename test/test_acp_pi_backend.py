@@ -1958,7 +1958,8 @@ class TestTheEffortControlIsReachableOnThisHarness:
 
     def test_the_advertised_option_answers_for_this_harness(self) -> None:
         """Written out per harness, so a silently granted authority names its own."""
-        assert ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION == frozenset({ACP_BACKEND_PI})
+        # droid joins on its own captured select, which offers every level Crew writes.
+        assert ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION == frozenset({ACP_BACKEND_PI, "droid"})
         assert ACP_BACKEND_KIRO not in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION
         assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION
         # deepseek is the near miss and stays out on purpose: its own vocabulary
