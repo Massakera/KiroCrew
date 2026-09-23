@@ -61,6 +61,7 @@ from kiro_crew.slack.handler import (
     get_orch_cfg,
     is_slack_session_trusted,
     is_thread_temporary,
+    linked_session_project,
     maybe_apply_privacy_modifiers,
     maybe_handle_keyword_command,
     maybe_route_linked_thread,
@@ -611,6 +612,7 @@ async def handle_message_transport(
                 # between the two modes.
                 blocks_reads=is_thread_temporary(session_key),
                 runtime_source="slack",
+                project=linked_session_project(session_key),
                 context_provider=client,
             )
         else:

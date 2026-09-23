@@ -2026,6 +2026,194 @@ class TestPerThreadAgent:
             _hydrated_sessions.discard("thread1")
 
 
+class _RecordingContextBuilder(ContextBuilder):
+    """A real ContextBuilder that also keeps what the turn asked of it."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.captured: dict = {}
+        self.built: str = ""
+
+    def build_message(self, text, is_new, session_key, **kw):
+        self.captured = kw
+        result = super().build_message(text, is_new, session_key, **kw)
+        self.built = result[0]
+        return result
+
+
+def _project_lines(prompt: str) -> list[str]:
+    return [line for line in prompt.splitlines() if line.startswith("[PROJECT] ")]
+
+
+class TestLinkedSessionProjectLine:
+    """A Slack turn on a linked dashboard session gets that session's ``[PROJECT]`` line.
+
+    The dashboard runner passes ``project=slot.project`` to ``build_message`` on
+    every turn. The inline Slack path is the other way into the SAME session,
+    so a reply arriving through Slack must scope the model to the same checkout
+    -- and, symmetrically, must not invent one for a session the dashboard
+    itself would leave unscoped.
+    """
+
+    OWNER_KEY = "dashboard:chat-7-1785861270"
+    SLOT_KEY = "chat-7-1785861270"
+
+    @staticmethod
+    def _log():
+        log = MagicMock()
+        log.get_metadata.return_value = {}
+        log.get_metadata_status.return_value = ({}, True)
+        log.recent.return_value = []
+        return log
+
+    @staticmethod
+    def _dashboard_with(slots: dict):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(_slots=slots)
+
+    def _linked_sessions(self):
+        owner_key = self.OWNER_KEY
+
+        class LinkedSessions(FakeSessionManager):
+            def get_session_for_thread(self, thread_ts):
+                return owner_key
+
+        return LinkedSessions()
+
+    async def _turn(self, monkeypatch, sessions, dashboard_state, *, agent: str = ""):
+        import kiro_crew.slack.handler as handler_mod
+        from kiro_crew.slack.handler import _hydrated_sessions
+
+        log = self._log()
+        if agent:
+            log.get_metadata.side_effect = lambda key: (
+                {"agent": agent} if key == self.OWNER_KEY else {}
+            )
+        ctx = _RecordingContextBuilder(conversation_log=log)
+        monkeypatch.setattr(handler_mod, "_dashboard_state", dashboard_state)
+        try:
+            await handle_message(
+                MockSlackClient(),
+                sessions,
+                "C1",
+                "hello",
+                "thread1",
+                "msg1",
+                "U_OWNER",
+                context_builder=ctx,
+                conversation_log=log,
+            )
+        finally:
+            _hydrated_sessions.discard(self.OWNER_KEY)
+            _hydrated_sessions.discard("slack:thread1")
+            _hydrated_sessions.discard("thread1")
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_linked_turn_carries_the_sessions_project(self, monkeypatch):
+        from types import SimpleNamespace
+
+        slot = SimpleNamespace(key=self.SLOT_KEY, linked_session_key="", project="/srv/checkout")
+        sessions = self._linked_sessions()
+
+        ctx = await self._turn(
+            monkeypatch, sessions, self._dashboard_with({self.SLOT_KEY: slot}), agent="sisyphus"
+        )
+
+        assert self.OWNER_KEY in sessions.keys_seen, "the turn never rerouted to the owner"
+        assert ctx.captured.get("project") == "/srv/checkout", ctx.captured.get("project")
+        assert ctx.captured.get("runtime_source") == "slack"
+        assert ctx.captured.get("agent") == "sisyphus"
+        assert _project_lines(ctx.built) == [
+            "[PROJECT] Active project directory: /srv/checkout"
+        ], ctx.built
+
+    @pytest.mark.asyncio
+    async def test_linked_session_without_a_project_gets_no_line(self, monkeypatch):
+        from types import SimpleNamespace
+
+        slot = SimpleNamespace(key=self.SLOT_KEY, linked_session_key="", project="")
+        sessions = self._linked_sessions()
+
+        ctx = await self._turn(monkeypatch, sessions, self._dashboard_with({self.SLOT_KEY: slot}))
+
+        assert self.OWNER_KEY in sessions.keys_seen
+        assert ctx.captured.get("project") is None, ctx.captured.get("project")
+        assert _project_lines(ctx.built) == [], ctx.built
+
+    @pytest.mark.asyncio
+    async def test_unlinked_thread_gets_no_line(self, monkeypatch):
+        """A Slack-born thread with no dashboard slot is scoped to nothing."""
+        from types import SimpleNamespace
+
+        stranger = SimpleNamespace(key="chat-9-1", linked_session_key="", project="/elsewhere")
+
+        ctx = await self._turn(
+            monkeypatch, FakeSessionManager(), self._dashboard_with({"chat-9-1": stranger})
+        )
+
+        assert ctx.captured.get("project") is None, ctx.captured.get("project")
+        assert _project_lines(ctx.built) == [], ctx.built
+
+    @pytest.mark.asyncio
+    async def test_slack_only_gateway_has_no_dashboard_to_ask(self, monkeypatch):
+        ctx = await self._turn(monkeypatch, self._linked_sessions(), None)
+
+        assert ctx.captured.get("project") is None
+        assert _project_lines(ctx.built) == []
+
+
+class TestLinkedSessionProject:
+    """``linked_session_project`` answers with the dashboard's own value, or None."""
+
+    def _state(self, monkeypatch, slots: dict):
+        from types import SimpleNamespace
+
+        import kiro_crew.slack.handler as handler_mod
+
+        monkeypatch.setattr(handler_mod, "_dashboard_state", SimpleNamespace(_slots=slots))
+
+    def test_dashboard_slot_by_its_own_key(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from kiro_crew.slack.handler import linked_session_project
+
+        slot = SimpleNamespace(key="chat-7-1", linked_session_key="", project="/srv/checkout")
+        self._state(monkeypatch, {"chat-7-1": slot})
+
+        assert linked_session_project("dashboard:chat-7-1") == "/srv/checkout"
+        assert linked_session_project("dashboard:chat-8-1") is None
+
+    def test_channel_born_slot_by_its_linked_key(self, monkeypatch):
+        """A mirror tab runs on the channel's own key; that key is what matches."""
+        from types import SimpleNamespace
+
+        from kiro_crew.slack.handler import linked_session_project
+
+        slot = SimpleNamespace(
+            key="slack_1700000000.000100",
+            linked_session_key="slack:1700000000.000100",
+            project="/srv/mirror",
+        )
+        self._state(monkeypatch, {slot.key: slot})
+
+        assert linked_session_project("slack:1700000000.000100") == "/srv/mirror"
+        assert linked_session_project("dashboard:slack_1700000000.000100") is None
+
+    def test_empty_project_and_missing_dashboard_are_none(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import kiro_crew.slack.handler as handler_mod
+        from kiro_crew.slack.handler import linked_session_project
+
+        self._state(monkeypatch, {"chat-7-1": SimpleNamespace(key="chat-7-1", project="")})
+        assert linked_session_project("dashboard:chat-7-1") is None
+
+        monkeypatch.setattr(handler_mod, "_dashboard_state", None)
+        assert linked_session_project("dashboard:chat-7-1") is None
+
+
 class TestStopCommand:
     """Tests for the !stop kill switch."""
 

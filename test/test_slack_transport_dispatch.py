@@ -691,6 +691,93 @@ class TestTransportNativeParity:
         assert cb.captured.get("user_display_name") == "Alice"
 
 
+class TestTransportLinkedSessionProjectLine:
+    """The transport path scopes a linked turn to the owning slot's project.
+
+    Same contract as the inline handler: ``build_message`` receives the
+    dashboard slot's ``project`` when the thread resolves to a dashboard-owned
+    session, and None when there is no slot or the slot has no project -- the
+    dashboard runner's own rule, so both surfaces of one session agree.
+    """
+
+    OWNER_KEY = "dashboard:chat-7-1785861270"
+    SLOT_KEY = "chat-7-1785861270"
+
+    def _prep(self, monkeypatch, dashboard_state):
+        import kiro_crew.slack.handler as handler_mod
+
+        monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
+        monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
+        monkeypatch.setattr(handler_mod, "_dashboard_state", dashboard_state)
+
+    def _linked_sessions(self):
+        owner_key = self.OWNER_KEY
+
+        class LinkedSessions(_CapturingSessions):
+            def get_session_for_thread(self, thread_ts):
+                return owner_key
+
+        return LinkedSessions(
+            ScriptedProvider(
+                [
+                    make_event(EVENT_TEXT_CHUNK, text="hi"),
+                    make_event(EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+                ]
+            )
+        )
+
+    def _turn(self, sessions):
+        cb = _CapturingCtxBuilder()
+        asyncio.run(
+            transport_dispatch.handle_message_transport(
+                slack=RecordingSlackClient(),
+                sessions=sessions,
+                channel="C1",
+                text="hello",
+                thread_ts="1700000000.000042",
+                msg_ts=_MSG_TS,
+                user_id="U_OWNER",
+                context_builder=cb,
+                conversation_log=None,
+            )
+        )
+        return cb.captured
+
+    def test_linked_turn_carries_the_sessions_project(self, monkeypatch):
+        from types import SimpleNamespace
+
+        slot = SimpleNamespace(key=self.SLOT_KEY, linked_session_key="", project="/srv/checkout")
+        self._prep(monkeypatch, SimpleNamespace(_slots={self.SLOT_KEY: slot}))
+
+        captured = self._turn(self._linked_sessions())
+
+        assert captured.get("project") == "/srv/checkout", captured.get("project")
+        assert captured.get("runtime_source") == "slack"
+
+    def test_linked_session_without_a_project_passes_none(self, monkeypatch):
+        from types import SimpleNamespace
+
+        slot = SimpleNamespace(key=self.SLOT_KEY, linked_session_key="", project="")
+        self._prep(monkeypatch, SimpleNamespace(_slots={self.SLOT_KEY: slot}))
+
+        assert self._turn(self._linked_sessions()).get("project") is None
+
+    def test_unlinked_thread_passes_none(self, monkeypatch):
+        from types import SimpleNamespace
+
+        stranger = SimpleNamespace(key="chat-9-1", linked_session_key="", project="/elsewhere")
+        self._prep(monkeypatch, SimpleNamespace(_slots={"chat-9-1": stranger}))
+
+        captured = self._turn(_CapturingSessions(self._linked_sessions()._provider))
+        assert captured.get("project") is None, captured.get("project")
+
+
 def _arm_reinjection(sessions) -> dict:
     """Give the session stand-in the real manager's one-shot flag surface."""
     ledger: dict = {"consumed": [], "marks": 0, "armed": True}

@@ -3977,6 +3977,7 @@ async def handle_message(
                 blocks_reads=_slack_blocks_reads,
                 model_window=_model_window,
                 runtime_source="slack",
+                project=linked_session_project(session_key),
                 user_text_range=_user_text_range,
                 context_provider=client,
             )
@@ -5642,6 +5643,32 @@ def _linked_slots_for(session_key: str) -> list[Any]:
     if not slots:
         return []
     return [slot for slot in list(slots.values()) if effective_session_key(slot) == session_key]
+
+
+def linked_session_project(session_key: str) -> str | None:
+    """The project directory a turn on *session_key* is scoped to, or None.
+
+    The dashboard runner hands ``build_message`` the slot's ``project`` on every
+    turn, so a session with a project is told its ``[PROJECT]`` line whichever
+    surface the turn arrives on -- except Slack, which passed nothing. A Slack
+    reply routed into a linked dashboard session then ran without the one line
+    that scopes file search and code references to that session's checkout,
+    and the model described itself as unscoped.
+
+    Same source as the dashboard path -- the live slot whose turns run on this
+    key -- so a Slack turn and a dashboard turn on the same session see the same
+    value. Deliberately NOT the session map's stored cwd: that is the provider's
+    working directory, which is set for every session (a default checkout when
+    no project was chosen), so reading it would state a project the dashboard
+    itself never states. A thread with no slot, or a slot with no project,
+    yields None and ``build_message`` emits no line, exactly as the dashboard
+    does for that slot.
+    """
+    for slot in _linked_slots_for(session_key):
+        project = getattr(slot, "project", "") or ""
+        if project:
+            return str(project)
+    return None
 
 
 def _linked_trust_grantable(session_key: str, request_id: str | int) -> bool:
