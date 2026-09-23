@@ -1186,31 +1186,36 @@ class TestSnapshotAndPortabilityRegistration:
 
 
 class TestConfigDefaults:
-    def test_beacon_on_by_default_with_https_endpoint(self):
+    def test_beacon_off_by_default_with_https_endpoint(self):
         from kiro_crew.config.loader import TelemetryConfig
 
         cfg = TelemetryConfig()
-        assert cfg.beacon_enabled is True
+        assert cfg.beacon_enabled is False
         assert cfg.beacon_endpoint.startswith("https://")
 
-    def test_a_default_install_actually_sends(self, _isolated_home):
-        """DEFAULT-ON, end to end — the whole suppression chain, not just the flag.
+    def test_a_default_install_does_not_send(self, _isolated_home):
+        from kiro_crew.config.loader import TelemetryConfig
 
-        The stored flag being True is necessary but not sufficient: this change
-        added a governance suppression ABOVE the flag in ``should_send``, so a
-        wrong ``capability_default`` (or a probe that failed closed) would silence
-        every install in the field while ``beacon_enabled`` still read True. That
-        failure is invisible in a flag assertion and would look like a collapse in
-        Daily Active Instances, so assert the actual verdict.
+        cfg = TelemetryConfig()
+        ok, _reason, _code = beacon.should_send(enabled=cfg.beacon_enabled, acked=True)
+        assert ok is False
+
+    def test_an_opted_in_install_actually_sends(self, _isolated_home):
+        """Opt-in, end to end — the whole suppression chain, not just the flag.
+
+        The stored flag being True is necessary but not sufficient: a governance
+        suppression sits ABOVE the flag in ``should_send``, so a wrong
+        ``capability_default`` (or a probe that failed closed) would silence every
+        opted-in install while ``beacon_enabled`` still read True.
 
         The fixture already neutralizes the CI and data-home suppressions (both
         fire in the test environment for reasons unrelated to defaults).
         """
         from kiro_crew.config.loader import TelemetryConfig
 
-        cfg = TelemetryConfig()
+        cfg = TelemetryConfig(beacon_enabled=True)
         ok, reason, _code = beacon.should_send(enabled=cfg.beacon_enabled, acked=True)
-        assert ok is True, f"a default install must send, got: {reason}"
+        assert ok is True, f"an opted-in install must send, got: {reason}"
         assert reason == "ready"
 
     def test_ungoverned_default_is_not_pinned_off(self, _isolated_home):

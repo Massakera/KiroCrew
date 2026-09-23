@@ -2907,7 +2907,7 @@ def _build_telemetry_config(telemetry_data: dict) -> TelemetryConfig:
         retention_days=_safe_int(telemetry_data.get("retention_days", 0), 0),
         max_total_mb=_safe_int(telemetry_data.get("max_total_mb", 0), 0),
         otlp_endpoint=str(telemetry_data.get("otlp_endpoint", "")),
-        beacon_enabled=bool(telemetry_data.get("beacon_enabled", True)),
+        beacon_enabled=bool(telemetry_data.get("beacon_enabled", False)),
         beacon_endpoint=str(telemetry_data.get("beacon_endpoint", _DEFAULT_BEACON_ENDPOINT)),
     )
 
@@ -3957,7 +3957,7 @@ class KiroCrewConfig:
         metadata=_meta("Default Memory Store", "Fallback memory store name."),
     )
     auto_update: bool = field(
-        default=True,
+        default=False,
         metadata=_meta("Auto Update", "Enable automatic update checks."),
     )
     #: Opt-in for the Connections gallery, which is merged but held for a later
@@ -4684,7 +4684,7 @@ class KiroCrewConfig:
             # There is deliberately NO ``enabled`` key read here — see
             # ComputerUseConfig's docstring and computer_use_state_path().
             computer_use=_build_computer_use_config(computer_use_data),
-            auto_update=data.get("auto_update", True),
+            auto_update=data.get("auto_update", False),
             connections_ui=_safe_bool(data.get("connections_ui", True), True),
             _degraded_sections=frozenset(_degraded | _OBSERVED_DEGRADED_SECTIONS),
             timezone=data.get("timezone", ""),

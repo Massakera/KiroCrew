@@ -7163,3 +7163,19 @@ class TestMigrationWriteBackOrdering:
         assert wrote is False
         assert not Path(str(cfg_path) + ".bak").exists()
         assert json.loads(cfg_path.read_text(encoding="utf-8")) == already_migrated
+
+
+class TestForkPrivacyDefaults:
+    """This fork ships with automatic updates and the anonymous beacon OFF."""
+
+    def test_auto_update_and_beacon_default_off(self):
+        cfg = _load_from_raw_string("{}")
+        assert cfg.auto_update is False
+        assert cfg.telemetry.beacon_enabled is False
+
+    def test_both_can_be_re_enabled_from_config(self):
+        cfg = _load_from_raw_string(
+            json.dumps({"auto_update": True, "telemetry": {"beacon_enabled": True}})
+        )
+        assert cfg.auto_update is True
+        assert cfg.telemetry.beacon_enabled is True

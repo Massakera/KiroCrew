@@ -183,7 +183,7 @@ Set a registered value with, for example,
     "folder_ingest_chunk_budget": 300,
     "dedup_every_n_sweeps": 12
   },
-  "auto_update": true,
+  "auto_update": false,
   "timezone": ""
 }
 ```
@@ -487,7 +487,7 @@ member-memory sandbox is required.
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `auto_update` | Enable automatic update checks | `true` |
+| `auto_update` | Apply available updates automatically (checks still run and notify) | `false` |
 | `timezone` | IANA timezone name, e.g. `"America/Los_Angeles"` | `""` (falls back to UTC) |
 | `snapshot_dir` | Where `kirocrew snapshot` writes tarballs | `""` (`~/.kiro/crew/snapshots`) |
 

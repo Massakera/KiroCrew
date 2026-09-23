@@ -2007,7 +2007,7 @@ class KiroCrewConfig:
     computer_use: ComputerUseConfig
     hooks_data: dict               # raw hooks from config.json
     dashboard_url: str = ""        # e.g. "http://my-host.example.com:8080"
-    auto_update: bool = True
+    auto_update: bool = False      # fork default; checks still run and notify
     snapshot_dir: str = ""         # snapshot output dir (default ~/.kiro/crew/snapshots)
     slack_channels: dict[str, ChannelConfig]  # per-channel config keyed by channel ID
     slack_dm_activation: str = "always"       # activation mode for DMs (D-prefix channels)

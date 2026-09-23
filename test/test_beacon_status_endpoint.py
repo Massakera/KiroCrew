@@ -37,10 +37,13 @@ def _neutral_env(tmp_path, monkeypatch):
     ``privacy_acked`` is part of that neutralization: the first-egress gate holds
     a heartbeat until the disclosure has been shown, and an unacked tmp home would
     make every ``would_send`` false for that reason instead of the one under test.
+
+    The beacon is off by default in this fork, so the fixture opts in explicitly.
     """
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
     (tmp_path / "config.json").write_text(
-        json.dumps({"dashboard": {"privacy_acked": True}}), encoding="utf-8"
+        json.dumps({"dashboard": {"privacy_acked": True}, "telemetry": {"beacon_enabled": True}}),
+        encoding="utf-8",
     )
     monkeypatch.setattr(beacon, "config_dir", lambda: tmp_path)
     monkeypatch.setattr(beacon, "is_default_home", lambda: True)
@@ -65,6 +68,16 @@ class TestBeaconStatusEndpoint:
         assert body["reason"] == "ready"
         assert body["env_override"] is False
         assert body["env_var"] == beacon.DISABLE_ENV
+
+    @pytest.mark.asyncio
+    async def test_default_config_reports_disabled(self, _neutral_env) -> None:
+        (_neutral_env / "config.json").write_text(
+            json.dumps({"dashboard": {"privacy_acked": True}}), encoding="utf-8"
+        )
+        async with TestClient(TestServer(_make_app())) as c:
+            body = await _get(c)
+        assert body["enabled"] is False
+        assert body["would_send"] is False
 
     @pytest.mark.asyncio
     async def test_env_override_is_flagged(self, _neutral_env, monkeypatch) -> None:

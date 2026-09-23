@@ -246,8 +246,9 @@ Kiro Crew sends **one anonymous heartbeat per day** so maintainers can see how
 many copies are actively running and which releases, Python minors, and install
 paths still need support. After a successful install or update from the official
 app catalog, it also sends one anonymous per-app receipt. Both signals are
-enabled by default, but first egress waits until the first-run privacy disclosure
-has been shown; they use the same controls below.
+**disabled by default in this fork** (`telemetry.beacon_enabled: false`); once
+enabled, first egress still waits until the first-run privacy disclosure has been
+shown, and they use the same controls below.
 
 To turn it off, flip **Settings → Privacy → Send anonymous usage heartbeat** in
 the dashboard (the same switch appears on the last step of first-run

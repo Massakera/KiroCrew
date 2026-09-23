@@ -4279,7 +4279,7 @@ class TelemetryConfig:
         ),
     )
     beacon_enabled: bool = field(
-        default=True,
+        default=False,
         metadata=_meta(
             "Anonymous Usage Beacon",
             "Anonymous daily heartbeat so maintainers can see how many "
