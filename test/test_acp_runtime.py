@@ -8525,7 +8525,8 @@ async def test_unknown_session_drops_aggregate_into_one_counted_record(caplog):
         records = _drop_records(caplog)
         assert len(records) == 1, records
         assert (
-            "Dropped 6 unroutable frame(s) for session ghost (method=session/update)" in records[0]
+            "Dropped 6 unroutable frame(s) for session ghost (method='session/update')"
+            in records[0]
         )
         # The point of the change: SIX dropped frames produce ONE log record,
         # not six. Counts every record naming the session, whatever its wording.
@@ -8596,7 +8597,7 @@ async def test_no_session_broadcast_drops_are_counted(caplog):
         records = _drop_records(caplog)
         assert len(records) == 1, records
         assert "Dropped 4 unroutable frame(s)" in records[0]
-        assert "(method=mcp/status)" in records[0]
+        assert "(method='mcp/status')" in records[0]
     finally:
         await _stop_reader(task)
 
@@ -8731,7 +8732,7 @@ def test_drop_counter_placeholder_appears_in_flushed_summary(caplog):
 
     records = _drop_records(caplog)
     assert len(records) == 1, records
-    assert "Dropped 1 unroutable frame(s) for session ? (method=?)" in records[0]
+    assert "Dropped 1 unroutable frame(s) for session ? (method='?')" in records[0]
 
 
 class TestToolPurposeExtraction:
@@ -9323,6 +9324,13 @@ async def _drain_audits(rt) -> None:
     """Await in-flight audit tasks so none outlives the test's event loop."""
     if rt._audit_tasks:
         await asyncio.gather(*list(rt._audit_tasks), return_exceptions=True)
+
+
+async def _drain_answers(rt) -> None:
+    """Await the retained off-loop permission answers (each writes stdin under
+    the transport's write lock, so a burst completes over several turns)."""
+    if rt._answer_tasks:
+        await asyncio.gather(*list(rt._answer_tasks), return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -12273,6 +12281,9 @@ async def test_buffered_burst_with_responsive_backend_does_not_trip_cap():
     task = await _start_reader(rt)
     try:
         await _drain(reader)
+        # The answers are retained tasks that take the stdin write lock in
+        # turn; wait on that observable condition rather than a turn count.
+        await _drain_answers(rt)
         await _drain_audits(rt)
         # Responsive backend (writes complete immediately): every request
         # answered, cap never tripped.
