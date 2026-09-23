@@ -939,7 +939,9 @@ class TestLLMPoolEffort:
         with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
             result = await pool._create_worker()
 
-        worker_type.assert_called_once_with(sandbox_mode="auto", effort="high")
+        worker_type.assert_called_once_with(
+            sandbox_mode="auto", effort="high", acp_backend=ACP_BACKEND_KIRO
+        )
         assert result is fake_worker
 
     @pytest.mark.asyncio
@@ -951,7 +953,9 @@ class TestLLMPoolEffort:
         with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
             await pool._create_worker()
 
-        worker_type.assert_called_once_with(sandbox_mode="auto", effort=None)
+        worker_type.assert_called_once_with(
+            sandbox_mode="auto", effort=None, acp_backend=ACP_BACKEND_KIRO
+        )
 
     @pytest.mark.asyncio
     async def test_fetch_sized_pool_ignores_extraction_size_config(self):
