@@ -71,7 +71,11 @@ from kiro_crew.history import (
 )
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.mcp_discovery import sync_discovered_servers
-from kiro_crew.messaging.link import canonical_key
+from kiro_crew.messaging.link import (
+    _TELEMETRY_LOCAL_PREFIXES,
+    _in_namespace,
+    canonical_key,
+)
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     configured_sandbox_mode,
@@ -1147,6 +1151,66 @@ def _open_slot_transcript_keys(state: DashboardState) -> set[str]:
     return keys
 
 
+#: Namespaces a conversation can be STARTED in, so their transcripts stay listed.
+#: Spelled as the kept set rather than as a subtraction: a namespace is added to
+#: ``_TELEMETRY_LOCAL_PREFIXES`` by whoever mints it, and the safe default for a
+#: name nobody has classified is to keep showing it.
+#:
+#: * ``dashboard`` — the user's own chats, which is the whole list being kept.
+#: * ``cron`` — a job without ``hide_in_chat`` backs a real chat slot, so its
+#:   transcript is a tab the user follows; only the opted-out ones are silent,
+#:   and the key does not record which kind wrote it.
+#: * ``side`` — the slot's own side panel, which the user typed into; ``sel.py``'s
+#:   audit-source attributor classifies ``side:`` as a ``dashboard`` surface for
+#:   that reason. Side messages are documented as never reaching a persistent
+#:   store, so a ``side_`` transcript should not exist — which is why dropping the
+#:   namespace buys nothing while risking the one outcome this filter must avoid.
+_USER_STARTED_NAMESPACES: frozenset[str] = frozenset({"dashboard", "cron", "side"})
+
+#: Namespaces whose transcripts belong to a machine run. Channel namespaces
+#: (``slack``, ``discord``, …) are absent from ``_TELEMETRY_LOCAL_PREFIXES`` by
+#: construction, so a conversation held on a messaging channel is never dropped.
+#: ``channel`` IS a member and IS dropped: it keys a persistent channel AGENT's
+#: own session (``channel:<channel_id>:<agent_id>``), not the channel transcript
+#: a person reads.
+_MACHINE_ONLY_NAMESPACES: tuple[str, ...] = tuple(
+    ns for ns, _label in _TELEMETRY_LOCAL_PREFIXES if ns not in _USER_STARTED_NAMESPACES
+)
+
+
+#: A machine namespace that nonetheless had a real chat slot opened ON it, making
+#: the row a conversation. ``POST /api/taskrunner/{id}/to-chat`` is the one producer:
+#: it binds ``taskrunner:<task_id>:chat:<token>`` as a slot's ``linked_session_key``
+#: and titles the slot ``Plan: <task_id>``.
+#:
+#: Both parts of the pattern are load-bearing. The segment is matched as delimited
+#: text rather than by index because ``_safe_key`` folds EVERY ``:`` to ``_``, so a
+#: ``task_id`` containing ``_`` shifts the index — counting separators would drop
+#: exactly the rows with underscores in their spec name. The trailing 32 hex
+#: characters are the producer's ``uuid.uuid4().hex``, and requiring them is what
+#: separates a to-chat session from an ordinary run: ``taskrunner.py`` also mints
+#: ``taskrunner:run:<spec stem>``, so a spec named ``chat_triage.yaml`` becomes the
+#: stem ``taskrunner_run_chat_triage``, which a bare ``chat`` match would exempt.
+#:
+#: Residual, pointing the safe way: a spec stem ending in ``chat_`` plus 32 hex
+#: characters is still exempted. Showing one machine row too many is the defect this
+#: filter narrows; hiding one real conversation is worse, so ambiguity shows the row.
+_USER_CHAT_SEGMENT_RE = re.compile(r"[:_]chat[:_][0-9a-f]{32}$")
+
+
+def _is_machine_only_session(key: str) -> bool:
+    """True when *key* sits in a namespace no user ever addressed directly.
+
+    Matched through ``_in_namespace`` because this reads a PERSISTED name:
+    ``history._safe_key`` folds ``subagent:<id>`` to the stem ``subagent_<id>``,
+    so the colon spelling every other subagent guard in the tree uses can never
+    match here.
+    """
+    if not any(_in_namespace(key, ns) for ns in _MACHINE_ONLY_NAMESPACES):
+        return False
+    return _USER_CHAT_SEGMENT_RE.search(key) is None
+
+
 async def api_sessions(request: web.Request) -> web.Response:
     """GET /api/sessions — list conversation session files.
 
@@ -1162,6 +1226,13 @@ async def api_sessions(request: web.Request) -> web.Response:
         both would silently skip the user's active conversations if this
         endpoint decided on their behalf. Only the caller rendering the
         complement of the open tabs asks for it.
+      - ``user_only``: when truthy, drop sessions whose key is in a machine-only
+        namespace (see :data:`_MACHINE_ONLY_NAMESPACES`). Opt-in for the same
+        reason as ``exclude_open``: a subagent or workflow transcript is still a
+        session those two callers must see. Only the sidebar's Older-sessions
+        pane asks, because it is the one surface that presents a row as a
+        conversation the user can return to — and a machine transcript carries no
+        title, so it renders its own storage key there.
 
     Returns ``{sessions, total, has_more}`` for pagination.
     """
@@ -1178,6 +1249,7 @@ async def api_sessions(request: web.Request) -> web.Response:
         offset = 0
     want_preview = (request.query.get("preview") or "").lower() in ("1", "true", "yes")
     exclude_open = (request.query.get("exclude_open") or "").lower() in ("1", "true", "yes")
+    user_only = (request.query.get("user_only") or "").lower() in ("1", "true", "yes")
     # list_sessions() globs, stats, and reads the first line of EVERY session file
     # in the history dir — O(all sessions). At 2000 sessions, that's ~200 ms of
     # blocking IO (measured: 208 ms / 2000 files on a dev host). Running that on
@@ -1197,6 +1269,8 @@ async def api_sessions(request: web.Request) -> web.Response:
             for s in all_sessions
             if s.get("key", "") not in open_keys and canon(s.get("key", "")) not in open_keys
         ]
+    if user_only:
+        all_sessions = [s for s in all_sessions if not _is_machine_only_session(s.get("key", ""))]
     # Count AFTER the exclusion so the page, ``total`` and ``has_more`` describe
     # one list. The client advances its offset by the number of rows it received,
     # so filtering on its side instead would skip or repeat rows across pages.
