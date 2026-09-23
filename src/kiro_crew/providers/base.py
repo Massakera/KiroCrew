@@ -426,6 +426,27 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def supports_steering_extension(self) -> bool:
+        """True when the provider accepts ``_session/steering``. Default False.
+
+        Distinct from :attr:`supports_steer`, which is the chat's
+        ``_session/steer`` echo path. Granted by opt-in, never inherited
+        (harness-parity H14): the subagent steer path reads this off the
+        provider contract rather than probing a concrete class.
+        """
+        return False
+
+    async def inject_steering(self, message: str) -> str:
+        """Inject *message* via ``_session/steering``.
+
+        Returns the harness outcome (``injected``, ``startedNewTurn``,
+        ``promptRequired``, ``failed``), or ``""`` when this provider has no
+        such channel. Default ``""`` — a provider that does not override it
+        never reports a steer the model did not receive.
+        """
+        return ""
+
+    @property
     def last_steer_monotonic(self) -> float:
         """Monotonic time of the last steer this provider handed to its backend,
         0.0 when it has never steered one.

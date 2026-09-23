@@ -1268,6 +1268,26 @@ class RunEventCoordinator(ManagerComponent):
         except Exception:
             logger.debug("Failed to capture live cleanup identity for %s", info.id, exc_info=True)
 
+        # Freeze the harness this provider is actually serving, including a
+        # default-routed run whose spawn omitted ``backend``. Done AFTER the
+        # sharing and pool decision above, so the first start still follows the
+        # default path. A retry, continuation or rate-limit failover then reads
+        # the frozen wire name instead of re-resolving ``agent.acp_backend``.
+        if not info.acp_backend:
+            from kiro_crew.subagent_backend import provider_wire_backend
+
+            frozen_backend = provider_wire_backend(client)
+            if frozen_backend:
+                info.acp_backend = frozen_backend
+                try:
+                    await self._manager._write_state_off_loop(
+                        info, "effective backend", acp_backend=frozen_backend
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to persist the effective backend for %s", info.id, exc_info=True
+                    )
+
         # Both arms above land here with a live session, so this is the one place
         # that can say what its MCP servers reported — before the run spends its
         # turn budget hunting a tool that was never mounted. Logged for the

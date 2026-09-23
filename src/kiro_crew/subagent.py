@@ -1627,10 +1627,11 @@ class SubagentInfo:
     # Like ``model``, a non-empty value forces the dedicated-process path.
     reasoning_effort: str = ""
     # Per-spawn ACP harness, as its WIRE name (``"kiro"``, ``"codex"``...; see
-    # ``subagent_backend``). ``""`` inherits the configured default. Like
-    # ``model``, a non-empty value forces the dedicated-process path, and it is
-    # persisted in state.json so a continuation or retry resumes on the same
-    # harness that owns the conversation's session record.
+    # ``subagent_backend``). ``""`` at admission inherits the configured default
+    # and still takes the shared-runtime path. Once the provider starts, a
+    # default-routed run freezes the wire name it actually got, so a later
+    # retry, continuation or failover does not re-resolve ``agent.acp_backend``.
+    # A non-empty value known at admission forces the dedicated-process path.
     acp_backend: str = ""
     allowed_tools: list[str] = field(default_factory=list)
     bare: bool = False

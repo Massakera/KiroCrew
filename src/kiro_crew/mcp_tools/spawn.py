@@ -1083,6 +1083,12 @@ def spawn_steer(name: str, args: dict[str, Any]) -> str:
             "continuation's result arrives as a separate [Subagent completion event] "
             "after this run's own."
         )
+    if d.get("status") == "started_new_turn":
+        return (
+            f"Steered run {agent_id}: the harness accepted the message as a new "
+            "turn (the previous one had already finished). It was not queued again. "
+            "Its completion event will reflect the correction."
+        )
     if mode == "follow_up":
         return (
             f"Queued follow-up for run {agent_id}: it will be delivered as "

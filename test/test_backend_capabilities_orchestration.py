@@ -9,13 +9,15 @@ rests on rather than a hand-written shape:
 * droid's model and reasoning-effort selects are the ones its ``session/new``
   advertises (``droid/handshake-live.jsonl``);
 * ``spawn_steer`` never reports an injection the model did not get: codex rides
-  ``_session/steering`` and counts only ``injected``, and a harness with no
-  mid-turn channel (droid answers ``-32601``, ``droid/steer-refused-live.jsonl``)
-  has the message queued as a follow-up, with the detail saying so.
+  ``_session/steering`` and counts ``injected`` and ``startedNewTurn`` as
+  delivered, and a harness with no mid-turn channel (droid answers ``-32601``,
+  ``droid/steer-refused-live.jsonl``) has the message queued as a follow-up,
+  with the detail naming the live backend.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
 from unittest.mock import AsyncMock, MagicMock
@@ -227,6 +229,13 @@ async def test_codex_steering_sends_the_extension_and_returns_the_outcome(
 
 
 @pytest.mark.asyncio
+async def test_started_new_turn_stamps_delivery(tmp_path: pathlib.Path) -> None:
+    handle, _wire = _codex_handle(tmp_path, {"outcome": "startedNewTurn"})
+    assert await handle.inject_steering("keep going") == "startedNewTurn"
+    assert handle.last_steer_monotonic > 0
+
+
+@pytest.mark.asyncio
 async def test_a_non_member_handle_sends_nothing(tmp_path: pathlib.Path) -> None:
     runtime = AcpRuntime(work_dir=tmp_path, acp_backend="")
     runtime._send_and_await = AsyncMock()
@@ -276,6 +285,52 @@ async def test_codex_steer_counts_only_an_injected_outcome() -> None:
 
 
 @pytest.mark.asyncio
+async def test_started_new_turn_is_delivered_and_not_queued_again() -> None:
+    provider = _provider(steer=False, extension=True, outcome="startedNewTurn")
+    mgr = _manager(provider)
+    info = SubagentInfo(id="run1", task="t", acp_backend=ACP_BACKEND_CODEX)
+    mgr._agents["run1"] = info
+
+    ok, detail = await mgr.steer_run("run1", "continue in a fresh turn")
+
+    assert (ok, detail) == (True, "started_new_turn")
+    assert info.pending_followups == []
+    mgr._arm_followup_watcher.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_inherited_backend_is_named_from_the_live_provider() -> None:
+    from types import SimpleNamespace
+
+    provider = _provider(steer=False, extension=False)
+    provider.client = SimpleNamespace(backend=ACP_BACKEND_DROID)
+    mgr = _manager(provider)
+    info = SubagentInfo(id="run1", task="t", acp_backend="")
+    mgr._agents["run1"] = info
+
+    ok, detail = await mgr.steer_run("run1", "stop editing README")
+
+    assert ok is True
+    assert "backend droid has no mid-turn steer channel" in detail
+    assert "backend kiro" not in detail
+
+
+@pytest.mark.asyncio
+async def test_an_inherited_backend_falls_back_to_the_captured_label() -> None:
+    provider = _provider(steer=False, extension=False)
+    mgr = _manager(provider)
+    info = SubagentInfo(id="run1", task="t", acp_backend="")
+    info._session_provider = "droid"
+    mgr._agents["run1"] = info
+
+    ok, detail = await mgr.steer_run("run1", "stop editing README")
+
+    assert ok is True
+    assert "backend droid has no mid-turn steer channel" in detail
+    assert "backend kiro" not in detail
+
+
+@pytest.mark.asyncio
 async def test_an_idle_codex_turn_falls_back_to_a_follow_up() -> None:
     provider = _provider(steer=False, extension=True, outcome="promptRequired")
     mgr = _manager(provider)
@@ -314,6 +369,48 @@ async def test_a_steer_member_keeps_the_native_path() -> None:
 
     assert await mgr.steer_run("run1", "go") == (True, "ok")
     provider.steer.assert_awaited_once_with("go")
+
+
+def test_spawn_steer_says_when_the_harness_opened_a_new_turn(monkeypatch) -> None:
+    from kiro_crew.mcp_tools import spawn as spawn_tools
+
+    monkeypatch.setattr(
+        spawn_tools.mcp_core,
+        "_post",
+        lambda path, body: {"id": "run1", "status": "started_new_turn"},
+    )
+    out = spawn_tools.spawn_steer("spawn_steer", {"agent_id": "run1", "message": "x"})
+    assert "accepted the message as a new turn" in out
+    assert "was not queued again" in out
+    assert "could not be steered" not in out
+    assert "injected into its" not in out
+
+
+def test_the_steering_extension_defaults_off_on_the_provider_contract() -> None:
+    from kiro_crew.providers.base import LLMProvider
+
+    class _Foreign(LLMProvider):
+        async def start(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+        async def stream(self, message: str):
+            raise NotImplementedError
+
+        async def approve_tool(self, request_id, *, always: bool = False) -> None:
+            raise NotImplementedError
+
+        async def reject_tool(self, request_id) -> None:
+            raise NotImplementedError
+
+        def context_usage_pct(self) -> float:
+            return 0.0
+
+    provider = _Foreign()
+    assert provider.supports_steering_extension is False
+    assert asyncio.run(provider.inject_steering("x")) == ""
 
 
 def test_spawn_steer_tells_the_coordinator_when_it_was_queued(monkeypatch) -> None:
