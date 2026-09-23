@@ -3136,6 +3136,23 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 {"error": "slot changed during agent resolution", "code": "session_rebound"},
                 status=409,
             )
+    # An adopted slot's `workspace` field is the PEER's, read off its row, in
+    # place of the create default the peer-bound branch above skipped resolving.
+    # Same terms as `agent`: it is a mirror of what the crew committed for a
+    # session it runs -- exactly the value the forwarded agent/workspace picks
+    # write back into this field from the peer's answer. Left at the default, the
+    # slot projected and persisted a workspace name of this machine's choosing
+    # for a conversation whose turns run somewhere else.
+    #
+    # Kept apart from `workspace` on purpose: that variable is still THIS
+    # machine's workspace, and `default_project_dir(workspace)` below derives
+    # the local `project` (file search, @-mentions) from it. Feeding the peer's
+    # name through that lookup would resolve a same-named LOCAL workspace the
+    # crew never meant -- the very hazard that keeps `workspace` out of the
+    # agent-binding resolution for a peer-bound create. So the peer's value
+    # reaches the slot field only, and local `project` / `memory_store`
+    # resolution reads the local default it always did.
+    slot_workspace = peer_meta.get("workspace") or workspace
 
     # Whether this request will MINT a genuinely new slot, decided before
     # get_or_create_slot runs. `name` can address an already-open slot (the
@@ -3174,7 +3191,7 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             slot = state.get_or_create_slot(
                 name,
                 agent=agent,
-                workspace=workspace,
+                workspace=slot_workspace,
                 model=model,
                 mode=_mode,
                 memory_mode=memory_mode,
