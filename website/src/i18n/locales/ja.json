@@ -285,6 +285,12 @@
     }
   },
   "apps": {
+    "builtinAppRoute": {
+      "refused_page_detail_label": "このコピーを組み立てた担当者向けの詳細",
+      "refused_page_handoff_note": "エージェントに質問すると、これらの詳細が添付された状態でチャットが開きます。",
+      "refused_page_lead": "{{productName}} は起動時にこのページを拒否しました。このコピーでの設定が誤っているためです。再試行しても元には戻らず、このコピーを組み立てた担当者が修正する必要があります。",
+      "refused_page_title": "{{route}} を読み込めませんでした"
+    },
     "agentWorlds": {
       "manifest": {
         "use_case_1": "クルーの作業中、実行中のエージェント、cron、サブエージェントをセカンドスクリーンで一覧できます。",

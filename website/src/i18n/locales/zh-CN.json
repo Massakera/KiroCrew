@@ -285,6 +285,12 @@
     }
   },
   "apps": {
+    "builtinAppRoute": {
+      "refused_page_detail_label": "供组装此副本的人员参考的详细信息",
+      "refused_page_handoff_note": "询问代理会打开一个已附带这些详细信息的对话。",
+      "refused_page_lead": "{{productName}} 启动时拒绝了此页面，因为它在此副本中的设置有误。重试无法恢复它——需要由组装此副本的人员来修正。",
+      "refused_page_title": "无法加载 {{route}}"
+    },
     "agentWorlds": {
       "manifest": {
         "use_case_1": "在 crew 工作时，通过第二块屏幕上的概览视图实时查看代理、定时任务和子代理。",

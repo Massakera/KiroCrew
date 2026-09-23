@@ -289,6 +289,12 @@
     }
   },
   "apps": {
+    "builtinAppRoute": {
+      "refused_page_detail_label": "Details für diejenigen, die diese Kopie zusammengestellt haben",
+      "refused_page_handoff_note": "Den Agenten zu fragen öffnet einen Chat, an den diese Details bereits angehängt sind.",
+      "refused_page_lead": "{{productName}} hat diese Seite beim Start abgelehnt, weil sie in dieser Kopie falsch eingerichtet ist. Ein erneuter Versuch bringt sie nicht zurück — wer diese Kopie zusammengestellt hat, muss das beheben.",
+      "refused_page_title": "{{route}} konnte nicht geladen werden"
+    },
     "agentWorlds": {
       "manifest": {
         "description": "Verwandelt deine laufenden Agenten in Figuren einer animierten Pixel-Art-Szene, sodass ein Blick genügt, um zu sehen, wie ausgelastet Kiro Crew ist. Jeder aktive Agent erscheint als Sprite, das reagiert, wenn Arbeit beginnt und endet, über Themenszenen hinweg, vom klassischen Büro bis zum Zauberturm oder Unterwasserlabor. Kopple es in ein eigenes Fenster aus, um es beim Arbeiten auf einem zweiten Bildschirm zu behalten.",
