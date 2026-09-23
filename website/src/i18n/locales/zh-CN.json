@@ -8080,7 +8080,8 @@
       "time_to_live": "存活时间",
       "views": "次浏览",
       "what_if_traffic_scenarios_you_pay_only_for_actua": "流量假设场景 — 你只需为实际用量付费 ·",
-      "will_provision": "将预置"
+      "will_provision": "将预置",
+      "deployment_available_under_feature_previews": "部署功能位于“设置 → 开发者 → 功能预览”。"
     },
     "webPreviewPanel": {
       "back": "后退",
@@ -8606,6 +8607,18 @@
       "label": "修改后需重启",
       "tooltip": "{{productName}} 运行期间无法更改此设置。已保存的值会保留，并在 {{productName}} 下次重启后应用（设置 → 关于，或启动它的终端）。",
       "schema_unavailable": "无法检查此设置是否需要重启。"
+    },
+    "directDeploy": {
+      "deploy_via_agent": "通过智能体部署",
+      "deploy_as_permanent": "部署为永久",
+      "ttl_permanent": "永久（不过期）",
+      "ttl_expires_in_hours": "{{hours}} 小时后过期",
+      "deploys_from_here_confirm_gated": "从这里部署 — 先由你确认",
+      "propagating_note": "首次部署可能需要 5-15 分钟才能在各处打开。",
+      "deployed": "已部署！",
+      "unexpected_response": "意外的响应",
+      "deploy_failed": "部署失败",
+      "stale_preview_retry": "检查后应用已更改 — 请重试。"
     }
   },
   "hooks": {
@@ -9038,7 +9051,6 @@
       "deploy": "部署",
       "deploy_anyway": "仍然部署",
       "deploy_artifact": "部署 {{name}}",
-      "deploy_opens_a_new_chat_session_that_runs_the_ar": "“部署”会打开一个新的聊天会话，用所选配置文件运行 artifact-deploy 技能。",
       "deploy_profile_for_slug": "{{slug}} 的部署配置文件",
       "deploy_recall_destroy_each_require_explicit_conf": "部署 / 撤回 / 销毁 都需要显式确认\n              （从不自动批准），并会发出 SEL 审计事件。",
       "deployments_count": "部署（{{count}}）",
@@ -9150,7 +9162,16 @@
       "remove_profile_title": "移除配置文件？",
       "remove_profile_button": "移除配置文件",
       "retry": "重试",
-      "profile_errors_title": "部分配置文件无法列出"
+      "profile_errors_title": "部分配置文件无法列出",
+      "4_optional_install_auto_cleanup": "4. 可选：安装自动清理",
+      "auto_cleanup_explainer": "只有希望部署自动过期时才需要。",
+      "deploy_publishes_directly_from_this_page": "确认后 Deploy 直接从本页发布。",
+      "deployments_read_live_from_tags": "此列表直接读取 AWS 资源标签，因此刚完成的部署可能要过几分钟才会出现在这里。",
+      "col_name": "名称",
+      "col_status": "状态",
+      "col_est_cost": "预估费用",
+      "col_profile": "配置文件",
+      "col_expiry": "过期时间"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· 远端副本中有更新的版本",
@@ -11242,7 +11263,10 @@
         "decisions_api_key_remove": "删除密钥",
         "decisions_api_key_remove_confirm": "删除密钥无法撤销：保险库不会返回值，你得重新粘贴一个新的。",
         "decisions_api_key_remove_cancel": "保留",
-        "decisions_api_key_delete": "永久删除密钥"
+        "decisions_api_key_delete": "永久删除密钥",
+        "artifact_deploy": "产物部署",
+        "artifact_deploy_desc": "把工件发布到你自己 AWS 账户上的公开 HTTPS 地址。默认关闭：每次部署都会在你的账户产生费用，并把内容放到公开互联网上。",
+        "open_artifact_deploy": "打开 产物部署"
       },
       "kiroSignInCard": {
         "title": "Kiro 登录",

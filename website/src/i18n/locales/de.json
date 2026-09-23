@@ -8193,7 +8193,8 @@
       "time_to_live": "Lebensdauer",
       "views": "Aufrufe",
       "what_if_traffic_scenarios_you_pay_only_for_actua": "Was-wäre-wenn-Verkehrsszenarien — Sie zahlen nur für die tatsächliche Nutzung ·",
-      "will_provision": "Wird bereitstellen"
+      "will_provision": "Wird bereitstellen",
+      "deployment_available_under_feature_previews": "Die Bereitstellung ist unter Einstellungen → Entwickler → Funktionsvorschauen verfügbar."
     },
     "webPreviewPanel": {
       "back": "Zurück",
@@ -8723,6 +8724,18 @@
       "label": "Änderungen erfordern Neustart",
       "tooltip": "Diese Einstellung kann sich nicht ändern, während {{productName}} läuft. Der gespeicherte Wert bleibt erhalten und gilt beim nächsten Neustart von {{productName}} (Einstellungen → Über, oder das Terminal, aus dem du es gestartet hast).",
       "schema_unavailable": "Es konnte nicht geprüft werden, ob diese Einstellung einen Neustart braucht."
+    },
+    "directDeploy": {
+      "deploy_via_agent": "Über Agent bereitstellen",
+      "deploy_as_permanent": "Dauerhaft bereitstellen",
+      "ttl_permanent": "Dauerhaft (kein Ablauf)",
+      "ttl_expires_in_hours": "Läuft in {{hours}} Stunden ab",
+      "deploys_from_here_confirm_gated": "wird von hier bereitgestellt — du bestätigst zuerst",
+      "propagating_note": "Eine erste Bereitstellung kann 5-15 Minuten brauchen, bis er uberall offnet.",
+      "deployed": "Bereitgestellt!",
+      "unexpected_response": "Unerwartete Antwort",
+      "deploy_failed": "Bereitstellung fehlgeschlagen",
+      "stale_preview_retry": "Die App hat sich seit der Prüfung geändert — versuche es erneut."
     }
   },
   "hooks": {
@@ -9164,7 +9177,6 @@
       "deploy": "Bereitstellen",
       "deploy_anyway": "Trotzdem bereitstellen",
       "deploy_artifact": "{{name}} bereitstellen",
-      "deploy_opens_a_new_chat_session_that_runs_the_ar": "„Bereitstellen“ öffnet eine neue Chat-Sitzung, die den Skill „artifact-deploy“ mit dem gewählten Profil ausführt.",
       "deploy_profile_for_slug": "Bereitstellungsprofil für {{slug}}",
       "deploy_recall_destroy_each_require_explicit_conf": "Bereitstellen / Zurückziehen / Zerstören erfordern jeweils eine ausdrückliche Bestätigung\n              (niemals automatisch genehmigt) und lösen ein SEL-Audit-Ereignis aus.",
       "deployments_count": "Bereitstellungen ({{count}})",
@@ -9278,7 +9290,16 @@
       "remove_profile_title": "Profil entfernen?",
       "remove_profile_button": "Profil entfernen",
       "retry": "Wiederholen",
-      "profile_errors_title": "Einige Profile konnten nicht aufgelistet werden"
+      "profile_errors_title": "Einige Profile konnten nicht aufgelistet werden",
+      "4_optional_install_auto_cleanup": "4. Optional: Auto-Aufräumen installieren",
+      "auto_cleanup_explainer": "Nur nötig für Bereitstellungen, die von selbst ablaufen sollen.",
+      "deploy_publishes_directly_from_this_page": "Deploy veröffentlicht nach deiner Bestätigung direkt von dieser Seite.",
+      "deployments_read_live_from_tags": "Diese Liste wird live aus AWS-Ressourcen-Tags gelesen, daher kann eine gerade erstellte Bereitstellung einige Minuten brauchen, bis sie hier erscheint.",
+      "col_name": "Name",
+      "col_status": "Status",
+      "col_est_cost": "Gesch. Kosten",
+      "col_profile": "Profil",
+      "col_expiry": "Ablauf"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· eine neuere Version ist in der Remote-Kopie verfügbar",
@@ -11402,7 +11423,10 @@
         "decisions_api_key_remove": "Schlüssel entfernen",
         "decisions_api_key_remove_confirm": "Das Entfernen lässt sich nicht rückgängig machen — der Tresor gibt keinen Wert zurück, du müsstest also einen neuen einfügen.",
         "decisions_api_key_remove_cancel": "Behalten",
-        "decisions_api_key_delete": "Schlüssel löschen"
+        "decisions_api_key_delete": "Schlüssel löschen",
+        "artifact_deploy": "Artifact Deploy",
+        "artifact_deploy_desc": "Veröffentlicht ein Artefakt unter einer öffentlichen HTTPS-URL in deinem eigenen AWS-Konto. Standardmäßig aus: jede Bereitstellung kostet Geld in deinem Konto und stellt die Inhalte im offenen Internet bereit.",
+        "open_artifact_deploy": "Artifact Deploy öffnen"
       },
       "kiroSignInCard": {
         "title": "Kiro-Anmeldung",

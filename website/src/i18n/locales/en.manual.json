@@ -3368,6 +3368,12 @@
     },
     "modelDropdownList": {
       "auto_jev": "Auto (Jev)"
+    },
+    "directDeploy": {
+      "deployed": "Deployed!",
+      "unexpected_response": "Unexpected response",
+      "deploy_failed": "Deploy failed",
+      "stale_preview_retry": "The app changed since it was checked — try again."
     }
   },
   "hooks": {
@@ -3622,7 +3628,12 @@
       "remove_profile_title": "Remove profile?",
       "remove_profile_button": "Remove profile",
       "retry": "Retry",
-      "profile_errors_title": "Some profiles could not be listed"
+      "profile_errors_title": "Some profiles could not be listed",
+      "col_name": "Name",
+      "col_status": "Status",
+      "col_est_cost": "Est. Cost",
+      "col_profile": "Profile",
+      "col_expiry": "Expiry"
     },
     "artifactDetailPage": {
       "agent_chat": "Agent chat",
