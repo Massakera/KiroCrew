@@ -113,6 +113,7 @@ def solo_spawn_refusal(
     agent: str = "",
     crew: str = "",
     tool: str = "spawn_run",
+    backend: str = "",
 ) -> str | None:
     """Tool-side gate: the refusal text, or ``None`` when the spawn may proceed.
 
@@ -125,7 +126,7 @@ def solo_spawn_refusal(
         return None
     if solo_reason:
         return None
-    if _named_model(model) or agent or crew:
+    if _named_model(model) or agent or crew or backend:
         return None
     return solo_spawn_question(tool=tool)
 
@@ -187,9 +188,10 @@ def solo_spawn_difference(
     agent: str = "",
     model: str = "",
     crew: str = "",
+    backend: str = "",
 ) -> str:
     """Gateway roster check: on what ground is the requested agent / model /
-    crew NOT the parent's own?
+    crew / backend NOT the parent's own?
 
     Returns the ground -- ``"crew"``, ``"agent"`` or ``"model"``, suffixed with
     ``" (parent unknown)"`` when the parent fact could not be compared and the
@@ -239,4 +241,14 @@ def solo_spawn_difference(
             return "model (parent unknown)"
         if _canonical_model(model) != _canonical_model(parent_model):
             return "model"
+    if backend:
+        # circular import: subagent_backend reaches agent_sdk, which reaches
+        # validation.py, which imports this module.
+        from kiro_crew.subagent_backend import parent_backend_name
+
+        own_backend = parent_backend_name(state, parent_session)
+        if not own_backend:
+            return "backend (parent unknown)"
+        if backend != own_backend:
+            return "backend"
     return ""

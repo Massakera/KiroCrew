@@ -19,6 +19,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_DROID,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -45,7 +46,12 @@ FIELD = "agent.acp_backend"
 #: justification. Four live captures across its confined and read-only postures raised
 #: no permission request at all. So Crew's PreToolUse gate would not run for what a
 #: session actually does, and the switch would be offering a harness Crew cannot gate.
-NOT_SHIPPED_SELECTABLE: frozenset = frozenset({ACP_BACKEND_DEEPSEEK})
+#:
+#: droid passes both halves on its handshake -- its ``autonomy_level`` option is the
+#: SESSION_CONFIG route Crew arms -- and fails the EVIDENCE half: no recorded turn yet
+#: shows a write raised as ``session/request_permission`` (its corpus has a
+#: synthesized turn). It is offered only behind ``KIROCREW_EXPERIMENTAL_BACKENDS``.
+NOT_SHIPPED_SELECTABLE: frozenset = frozenset({ACP_BACKEND_DEEPSEEK, ACP_BACKEND_DROID})
 
 
 @pytest.fixture

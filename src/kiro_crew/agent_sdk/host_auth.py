@@ -65,6 +65,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_DROID,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -626,6 +627,47 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # Excluded deliberately, and for this harness the reason is stronger than a
         # separate store: there is no host credential on the wire at all, so a
         # ``kiro-cli logout`` cannot bear on whether a running session still works.
+        host_logout_retires_children=False,
+        entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+    ),
+    AgentAuthDeclaration(
+        backend=ACP_BACKEND_DROID,
+        # Read out of droid 0.225.1's own bundle: a device-paired login is saved as an
+        # encrypted ``auth.v2.file`` beside the ``auth.v2.key`` that opens it (or in
+        # the OS keyring), and MCP OAuth tokens as the same pair under ``mcp-oauth``.
+        # ``FACTORY_API_KEY`` in the environment needs no file at all.
+        credential_leaves=(
+            ".factory/auth.v2.file",
+            ".factory/auth.v2.key",
+            ".factory/mcp-oauth.v2.file",
+            ".factory/mcp-oauth.v2.key",
+        ),
+        # ``FACTORY_HOME_OVERRIDE`` stands in for ``$HOME`` itself (the bundle reads it
+        # before ``HOME``), so under it each leaf keeps its whole ``.factory/`` path.
+        home_override_env_vars=("FACTORY_HOME_OVERRIDE",),
+        override_relative_leaves=(
+            ".factory/auth.v2.file",
+            ".factory/auth.v2.key",
+            ".factory/mcp-oauth.v2.file",
+            ".factory/mcp-oauth.v2.key",
+        ),
+        # The harness authenticates ITSELF from these, like codex from its
+        # ``auth.json``, so the mask its enforced routing applies must spare them.
+        adapter_own_leaves=(
+            ".factory/auth.v2.file",
+            ".factory/auth.v2.key",
+            ".factory/mcp-oauth.v2.file",
+            ".factory/mcp-oauth.v2.key",
+        ),
+        sign_in_remedy=(
+            "Factory Droid signs in on its own: run droid once and complete its "
+            "browser login, or set FACTORY_API_KEY in the gateway's environment. "
+            "Neither is checked here: the harness reads them itself."
+        ),
+        signed_out_message=(
+            "Factory Droid is not signed in. Run `droid` once and complete its login, "
+            "or set FACTORY_API_KEY in the gateway's environment, then start a new chat."
+        ),
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
     ),

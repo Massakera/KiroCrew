@@ -153,6 +153,43 @@ ROLE_MODEL_KEYS: tuple[str, ...] = ("background", "subagent")
 BACKGROUND_WORKER_AGENTS: tuple[str, ...] = ("kirocrew-lite", "kirocrew-heartbeat")
 
 
+_BACKEND_WIRE_NAME_RE = _re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+#: Bounds on the per-backend sub-agent knobs; past these a value is an input error.
+MAX_BACKEND_FALLBACK_ENTRIES = 8
+MAX_BACKEND_LIMIT = 64
+
+
+def coerce_backend_fallback(raw: object) -> list[str]:
+    """``agent.subagent_backend_fallback`` as an ordered, de-duplicated name list.
+
+    Only the SHAPE is kept here; whether a name is selectable is decided when a
+    failover picks it, because the registry can change after config load.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return []
+    names: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            name = item.strip().lower()
+            if _BACKEND_WIRE_NAME_RE.match(name) and name not in names:
+                names.append(name)
+    return names[:MAX_BACKEND_FALLBACK_ENTRIES]
+
+
+def coerce_backend_limits(raw: object) -> dict[str, int]:
+    """``agent.subagent_backend_limits`` with every entry a positive, bounded count."""
+    if not isinstance(raw, dict):
+        return {}
+    limits: dict[str, int] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int):
+            continue
+        name = key.strip().lower()
+        if _BACKEND_WIRE_NAME_RE.match(name) and value >= 1:
+            limits[name] = min(value, MAX_BACKEND_LIMIT)
+    return limits
+
+
 def coerce_role_models(raw: object) -> dict[str, str]:
     """Normalize the per-role model map from hand-edited config / request bodies.
 
@@ -976,6 +1013,27 @@ class AgentConfig:
             # frozen literal.
         ),
     )
+    subagent_backend_fallback: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Sub-agent backend fallback",
+            "Ordered backends (wire names, e.g. ['codex', 'droid', 'kiro']) a "
+            "sub-agent is re-dispatched to when its backend fails it on a rate or "
+            "usage limit before it ran any tool. The failed backend cools down and "
+            "the next selectable, installed one in the list takes the task. Empty "
+            "(default) disables failover.",
+        ),
+    )
+    subagent_backend_limits: dict[str, int] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Sub-agent limit per backend",
+            "Most sub-agents allowed to run at once on each backend (wire name to a "
+            "count, e.g. {'codex': 3, 'droid': 2}), on top of the global cap. A "
+            "backend with no entry is limited only by the global cap. Useful to keep "
+            "a subscription's rate window from being spent by one wide fan-out.",
+        ),
+    )
     default_agent: str = field(
         default="",
         metadata=_meta("Default Agent", "Default agent name for new sessions."),
@@ -1757,6 +1815,8 @@ class AgentConfig:
         # feeds coerced input.
         self.role_models = coerce_role_models(self.role_models)
         self.role_efforts = coerce_role_efforts(self.role_efforts)
+        self.subagent_backend_fallback = coerce_backend_fallback(self.subagent_backend_fallback)
+        self.subagent_backend_limits = coerce_backend_limits(self.subagent_backend_limits)
         # Same defensive coercion for the throttle-fallback model: normalize to
         # ""/"auto"/acp id, so consumers can trust the stored shape.
         self.fallback_model = coerce_fallback_model(self.fallback_model)
@@ -4279,7 +4339,7 @@ class TelemetryConfig:
         ),
     )
     beacon_enabled: bool = field(
-        default=True,
+        default=False,
         metadata=_meta(
             "Anonymous Usage Beacon",
             "Anonymous daily heartbeat so maintainers can see how many "

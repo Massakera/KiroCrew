@@ -852,6 +852,7 @@ class TestEndpointPayloadShape:
             "claude",
             "codex",
             "deepseek",
+            "droid",
             "goose",
             "kas",
             "kiro",

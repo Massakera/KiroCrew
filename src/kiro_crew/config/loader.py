@@ -2567,6 +2567,12 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         ),
         acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
         member_acp_backend=_normalize_acp_backend(agent_data.get("member_acp_backend", "kas")),
+        subagent_backend_fallback=_sections.coerce_backend_fallback(
+            agent_data.get("subagent_backend_fallback")
+        ),
+        subagent_backend_limits=_sections.coerce_backend_limits(
+            agent_data.get("subagent_backend_limits")
+        ),
         default_agent=agent_data.get("default_agent", ""),
         sweep_agents_backups=_safe_bool(agent_data.get("sweep_agents_backups", False), False),
         sandbox=agent_data.get("sandbox", "auto"),
@@ -2907,7 +2913,7 @@ def _build_telemetry_config(telemetry_data: dict) -> TelemetryConfig:
         retention_days=_safe_int(telemetry_data.get("retention_days", 0), 0),
         max_total_mb=_safe_int(telemetry_data.get("max_total_mb", 0), 0),
         otlp_endpoint=str(telemetry_data.get("otlp_endpoint", "")),
-        beacon_enabled=bool(telemetry_data.get("beacon_enabled", True)),
+        beacon_enabled=bool(telemetry_data.get("beacon_enabled", False)),
         beacon_endpoint=str(telemetry_data.get("beacon_endpoint", _DEFAULT_BEACON_ENDPOINT)),
     )
 
@@ -3957,7 +3963,7 @@ class KiroCrewConfig:
         metadata=_meta("Default Memory Store", "Fallback memory store name."),
     )
     auto_update: bool = field(
-        default=True,
+        default=False,
         metadata=_meta("Auto Update", "Enable automatic update checks."),
     )
     #: Opt-in for the Connections gallery, which is merged but held for a later
@@ -4684,7 +4690,7 @@ class KiroCrewConfig:
             # There is deliberately NO ``enabled`` key read here — see
             # ComputerUseConfig's docstring and computer_use_state_path().
             computer_use=_build_computer_use_config(computer_use_data),
-            auto_update=data.get("auto_update", True),
+            auto_update=data.get("auto_update", False),
             connections_ui=_safe_bool(data.get("connections_ui", True), True),
             _degraded_sections=frozenset(_degraded | _OBSERVED_DEGRADED_SECTIONS),
             timezone=data.get("timezone", ""),
@@ -5527,6 +5533,9 @@ class KiroCrewConfig:
             # the session would spawn on the backend's default with no error.
             permission_mode: str | None = None,
             shared_scratch: Path | None = None,
+            # Per-spawn harness for a sub-agent (``None`` = no override; ``""``
+            # names kiro). NAMED for the same reason as ``permission_mode``.
+            acp_backend_override: str | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -5573,6 +5582,7 @@ class KiroCrewConfig:
                 session_key,
                 self.agent.member_acp_backend,
                 self.agent.acp_backend,
+                acp_backend_override,
             )
             # Resolved BEFORE the model, and threaded into the resolution: the
             # model's namespace translation and its pin-scope check both have to

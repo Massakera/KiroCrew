@@ -8999,7 +8999,8 @@ class GatewayOrchestrator:
                 f"Agent `{info.id}`"
                 f"{f' ({info.agent})' if info.agent else ''}"
                 f" {status} {emoji}\n"
-                f"Task: {task_text}\n\n"
+                f"Task: {task_text}\n"
+                f"{f'Backend: {info.acp_backend}{chr(10)}' if info.acp_backend else ''}\n"
                 f"{detail}"
                 f"{guard_msg}"
             )
@@ -9015,6 +9016,7 @@ class GatewayOrchestrator:
                 task=task_text,
                 requested_model=info.requested_model or info.model or "",
                 resolved_model=info.resolved_model or "",
+                backend=info.acp_backend,
             )
 
             if _flush_only:

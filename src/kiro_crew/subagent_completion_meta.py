@@ -43,6 +43,7 @@ def single_completion_meta(
     note: str = "",
     requested_model: str = "",
     resolved_model: str = "",
+    backend: str = "",
 ) -> dict:
     """Structured facts for a per-agent completion card.
 
@@ -61,7 +62,7 @@ def single_completion_meta(
     default to ``""`` so existing callers are unchanged and the key is simply
     absent-equivalent when a provider cannot report a model.
     """
-    return {
+    meta = {
         "kind": "single",
         "agentId": agent_id,
         "agentName": agent_name,
@@ -71,6 +72,10 @@ def single_completion_meta(
         "requestedModel": requested_model,
         "resolvedModel": resolved_model,
     }
+    if backend:
+        # The harness a per-spawn backend put this run on (wire name).
+        meta["backend"] = backend
+    return meta
 
 
 def wave_final_meta(

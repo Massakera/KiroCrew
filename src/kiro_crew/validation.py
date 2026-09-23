@@ -188,6 +188,7 @@ ARTIFACT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?\Z")
 
 # Valid model name pattern — alphanumerics, hyphens, dots (e.g. "claude-opus-4.8", "deepseek-3.2")
 _MODEL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+BACKEND_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 # Content-bound theme-persona consent hash: sha256 rendered as EXACTLY 64
 # lowercase hex chars. This value flows into hmac.compare_digest at the
@@ -1131,6 +1132,18 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # `unknown_crew` code rather than degrading to the global store.
         FieldSpec("crew", str, max_len=MAX_SHORT_STRING),
         FieldSpec("target_member", str, max_len=MAX_SHORT_STRING),
+        # Per-spawn ACP harness by WIRE name (``kiro``, ``codex``, ``claude``...).
+        # Only the shape is bounded here; whether the name is selectable on this
+        # deployment is decided at the endpoint (``subagent_backend``), which
+        # refuses rather than degrades.
+        FieldSpec("backend", str, max_len=MAX_SHORT_STRING, pattern=BACKEND_NAME_RE),
+        FieldSpec(
+            "backends",
+            list,
+            item_type=str,
+            item_max_len=MAX_SHORT_STRING,
+            item_pattern=BACKEND_NAME_RE,
+        ),
     ],
 )
 

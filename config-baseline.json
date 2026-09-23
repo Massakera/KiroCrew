@@ -27,6 +27,8 @@
         "mcp_quarantine_after_failures": 3,
         "acp_backend": "",
         "member_acp_backend": "kas",
+        "subagent_backend_fallback": [],
+        "subagent_backend_limits": {},
         "default_agent": "",
         "sweep_agents_backups": false,
         "sandbox": "auto",
@@ -324,6 +326,62 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "kas"
+    },
+    {
+      "path": "agent.subagent_backend_fallback",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Sub-agent backend fallback",
+      "help": "Ordered backends (wire names, e.g. ['codex', 'droid', 'kiro']) a sub-agent is re-dispatched to when its backend fails it on a rate or usage limit before it ran any tool. The failed backend cools down and the next selectable, installed one in the list takes the task. Empty (default) disables failover.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "agent.subagent_backend_fallback.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "agent.subagent_backend_limits",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Sub-agent limit per backend",
+      "help": "Most sub-agents allowed to run at once on each backend (wire name to a count, e.g. {'codex': 3, 'droid': 2}), on top of the global cap. A backend with no entry is limited only by the global cap. Useful to keep a subscription's rate window from being spent by one wide fan-out.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "agent.subagent_backend_limits.*",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "agent.default_agent",
@@ -2919,7 +2977,7 @@
         "retention_days": 0,
         "max_total_mb": 0,
         "otlp_endpoint": "",
-        "beacon_enabled": true,
+        "beacon_enabled": false,
         "beacon_endpoint": "https://d175o3ylxqum0e.cloudfront.net"
       }
     },
@@ -3019,7 +3077,7 @@
       "help": "Anonymous daily heartbeat so maintainers can see how many copies are actively running, which versions are in use, and which distribution channels they came from. Sends EXACTLY five fields, at most once per day: a random installation id, app release (major.minor.patch only — build stamps are stripped), Python minor version, distribution channel, and a first-run bit. NEVER sends prompts, model output, file contents, paths, repo names, credentials, hostname, username, IP address, operating system, CPU architecture, release channel, or governance posture. Automatically suppressed in CI and for a non-default KIROCREW_HOME. Opt out with KIROCREW_TELEMETRY_DISABLED=1 or by turning this off; an enterprise policy can also pin it off via the capabilities.telemetry governance scope, which this switch cannot override. Independent of the 'enabled' switch above, which is local-only metrics collection and still never egresses.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": true
+      "defaultValue": false
     },
     {
       "path": "telemetry.beacon_endpoint",
@@ -8708,7 +8766,7 @@
       "help": "Enable automatic update checks.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": true
+      "defaultValue": false
     },
     {
       "path": "connections_ui",

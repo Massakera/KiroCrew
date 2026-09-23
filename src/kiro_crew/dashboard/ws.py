@@ -124,6 +124,7 @@ def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
         "agent": _r(a.agent),
         "model": a.resolved_model,
         "requested_model": _r(a.requested_model),
+        "backend": getattr(a, "acp_backend", ""),
         "streaming": _r(a.streaming_text),
         "last_tool": _r(a.last_tool),
         "tool_count": a.tool_count,

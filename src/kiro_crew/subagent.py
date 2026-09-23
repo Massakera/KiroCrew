@@ -1626,6 +1626,12 @@ class SubagentInfo:
     # Wins over the ``role_efforts['subagent']`` pin; ``""`` defers to it.
     # Like ``model``, a non-empty value forces the dedicated-process path.
     reasoning_effort: str = ""
+    # Per-spawn ACP harness, as its WIRE name (``"kiro"``, ``"codex"``...; see
+    # ``subagent_backend``). ``""`` inherits the configured default. Like
+    # ``model``, a non-empty value forces the dedicated-process path, and it is
+    # persisted in state.json so a continuation or retry resumes on the same
+    # harness that owns the conversation's session record.
+    acp_backend: str = ""
     allowed_tools: list[str] = field(default_factory=list)
     bare: bool = False
     # Continuable conversations (spawn_run keep=True / spawn_continue):
@@ -1912,6 +1918,7 @@ class _ReportFailureSnapshot:
     model: str
     requested_model: str
     resolved_model: str
+    acp_backend: str
     stop_reason: str
     stop_class: str
     batch_id: str
@@ -1945,6 +1952,7 @@ class _ReportFailureSnapshot:
             model=bounded(info.model),
             requested_model=bounded(info.requested_model),
             resolved_model=bounded(info.resolved_model),
+            acp_backend=info.acp_backend,
             stop_reason=bounded(info.stop_reason),
             stop_class=bounded(info.stop_class),
             batch_id=info.batch_id,
@@ -1972,6 +1980,7 @@ class _ReportFailureSnapshot:
             self.model,
             self.requested_model,
             self.resolved_model,
+            self.acp_backend,
             self.stop_reason,
             self.stop_class,
             self.batch_id,
@@ -2004,6 +2013,7 @@ class _ReportFailureSnapshot:
             model=self.model,
             resolved_model=self.resolved_model,
             requested_model=self.requested_model,
+            acp_backend=self.acp_backend,
             conversation_key=self.conversation_key,
             user_stopped=self.user_stopped,
             stop_reason=self.stop_reason,
@@ -3705,6 +3715,7 @@ class SubagentManager:
         delegation: dict[str, str] | None = None,
         _execution_context: dict | None = None,
         _stage_boundary_owner: str = "",
+        acp_backend: str = "",
     ) -> SubagentInfo | None:
         result = self._admission.spawn_impl(
             task,
@@ -3742,6 +3753,7 @@ class SubagentManager:
             delegation=delegation,
             _execution_context=_execution_context,
             _stage_boundary_owner=_stage_boundary_owner,
+            acp_backend=acp_backend,
         )
         assert not isinstance(result, PreparedSpawn)
         # Every synchronous gate return (started, queued, or refused) receives
@@ -3931,6 +3943,22 @@ class SubagentManager:
 
     async def _safe_announce(self, info: SubagentInfo) -> None:
         return await self._admission._safe_announce_impl(info)
+
+    def _backend_at_cap(self, requested: str) -> bool:
+        """Whether a spawn on *requested* (``""`` = default) waits for its backend's cap."""
+        from kiro_crew.subagent_backend import backend_at_cap
+
+        return backend_at_cap(list(self._agents.values()), requested)
+
+    async def _maybe_fail_over(self, info: SubagentInfo) -> str | None:
+        """Re-dispatch a rate-limited run to a fallback backend; see ``subagent_backend``."""
+        from kiro_crew.subagent_backend import fail_over
+
+        try:
+            return await fail_over(self, info)
+        except Exception:
+            logger.warning("subagent %s: backend failover failed", info.id, exc_info=True)
+            return None
 
     def _announce_rejection(self, info: SubagentInfo) -> SubagentInfo:
         return self._admission._announce_rejection_impl(info)

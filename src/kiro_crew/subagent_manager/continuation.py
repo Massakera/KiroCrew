@@ -691,6 +691,17 @@ class ContinuationCoordinator(ManagerComponent):
                 "delegation", {}
             )
         )
+        # The harness owns the conversation's session record (kiro-cli's
+        # transcript, the thread under CODEX_HOME), so a follow-up must resume on
+        # the backend the conversation was created on -- never the current default.
+        acp_backend = str(
+            original.acp_backend
+            if original is not None
+            else ((read_state(conv_id) or {}) if _captured_state is ... else _captured_state).get(
+                "acp_backend", ""
+            )
+            or ""
+        )
         # A continuation has to run WHERE THE RUN RAN. `spawn` resolves an empty
         # cwd to the pool project before it validates the agent name, so a run
         # spawned against a project-local agent (defined under that project's
@@ -727,6 +738,7 @@ class ContinuationCoordinator(ManagerComponent):
             _memory_mode=_memory_mode,
             _stage_boundary_owner=_stage_boundary_owner,
             app=app,
+            acp_backend=acp_backend,
             **(
                 {"_execution_context": _execution_context.to_record()}
                 if _execution_context is not None

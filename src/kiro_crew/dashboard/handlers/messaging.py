@@ -327,6 +327,7 @@ async def api_spawn(request: web.Request) -> web.Response:
                 "solo_reason": body.get("solo_reason", ""),
                 "solo_details": body.get("solo_details", ""),
                 "target_member": body.get("target_member", ""),
+                "backend": body.get("backend", ""),
             },
             SPAWN_RUN_SCHEMA,
         )
@@ -335,6 +336,17 @@ async def api_spawn(request: web.Request) -> web.Response:
     task = (cleaned.get("task") or "").strip()
     if not task:
         return web.json_response({"error": "task is required"}, status=400)
+    acp_backend = cleaned.get("backend") or ""
+    if acp_backend:
+        from kiro_crew.subagent_backend import check_backend_installed, check_spawn_backend
+
+        backend_refusal = check_spawn_backend(acp_backend) or await asyncio.to_thread(
+            check_backend_installed, acp_backend
+        )
+        if backend_refusal is not None:
+            return web.json_response(
+                {"error": backend_refusal.error, "code": backend_refusal.code}, status=400
+            )
     parent_session = body.get("parent_session", "")
     if not isinstance(parent_session, str):
         return web.json_response(
@@ -463,7 +475,9 @@ async def api_spawn(request: web.Request) -> web.Response:
             {"error": reason_error, "code": SOLO_SPAWN_REFUSED_CODE}, status=400
         )
     if solo and not solo_reason:
-        ground = solo_spawn_difference(state, parent_session, agent=agent, model=model, crew=crew)
+        ground = solo_spawn_difference(
+            state, parent_session, agent=agent, model=model, crew=crew, backend=acp_backend
+        )
         if not ground:
             _sel().log_api_access(
                 caller="internal",
@@ -536,6 +550,7 @@ async def api_spawn(request: web.Request) -> web.Response:
         _memory_mode=admitted_mode,
         _execution_context=admitted_execution.to_record(),
         _stage_boundary_owner=_stage_boundary_owner_for_parent(state, parent_session),
+        acp_backend=acp_backend,
     )
     if not info:
         # Reached mgr.spawn (submission COUNTED at the top of spawn()) but
@@ -572,6 +587,8 @@ async def api_spawn(request: web.Request) -> web.Response:
         "status": "spawned",
         "parent_work_supported": can_work,
     }
+    if acp_backend:
+        resp["backend"] = acp_backend
     # Server-side effort verdict: only this side knows the model the factory's
     # effort gate will see (explicit per-call value, else the subagent role
     # pin, else the session chain for the effective agent — a crew's pin, else
@@ -1027,6 +1044,9 @@ async def api_spawn_status(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
     data = {"id": info.id, "task": _redact(info.task), "done": info.done}  # type: dict[str, object]
     data["started"] = info.started
+    _backend = getattr(info, "acp_backend", "")
+    if isinstance(_backend, str) and _backend:
+        data["backend"] = _backend
     if info.done:
         # Read full result from disk (info.result is truncated to 3000 chars)
         result = info.result
@@ -1117,6 +1137,9 @@ async def api_spawn_list(request: web.Request) -> web.Response:
             "agent": info.agent or info.crew,
             "started": info.started,
         }
+        _backend = getattr(info, "acp_backend", "")
+        if isinstance(_backend, str) and _backend:
+            entry["backend"] = _backend
         if info.done:
             entry["result"] = _redact(info.result)
             entry["error"] = _redact(info.error) if info.error else ""
@@ -1210,6 +1233,8 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         if previous_boundary_owner
         else None
     )
+    old_backend = getattr(old, "acp_backend", "")
+    old_backend = old_backend if isinstance(old_backend, str) else ""
     retry_boundary_owner = (
         previous_boundary_owner
         if exact_boundary is not None
@@ -1243,6 +1268,8 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         _memory_mode=execution.memory_mode,
         _execution_context=execution.to_record(),
         _stage_boundary_owner=retry_boundary_owner,
+        # And on the same harness: a retry on another backend is not a retry.
+        **({"acp_backend": old_backend} if old_backend else {}),
     )
     if not info:
         return web.json_response(

@@ -47,8 +47,10 @@ from kiro_crew.subagent import (
     resolve_max_subagents,
     visible_agent_names,
 )
+from kiro_crew.subagent_backend import BACKEND_UNAVAILABLE_CODE, UNKNOWN_BACKEND_CODE
 from kiro_crew.subagent_persistence import agent_dir_for_display
 from kiro_crew.validation import (
+    BACKEND_NAME_RE,
     MAX_MEDIUM_STRING,
     MAX_SHORT_STRING,
     SPAWN_CONTINUE_SCHEMA,
@@ -65,6 +67,8 @@ logger = logging.getLogger(__name__)
 # a tool description is always-on context in every session, so this buys
 # self-correction for a few dozen characters, not a full agent listing.
 _MAX_ROSTER_NAMES = 8
+
+_BACKEND_REFUSAL_CODES = frozenset({UNKNOWN_BACKEND_CODE, BACKEND_UNAVAILABLE_CODE})
 
 # Owner recorded on an audit record when the resolver named no session. An empty
 # owner is ambiguous by construction: a resolver whose every identity source
@@ -154,6 +158,21 @@ def _agent_roster_hint() -> str:
     return hint + "."
 
 
+def _backend_roster_hint() -> str:
+    """Selectable backend names, for the ``backend``/``backends`` descriptions.
+
+    Advisory like the agent roster: the gateway re-checks selectability and
+    installation, and owns the accept/refuse decision.
+    """
+    try:
+        from kiro_crew.subagent_backend import selectable_backend_names
+
+        names = selectable_backend_names()
+    except Exception:
+        return ""
+    return f" Selectable here: {', '.join(names)}." if names else ""
+
+
 def schemas() -> list[dict[str, Any]]:
     """Descriptors for the spawn tools."""
     # Advertise the concurrent sub-agent cap so the model fans out with
@@ -198,6 +217,7 @@ def schemas() -> list[dict[str, Any]]:
     # The valid agent names, read once and shared by every agent-taking field
     # below, so a caller that never called spawn_list still sees them.
     _agent_hint = _agent_roster_hint()
+    _backend_hint = _backend_roster_hint()
     # Context-scope switches, shared by spawn_run and spawn_sub_agents so the
     # rule cannot drift between them. The model reads these descriptions at
     # call time, which is why the rule lives here and not only in the prompt.
@@ -351,6 +371,25 @@ def schemas() -> list[dict[str, Any]]:
                             "'claude-haiku-4.5'). When set, the subagent runs on this model "
                             "instead of the gateway default. To discover available models, "
                             "run: kiro-cli chat --list-models --format json"
+                        ),
+                    },
+                    "backend": {
+                        "type": "string",
+                        "description": (
+                            "Optional agent harness for the subagent(s): run them on "
+                            "another backend than yours (e.g. 'codex', 'claude', 'kiro'). "
+                            "Applies to every task unless 'backends' is given. An unknown, "
+                            "unselectable or uninstalled backend is REFUSED, never "
+                            "replaced by the default." + _backend_hint
+                        ),
+                    },
+                    "backends": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Backend per task in 'tasks' (same length), to mix harnesses "
+                            "in one wave. Same rule as 'backend'. A continuation always "
+                            "resumes on the backend its conversation was created on."
                         ),
                     },
                     "reasoning_effort": {
@@ -557,6 +596,12 @@ def schemas() -> list[dict[str, Any]]:
                                     "type": "string",
                                     "description": "Task/prompt for the sub-agent",
                                 },
+                                "backend": {
+                                    "type": "string",
+                                    "description": "Optional agent harness for this "
+                                    "sub-agent (e.g. 'codex'); refused, never defaulted, "
+                                    "when unavailable." + _backend_hint,
+                                },
                             },
                             "required": ["prompt"],
                         },
@@ -670,6 +715,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     cwd = args.get("cwd") or ""
     model = args.get("model") or ""
     reasoning_effort = args.get("reasoning_effort") or ""
+    backend = args.get("backend") or ""
+    backends_list = args.get("backends") or []
     keep = bool(args.get("keep"))
     # Context scope: absent ⇒ true, so a parent that passes nothing gets the
     # same context a normal session would.
@@ -679,6 +726,11 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     if agents_list and len(agents_list) != len(task_list):
         return (
             f"Error: agents length ({len(agents_list)}) must match tasks length ({len(task_list)})"
+        )
+    if backends_list and len(backends_list) != len(task_list):
+        return (
+            f"Error: backends length ({len(backends_list)}) must match tasks length "
+            f"({len(task_list)})"
         )
     # THE SOLO GATE. One task, no reason, nothing named that could differ from
     # this session: refuse with the question instead of spawning. This is the
@@ -697,6 +749,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
         model=model,
         agent=agent or (agents_list[0] if agents_list else ""),
         crew=crew,
+        backend=backend or (backends_list[0] if backends_list else ""),
     )
     if refusal:
         mcp_core.sel().log_tool_invocation(
@@ -773,8 +826,13 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     # observed cost of not knowing that was a whole wave of doomed dispatches on
     # one invented name.
     refused_agents: dict[str, str] = {}
+    # Same reasoning for a backend: unknown, unselectable and uninstalled are all
+    # properties of the NAME on this host, so the rest of the wave on it is dead.
+    refused_backends: dict[str, str] = {}
+    agent_backends: list[str] = []
     for i, t in enumerate(task_list):
         a = agents_list[i] if agents_list else agent
+        b = backends_list[i] if backends_list else backend
         if a in refused_agents:
             # Short line on purpose: the full roster is already on the first
             # refusal above, and repeating it once per remaining member would
@@ -782,7 +840,13 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             errors.append(f"{t[:60]}: not dispatched - agent {a!r} refused above")
             _reconcile_lost(refused_agents[a])
             continue
+        if b and b in refused_backends:
+            errors.append(f"{t[:60]}: not dispatched - backend {b!r} refused above")
+            _reconcile_lost(refused_backends[b])
+            continue
         body: dict[str, Any] = {"task": t, "agent": a, "parent_session": parent_session}
+        if b:
+            body["backend"] = b
         if crew:
             body["crew"] = crew
         if target_member:
@@ -835,6 +899,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             errors.append(error_line)
             if a and _is_unknown_agent_refusal(d, a):
                 refused_agents[a] = str(d["error"])
+            if b and d.get("code") in _BACKEND_REFUSAL_CODES:
+                refused_backends[b] = str(d["error"])
             # Wave-liveness reconcile: every sibling's batch_total counts
             # THIS member,
             # but an explicit pre-spawn rejection never reached mgr.spawn
@@ -849,6 +915,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             continue
         agent_ids.append(d.get("id", "?"))
         agent_names.append(a)
+        agent_backends.append(b)
         agent_tasks.append(t)
         if d.get("effort_dropped"):
             effort_drops.append((str(d.get("id", "?")), str(d["effort_dropped"])))
@@ -897,8 +964,9 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             spawn_lines.append(
                 f"Spawned {len(agent_ids)} subagent(s). Monitor results via polling:"
             )
-        for aid, a, t in zip(agent_ids, agent_names, agent_tasks):
-            label = f"{aid} ({a})" if a else aid
+        for aid, a, b, t in zip(agent_ids, agent_names, agent_backends, agent_tasks):
+            tags = ", ".join(x for x in (a, f"backend={b}" if b else "") if x)
+            label = f"{aid} ({tags})" if tags else aid
             spawn_lines.append(f"  {label}: {t[:80]}")
         if solo:
             # The reason, or a pointer to the gateway's roster-check audit.
@@ -1068,6 +1136,8 @@ def spawn_list(name: str, args: dict[str, Any]) -> str:
                 progress = f" ({', '.join(parts)})"
             _withheld = a.get("context_withheld") or []
             scope = f"  ctx-withheld: {','.join(_withheld)}" if _withheld else ""
+            if a.get("backend"):
+                scope += f"  backend: {a['backend']}"
             lines.append(f"{a['id']}  [{status}]{err}{progress}{scope}  {_redact(a['task'])[:60]}")
     # Always append available agents (fresh read from disk). Same grammar filter and
     # redaction as the two rosters above, via the shared helper: this output is a
@@ -1212,6 +1282,9 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
         a = entry.get("agent_or_mode", "")
         if len(a) > MAX_SHORT_STRING:
             entry["agent_or_mode"] = a[:MAX_SHORT_STRING]
+        b = entry.get("backend", "")
+        if b and (not isinstance(b, str) or not BACKEND_NAME_RE.match(b)):
+            return f"Error: invalid backend {str(b)[:40]!r} in 'agents' entry"
 
     # THE SOLO GATE, as on spawn_run: one entry, no reason, no agent named.
     live_entries = [e for e in agents_input if str(e.get("prompt", "")).strip()]
@@ -1224,6 +1297,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
         solo_reason,
         agent=str(live_entries[0].get("agent_or_mode") or "") if solo else "",
         tool="spawn_sub_agents",
+        backend=str(live_entries[0].get("backend") or "") if solo else "",
     )
     if refusal:
         mcp_core.sel().log_tool_invocation(
@@ -1266,6 +1340,8 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
         }
         if cwd:
             sa_body["cwd"] = cwd
+        if entry.get("backend"):
+            sa_body["backend"] = entry["backend"]
         if solo:
             sa_body["solo"] = True
             if solo_reason:

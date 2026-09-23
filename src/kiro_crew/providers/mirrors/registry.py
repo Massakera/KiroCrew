@@ -33,6 +33,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_DROID,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -360,6 +361,22 @@ PROJECTIONS: dict[str, McpProjection] = {
             "set, because no mirror translates them. One hazard rides along, in "
             "mcp-stdio-rollback-live.jsonl: an element whose command cannot start fails "
             "the WHOLE session rather than being dropped"
+        ),
+        tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
+    ),
+    ACP_BACKEND_DROID: McpProjection(
+        kind=ProjectionKind.BROKER_ONLY,
+        reason=(
+            "droid accepts stdio entries in the session/new mcpServers array, which is "
+            "why it IS in ACP_BACKENDS_SESSION_MCP_ARRAY: the broker stubs "
+            "_pooled_mcp_servers appends for a backend outside MIRRORS are stdio "
+            "elements, and ACP v1 requires every agent to take that shape. Captured "
+            "only as far as session/new: test/fixtures/acp_frames/droid/"
+            "handshake-live.jsonl sends one stdio element whose command is not an MCP "
+            "server, and session/new still returns a sessionId, so an unstartable "
+            "element does not fail the whole session. Whether the tools are then "
+            "reachable in a turn needs a signed-in capture. No mirror translates its "
+            "agent spec's own servers or per-tool deny set"
         ),
         tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
     ),

@@ -90,6 +90,7 @@ provider.
 | `opencode` | OpenCode | Uses OpenCode's native ACP server. |
 | `pi` | Pi | Uses `pi-acp` and its Pi gate extension. |
 | `goose` | goose | Uses goose's native ACP server. |
+| `droid` | Factory Droid | Uses `droid exec --output-format acp`. Not offered by default: set `KIROCREW_EXPERIMENTAL_BACKENDS=droid` in the gateway's environment to opt in. Signs in with its own login or `FACTORY_API_KEY`. |
 
 The non-default harnesses are offered only when this build registers them. A
 host governance policy can narrow that list further, and the dashboard reports
@@ -112,6 +113,21 @@ per-harness capability matrix.
 
 Set a registered value with, for example,
 `kirocrew config set agent.acp_backend kas`.
+
+Codex signs in with its own subscription login first; when none is stored,
+`CODEX_API_KEY` or `OPENAI_API_KEY` in the gateway's environment signs it in
+instead (the key is read by the adapter, never copied by Kiro Crew).
+
+### Sub-agents on other backends
+
+An orchestrating session can put each sub-agent on its own backend with
+`spawn_run(backend=...)` or `spawn_run(backends=[...])`, one per task. Two agent
+settings shape that:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `agent.subagent_backend_fallback` | `[]` | Ordered backends a sub-agent is re-dispatched to when its backend fails it on a rate or usage limit before it ran any tool, e.g. `["codex", "droid", "kiro"]`. The failed backend cools down (15 minutes for a spent usage window, 2 minutes for a 429) and the failed run's completion names the replacement run. |
+| `agent.subagent_backend_limits` | `{}` | Most sub-agents running at once per backend, e.g. `{"codex": 3, "droid": 2}`, on top of `agent.max_subagents`. Extra spawns queue until a run on that backend ends. |
 
 ## Key Settings
 
@@ -183,7 +199,7 @@ Set a registered value with, for example,
     "folder_ingest_chunk_budget": 300,
     "dedup_every_n_sweeps": 12
   },
-  "auto_update": true,
+  "auto_update": false,
   "timezone": ""
 }
 ```
@@ -487,7 +503,7 @@ member-memory sandbox is required.
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `auto_update` | Enable automatic update checks | `true` |
+| `auto_update` | Apply available updates automatically (checks still run and notify) | `false` |
 | `timezone` | IANA timezone name, e.g. `"America/Los_Angeles"` | `""` (falls back to UTC) |
 | `snapshot_dir` | Where `kirocrew snapshot` writes tarballs | `""` (`~/.kiro/crew/snapshots`) |
 

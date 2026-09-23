@@ -1591,6 +1591,10 @@ class SessionAllocationService:
             # fixed when it was pre-spawned with no parent. Cold-starting is what
             # makes ``$KIROCREW_SCRATCH`` name the same place as the parent's.
             pool_decision = "bypass_shared_scratch"
+        elif extra_factory_kwargs.get("acp_backend_override") is not None:
+            # A pooled child runs the factory's DEFAULT backend; a sub-agent
+            # placed on a named harness must cold-start through the factory.
+            pool_decision = "bypass_backend"
         elif await self._crew_pins_effort(agent, extra_factory_kwargs.get("crew_agent")):
             # A CREW's pinned effort is fixed at spawn time and the warm-pool
             # claim path never re-pushes it, so a warm hit would silently run

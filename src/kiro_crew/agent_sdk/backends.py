@@ -253,6 +253,14 @@ ACP_BACKEND_GOOSE = "goose"
 # closure -- so one global install is the whole precondition, with no workspace
 # checkout and no per-profile dependency step.
 ACP_BACKEND_DEEPSEEK = "deepseek"
+# Factory Droid: a single binary whose headless mode serves ACP itself
+# (``droid exec --output-format acp``, the launch Zed and JetBrains use). No npm
+# adapter and no Node floor, so it takes the self-served launch row. Onboarded
+# DORMANT: only its handshake and ``session/new`` are captured so far, so every
+# capability decision below is the conservative one and it is not in the selectable
+# baseline. An operator may opt into it explicitly -- see
+# :data:`EXPERIMENTAL_OPT_IN_ENV`.
+ACP_BACKEND_DROID = "droid"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
 ACP_BACKEND_KIRO = ""
@@ -270,6 +278,7 @@ ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_DROID,
     }
 )
 
@@ -383,6 +392,12 @@ ACP_BACKENDS_META_IDENTITY: FrozenSet[str] = frozenset({ACP_BACKEND_GOOSE})
 # ``mcp-stdio-rollback-live.jsonl`` for what an unstartable element actually does.
 # It reads no ``~/.kiro/agents/<name>.json``, so this array is the only channel Crew
 # has to it.
+#
+# droid is a member on the protocol's word, not yet on a capture: ACP v1 requires
+# every agent to accept stdio entries in ``session/new``'s ``mcpServers``, and droid
+# reads no Kiro agent spec, so without this array Crew's own tools never reach its
+# sessions. The rollback hazard above is the one to re-check when its frames are
+# recorded (``test/fixtures/acp_frames/droid/``).
 ACP_BACKENDS_SESSION_MCP_ARRAY: FrozenSet[str] = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -390,6 +405,7 @@ ACP_BACKENDS_SESSION_MCP_ARRAY: FrozenSet[str] = frozenset(
         ACP_BACKEND_OPENCODE,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_DROID,
     }
 )
 
@@ -515,6 +531,7 @@ POLICY_ID_BY_BACKEND: dict = {
     ACP_BACKEND_PI: ACP_BACKEND_PI,
     ACP_BACKEND_GOOSE: ACP_BACKEND_GOOSE,
     ACP_BACKEND_DEEPSEEK: ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_DROID: ACP_BACKEND_DROID,
 }
 
 #: The backend a deployment policy may never deny.
@@ -1788,6 +1805,9 @@ _MODEL_REGISTRY_NAMESPACE_BY_BACKEND: dict = {
     # other harness spells, so a shared bucket would offer the picker ids that only
     # one backend can accept.
     ACP_BACKEND_DEEPSEEK: "deepseek",
+    # droid's catalog is Factory's own model ids plus ``custom:`` BYOK selectors, a
+    # vocabulary no other harness accepts.
+    ACP_BACKEND_DROID: "droid",
 }
 
 
@@ -2129,6 +2149,16 @@ ACP_BACKEND_ROUTING: dict = {
     # setting that governs escalations and assert a routing guarantee nothing
     # performs, which is the one thing this table exists to prevent.
     ACP_BACKEND_DEEPSEEK: Routing.UNVERIFIED,
+    # droid advertises the same shape codex does: a ``select`` config option,
+    # ``autonomy_level``, whose ``normal`` value "auto-approves only read operations"
+    # -- captured off droid 0.225.1's own ``session/new``
+    # (``test/fixtures/acp_frames/droid/handshake-live.jsonl``). So the mechanism is
+    # the enforced one: the option is required to be advertised and is written
+    # before the first prompt, or the session is refused. What the corpus does NOT
+    # yet hold is a turn in which a write is actually raised as
+    # ``session/request_permission`` -- that needs a signed-in harness -- which is
+    # why droid stays out of the selectable baseline until it does.
+    ACP_BACKEND_DROID: Routing.SESSION_CONFIG,
 }
 
 
@@ -2146,6 +2176,7 @@ ACP_BACKEND_ROUTING: dict = {
 #: token store.
 ACP_BACKEND_PERMISSION_CONFIG: dict = {
     ACP_BACKEND_CODEX: ("mode", "read-only"),
+    ACP_BACKEND_DROID: ("autonomy_level", "normal"),
 }
 
 
@@ -2277,6 +2308,18 @@ ACP_BACKEND_LAUNCH: Mapping[str, SelfServedLaunch] = {
             "this binary is the host that boots the profile it lives in."
         ),
     ),
+    # No ``--auto``: droid's headless mode is read-only without it, so anything past
+    # reading is raised to the client instead of run. Signs in on its own -- a stored
+    # Factory login, or ``FACTORY_API_KEY`` in the environment the child inherits.
+    ACP_BACKEND_DROID: SelfServedLaunch(
+        label="Factory Droid",
+        binary="droid",
+        acp_args=("exec", "--output-format", "acp"),
+        bin_env_var="DROID_BIN",
+        install_command="curl -fsSL https://app.factory.ai/cli | sh",
+        protocol_version=1,
+        missing_hint="No adapter package is needed: this harness serves ACP itself.",
+    ),
 }
 
 #: The harnesses whose whole launch is described by :data:`ACP_BACKEND_LAUNCH`.
@@ -2400,3 +2443,56 @@ def permission_setting_for(backend: str) -> tuple:
 def gate_probe_command_for(backend: str) -> str:
     """The probe command *backend*'s gate extension registers, or ``""`` when none."""
     return ACP_BACKEND_GATE_PROBE_COMMAND.get(backend, "")
+
+
+# ── Fork: explicit operator opt-in for a dormant harness ──
+
+#: The variable that names the dormant harnesses an operator opts into, as a
+#: comma-separated list of ids (``KIROCREW_EXPERIMENTAL_BACKENDS=droid``). Read once,
+#: when this leaf is imported, so every process of one install -- the gateway and each
+#: tool server -- agrees on what is selectable, and a ``config.json`` value cannot be
+#: needed before the config that would carry it has been loaded.
+EXPERIMENTAL_OPT_IN_ENV = "KIROCREW_EXPERIMENTAL_BACKENDS"
+
+#: The only harnesses the opt-in can reach. A closed list, so the variable is not a
+#: general way around :func:`register_selectable_backend`'s routing refusal: each
+#: member is a harness this fork onboarded dormant and wants tested on a real host.
+EXPERIMENTAL_OPT_IN_BACKENDS: FrozenSet[str] = frozenset({ACP_BACKEND_DROID})
+
+
+def opt_in_experimental_backends(raw: str | None = None) -> FrozenSet[str]:
+    """Make the opted-in dormant harnesses selectable. Returns the ones enabled.
+
+    Goes THROUGH :func:`register_selectable_backend`, so its refusal of an
+    ``UNVERIFIED`` harness still applies: an opt-in can only reach a member whose
+    routing is established. What the opt-in adds is an OPERATOR's explicit choice,
+    per harness, on their own host, to run one whose corpus is not complete yet.
+    Governance still narrows it like any other member of the baseline.
+    """
+    value = os.environ.get(EXPERIMENTAL_OPT_IN_ENV, "") if raw is None else raw
+    enabled: Set[str] = set()
+    for item in value.split(","):
+        backend = item.strip().lower()
+        if not backend:
+            continue
+        if backend not in EXPERIMENTAL_OPT_IN_BACKENDS:
+            logger.warning(
+                "%s names %r, which is not an opt-in backend (allowed: %s); ignored",
+                EXPERIMENTAL_OPT_IN_ENV,
+                backend,
+                ", ".join(sorted(EXPERIMENTAL_OPT_IN_BACKENDS)),
+            )
+            continue
+        register_selectable_backend(backend)
+        enabled.add(backend)
+        logger.warning(
+            "experimental backend %r opted in via %s: its permission routing is armed "
+            "and enforced, but no recorded turn yet shows it raising a write for "
+            "approval -- record its frames before relying on it",
+            backend,
+            EXPERIMENTAL_OPT_IN_ENV,
+        )
+    return frozenset(enabled)
+
+
+opt_in_experimental_backends()

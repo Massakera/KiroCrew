@@ -185,6 +185,7 @@ class _GateMixin(ManagerComponent):
         delegation: dict[str, str] | None = None,
         _execution_context: dict | None = None,
         _stage_boundary_owner: str = "",
+        acp_backend: str = "",
     ) -> "SubagentInfo | PreparedSpawn | ClaimPoint | None":
         """Spawn a subagent for *task*.
 
@@ -498,6 +499,7 @@ class _GateMixin(ManagerComponent):
             "max_turns": max_turns,
             "model": model,
             "reasoning_effort": reasoning_effort,
+            "acp_backend": acp_backend,
             "allowed_tools": allowed_tools,
             "bare": bare,
             "cwd": resolved_cwd,
@@ -786,6 +788,18 @@ class _GateMixin(ManagerComponent):
             and not self._manager._admission.root_may_start()
         ):
             should_queue, slot_free = True, False
+        # Per-backend cap (agent.subagent_backend_limits): the global cap has a slot,
+        # but this spawn's backend is full. Queued like capacity, with no slot free
+        # for it, so it drains when a run on that backend ends (the pick skips it
+        # until then -- ``fairness.pick_window_index``).
+        at_cap = getattr(type(self._manager), "_backend_at_cap", None)
+        if (
+            not should_queue
+            and not _dispatch_now
+            and callable(at_cap)
+            and at_cap(self._manager, acp_backend)
+        ):
+            should_queue, slot_free = True, False
         if should_queue:
             # A prevalidated app spawn does not carry its prevalidation INTO the
             # queue. `_agent_prevalidated` skips the agent-directory ownership
@@ -1013,6 +1027,7 @@ class _GateMixin(ManagerComponent):
             max_turns=max_turns,
             model=model or "",
             reasoning_effort=reasoning_effort or "",
+            acp_backend=acp_backend or "",
             allowed_tools=list(allowed_tools) if allowed_tools else [],
             bare=bare,
             cwd=resolved_cwd,

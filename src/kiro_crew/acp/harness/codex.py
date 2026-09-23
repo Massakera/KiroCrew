@@ -125,6 +125,7 @@ not the instrument that governs it.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -157,6 +158,32 @@ logger = logging.getLogger(__name__)
 #: claude's today: a divergence should be a one-line edit here rather than a silent
 #: downgrade of whichever harness moved first.
 PROTOCOL_VERSION_CODEX = 1
+
+
+#: codex-acp's own variable: the ACP ``authenticate`` request it sends ITSELF when
+#: Codex requires authentication. Crew never calls ``authenticate``, so this is the
+#: only way an API key in the environment becomes a signed-in session.
+DEFAULT_AUTH_REQUEST_ENV = "DEFAULT_AUTH_REQUEST"
+
+#: The adapter's env-var auth methods, in its own precedence order.
+_API_KEY_AUTH_METHODS = (("CODEX_API_KEY", "codex-api-key"), ("OPENAI_API_KEY", "openai-api-key"))
+
+
+def seed_api_key_auth_request(env: dict[str, str]) -> None:
+    """Let an API key in the environment sign codex in, as a FALLBACK only.
+
+    The adapter consults ``DEFAULT_AUTH_REQUEST`` only when Codex reports that it
+    requires authentication, so a subscription login already under ``CODEX_HOME``
+    still wins and this never re-authenticates a signed-in session. An operator's
+    own value is left alone. Names the METHOD, never the key: the adapter reads the
+    key from the variable itself, so no secret is copied into another variable.
+    """
+    if env.get(DEFAULT_AUTH_REQUEST_ENV):
+        return
+    for variable, method in _API_KEY_AUTH_METHODS:
+        if env.get(variable):
+            env[DEFAULT_AUTH_REQUEST_ENV] = json.dumps({"methodId": method})
+            return
 
 
 def _sandbox_wrapper_generations(sandbox_mode: str) -> int:
@@ -327,6 +354,7 @@ class CodexHarness(MembershipHarness):
         from kiro_crew.config import loader as loader_mod
 
         loader_mod.strip_kiro_cli_api_key(env)
+        seed_api_key_auth_request(env)
 
     @property
     def verifies_agent_activation(self) -> bool:

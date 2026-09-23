@@ -312,6 +312,7 @@ def test_known_membership_is_unchanged_by_the_move() -> None:
         "claude",
         "codex",
         "deepseek",
+        "droid",
         "goose",
         "kas",
         "opencode",
@@ -330,6 +331,8 @@ EXPECTED_CAPABILITIES = {
     "kas": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False),
     "claude": (PROVIDER_CLAUDE_CODE, "claude_code", True, True, True),
     "codex": (PROVIDER_ACP, "codex", True, True, True),
+    # Its own namespace, and none of the three demonstrated capabilities yet.
+    "droid": (PROVIDER_ACP, "droid", False, False, False),
     "nope": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False),
 }
 
