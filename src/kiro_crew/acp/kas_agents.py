@@ -40,6 +40,12 @@ reports as the session's own.
 protocol verb, so it has exactly one owner rather than being pinned in two places
 that can disagree.
 
+``welcomeMessage`` IS projected, through the same
+:func:`kiro_crew.agent_discovery.spec_welcome_message` reading the dashboard
+renders. One reader, so the hint a KAS session registers and the hint Crew shows
+cannot disagree -- and the cap and whitespace rules that reading already applies
+to this user-writable field are not re-argued for a second path onto the wire.
+
 ``permissions`` IS projected, and is the one field that changes behaviour rather
 than just describing it. KAS's policy is keyed by its own capability vocabulary
 instead of by tool name, so it is not a rename of Crew's ``allowedTools`` — see
@@ -64,6 +70,7 @@ from kiro_crew.agent_discovery import (
     AmbiguousAgentSpecError,
     read_agent_spec_strict,
     spec_by_declared_name,
+    spec_welcome_message,
 )
 from kiro_crew.agent_spec_format import agent_spec_candidates
 from kiro_crew.mcp_cleanup import (
@@ -727,9 +734,37 @@ def to_client_custom_agent(
         if entries:
             out["excludedTools"] = entries
 
-    include_mcp = spec.get("includeMcpJson")
-    if isinstance(include_mcp, bool):
-        out["includeMcpJson"] = include_mcp
+    welcome = spec_welcome_message(spec)
+    if welcome:
+        out["welcomeMessage"] = welcome
+
+    # Both flags widen the agent's VISIBLE tool set; neither auto-approves
+    # anything, so they do not cross the governance ceiling that filters
+    # ``allowedTools``. A tool they reveal is still resolved by ``permissions``,
+    # and this projection derives that from ``allowedTools`` alone -- so a
+    # revealed tool with no rule resolves to ``ask``.
+    #
+    # Forwarded ONLY when the spec states a bool, and no default is synthesized
+    # for an absent one. That is a decision, not an omission, because "absent"
+    # does not mean the same thing on the two hosts Crew writes for: kiro-cli
+    # reads an absent ``includeMcpJson`` as TRUE (``agent_capabilities``
+    # ``spec.get("includeMcpJson", True)``), while KAS's own disk schema defaults
+    # it to FALSE (``services/custom-agents/types.ts``). Sending a default would
+    # therefore be Crew inventing one host's answer and shipping it to the other.
+    #
+    # Nothing is lost by staying silent: the wire schema has no default, and KAS's
+    # consumer resolves an absent flag to false itself (``tools/tool-filter.ts``
+    # destructures ``includeMcpJson = false, includePowers = false``), which is
+    # already KAS's disk default. An absent flag thus reaches the same outcome as
+    # the file would have on KAS, with no guess from this side.
+    #
+    # A non-bool is dropped rather than coerced: ``z.boolean()`` rejects it, and a
+    # client agent that fails the wire schema is dropped WHOLE, costing the
+    # session its injected agent.
+    for flag in ("includeMcpJson", "includePowers"):
+        value = spec.get(flag)
+        if isinstance(value, bool):
+            out[flag] = value
 
     resources = spec.get("resources")
     if isinstance(resources, list):

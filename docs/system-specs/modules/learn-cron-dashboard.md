@@ -1311,10 +1311,17 @@ entry, synthesis not eligible) emits nothing here -- `_finish_queue_cycle`'s
 ### Agent welcome message (`welcomeMessage`)
 
 An agent spec may carry `welcomeMessage`, a hint its author wants read when that
-agent starts answering. `agent_discovery.agent_welcome_message` is its ONE reader
-and `chat_runner._surface_agent_welcome` its ONE emitter; before them the field
-had no reader at all, which is why the bundled `pptx_maker` agents ship a value
-nothing rendered.
+agent starts answering. `agent_discovery.agent_welcome_message` is the ONE reader
+of the transcript path and `chat_runner._surface_agent_welcome` its ONE emitter;
+the field had no reader at all before them, which is why the bundled `pptx_maker`
+agents ship a value nothing rendered.
+
+There is a second consumer, and it is deliberately not a second READING:
+`acp/kas_agents.to_client_custom_agent` projects the hint onto the KAS wire
+(`ClientCustomAgentSchema.welcomeMessage`) through `spec_welcome_message`, the
+same function the transcript path resolves to. One reading means the hint a KAS
+session registers and the hint the transcript shows cannot disagree, and the
+untrusted-input rules below hold on the wire without being restated there.
 
 Contract:
 
@@ -1338,7 +1345,10 @@ Contract:
   render nothing (`spec_str`'s rule); the text is capped at
   `WELCOME_MESSAGE_MAX_CHARS` (2000) including its ellipsis, and passes through
   `_redact_display_text`. The read is offloaded and total -- an unreadable spec
-  renders nothing rather than failing the turn.
+  renders nothing rather than failing the turn. The cap and the absent-value
+  rules reach the wire projection too, because it shares the reading; only
+  `_redact_display_text` does not, since that one is about what a transcript row
+  persists and re-broadcasts.
 
 Rationale for each choice is in the three docstrings, not repeated here.
 

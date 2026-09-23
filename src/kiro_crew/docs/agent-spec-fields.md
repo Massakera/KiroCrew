@@ -309,7 +309,7 @@ The
 |---|---|---|
 | `name` | str | The dispatch name. Outranks the filename: `spec_by_declared_name` resolves a spec whose declared `name` matches even when the file is called something else, which is how a package installs `<package>-<name>.json` and keeps the bare name. Two specs in one directory declaring the same `name` are refused, not arbitrated (`AmbiguousAgentSpecError`). |
 | `description` | str | Roster text, and projected on the KAS wire. A non-string reads as absent (`spec_str`) because the agents directory is shared with other tools and a structured value blanked the whole Agent Templates tab. |
-| `welcomeMessage` | str | Rendered once into a new chat transcript. Read by `agent_welcome_message` only, which asks `list_agents` which spec is live rather than re-deciding, then truncates at `WELCOME_MESSAGE_MAX_CHARS`, with the ellipsis inside that budget rather than added to it. Whitespace-only collapses to nothing. Best-effort: an unreadable spec and an absent hint are the same answer. |
+| `welcomeMessage` | str | Rendered once into a new chat transcript, and projected on the KAS wire from the same reading, so the two surfaces cannot disagree. Read by `agent_welcome_message` only, which asks `list_agents` which spec is live rather than re-deciding, then truncates at `WELCOME_MESSAGE_MAX_CHARS`, with the ellipsis inside that budget rather than added to it. Whitespace-only collapses to nothing. Best-effort: an unreadable spec and an absent hint are the same answer. |
 | `keyboardShortcut` | str | Carried as an ordinary (non-capability) field through fork and publish (`agent_capabilities.py`, `ORDINARY_FIELDS`). Nothing else in this tree reads it. |
 
 ### Prompt
@@ -359,7 +359,8 @@ unconfirmed.
 | Field | Type | Effect |
 |---|---|---|
 | `mcpServers` | object | Name → server entry. The keys become the roster's server chips (`_mcp_server_names`). A local entry may carry `command`, `args`, `type`, `env`, `timeout`, `disabled`, `disabledTools` and `autoApprove`. |
-| `includeMcpJson` | bool | Whether the backend also loads its global `mcp.json`. Crew's own generated specs pin `false` (shipped in `defaults.json` and re-pinned by `_refresh_dynamic_fields`), so for those a spec's own `mcpServers` is the complete set. Absent, it reads as `true`. Projected on the wire when it is a bool. |
+| `includeMcpJson` | bool | Whether the backend also loads its global `mcp.json`. Crew's own generated specs pin `false` (shipped in `defaults.json` and re-pinned by `_refresh_dynamic_fields`), so for those a spec's own `mcpServers` is the complete set. Absent, kiro-cli reads it as `true` and KAS's own disk schema as `false`, so Crew projects it only when the spec states a bool and synthesizes no default for either host — KAS's wire schema has none, and its tool filter resolves an absent flag to `false` itself. |
+| `includePowers` | bool | Whether the backend also unions in its Powers tools. Same shape and same absent-default rule as `includeMcpJson`. It widens which tools are VISIBLE, not which are auto-approved: a tool it reveals still has no `permissions` rule, so KAS resolves the call to `ask`. |
 
 `autoApprove` inside an `mcpServers` entry is the SECOND way a call skips the
 gate, and a more direct one: kiro-cli approves an auto-approved MCP tool locally
@@ -459,14 +460,15 @@ every other mirrored harness.
 | `excludedTools` | honoured | wire field | read by Tool Search only |
 | `permissions` | ignored (kiro-cli field set); refused below 2.23.0, so not written there | Crew-derived only, never forwarded | not read |
 | `mcpServers` | honoured | projected, minus `env` / `headers` | session array instead |
-| `includeMcpJson` | honoured | wire field | not read |
+| `includeMcpJson` | honoured; absent reads as `true` | wire field when the spec states a bool; no default synthesized | not read |
+| `includePowers` | not read | wire field when the spec states a bool | not read |
 | `resources` `skill://` | Crew injects the mapped set; the native launch view carries no `skill://` | forwarded on the wire, and Crew injects the mapped set | Crew injects the mapped set |
 | `resources` `file://` | loaded natively | loaded natively | Crew injects, from `kirocrew.json` only |
 | `hooks` | honoured | dropped from the wire projection; KAS's own on-disk profile is a separate file | Crew's gate, renamed events |
 | `toolsSettings` | honoured | no wire slot | not read |
 | `toolAliases` | honoured | no wire slot | not read |
 | `managedToolPolicy` | Crew-side, per session | Crew-side, per session | Crew-side, per session |
-| `welcomeMessage` | Crew-only (chat transcript) | same | same |
+| `welcomeMessage` | Crew-only (chat transcript) | chat transcript, and a wire field from the same capped reading | Crew-only (chat transcript) |
 
 ## Ownership and refresh
 

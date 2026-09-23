@@ -27,6 +27,10 @@ from kiro_crew.acp.kas_agents import (
     resolve_prompt,
     to_client_custom_agent,
 )
+from kiro_crew.agent_discovery import (
+    WELCOME_MESSAGE_MAX_CHARS,
+    spec_welcome_message,
+)
 
 
 def _rule(policy, capability):
@@ -107,11 +111,98 @@ class TestDeliberateOmissions:
     the spec gives nothing to derive it from. ``mcpServers`` is not in this
     list either: omitting it left a KAS session with ``@server`` refs naming
     nothing — see :class:`TestMcpServersProjection`.
+
+    ``effortLevel`` and ``dispatchKind`` are absent for a different reason again:
+    ``ClientCustomAgentSchema`` has no slot for either, so there is nothing to
+    project into.
     """
 
-    @pytest.mark.parametrize("key", ["model", "welcomeMessage"])
+    @pytest.mark.parametrize("key", ["model", "effortLevel", "dispatchKind"])
     def test_key_is_not_projected(self, key):
-        assert key not in to_client_custom_agent("a", _spec(), "p")
+        assert key not in to_client_custom_agent("a", _spec(**{key: "x"}), "p")
+
+
+class TestWelcomeMessageProjection:
+    """``welcomeMessage`` is a wire field, read by the dashboard's own function.
+
+    The hint is authored in a user-writable, tool-shared directory, so the wire
+    must not become a second, unbounded path for it: the assertions below pin
+    that the projected value is the SAME reading the transcript renders — capped
+    at ``WELCOME_MESSAGE_MAX_CHARS``, whitespace-stripped, non-string treated as
+    absent — rather than the raw spec value.
+    """
+
+    def test_projected_when_present(self):
+        out = to_client_custom_agent("a", _spec(welcomeMessage="Ask me for slides."), "p")
+        assert out["welcomeMessage"] == "Ask me for slides."
+
+    def test_absent_when_the_spec_has_none(self):
+        assert "welcomeMessage" not in to_client_custom_agent("a", _spec(), "p")
+
+    @pytest.mark.parametrize("value", ["", "   \n\t ", 17, None, {"a": 1}, ["x"]])
+    def test_blank_and_non_string_read_as_absent(self, value):
+        out = to_client_custom_agent("a", _spec(welcomeMessage=value), "p")
+        assert "welcomeMessage" not in out
+
+    def test_surrounding_whitespace_is_stripped(self):
+        out = to_client_custom_agent("a", _spec(welcomeMessage="\n  hi  \n"), "p")
+        assert out["welcomeMessage"] == "hi"
+
+    def test_capped_at_the_transcript_ceiling(self):
+        long_hint = "y" * (WELCOME_MESSAGE_MAX_CHARS + 500)
+        out = to_client_custom_agent("a", _spec(welcomeMessage=long_hint), "p")
+        assert len(out["welcomeMessage"]) == WELCOME_MESSAGE_MAX_CHARS
+        assert out["welcomeMessage"].endswith("\u2026")
+
+    def test_the_wire_value_equals_what_the_transcript_would_render(self):
+        """One reader for both surfaces, so a hint cannot differ between them."""
+        for hint in ["plain", "  padded  ", "z" * (WELCOME_MESSAGE_MAX_CHARS + 1)]:
+            spec = _spec(welcomeMessage=hint)
+            out = to_client_custom_agent("a", spec, "p")
+            assert out.get("welcomeMessage", "") == spec_welcome_message(spec)
+
+
+class TestInclusionFlagProjection:
+    """``includeMcpJson`` / ``includePowers``: forwarded, never defaulted.
+
+    An ABSENT flag is deliberately left absent rather than given a default,
+    because absence does not mean the same thing on the two hosts Crew writes
+    specs for: kiro-cli reads an absent ``includeMcpJson`` as ``True``, KAS's own
+    disk schema defaults it to ``False``. Crew picking either would ship one
+    host's answer to the other. KAS loses nothing by the silence — its wire
+    schema has no default and its tool filter resolves an absent flag to
+    ``false``, which is already its disk default.
+    """
+
+    @pytest.mark.parametrize("flag", ["includeMcpJson", "includePowers"])
+    @pytest.mark.parametrize("value", [True, False])
+    def test_a_bool_is_forwarded_verbatim(self, flag, value):
+        out = to_client_custom_agent("a", _spec(**{flag: value}), "p")
+        assert out[flag] is value
+
+    @pytest.mark.parametrize("flag", ["includeMcpJson", "includePowers"])
+    def test_absent_stays_absent_rather_than_defaulted(self, flag):
+        spec = _spec()
+        spec.pop(flag, None)
+        assert flag not in to_client_custom_agent("a", spec, "p")
+
+    @pytest.mark.parametrize("flag", ["includeMcpJson", "includePowers"])
+    @pytest.mark.parametrize("value", ["true", "no", 1, 0, None, [], {}])
+    def test_a_non_bool_is_dropped_rather_than_coerced(self, flag, value):
+        """``z.boolean()`` rejects it, and a failing agent is dropped WHOLE."""
+        out = to_client_custom_agent("a", _spec(**{flag: value}), "p")
+        assert flag not in out
+
+    def test_neither_flag_widens_the_permissions_policy(self):
+        """They reveal tools; they do not auto-approve them."""
+        bare = to_client_custom_agent("a", _spec(allowedTools=["web_fetch"]), "p")
+        widened = to_client_custom_agent(
+            "a",
+            _spec(allowedTools=["web_fetch"], includeMcpJson=True, includePowers=True),
+            "p",
+        )
+        assert widened["permissions"] == bare["permissions"]
+        assert widened["tools"] == bare["tools"]
 
 
 class TestOptionalPassThrough:
