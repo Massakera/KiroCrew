@@ -643,14 +643,15 @@ class TestAForeignProviderIsClassifiedThePreviousWay:
         assert SubagentManager._is_cc_provider(self._foreign_provider()) is False
 
 
-def test_the_knowledge_pool_client_takes_the_default_backend() -> None:
-    """Pins why swapping ``_is_claude`` for the effort capability changed nothing.
+def test_the_knowledge_pool_client_takes_the_configured_backend() -> None:
+    """The knowledge pool must hand ``agent.acp_backend`` to ``AcpClient``.
 
-    ``AcpWorker`` constructs its ``AcpClient`` without ``acp_backend``, so the
-    backend is the kiro default and both the old identity read and the new
-    capability answer False. If a future pool starts selecting a backend this
-    fails, which is the moment to check the effort channel deliberately rather
-    than inherit whichever arm the old branch left behind.
+    Omitting the kwarg is the kiro-cli spawn, so a host configured for Pi (or
+    any other selectable harness) kept looking for ``kiro-cli`` during
+    extraction. The effort channel is already ``capabilities_for(client.backend)``:
+    an empty backend stays on kiro's ``/effort`` command, and Pi writes its
+    config option. This pin fails if a later edit drops the kwarg and silently
+    returns extraction to kiro-cli.
     """
     tree = _tree("knowledge/llm_pool.py")
     constructions = [
@@ -661,8 +662,9 @@ def test_the_knowledge_pool_client_takes_the_default_backend() -> None:
     assert constructions, "llm_pool no longer constructs an AcpClient; re-check this pin"
     for call in constructions:
         passed = {kw.arg for kw in call.keywords}
-        assert "acp_backend" not in passed, (
-            f"llm_pool.py:{call.lineno} now selects a backend; decide the effort "
-            f"channel for it instead of relying on the kiro default"
+        assert "acp_backend" in passed, (
+            f"llm_pool.py:{call.lineno} constructs AcpClient without acp_backend; "
+            f"extraction would spawn kiro-cli regardless of agent.acp_backend"
         )
     assert capabilities_for("").effort_via_config_option is False
+    assert capabilities_for("pi").effort_via_config_option is True

@@ -9,7 +9,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO
+from kiro_crew.acp_backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_PI,
+)
 from kiro_crew.knowledge.llm_pool import (
     DEFAULT_IDLE_TTL_SECS,
     WORKER_RECYCLE_CALLS,
@@ -18,6 +24,7 @@ from kiro_crew.knowledge.llm_pool import (
     CCWorker,
     LLMPool,
     Worker,
+    _get_acp_backend,
     _get_idle_ttl,
     _get_provider_type,
     _get_sandbox_mode,
@@ -472,6 +479,7 @@ class TestReadConfig:
         the no-op-on-malformed-config contract of ``_read_config``."""
         assert _get_provider_type(bad) == "acp"
         assert _get_sandbox_mode(bad) == "auto"
+        assert _get_acp_backend(bad) == ACP_BACKEND_KIRO
 
     def test_read_config_coerces_non_dict_sections(self, tmp_path):
         """``_read_config`` normalises non-dict ``agent``/``knowledge`` to ``{}``
@@ -510,6 +518,109 @@ class TestReadConfig:
             worker = AcpWorker()
             await worker.start()
         assert mk.call_args.kwargs["sandbox_mode"] == "auto"
+        assert mk.call_args.kwargs["acp_backend"] == ACP_BACKEND_KIRO
+
+    def test_acp_backend_parser_reads_the_configured_harness(self):
+        assert _get_acp_backend({"agent": {"acp_backend": "pi"}}) == ACP_BACKEND_PI
+        assert _get_acp_backend({}) == ACP_BACKEND_KIRO
+        assert _get_acp_backend({"agent": {"acp_backend": "not-a-backend"}}) == (
+            ACP_BACKEND_KIRO
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_passes_configured_acp_backend_to_client(self, tmp_path):
+        """A Pi host must spawn pi-acp, not go looking for kiro-cli."""
+        config = tmp_path / ".kirocrew" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text('{"agent": {"acp_backend": "pi"}}')
+        mock_client = AsyncMock()
+        mock_client.is_ready = True
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk:
+            worker = AcpWorker()
+            await worker.start()
+        assert mk.call_args.kwargs["acp_backend"] == ACP_BACKEND_PI
+
+    @pytest.mark.asyncio
+    async def test_explicit_backend_is_not_reread_from_config(self, tmp_path):
+        """A backend passed in is the one spawned, even when config names another."""
+        config = tmp_path / ".kirocrew" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text('{"agent": {"acp_backend": "codex"}}')
+        mock_client = AsyncMock()
+        mock_client.is_ready = True
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk:
+            worker = AcpWorker(acp_backend=ACP_BACKEND_PI)
+            await worker.start()
+        assert mk.call_args.kwargs["acp_backend"] == ACP_BACKEND_PI
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_KAS, ACP_BACKEND_CODEX])
+    async def test_runtime_backend_starts_on_acp_runtime_not_acp_client(
+        self, tmp_path, backend
+    ):
+        """KAS and codex have no AcpClient spawn arm; the label must not hide kiro-cli."""
+        runtime = MagicMock()
+        runtime.spawn = AsyncMock()
+        runtime.create_session = AsyncMock(return_value=object())
+        runtime.kill = AsyncMock()
+
+        class _RuntimeProvider:
+            """No ``send_message``: a MagicMock would invent one and skip the stream."""
+
+            def __init__(self) -> None:
+                self.backend = backend
+                self._pid = 4242
+
+            def is_process_alive(self) -> bool:
+                return True
+
+            async def stream(self, message: str):
+                assert message == "ping"
+                yield MagicMock(kind="text_chunk", text="ab")
+                yield MagicMock(kind="tool_call", text="ignored")
+                yield MagicMock(kind="text_chunk", text="c")
+
+        provider = _RuntimeProvider()
+        registered: list[int] = []
+        runtime_cls = "kiro_crew.acp.runtime.AcpRuntime"
+        provider_cls = "kiro_crew.acp.session_provider.AcpSessionProvider"
+        shield = "kiro_crew.knowledge.llm_pool.register_protected_pid"
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch(runtime_cls, return_value=runtime) as rt, \
+             patch(provider_cls, return_value=provider), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient") as client, \
+             patch(shield, side_effect=registered.append):
+            worker = AcpWorker(acp_backend=backend)
+            await worker.start()
+            text = await worker.send_message("ping", timeout=5)
+        client.assert_not_called()
+        assert rt.call_args.kwargs["acp_backend"] == backend
+        assert rt.call_args.kwargs["agent"] == "kirocrew-knowledge"
+        runtime.spawn.assert_awaited_once()
+        runtime.create_session.assert_awaited_once()
+        assert runtime.create_session.await_args.kwargs["agent"] == "kirocrew-knowledge"
+        runtime.kill.assert_not_awaited()
+        assert text == "abc"
+        assert registered == [4242]
+
+    @pytest.mark.asyncio
+    async def test_failed_runtime_session_kills_the_process_it_spawned(self, tmp_path):
+        runtime = MagicMock()
+        runtime.spawn = AsyncMock()
+        runtime.create_session = AsyncMock(side_effect=RuntimeError("session refused"))
+        runtime.kill = AsyncMock()
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.acp.runtime.AcpRuntime", return_value=runtime), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient") as client:
+            worker = AcpWorker(acp_backend=ACP_BACKEND_KAS)
+            with pytest.raises(RuntimeError, match="session refused"):
+                await worker.start()
+        client.assert_not_called()
+        runtime.spawn.assert_awaited_once()
+        runtime.kill.assert_awaited_once()
+        assert runtime.kill.await_args.kwargs["expected"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +676,28 @@ class TestLLMPoolStart:
             await pool.start()  # second call should no-op
 
         assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_start_threads_configured_backend_into_workers(self, tmp_path):
+        config = tmp_path / ".kirocrew" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text('{"agent": {"provider": "acp", "acp_backend": "pi"}}')
+        created: list[FakeWorker] = []
+
+        class _Recording(FakeWorker):
+            def __init__(self, *, sandbox_mode=None, effort=None, acp_backend=""):
+                super().__init__()
+                self.acp_backend = acp_backend
+                created.append(self)
+
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpWorker", _Recording):
+            pool = LLMPool(pool_size=1, use_config_pool_size=False)
+            await pool.start()
+
+        assert len(created) == 1
+        assert created[0].acp_backend == ACP_BACKEND_PI
+        assert pool._acp_backend == ACP_BACKEND_PI
 
 
 # ---------------------------------------------------------------------------
@@ -879,7 +1012,9 @@ class TestLLMPoolEffort:
         with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
             result = await pool._create_worker()
 
-        worker_type.assert_called_once_with(sandbox_mode="auto", effort="high")
+        worker_type.assert_called_once_with(
+            sandbox_mode="auto", effort="high", acp_backend=ACP_BACKEND_KIRO
+        )
         assert result is fake_worker
 
     @pytest.mark.asyncio
@@ -891,7 +1026,9 @@ class TestLLMPoolEffort:
         with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
             await pool._create_worker()
 
-        worker_type.assert_called_once_with(sandbox_mode="auto", effort=None)
+        worker_type.assert_called_once_with(
+            sandbox_mode="auto", effort=None, acp_backend=ACP_BACKEND_KIRO
+        )
 
     @pytest.mark.asyncio
     async def test_fetch_sized_pool_ignores_extraction_size_config(self):
