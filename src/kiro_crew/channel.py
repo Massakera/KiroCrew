@@ -238,6 +238,16 @@ class ChannelMessage:
     thread_id: str | None = None  # parent message ID (None = top-level)
     reply_to: str | None = None  # agent ID of parent message sender
     reply_count: int = 0  # thread reply count (top-level only)
+    # Structured facts beside the prose, for renderers that make decisions
+    # from the message rather than display it. An approval carries the
+    # server's own verdict on which trust tiers it can record (see the
+    # approval post in ``_stream_task``), so the card is gated by server fact
+    # instead of a client regex over ``content``. Flat string values only,
+    # mirroring chat's ``perm_meta``; every value is already display-redacted.
+    # ``None`` for every other message and for messages persisted before the
+    # field existed -- their prose is unchanged, so a renderer that ignores
+    # ``meta`` (Slack mirrors, older dashboards) shows exactly what it did.
+    meta: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -251,6 +261,7 @@ class ChannelMessage:
             "thread_id": self.thread_id,
             "reply_to": self.reply_to,
             "reply_count": self.reply_count,
+            "meta": self.meta,
         }
 
 
@@ -393,6 +404,7 @@ class Channel:
         mention: str | list[str] | None = None,
         msg_type: str = "progress",
         thread_id: str | None = None,
+        meta: dict[str, str] | None = None,
     ) -> ChannelMessage:
         # Normalize mentions to a set
         mentions: set[str] = set()
@@ -419,6 +431,7 @@ class Channel:
             msg_type=msg_type,
             thread_id=thread_id,
             reply_to=reply_to,
+            meta=meta,
         )
         self.messages.append(msg)
         self._msg_index[msg.id] = msg
@@ -598,6 +611,7 @@ class Channel:
                 thread_id=md.get("thread_id"),
                 reply_to=md.get("reply_to"),
                 reply_count=md.get("reply_count", 0),
+                meta=md.get("meta"),
             )
             ch.messages.append(msg)
             ch._msg_index[msg.id] = msg
@@ -1228,6 +1242,26 @@ async def _stream_task(
                 approval_future = loop.create_future()
                 agent._pending_approval_command = _cmd if _command_grantable else ""
                 agent._approval_future = approval_future
+                # The card's structured facts, beside the unchanged prose. The
+                # server is the only side that can refuse a per-command tier
+                # (``handlers_channel.approve``), so it states here which
+                # tiers THIS approval can record: ``is_shell`` gates both
+                # per-command tiers, ``base_derivable`` the base tier alone,
+                # and ``base_command`` is the very binary the endpoint would
+                # grant -- a compound ``cat f | wc -l`` has none, where a
+                # first-token guess would have offered ``cat``. Values are the
+                # already-redacted display strings; the raw command never
+                # leaves this scope.
+                _base_binary = _shell_base_binary(_cmd) if _command_grantable else None
+                approval_meta: dict[str, str] = {
+                    "request_id": str(event.request_id),
+                    "tool_title": sanitized_name,
+                    "tool_input": sanitized_input,
+                    "is_shell": "1" if _cmd else "",
+                    "command_grantable": "1" if _command_grantable else "",
+                    "base_derivable": "1" if _base_binary else "",
+                    "base_command": _base_binary or "",
+                }
                 try:
                     # Posting and waiting are one ownership scope. If the post
                     # itself fails, neither the Future nor its command authority
@@ -1238,6 +1272,7 @@ async def _stream_task(
                         from_role=agent.role,
                         msg_type="approval",
                         thread_id=thread_id,
+                        meta=approval_meta,
                     )
                     decision = await asyncio.wait_for(approval_future, timeout=3600)
                 except asyncio.TimeoutError:
