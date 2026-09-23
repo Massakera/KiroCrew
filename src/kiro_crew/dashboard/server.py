@@ -50,6 +50,7 @@ from kiro_crew.config.loader import (
     tailnet_effective_allowed_logins,
     tailnet_identity_unknown,
 )
+from kiro_crew.crewmate_prune_migration import HistoryUnreadable, prune_synced_crewmates
 from kiro_crew.dashboard import (
     cautious_boot,
     channel_slots,
@@ -5564,6 +5565,34 @@ async def start_dashboard(
     # intermediate states no client renders. Reseeding happens inside the block too
     # — it must complete before the single broadcast so clients never see slots
     # under a counter that could still re-mint a colliding index.
+    # One-time prune of the crewmates an enrol-on-mount agent sync generated
+    # from the user's own specs (see crewmate_prune_migration). AFTER the
+    # listener binds -- off the boot path -- and BEFORE the slot restores, so a
+    # removed crewmate's DM slot is not rebuilt to point at a row that is gone.
+    # New DM threads are held back while it runs: api_member_thread waits on
+    # ``crewmate_prune_settled``, so no thread can be opened between a
+    # candidate's history check and its delete. Marker-gated, so a cheap no-op
+    # on every later boot. Off-loop: the config lock and the history reads are
+    # IO. The event is set in ``finally`` -- a failed pass must never leave the
+    # thread route waiting.
+    state.crewmate_prune_settled.clear()
+    try:
+        prune = await asyncio.to_thread(prune_synced_crewmates, state.conversation_log)
+        if prune.removed:
+            logger.info(
+                "removed %d unused auto-generated crewmates: %s",
+                len(prune.removed),
+                ", ".join(prune.removed),
+            )
+    except HistoryUnreadable as exc:
+        # Removal needs evidence; without it nothing moves and the pass runs
+        # again next boot.
+        logger.warning("crewmate prune skipped: %s", exc)
+    except Exception:
+        logger.warning("crewmate prune migration failed", exc_info=True)
+    finally:
+        state.crewmate_prune_settled.set()
+
     # Converge any leftover copy transcripts BEFORE the restores read them. On an
     # install carrying a second transcript for a channel conversation under a
     # derived dashboard key, its dashboard-authored turns exist nowhere else, so

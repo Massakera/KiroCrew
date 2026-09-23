@@ -470,6 +470,17 @@ async def api_member_thread(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "dashboard state unavailable", "code": "state_unavailable"}, status=503
         )
+    # The startup crewmate prune decides from the DM binding this route writes;
+    # while it runs, opening a thread waits so a binding cannot appear between
+    # a candidate's check and its delete. Bounded: a pass that has not settled
+    # in this long answers 503 rather than holding the page open forever.
+    try:
+        await asyncio.wait_for(state.crewmate_prune_settled.wait(), timeout=60)
+    except asyncio.TimeoutError:
+        return web.json_response(
+            {"error": "Crewmates are being tidied; retry shortly.", "code": "prune_in_progress"},
+            status=503,
+        )
     slug = request.match_info["slug"]
     try:
         members_mod.validate_slug(slug)

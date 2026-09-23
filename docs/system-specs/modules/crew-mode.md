@@ -803,6 +803,77 @@ Settings content — the built-from template, wake sources and schedules, the
 memory binding, cloud — lives only on the crew editor / detail page.
 Operator-facing memory diagnostics never render in the panel.
 
+## One-time prune of sync-generated crewmates (startup migration)
+
+Older dashboards called `POST /api/agents/sync` on every chat mount, and that
+sync enrolled every user-authored spec under `~/.kiro/agents` as a crewmate — a
+`config.agents` row with no `member_id`, on the shared `default` memory store,
+bound to the spec by name. An existing install therefore carries one crewmate
+per custom agent, most never opened. `crewmate_prune_migration.py` runs once at
+gateway startup (`start_dashboard`, after the listener binds — off the boot
+path — and before the slot restores, off-loop) and settles that without any UI
+— removal only; nothing is created or rebound:
+
+- **Candidate** = a row that is exactly what the sync wrote: its name is its
+  `kiro_agent`; that spec is on disk, user-authored (`source == "builtin"`),
+  not the runtime's own (`kirocrew_owned`) and not a crew's private copy
+  (`private_to`); and every field other than `description` is at its default
+  — no `member_id`, the `default` store, no model, effort, triggers, colour,
+  star, avatar or workspace (`_is_fresh_sync_shape`, tested on the raw row as
+  the file holds it; a missing key reads as its default). A row the owner
+  touched in any of those ways is the owner's and is never a candidate. A
+  hand-made crewmate has a `member_id`; a package's spec has another source; a
+  row whose spec is gone is left alone. No memory directory is inspected.
+- **Chatted** = the crewmate's DM thread was opened (its binding file exists
+  and its `member` is the row's exact name — the thread route writes that file
+  on first open), OR a session's metadata line names it as the agent. Either
+  suffices. Both are read strictly by the migration itself, never through the
+  roster's total-by-contract readers (`read_dm_binding`, `list_sessions`),
+  which answer "absent" for a damaged directory, an unreadable file or a
+  malformed payload — a removal must not mistake any of those for "never".
+  Only a binding file that does not exist reads as never opened; a session
+  whose first line is not a metadata record names nobody.
+- **Never chatted → removed** (`remove_never_chatted`): the row is deleted
+  through a delta mutate under the config lock, and only while the row on disk
+  still has the same `kiro_agent` and the fresh-sync shape. The fence is
+  identity and shape, not equality with a default-filled snapshot, so a row
+  written by a build whose record had fewer keys is still recognised. A row
+  that changed meanwhile is **refused**: a refusal is not a commit, so the pass
+  writes no marker, logs the names, and the next boot re-judges them.
+- **Chatted → untouched.** A kept crewmate stays exactly as it is: on the
+  shared `default` store, with no `member_id`. A memory binding is identity and
+  is chosen only at creation; an existing member retains its exact V1 binding
+  ([memory-skills-hooks](memory-skills-hooks.md#member-memory-experience-and-lifecycle)),
+  and no startup pass rewrites it.
+- **Fail closed.** With no conversation log, a session file that cannot be
+  statted, read or parsed, or a binding whose path cannot be resolved or whose
+  file exists but cannot be read or parsed, the pass raises `HistoryUnreadable`,
+  removes nothing further and writes no marker, so it runs again next boot.
+- **Serialized.** `DashboardState.crewmate_prune_settled` is cleared before
+  the pass and set after (in `finally`); `POST /api/members/{slug}/thread` —
+  the one route that writes a DM binding — waits on it (bounded at 60 s, then
+  503 `prune_in_progress`), so no thread can be opened between a candidate's
+  check and its delete. Each candidate's check runs immediately before its own
+  removal, never once for the whole list.
+- **Marker.** A completed pass (a no-op included) writes
+  `<config dir>/crewmate_prune_migrated.json` with `{migrated_at, removed,
+  kept}` — the same marker-file seam the config loader's one-shot migrations
+  use (`connections_ui_migrated.json`); later boots return at once. One INFO
+  line records the removal: `removed N unused auto-generated crewmates:
+  <names>`.
+
+Removed rows do not come back: since #12224 the dashboard pickers read
+`GET /api/agents/catalog` and nothing calls `POST /api/agents/sync`, so the rows
+this pass removes were written by builds before that change. The sync route's
+own contract is unchanged.
+
+The RFC's original screen 03 ("a user with custom agents but no crewmates is
+offered to add them") is superseded: #12224 ended the enrol-on-mount behaviour,
+and the Crewmates page's empty state with **New crewmate** (#12924) is the path
+from a custom agent to a crewmate. What an existing user actually has is the
+opposite problem — the crewmates that sync already made — and that is what this
+migration settles.
+
 ## Selection: the `select_crew` contract
 
 Discovery importing a provider template as a configured member does not rebind

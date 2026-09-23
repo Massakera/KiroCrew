@@ -4751,6 +4751,13 @@ class DashboardState:
         self.workflow_startup_task: asyncio.Task[None] | None = None
         self.context_builder = context_builder
         self.conversation_log = conversation_log
+        # Set except while the startup crewmate prune runs (server.py clears it
+        # before the pass and sets it after): api_member_thread waits on it so
+        # a DM thread cannot be opened between the prune's history check of a
+        # candidate and its delete. Set by default so every other entry point
+        # -- tests, the CLI -- never waits.
+        self.crewmate_prune_settled = asyncio.Event()
+        self.crewmate_prune_settled.set()
         self.consolidator = consolidator
         self.task_runner = task_runner
         self.slack_client = slack_client
