@@ -666,6 +666,25 @@ describe('sseSubagentSpawn — requestedModel threading (#5326)', () => {
   })
 })
 
+describe('sseSubagentSpawn — pi child usage', () => {
+  it('keeps a published zero cost and does not invent a missing input count', () => {
+    const store = configureStore({
+      reducer: { chat: chatReducer },
+      middleware: (getDefault) => getDefault({ serializableCheck: false, immutableCheck: false }),
+    })
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseSubagentSpawn({
+      slot: 'active', id: 'pi:run-77', task: 'review', agent: 'review-api-security',
+      model: 'factory/claude-opus-5-5', total_tokens: 4321, cost_usd: 0,
+    }))
+    const row = store.getState().chat.subagents['pi:run-77']
+    expect(row.agent).toBe('review-api-security')
+    expect(row.totalTokens).toBe(4321)
+    expect(row.costUsd).toBe(0)
+    expect(row.inputTokens).toBeUndefined()
+  })
+})
+
 describe('sseSubagentDone — requestedModel threading (#5326)', () => {
   function makeDoneStore() {
     return configureStore({ reducer: { chat: chatReducer } })

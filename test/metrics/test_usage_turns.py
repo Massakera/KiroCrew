@@ -43,6 +43,7 @@ def _row(slot, *, ts=None, **extra):
         "duration_ms": 42000,
         "context_used": 74000,
         "context_window": 200000,
+        "total_tokens": 1200,
     }
     row.update(extra)
     return row

@@ -672,11 +672,23 @@ type SpendGroup = 'session' | 'category' | 'model'
 type TurnUsageRow = {
   ts: string
   model: string
+  input?: number
+  output?: number
+  total_tokens?: number
   credits?: number
   cost?: number
   duration_ms?: number
   context_used?: number
   context_window?: number
+}
+
+/** Published tokens for one turn. Input plus output when either was recorded;
+ *  otherwise the async total. A missing dimension is left out of the sum. */
+function turnTokens(row: TurnUsageRow): number | null {
+  const parts = [row.input, row.output].filter((n): n is number => typeof n === 'number')
+  if (parts.length > 0) return parts.reduce((sum, n) => sum + n, 0)
+  if (typeof row.total_tokens === 'number') return row.total_tokens
+  return null
 }
 
 const DRILL_TH = 'text-left font-normal text-[10px] text-muted uppercase tracking-wide px-2 py-1'
@@ -732,6 +744,7 @@ function SessionTurnsDrilldown({ slot }: { slot: string }) {
           <th className={DRILL_TH}>{i18nT('pages.telemetryPanel.turn_col')}</th>
           <th className={`${DRILL_TH} ${DRILL_HIDE_TIME}`}>{i18nT('pages.telemetryPanel.time_col')}</th>
           <th className={DRILL_TH}>{i18nT('pages.telemetryPanel.model_col')}</th>
+          <th className={`${DRILL_TH} text-right ${DRILL_HIDE_DURATION}`}>{i18nT('pages.telemetryPanel.used_tokens_col')}</th>
           <th className={`${DRILL_TH} text-right`}>{i18nT('pages.telemetryPanel.credits_col')}</th>
           <th className={`${DRILL_TH} text-right ${DRILL_HIDE_DURATION}`}>{i18nT('pages.telemetryPanel.duration_col')}</th>
           <th className={`${DRILL_TH} text-right ${DRILL_HIDE_CONTEXT}`}>{i18nT('pages.telemetryPanel.context_col')}</th>
@@ -752,8 +765,15 @@ function SessionTurnsDrilldown({ slot }: { slot: string }) {
                 {t.model || '—'}
               </span>
             </td>
+            <td className={`${DRILL_TD} text-right text-muted ${DRILL_HIDE_DURATION}`}>
+              {turnTokens(t) != null ? fmtNumber(turnTokens(t) as number) : '—'}
+            </td>
             <td className={`${DRILL_TD} text-right`}>
-              {t.credits !== undefined ? fmtNumber(t.credits, { maximumFractionDigits: 2 }) : '—'}
+              {t.credits !== undefined
+                ? fmtNumber(t.credits, { maximumFractionDigits: 2 })
+                : t.cost !== undefined
+                  ? fmtNumber(t.cost, { maximumFractionDigits: 4 })
+                  : '—'}
             </td>
             <td className={`${DRILL_TD} text-right text-muted ${DRILL_HIDE_DURATION}`}>
               {t.duration_ms !== undefined

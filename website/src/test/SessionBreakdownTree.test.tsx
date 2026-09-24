@@ -12,7 +12,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
-import { SessionBreakdownTree, nodeSegments } from '../pages/SessionBreakdownTree'
+import { SessionBreakdownTree, nodeSegments, reportedTokens } from '../pages/SessionBreakdownTree'
 import { type ContextTrace } from '../pages/ContextBreakdownPanel'
 import type { SubagentActivity } from '../types'
 
@@ -143,6 +143,25 @@ describe('SessionBreakdownTree', () => {
     // en fallback for a nameless node is the literal "sub-agent" (exact match
     // so the plural "N sub-agents" in the header meta does not also match).
     expect(screen.getByText('sub-agent')).toBeTruthy()
+  })
+
+  it('shows a pi child model, published tokens, and a factory cost of 0', () => {
+    renderTree({
+      a: sub({
+        id: 'pi:run-77',
+        agent: 'review-api-security',
+        model: 'factory/claude-opus-5-5',
+        childSession: '',
+        totalTokens: 4321,
+        costUsd: 0,
+        startedAt: 1,
+      }),
+    })
+    expect(reportedTokens(sub({ totalTokens: 4321, childSession: '' }))).toBe(4321)
+    expect(screen.getByText('factory/claude-opus-5-5')).toBeTruthy()
+    expect(screen.getByText('4,321')).toBeTruthy()
+    expect(screen.getByText('0')).toBeTruthy()
+    expect(screen.queryByText('kirocrew')).toBeNull()
   })
 
   it('collapses the whole tree when the header is toggled', () => {
