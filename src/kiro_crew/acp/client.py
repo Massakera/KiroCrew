@@ -598,7 +598,8 @@ PI_BRIDGE_EXTENSION_SHA256 = "10200bd1c89e7f61eb165dd87a59df48426580fd42ac8dea4f
 _ENV_PI_BRIDGE_SERVERS = "KIROCREW_PI_BRIDGE_SERVERS"
 # What the bridge carries into a pi session: Crew's control-plane server, and of
 # it only the subagent tools, which is what replaces the harness's own subagent
-# extension. Each call still goes through the gate like any other tool.
+# extension, plus the Knowledge Library search, which pi has no other way to
+# reach. Each call still goes through the gate like any other tool.
 _PI_BRIDGE_TOOLS: dict[str, tuple[str, ...]] = {
     "kirocrew-core": (
         "spawn_run",
@@ -608,6 +609,7 @@ _PI_BRIDGE_TOOLS: dict[str, tuple[str, ...]] = {
         "spawn_list",
         "spawn_status",
         "spawn_sub_agents",
+        "local_knowledge_search",
     ),
 }
 # Named once per process: a gateway whose broker does not stub Crew's server says

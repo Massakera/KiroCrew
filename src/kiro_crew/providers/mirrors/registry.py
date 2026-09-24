@@ -305,7 +305,7 @@ PROJECTIONS: dict[str, McpProjection] = {
             "mcp_gateway.stub_servers naming kirocrew-core, Crew's own tool bridge "
             "extension (gate_extensions/pi/kiro_crew_tool_bridge.ts, "
             "ACP_BACKENDS_EXTENSION_TOOL_BRIDGE) carries a fixed set of subagent "
-            "tools from that server's broker stub, whatever the spec says"
+            "tools and the Knowledge Library search from that server's broker stub, whatever the spec says"
         ),
         channel=(
             "the adapter forwarding the array to the pi process (an open upstream "
