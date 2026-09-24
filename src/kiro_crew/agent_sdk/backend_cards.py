@@ -400,6 +400,14 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "membership is a steer reported injected that never reached the model, which "
         "is a defect"
     ),
+    "ACP_BACKENDS_EXTENSION_TOOL_BRIDGE": (
+        "which channel carries Crew's subagent tools into a harness whose session "
+        "array is inert. It carries a fixed subset, and only while the broker stubs "
+        "Crew's server, so marking the Crew-tools line available on it would claim a "
+        "whole tool set the session does not hold; leaving the line off states the "
+        "default accurately. A wrong membership is a bridge sealed where no harness "
+        "loads it, or tools missing where one does, which is a defect"
+    ),
     "ACP_BACKENDS_SEED_LOCAL_SETTINGS": (
         "whether a settings file is re-seeded on a model switch. Invisible when "
         "right, a stale model when wrong"

@@ -300,14 +300,19 @@ PROJECTIONS: dict[str, McpProjection] = {
             "dashboard report Crew tools as mounted on a session where none can be "
             "called -- which is why pi is outside ACP_BACKENDS_SESSION_MCP_ARRAY. The "
             "shared gateway's broker stubs are stdio elements too and land in the same "
-            "inert array. A pi session therefore holds none of Crew's own tools, "
-            "gateway on or off"
+            "inert array. A pi session therefore holds none of the servers its agent "
+            "spec declares. The one exception is not a projection: with "
+            "mcp_gateway.stub_servers naming kirocrew-core, Crew's own tool bridge "
+            "extension (gate_extensions/pi/kiro_crew_tool_bridge.ts, "
+            "ACP_BACKENDS_EXTENSION_TOOL_BRIDGE) carries a fixed set of subagent "
+            "tools from that server's broker stub, whatever the spec says"
         ),
         channel=(
             "the adapter forwarding the array to the pi process (an open upstream "
-            "change does this by loading a bridge extension into pi), or an extension "
-            "of Crew's that bridges MCP the way the gate extension bridges permissions "
-            "-- the one channel this harness is shown to read today"
+            "change does this by loading a bridge extension into pi), or widening "
+            "Crew's tool bridge extension from its fixed subagent tool set to the "
+            "spec's servers -- extensions are the one channel this harness is shown "
+            "to read today"
         ),
         tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
     ),

@@ -117,7 +117,27 @@ function boundInput(toolName: string, input: unknown): Bounded {
   return { value: out, truncated };
 }
 
-function envelope(toolCallId: unknown, toolName: string, input: unknown): string | null {
+/**
+ * The file pi says registered *toolName*, or "" for a built-in or an unknown tool.
+ * pi's own `sourceInfo` is the provenance field; the host reads it to tell a tool
+ * its bridge extension registered from one that merely shares the name.
+ */
+function toolSource(pi: ExtensionAPI, toolName: string): string {
+  try {
+    const tool = pi.getAllTools().find((t) => t.name === toolName);
+    const path = tool?.sourceInfo?.path;
+    return tool?.sourceInfo?.source !== "builtin" && typeof path === "string" ? path : "";
+  } catch {
+    return "";
+  }
+}
+
+function envelope(
+  toolCallId: unknown,
+  toolName: string,
+  input: unknown,
+  source: string,
+): string | null {
   const kind = KIND_BY_TOOL[toolName] ?? "other";
   const bounded = boundInput(toolName, input);
   const rendered = JSON.stringify({
@@ -126,6 +146,7 @@ function envelope(toolCallId: unknown, toolName: string, input: unknown): string
     toolCallId: typeof toolCallId === "string" ? toolCallId : "",
     tool: toolName,
     kind,
+    source,
     input: bounded.value,
     truncated: bounded.truncated,
   });
@@ -149,7 +170,7 @@ export default function (pi: ExtensionAPI) {
       // No dialog channel means no way to ask, so the call does not run.
       return { block: true, reason: "Kiro Crew tool gate: no permission channel" };
     }
-    const message = envelope(event.toolCallId, toolName, event.input);
+    const message = envelope(event.toolCallId, toolName, event.input, toolSource(pi, toolName));
     if (message === null) {
       return { block: true, reason: "Kiro Crew tool gate: tool arguments too large to judge" };
     }

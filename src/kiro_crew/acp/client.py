@@ -60,6 +60,7 @@ from kiro_crew.acp import seed_provenance
 from kiro_crew.acp._dispatch import (
     ACP_BACKENDS_META_IDENTITY,
     DRAIN_YIELD_AFTER_S,
+    GateBridgeIdentity,
     _measure_tool_output,
     agent_version_from_init,
     build_permission_event,
@@ -107,6 +108,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_EXTENSION_TOOL_BRIDGE,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INLINE_COMPACTION,
@@ -585,7 +587,32 @@ _ENV_PI_GATE_SESSION = "KIROCREW_PI_GATE_SESSION"
 # digest over the raw bytes would read every Windows install as tampered and refuse
 # every pi session there. ``.gitattributes`` pins the checkout LF as well; the
 # normalization here is what keeps the property from resting on a repo-config line.
-PI_GATE_EXTENSION_SHA256 = "33caa696e70e3b0c0793a705b0c6e06c372c52478e3ac4abf75f0e8d67d1e600"
+PI_GATE_EXTENSION_SHA256 = "5634db295d39cb5a92a825651fe1c0f3b3cc527be39f1b60d24f46d558d594f0"
+# The tool bridge (``gate_extensions/pi/kiro_crew_tool_bridge.ts``) is sealed the
+# same way and for the same reason: a bridged tool is governed under the MCP
+# identity it claims only when the gate reports it came from the sealed copy, so
+# the copy must be code this build shipped.
+PI_BRIDGE_EXTENSION_SHA256 = "10200bd1c89e7f61eb165dd87a59df48426580fd42ac8dea4f32f60f5089944d"
+# The server list the bridge reads, as JSON: ``{"servers": [{name, command, args,
+# env, tools}]}``. Only the pooled broker stubs of the servers below go in it.
+_ENV_PI_BRIDGE_SERVERS = "KIROCREW_PI_BRIDGE_SERVERS"
+# What the bridge carries into a pi session: Crew's control-plane server, and of
+# it only the subagent tools, which is what replaces the harness's own subagent
+# extension. Each call still goes through the gate like any other tool.
+_PI_BRIDGE_TOOLS: dict[str, tuple[str, ...]] = {
+    "kirocrew-core": (
+        "spawn_run",
+        "spawn_continue",
+        "spawn_steer",
+        "spawn_release",
+        "spawn_list",
+        "spawn_status",
+        "spawn_sub_agents",
+    ),
+}
+# Named once per process: a gateway whose broker does not stub Crew's server says
+# why pi sessions carry no Crew tools once, not on every spawn.
+_pi_bridge_off_noted: set[str] = set()
 # ── deepseek (ACP_BACKEND_DEEPSEEK) ──
 # DeepSeek Harness is a plugin host, and ACP is one of the profiles it boots. So the
 # argv is the harness's own binary plus the profile selector -- the plain-binary
@@ -1101,7 +1128,7 @@ def _opencode_readback_remedy() -> str:
 
 _pi_acp_argv_cache: tuple[list[str] | None, str] | object = _UNRESOLVED
 _pi_bin_cache: tuple[str | None, str] | object = _UNRESOLVED
-_pi_gate_launcher_cache: dict[tuple[str, str], str] = {}
+_pi_gate_launcher_cache: dict[tuple[str, str, tuple[str, ...]], str] = {}
 
 
 def _resolve_pi_acp_bin() -> tuple[list[str] | None, str]:
@@ -1161,6 +1188,11 @@ def pi_gate_extension_path() -> str:
         / "pi"
         / "kiro_crew_tool_gate.ts"
     )
+
+
+def pi_bridge_extension_path() -> str:
+    """The absolute path of the tool bridge extension Kiro Crew ships for pi."""
+    return str(Path(pi_gate_extension_path()).with_name("kiro_crew_tool_bridge.ts"))
 
 
 def _pi_gate_artifact_dir() -> str:
@@ -1234,7 +1266,26 @@ def _seal_pi_gate_extension() -> str:
 
     Blocking (reads and may write a file); callers run it off the loop.
     """
-    source = pi_gate_extension_path()
+    return _seal_pi_extension(pi_gate_extension_path(), PI_GATE_EXTENSION_SHA256, "", "gate")
+
+
+def _seal_pi_bridge_extension() -> str:
+    """The tool bridge's sealed copy, verified like the gate's.
+
+    Raises :class:`PiGateExtensionTampered` like the gate seal; unlike the gate,
+    the caller treats that as "no bridge this session", not as a refusal.
+    """
+    return _seal_pi_extension(
+        pi_bridge_extension_path(), PI_BRIDGE_EXTENSION_SHA256, "_bridge", "bridge"
+    )
+
+
+def _seal_pi_extension(source: str, pinned: str, name_suffix: str, label: str) -> str:
+    """Verify *source* against *pinned* and write its read-only copy into the gate dir.
+
+    Every copy is named ``kirocrew_pi_gate_<pid><name_suffix>.ts`` so the gate-dir
+    sweep (``sandbox._PI_GATE_DIR_ARTIFACTS``) claims it by the same prefix and pid.
+    """
     try:
         with open(source, "rb") as fh:
             payload = _pi_gate_extension_bytes(fh.read())
@@ -1242,18 +1293,18 @@ def _seal_pi_gate_extension() -> str:
         # An install without the package data is the same refusal as one with the
         # wrong bytes: no gate this build shipped, no session.
         raise PiGateExtensionTampered(
-            f"the pi gate extension at {source} cannot be read ({exc}); a session cannot "
-            "start on a gate whose code this build did not ship. Reinstall Kiro Crew."
+            f"the pi {label} extension at {source} cannot be read ({exc}); a session cannot "
+            f"start on a {label} whose code this build did not ship. Reinstall Kiro Crew."
         ) from exc
     digest = hashlib.sha256(payload).hexdigest()
-    if digest != PI_GATE_EXTENSION_SHA256:
+    if digest != pinned:
         raise PiGateExtensionTampered(
-            f"the pi gate extension at {source} does not match the digest this build "
-            f"pinned ({digest[:12]}… vs {PI_GATE_EXTENSION_SHA256[:12]}…); a session "
-            "cannot start on a gate whose code this build did not ship. Reinstall Kiro Crew."
+            f"the pi {label} extension at {source} does not match the digest this build "
+            f"pinned ({digest[:12]}… vs {pinned[:12]}…); a session "
+            f"cannot start on a {label} whose code this build did not ship. Reinstall Kiro Crew."
         )
     artifact_dir = _pi_gate_artifact_dir()
-    sealed = os.path.join(artifact_dir, f"kirocrew_pi_gate_{os.getpid()}.ts")
+    sealed = os.path.join(artifact_dir, f"kirocrew_pi_gate_{os.getpid()}{name_suffix}.ts")
     try:
         with open(sealed, "rb") as fh:
             if fh.read() == payload:
@@ -1276,23 +1327,28 @@ def _seal_pi_gate_extension() -> str:
     return sealed
 
 
-def _pi_gate_launcher_body(pi_bin: str, extension_path: str) -> str:
+def _pi_gate_launcher_body(
+    pi_bin: str, extension_path: str, extra_extensions: tuple[str, ...] = ()
+) -> str:
     """The launcher pi-acp is told to run in place of ``pi``.
 
-    It forwards every argument the adapter passes and appends the extension flag,
-    so the harness process is the one the adapter meant to start plus Crew's gate.
+    It forwards every argument the adapter passes and appends one extension flag per
+    file -- the gate first, then *extra_extensions* (the tool bridge) -- so the
+    harness process is the one the adapter meant to start plus Crew's extensions.
     A shell script on POSIX; a ``.cmd`` on Windows, where the adapter itself uses a
     shell for exactly that extension.
     """
+    paths = (extension_path, *extra_extensions)
     if platform_compat.IS_WINDOWS:
-        return f'@echo off\r\n"{pi_bin}" %* {_PI_EXTENSION_FLAG} "{extension_path}"\r\n'
-    return (
-        "#!/bin/sh\n"
-        f'exec {shlex.quote(pi_bin)} "$@" {_PI_EXTENSION_FLAG} {shlex.quote(extension_path)}\n'
-    )
+        flags = " ".join(f'{_PI_EXTENSION_FLAG} "{p}"' for p in paths)
+        return f'@echo off\r\n"{pi_bin}" %* {flags}\r\n'
+    flags = " ".join(f"{_PI_EXTENSION_FLAG} {shlex.quote(p)}" for p in paths)
+    return f'#!/bin/sh\nexec {shlex.quote(pi_bin)} "$@" {flags}\n'
 
 
-def _ensure_pi_gate_launcher(pi_bin: str, extension_path: str) -> str:
+def _ensure_pi_gate_launcher(
+    pi_bin: str, extension_path: str, extra_extensions: tuple[str, ...] = ()
+) -> str:
     """Write (once per process and inputs) the launcher and return its path.
 
     Lives in the owner-only pi gate artifact directory, which the sandbox exposes
@@ -1304,7 +1360,7 @@ def _ensure_pi_gate_launcher(pi_bin: str, extension_path: str) -> str:
 
     Blocking (writes a file); callers run it off the loop.
     """
-    key = (pi_bin, extension_path)
+    key = (pi_bin, extension_path, tuple(extra_extensions))
     cached = _pi_gate_launcher_cache.get(key)
     if cached and os.path.isfile(cached):
         return cached
@@ -1315,7 +1371,7 @@ def _ensure_pi_gate_launcher(pi_bin: str, extension_path: str) -> str:
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-            fh.write(_pi_gate_launcher_body(pi_bin, extension_path))
+            fh.write(_pi_gate_launcher_body(pi_bin, extension_path, tuple(extra_extensions)))
         if not platform_compat.IS_WINDOWS:
             os.chmod(tmp, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501  # fmt: skip
     except OSError:
@@ -5049,6 +5105,12 @@ class AcpClient:
         # of denied calls, which must never reach ``completed``.
         self._pi_gate_request_tool: dict[str, str] = {}
         self._pi_gate_denied_ids: set[str] = set()
+        # The tool bridge's server list for the child's environment, and what lets
+        # the permission parser treat a bridged call as the MCP tool it names. Both
+        # are set in the pi spawn arm only when the bridge was sealed and Crew's
+        # server is stubbed; empty otherwise, which leaves pi exactly as before.
+        self._pi_bridge_servers_env = ""
+        self._pi_bridge_identity: GateBridgeIdentity | None = None
         self._session_key = session_key
         # When set, this client emits a per-tool-call SEL audit from the ACP
         # dispatch loop. Used by app/worker-pool clients (e.g. code-review-sage,
@@ -5534,6 +5596,80 @@ class AcpClient:
             ),
             self._stub_session_token,
         )
+
+    def _prepare_pi_tool_bridge(self) -> tuple[str, str, GateBridgeIdentity] | None:
+        """Seal the tool bridge and build its server list, or ``None`` to run without it.
+
+        The list holds this session's own broker stubs for the servers in
+        :data:`_PI_BRIDGE_TOOLS`, each with the tools the bridge may register. A
+        stub talks to gatewayd, which runs the real server OUTSIDE the sandbox and
+        binds each call to this session through the token the stub carries -- the
+        route that works for an enforced harness, whose child cannot read the
+        credentials an in-sandbox server would need. So no stub means no bridge:
+        the gateway is off, or ``mcp_gateway.stub_servers`` does not name the server.
+
+        Every failure is "no bridge", never a refused session: pi without Crew's
+        tools is the state it was in before the bridge existed, and the gate, which
+        is what makes the session safe to run, does not depend on any of this.
+
+        Blocking (reads the overlay, may write the sealed copy); run off the loop.
+        """
+        try:
+            stubs = self._pooled_broker_stubs()
+        except Exception:
+            logger.warning("pi tool bridge: could not read the broker stubs", exc_info=True)
+            return None
+        servers: list[dict[str, Any]] = []
+        for element in stubs:
+            name = element.get("name")
+            tools = _PI_BRIDGE_TOOLS.get(name) if isinstance(name, str) else None
+            command = element.get("command")
+            if not tools or not isinstance(command, str) or not command:
+                continue
+            raw_args = element.get("args")
+            raw_env = element.get("env")
+            servers.append(
+                {
+                    "name": name,
+                    "command": command,
+                    "args": (
+                        [a for a in raw_args if isinstance(a, str)]
+                        if isinstance(raw_args, list)
+                        else []
+                    ),
+                    "env": {
+                        e["name"]: e["value"]
+                        for e in (raw_env if isinstance(raw_env, list) else [])
+                        if isinstance(e, dict)
+                        and isinstance(e.get("name"), str)
+                        and isinstance(e.get("value"), str)
+                    },
+                    "tools": list(tools),
+                }
+            )
+        if not servers:
+            missing = ", ".join(sorted(_PI_BRIDGE_TOOLS))
+            if missing not in _pi_bridge_off_noted:
+                _pi_bridge_off_noted.add(missing)
+                logger.warning(
+                    "pi tool bridge: off -- the MCP gateway stubs none of %s for agent %r, "
+                    "so pi sessions carry no Crew tools (spawn_run and the other subagent "
+                    "tools). Enable it with mcp_gateway.enabled: true and "
+                    'mcp_gateway.stub_servers: ["kirocrew-core"].',
+                    missing,
+                    self._agent,
+                )
+            return None
+        try:
+            sealed = _seal_pi_bridge_extension()
+        except (PiGateExtensionTampered, AcpToolGateUnroutable, OSError) as exc:
+            logger.warning("pi tool bridge: off -- %s", exc)
+            return None
+        identity = GateBridgeIdentity(
+            sources=frozenset({os.path.normcase(sealed), _same_file_spelling(sealed)}),
+            servers=frozenset(s["name"] for s in servers),
+        )
+        return sealed, json.dumps({"servers": servers}, separators=(",", ":")), identity
 
     def _append_member_dispatch_server(
         self,
@@ -6271,6 +6407,9 @@ class AcpClient:
             _resolve_spawn_env({**os.environ, **self._extra_env}, kiro_api_key=False)
         )
         env["PATH"] = augmented_path(env.get("PATH", ""))
+        # The bridge loads here with no servers, so the probe answers without
+        # starting any MCP child.
+        env.pop(_ENV_PI_BRIDGE_SERVERS, None)
         # Offline for the read-back only: pi's startup network work (update checks,
         # package refresh) has no bearing on which extensions loaded, and a probe
         # that waits on the network is a probe that can stall the spawn.
@@ -8015,8 +8154,23 @@ class AcpClient:
             # here rather than loaded. Off-loop: a file read and possibly a write.
             extension_path = await asyncio.to_thread(_seal_pi_gate_extension)
             self._pi_gate_nonce = uuid.uuid4().hex
+            # The tool bridge rides the same launcher. Optional where the gate is
+            # not: without it the session holds no Crew tools, which is where pi
+            # stood before the bridge existed. The read-back child below loads it
+            # too, but without the server list, so it registers nothing but its
+            # probe there.
+            bridge_path = ""
+            self._pi_bridge_servers_env = ""
+            self._pi_bridge_identity = None
+            if self.backend in ACP_BACKENDS_EXTENSION_TOOL_BRIDGE:
+                bridge = await asyncio.to_thread(self._prepare_pi_tool_bridge)
+                if bridge is not None:
+                    bridge_path, self._pi_bridge_servers_env, self._pi_bridge_identity = bridge
             self._pi_gate_launcher = await asyncio.to_thread(
-                _ensure_pi_gate_launcher, pi_bin, extension_path
+                _ensure_pi_gate_launcher,
+                pi_bin,
+                extension_path,
+                (bridge_path,) if bridge_path else (),
             )
             # Wrapped in the SAME sandbox with the SAME credential mask as the
             # session spawn below, for the same reason the opencode read-back is:
@@ -8317,6 +8471,12 @@ class AcpClient:
             # Reaches the pi process through the adapter, which spawns it with its
             # own environment; the extension echoes it in every dialog.
             env[_ENV_PI_GATE_SESSION] = self._pi_gate_nonce
+            # Set only from this session's own stubs; an inherited value would hand
+            # the bridge servers this spawn did not choose.
+            if self._pi_bridge_servers_env:
+                env[_ENV_PI_BRIDGE_SERVERS] = self._pi_bridge_servers_env
+            else:
+                env.pop(_ENV_PI_BRIDGE_SERVERS, None)
         if self._is_opencode and self._opencode_config_content:
             # The seed the read-back above verified, applied unconditionally: the
             # merge in ``_opencode_routing_config`` already preserved every key the
@@ -12999,6 +13159,8 @@ class AcpClient:
             # Same compatibility shape as the maps above: an instance built without
             # ``__init__`` has no nonce, and no nonce means no envelope is trusted.
             gate_envelope_nonce=_gate_nonce or None,
+            # Same compatibility shape: no bridge identity, no bridged MCP identity.
+            gate_bridge=getattr(self, "_pi_bridge_identity", None) if _gate_nonce else None,
         )
         if recorded is not None:
             self._permission_options[event.request_id] = recorded

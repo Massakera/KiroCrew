@@ -680,7 +680,10 @@ the array is easy; one that accepts it and does nothing is the state that makes 
 dashboard report tools as mounted on a session where none can be called. It is
 recorded in `providers/mirrors/registry.py` as a `no-channel` projection naming that reason,
 and it is why the extension mechanism — not the MCP array — is the channel anything
-of Crew's reaches pi through today.
+of Crew's reaches pi through today. The subagent tools arrive that way: a second
+sealed extension, the tool bridge, speaks MCP to the session's own `kirocrew-core`
+broker stub when the gateway stubs that server (see the Pi delivery-channel cell in
+[agent-host-contract](agent-host-contract.md)).
 
 The second is the shape of the routing itself. OpenCode's read-back proved a
 SETTING was in force. Pi has no setting, so what is read back is whether Crew's own

@@ -428,7 +428,8 @@ class TestGateArtifactsRefuseAnUnsafeDirectory:
         assert list(elsewhere.iterdir()) == []
 
     def test_both_writers_go_through_the_strict_resolver(self):
-        for function in (_seal_pi_gate_extension, _ensure_pi_gate_launcher):
+        assert "_seal_pi_extension(" in inspect.getsource(_seal_pi_gate_extension)
+        for function in (acp_client._seal_pi_extension, _ensure_pi_gate_launcher):
             source = inspect.getsource(function)
             assert "_pi_gate_artifact_dir()" in source
             assert "_ensure_run_dir" not in source
@@ -1592,7 +1593,7 @@ class TestTheGateArtifactsStayReachableInsideTheSandbox:
         launcher = _ensure_pi_gate_launcher("/usr/bin/pi", sealed)
         assert Path(sealed).parent == artifact_dir
         assert Path(launcher).parent == artifact_dir
-        for function in (_seal_pi_gate_extension, _ensure_pi_gate_launcher):
+        for function in (acp_client._seal_pi_extension, _ensure_pi_gate_launcher):
             source = inspect.getsource(function)
             assert "_pi_gate_artifact_dir()" in source
             assert "_ensure_run_dir" not in source
@@ -1613,7 +1614,8 @@ class TestTheGateArtifactsStayReachableInsideTheSandbox:
         monkeypatch.setattr(acp_client, "_pi_gate_artifact_dir", lambda: str(artifact_dir))
         monkeypatch.setattr(acp_client, "_pi_gate_launcher_cache", {})
         sealed = _seal_pi_gate_extension()
-        _ensure_pi_gate_launcher("/usr/bin/pi", sealed)
+        bridge = acp_client._seal_pi_bridge_extension()
+        _ensure_pi_gate_launcher("/usr/bin/pi", sealed, (bridge,))
         families = sandbox._PI_GATE_DIR_ARTIFACTS
         written = sorted(entry.name for entry in artifact_dir.iterdir())
         assert written, "the writers produced nothing to check"

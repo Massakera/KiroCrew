@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -1140,13 +1141,57 @@ def gate_envelope(tool_call: dict[str, Any], nonce: str | None) -> dict[str, Any
         return None
     kind = body.get("kind")
     tool_call_id = body.get("toolCallId")
+    source = body.get("source")
     return {
         "toolCallId": tool_call_id if isinstance(tool_call_id, str) and tool_call_id else "",
         "title": tool,
         "kind": kind if isinstance(kind, str) else "other",
         "input": body.get("input"),
         "truncated": body.get("truncated") is True,
+        "source": source if isinstance(source, str) else "",
     }
+
+
+@dataclass(frozen=True)
+class GateBridgeIdentity:
+    """What lets a gate envelope name an MCP tool the bridge extension registered.
+
+    ``sources`` holds the spellings of the sealed bridge copy this session loaded
+    (normcased, the path as written and its realpath), and ``servers`` the MCP
+    servers that copy was handed. Both are the driver's own values; nothing here
+    comes from the harness.
+    """
+
+    sources: frozenset[str]
+    servers: frozenset[str]
+
+
+def gate_bridged_mcp_call(
+    envelope: dict[str, Any] | None, bridge: GateBridgeIdentity | None
+) -> tuple[str, str] | None:
+    """The ``(server, tool)`` a gate envelope names through the bridge, or ``None``.
+
+    A bridged tool is registered in pi as ``mcp__<server>__<tool>``. The name alone
+    is not identity: any extension in the process can register a tool of that name.
+    So the envelope's ``source`` -- the file pi's own registry says registered the
+    tool, read by the gate extension -- must be the sealed bridge copy, and the
+    server must be one this session handed that copy. The server is matched as a
+    known PREFIX rather than split on ``__``, so a tool name containing ``__`` still
+    resolves to the right pair.
+    """
+    if envelope is None or bridge is None or not bridge.sources:
+        return None
+    source = envelope.get("source")
+    if not isinstance(source, str) or os.path.normcase(source) not in bridge.sources:
+        return None
+    title = envelope.get("title")
+    if not isinstance(title, str):
+        return None
+    for server in bridge.servers:
+        prefix = f"mcp__{server}__"
+        if title.startswith(prefix) and len(title) > len(prefix):
+            return server, title[len(prefix) :]
+    return None
 
 
 def scoped_tool_cache_key(cache_scope: str, tool_call_id: str) -> str:
@@ -1234,12 +1279,15 @@ def build_permission_event(
     cache_scope: str = "",
     diff_path_cache: dict[str, str] | None = None,
     gate_envelope_nonce: str | None = None,
+    gate_bridge: GateBridgeIdentity | None = None,
 ) -> tuple[AcpEvent, dict[str, str] | None]:
     """Build an ``EVENT_PERMISSION_REQUEST`` from a ``session/request_permission``.
 
     ``gate_envelope_nonce`` is set only by a caller whose session runs Kiro Crew's
     gate extension (``Routing.VERIFIED_GATE_EXTENSION``); see :func:`gate_envelope`
-    for what it unlocks and why the default consults nothing.
+    for what it unlocks and why the default consults nothing. ``gate_bridge`` is
+    set only when that session also loaded the tool bridge; see
+    :func:`gate_bridged_mcp_call`.
 
     Single source of truth shared by ``AcpClient`` and ``AcpSessionHandle`` so
     the two transports cannot drift on the kiro/claude permission payload shape:
@@ -1474,6 +1522,13 @@ def build_permission_event(
     # payload would leave this False and fail closed in
     # AcpEvent.child_mcp_identity_trusted.
     _mcp_identity_trusted = _cached_server is not None and _cached_tool is not None
+    # A bridged call's identity comes from the gate envelope, never from the frame:
+    # pi-acp's own ``tool_call`` frame names no server, so the caches above hold
+    # nothing (or an empty server) for it.
+    _bridged = gate_bridged_mcp_call(envelope, gate_bridge)
+    if _bridged is not None and not _mcp_server_name:
+        _mcp_server_name, _tool_name = _bridged
+        _mcp_identity_trusted = True
 
     # The path the preceding tool_call's diff CONTENT BLOCK named, cached by the
     # same scoped toolCallId as the params. An edit backend may stream trusted

@@ -96,6 +96,9 @@ with no row here.
    * - ``ACP_BACKENDS_STEERING_EXTENSION``
      - driver-internal (whether a subagent steer can ride ``_session/steering``
        before falling back to a queued follow-up)
+   * - ``ACP_BACKENDS_EXTENSION_TOOL_BRIDGE``
+     - driver-internal (whether the spawn seals Crew's tool bridge extension and
+       hands it the session's control-plane broker stubs)
    * - ``ACP_BACKENDS_COMPACT``
      - pre-session registry query (whether manual ``/compact`` is offered at all)
    * - ``ACP_BACKENDS_INLINE_COMPACTION``
@@ -1057,6 +1060,20 @@ ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # is answered ``injected`` and then discarded with the turn, because codex's only
 # reject option cancels it; the refusal-recovery continuation still covers that case.
 ACP_BACKENDS_STEERING_EXTENSION = frozenset({ACP_BACKEND_CODEX})
+
+# Backends whose sessions receive Crew's control-plane tools through a Crew
+# EXTENSION loaded into the harness, not through the ``session/new`` array. pi-acp
+# accepts that array and never hands it to pi (``providers/mirrors/registry.py``),
+# so the only channel into a pi session is an extension of Crew's -- the same one
+# the gate rides (``Routing.VERIFIED_GATE_EXTENSION``). The bridge extension speaks
+# MCP to the session's pooled broker stubs, so it works only while
+# ``mcp_gateway.stub_servers`` names ``kirocrew-core``; without that the session runs
+# exactly as a non-member does, and the spawn logs why once per process.
+#
+# Its own set rather than a reading of the gate routing (H6): a harness gated by an
+# extension need not carry tools through one, and a harness that does may gate some
+# other way.
+ACP_BACKENDS_EXTENSION_TOOL_BRIDGE = frozenset({ACP_BACKEND_PI})
 
 # Backends that can serve a MANUAL ``/compact`` (the user-typed slash command).
 # Every member acts on the ``/compact`` prompt that ``AcpProvider.compact()``
