@@ -14,6 +14,7 @@
  * the Subagents side panel.
  */
 import { memo } from 'react'
+import SubagentLocation, { subagentStatusLabel } from './SubagentLocation'
 import { Bot, Loader2, CheckCircle2, AlertCircle, Clock, Square, Hand } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { useAppSelector, useAppDispatch } from '../../store'
@@ -295,6 +296,21 @@ const SubagentRunCard = memo(function SubagentRunCard({
               <Square size={10} aria-hidden /> {counts.stopped}
             </span>
           )}
+        </div>
+        <div className="mt-1 space-y-2">
+          {launch.ids.slice(0, 4).map(id => {
+            const child = subagents[id]
+            return (
+              <div key={id} className="min-w-0" data-testid="subagent-run-summary">
+                <div className="flex flex-wrap gap-x-2 text-[12px]">
+                  <span className="text-text break-all">{sanitizeLlmOutput(child?.agent || id)}</span>
+                  <span className="text-muted">{subagentStatusLabel(child)}</span>
+                  {child?.backend && <span className="text-muted">{sanitizeLlmOutput(child.backend)}</span>}
+                </div>
+                <SubagentLocation workspace={child?.workspace} compact />
+              </div>
+            )
+          })}
         </div>
         <div className="text-[10px] leading-4 text-muted font-mono truncate mt-1">
           {idPreview ? `${idPreview}${launch.ids.length > 4 ? ` +${launch.ids.length - 4}` : ''} · ` : ''}

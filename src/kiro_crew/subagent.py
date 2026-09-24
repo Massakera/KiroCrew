@@ -1675,6 +1675,8 @@ class SubagentInfo:
     # ``CLAUDE.md``) resolve against this directory. Validated on spawn against
     # ``AgentConfig.subagent_cwd_allowed_roots``.
     cwd: str = ""
+    # Dashboard-only launch observation; never used to route or resume a run.
+    launch_workspace: dict[str, str] = field(default_factory=dict)
     _pid: int | None = None  # PID of kiro-cli child process, for tombstone diagnostics
     # Wall-clock (time.time) when _run_inner actually began executing. Distinct
     # from ``started`` (set at registration): a subagent may sit in ``_agents``

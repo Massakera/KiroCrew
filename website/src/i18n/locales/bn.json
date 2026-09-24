@@ -10516,6 +10516,13 @@
         "rate_right": "Jev এই সংকোচন ঠিক বুঝেছে",
         "rate_wrong": "Jev এই সংকোচন ভুল বুঝেছে",
         "not_scored": "(+{{count}}টি যাচাই হয়নি)"
+      },
+      "subagentLocation": {
+        "at_start": "শুরুর প্রসঙ্গ",
+        "unavailable": "শুরুর অবস্থান পাওয়া যাচ্ছে না",
+        "status_unknown": "অবস্থা পাওয়া যাচ্ছে না",
+        "detached": "বিচ্ছিন্ন HEAD · {{head}}",
+        "worktree": "ওয়ার্কট্রি: {{path}}"
       }
     },
     "chatPage": {

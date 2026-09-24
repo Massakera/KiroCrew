@@ -10372,6 +10372,13 @@
         "rate_right": "Jev 判断正确",
         "rate_wrong": "Jev 判断错误",
         "not_scored": "（另有 {{count}} 次未评分）"
+      },
+      "subagentLocation": {
+        "at_start": "启动上下文",
+        "unavailable": "启动目录不可用",
+        "status_unknown": "状态不可用",
+        "detached": "分离的 HEAD · {{head}}",
+        "worktree": "工作树：{{path}}"
       }
     },
     "chatPage": {

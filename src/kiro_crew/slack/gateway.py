@@ -10178,6 +10178,15 @@ class GatewayOrchestrator:
                 return
             slot_name = _event_slot(info.parent_session_key)
             base = {"id": info.id, "slot": slot_name}
+            if etype in {"subagent_spawn", "subagent_done"}:
+                from ..dashboard.subagent_workspace import (
+                    capture_launch_workspace,
+                    workspace_event_fields,
+                )
+
+                if etype == "subagent_spawn":
+                    await capture_launch_workspace(info)
+                base.update(workspace_event_fields(info))
             # Batch identity rides every frame when present so the UI can
             # group/aggregate a wave without a lookup table. (Type guard:
             # test doubles pass MagicMock infos.)

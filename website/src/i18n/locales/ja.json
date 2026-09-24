@@ -10372,6 +10372,13 @@
         "rate_right": "Jev の判断は正しい",
         "rate_wrong": "Jev の判断は誤り",
         "not_scored": "（+{{count}} 件は未評価）"
+      },
+      "subagentLocation": {
+        "at_start": "起動時のコンテキスト",
+        "unavailable": "起動ディレクトリを取得できません",
+        "status_unknown": "状態を取得できません",
+        "detached": "分離した HEAD · {{head}}",
+        "worktree": "ワークツリー: {{path}}"
       }
     },
     "chatPage": {

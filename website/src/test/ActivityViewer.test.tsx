@@ -662,7 +662,7 @@ describe('ActivityViewer — Artifacts tab', () => {
     // Agent chip: yields BEFORE the status label (weighted shrink) and capped,
     // so a long agent name can neither wrap nor starve the label, the clock and
     // the Cancel button.
-    const chip = screen.getByText('kirocrew')
+    const chip = screen.getByText('kirocrew', { selector: 'code' })
     expect(chip.className).toContain('shrink-[3]')
     expect(chip.className).toContain('truncate')
     expect(chip.className).toContain('min-w-0')

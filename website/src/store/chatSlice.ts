@@ -14,7 +14,7 @@ import type { PhaseDetail, ToolPhaseDetail } from '../utils/toolStatusLabel'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { gcSessionStorage } from '../utils/storageGc'
 import type { RootState } from './index'
-import type { ChatMessage, ChatSlot, SessionInfo, SubagentActivity, ToolActivity, ToolPayloadCut, WorkflowRunSummary } from '../types'
+import type { ChatMessage, ChatSlot, SessionInfo, SubagentActivity, SubagentRunContext, ToolActivity, ToolPayloadCut, WorkflowRunSummary } from '../types'
 import { SOFT_STOP_DEBOUNCE_MS, SPAWN_LAUNCH_MARKER } from '../pages/chat/types'
 import { mergePreservedPastes } from '../utils/pasteTokens'
 import { safeSetItem } from '../utils/safeStorage'
@@ -5081,7 +5081,7 @@ const chatSlice = createSlice({
         if (b) { b.approving = action.payload.approving; return }
       }
     },
-    sseSubagentSpawn(state, action: PayloadAction<{ slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; total_tokens?: number; cost_usd?: number }>) {
+    sseSubagentSpawn(state, action: PayloadAction<SubagentRunContext & { slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; total_tokens?: number; cost_usd?: number }>) {
       if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
       const subs = action.payload.slot !== state.activeSlot
         ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).subagents
@@ -5096,6 +5096,8 @@ const chatSlice = createSlice({
         // Same guard for requestedModel: only set when the frame carries a value.
         if (action.payload.requested_model) existing.requestedModel = action.payload.requested_model
         if (action.payload.child_session) existing.childSession = action.payload.child_session
+        if (action.payload.backend) existing.backend = action.payload.backend
+        if (action.payload.workspace) existing.workspace = action.payload.workspace
         applyChildUsage(existing, action.payload)
         // The spawn event carries the authoritative task text (the pending
         // card's task is derived from the approval title, which may be empty
@@ -5107,6 +5109,8 @@ const chatSlice = createSlice({
         id: action.payload.id, task: action.payload.task, agent: action.payload.agent || 'kirocrew',
         model: action.payload.model || '',
         requestedModel: action.payload.requested_model || existing?.requestedModel || undefined,
+        backend: action.payload.backend || existing?.backend,
+        workspace: action.payload.workspace || existing?.workspace,
         childSession: action.payload.child_session || undefined,
         status: 'running', streaming: existing?.streaming || '', lastTool: '', startedAt: existing?.startedAt || Date.now(), elapsed: 0,
         // Reusing an entry's start time inherits whether that time was ASSUMED.
@@ -5210,7 +5214,7 @@ const chatSlice = createSlice({
         if (st === 'done' || st === 'error' || st === 'stopped') delete subs[id]
       }
     },
-    sseSubagentDone(state, action: PayloadAction<{ slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; requested_model?: string; child_session?: string; result?: string; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; total_tokens?: number; cost_usd?: number }>) {
+    sseSubagentDone(state, action: PayloadAction<SubagentRunContext & { slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; requested_model?: string; child_session?: string; result?: string; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; total_tokens?: number; cost_usd?: number }>) {
       if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
       const subs = action.payload.slot !== state.activeSlot
         ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).subagents
@@ -5252,6 +5256,8 @@ const chatSlice = createSlice({
         // keeps the live-downgrade amber chip. Never clobber a known value to ''.
         if (action.payload.requested_model) a.requestedModel = action.payload.requested_model
         if (action.payload.child_session && !a.childSession) a.childSession = action.payload.child_session
+        if (action.payload.backend) a.backend = action.payload.backend
+        if (action.payload.workspace) a.workspace = action.payload.workspace
         applyChildUsage(a, action.payload)
         if (isNative && action.payload.result !== undefined) a.result = action.payload.result
         // A done frame carries authoritative `elapsed`, which reconstructs the
@@ -5271,6 +5277,8 @@ const chatSlice = createSlice({
           agent: action.payload.agent || 'kirocrew',
           model: action.payload.model || '',
           requestedModel: action.payload.requested_model || undefined,
+          backend: action.payload.backend,
+          workspace: action.payload.workspace,
           childSession: action.payload.child_session || undefined,
           status: doneStatus,
           streaming: '',
@@ -5531,7 +5539,7 @@ const chatSlice = createSlice({
       if (idx >= 0) side.messages.splice(idx, 1)
       side.pending = false
     },
-    sseSubagentSnapshot(state, action: PayloadAction<{ id: string; slot: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean; idle_secs?: number }>) {
+    sseSubagentSnapshot(state, action: PayloadAction<SubagentRunContext & { id: string; slot: string; task: string; agent: string; model?: string; requested_model?: string; child_session?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean; idle_secs?: number }>) {
       const d = action.payload
       // A snapshot without an owning slot is an orphan, not evidence that it
       // belongs to whichever chat this browser happens to show. Popout windows
@@ -5555,6 +5563,8 @@ const chatSlice = createSlice({
         model: d.model || existing?.model || '',
         // Same guard for requestedModel: prefer frame value, fall back to existing.
         requestedModel: d.requested_model || existing?.requestedModel || undefined,
+        backend: d.backend || existing?.backend,
+        workspace: d.workspace || existing?.workspace,
         childSession: d.child_session || existing?.childSession || undefined,
         status: d.last_tool ? 'tool' : 'running', streaming: d.streaming, lastTool: d.last_tool,
         startedAt: d.started * 1000, elapsed: 0,

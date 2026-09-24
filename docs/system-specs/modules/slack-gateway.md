@@ -1,5 +1,9 @@
 # Slack Gateway Module
 
+Managed subagent lifecycle broadcasts attach display-only launch workspace and
+backend metadata through `dashboard.subagent_workspace`; the Subagent module
+spec owns the payload and launch-observation contract.
+
 ## Overview
 
 The Slack integration (`kiro_crew/slack/`) connects KiroCrew to Slack via Socket Mode. DMs are routed through ACP to kiro-cli with real-time streaming and interactive tool approval.

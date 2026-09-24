@@ -21,6 +21,7 @@ from kiro_crew.dashboard.state import (
     _slots_serialization_note,
 )
 from kiro_crew.dashboard.status_counts import cached_status_snapshot
+from kiro_crew.dashboard.subagent_workspace import workspace_event_fields
 from kiro_crew.dashboard.ws_event_scope import (
     _audit_allow,
     _audit_deny,
@@ -127,6 +128,7 @@ def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
         "model": a.resolved_model,
         "requested_model": _r(a.requested_model),
         "backend": getattr(a, "acp_backend", ""),
+        **workspace_event_fields(a),
         "streaming": _r(a.streaming_text),
         "last_tool": _r(a.last_tool),
         "tool_count": a.tool_count,
@@ -946,6 +948,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                                 "agent": _r(a.agent),
                                                 "model": a.resolved_model,
                                                 "requested_model": _r(a.requested_model),
+                                                **workspace_event_fields(a),
                                             },
                                         }
                                     )

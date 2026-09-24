@@ -10660,6 +10660,13 @@
         "rate_right": "Jev ha letto bene questa compattazione",
         "rate_wrong": "Jev ha letto male questa compattazione",
         "not_scored": "(+{{count}} non valutate)"
+      },
+      "subagentLocation": {
+        "at_start": "Contesto iniziale",
+        "unavailable": "Posizione iniziale non disponibile",
+        "status_unknown": "Stato non disponibile",
+        "detached": "HEAD scollegato · {{head}}",
+        "worktree": "Albero di lavoro: {{path}}"
       }
     },
     "chatPage": {

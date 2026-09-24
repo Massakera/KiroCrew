@@ -149,3 +149,27 @@ describe('subagent snapshot ownership', () => {
     expect(count(store)).toBe(1)
   })
 })
+
+
+describe('subagent launch context', () => {
+  it('survives lifecycle updates and reconnects in a background slot', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('a'))
+    const workspace = { cwd: '/repo/src', worktree: '/repo', branch: 'feature/review' }
+    store.dispatch(sseSubagentSpawn({ slot: 'b', id: 'x1', task: 'review', agent: 'reviewer', backend: 'pi', workspace }))
+    const context = () => store.getState().chat.slotActivity.b.subagents.x1
+    expect(context()).toMatchObject({ backend: 'pi', workspace, status: 'running' })
+    store.dispatch(sseSubagentSnapshot({ slot: 'b', id: 'x1', task: 'review', agent: 'reviewer', streaming: '', last_tool: '', started: 1 }))
+    expect(context()).toMatchObject({ backend: 'pi', workspace })
+    store.dispatch(sseSubagentDone({ slot: 'b', id: 'x1', elapsed: 2 }))
+    expect(context()).toMatchObject({ backend: 'pi', workspace, status: 'done' })
+  })
+
+  it('reconstructs a completed child from a reconnect frame', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('a'))
+    const workspace = { cwd: '/repo', head: 'abcd123' }
+    store.dispatch(sseSubagentDone({ slot: 'a', id: 'x1', elapsed: 2, agent: 'reviewer', backend: 'pi', workspace }))
+    expect(store.getState().chat.subagents.x1).toMatchObject({ backend: 'pi', workspace, status: 'done' })
+  })
+})

@@ -1,3 +1,5 @@
+import { sanitizeLlmOutput } from '../../utils/sanitize'
+import SubagentLocation from './SubagentLocation'
 import { useEffect, useRef, useState, useCallback, useMemo, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
@@ -279,6 +281,12 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
         {isRunning && <button data-testid="subagent-cancel-btn" className="text-[11px] px-1.5 py-0.5 rounded border border-danger/40 text-danger/70 hover:bg-danger-subtle hover:text-danger cursor-pointer transition-all shrink-0 whitespace-nowrap inline-flex items-center" onClick={onCancel}><X className="lucide-inline" /> {i18nT('pages.chat.activityViewer.cancel')}</button>}
         {isDone && <span className="text-[14px] text-muted bg-bg-hover px-1.5 py-0.5 rounded shrink-0 ml-1">{collapsed ? '▸' : '▾'}</span>}
       </div>
+      {!collapsed && (
+        <div className="px-3 pb-2 min-w-0">
+          <div className="text-[12px] text-text break-all">{sanitizeLlmOutput(identity)}{a.backend ? ` · ${sanitizeLlmOutput(a.backend)}` : ''}</div>
+          <SubagentLocation workspace={a.workspace} />
+        </div>
+      )}
       {/* Input (task). Gated on the task itself: an entry recovered from an
           incremental frame has none, and the header over an empty block reads as
           a task that is blank rather than one not yet known. */}

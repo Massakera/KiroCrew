@@ -10372,6 +10372,13 @@
         "rate_right": "Jev의 판단이 맞음",
         "rate_wrong": "Jev의 판단이 틀림",
         "not_scored": "(+{{count}}개는 평가 안 함)"
+      },
+      "subagentLocation": {
+        "at_start": "시작 컨텍스트",
+        "unavailable": "시작 위치를 확인할 수 없음",
+        "status_unknown": "상태를 확인할 수 없음",
+        "detached": "분리된 HEAD · {{head}}",
+        "worktree": "작업 트리: {{path}}"
       }
     },
     "chatPage": {

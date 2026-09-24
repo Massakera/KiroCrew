@@ -10804,6 +10804,13 @@
         "rate_right": "Jev оценил это сжатие верно",
         "rate_wrong": "Jev оценил это сжатие неверно",
         "not_scored": "(+{{count}} не оценено)"
+      },
+      "subagentLocation": {
+        "at_start": "Контекст запуска",
+        "unavailable": "Каталог запуска недоступен",
+        "status_unknown": "Статус недоступен",
+        "detached": "Отсоединённый HEAD · {{head}}",
+        "worktree": "Рабочее дерево: {{path}}"
       }
     },
     "chatPage": {

@@ -926,6 +926,19 @@ On timeout (inner or outer):
 
 `_inject_with_retry()` in `slack/gateway.py` makes up to 3 attempts (1 initial + 2 retries) of `stream_and_collect` on AcpError. Between retries: cancels orphaned prompt, exponential backoff. On `PromptBusyExhaustedError`: kills provider, queues failure event. Note: the 1200s outer cap (`_ON_DONE_TIMEOUT`) bounds total wall-clock time, so not all retries may fire if earlier attempts consume the budget.
 
+**Launch context in the dashboard.** Managed spawn and done events and reconnect
+replays carry the selected `backend` and an optional `workspace` observation
+(`cwd`, Git `worktree` root, `branch`, or detached `head`). The gateway observes
+the acquired session's CWD at spawn, using the project browser's bounded,
+sensitive-path-aware Git metadata reader off the event loop. This display-only
+observation is redacted and kept in memory; it never routes or resumes a run.
+It describes launch context, not subsequent shell `cd` or branch changes.
+Historical runs without an observation show an unavailable location.
+The inline launch card lists up to four children with agent, status, backend and
+launch location; clicking opens the existing Subagents panel with full paths and
+model details. Missing children are not presented as running. The full panel
+retains access to the remaining children of larger waves.
+
 **Reconnect recovery**: `subscribe_subagents` in `ws.py` restores both managed and native subagent cards. Managed subagents are authoritative in `SubagentManager`: running records replay as `subagent_snapshot`, and recently completed records replay as `subagent_done`. Managed results remain disk-backed and are not copied into inline Redux card payloads.
 
 Native kiro-cli subagents run inside the parent ACP turn and are owned by the parent dashboard slot. `DashboardState.native_subagent_snapshots()` replays running native cards as `subagent_snapshot` and recent terminal cards as `subagent_done`. A native `subagent_done` payload may include optional `task`, `agent`, and `result` fields. `result` is a redacted output tail bounded to 8,000 characters, with an explicit truncation marker when earlier output was dropped. Running output retained for replay is bounded to 40,000 characters, with an 80,000-character hard accumulation ceiling. Terminal native records are retained globally up to 50 cards for at most one hour. The client treats `done` and `error` as monotonic terminal states, so a stale running snapshot interleaved after a live completion cannot demote the card.

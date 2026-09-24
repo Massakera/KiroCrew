@@ -404,3 +404,19 @@ describe('SubagentRunCard — a run parked on a spawn approval is not running', 
     expect(screen.queryByTestId('subagent-card-awaiting')).toBeNull()
   })
 })
+
+
+describe('SubagentRunCard launch context', () => {
+  it('names the child, status, backend and launch directory and branch', () => {
+    const child = { ...agent('a1', 'running'), agent: 'review-architecture', backend: 'pi',
+      workspace: { cwd: '/worktrees/review/src', worktree: '/worktrees/review', branch: 'feature/review' } }
+    const store = createTestStore({ chat: { activeSlot: SLOT, subagents: { a1: child }, subagentQueued: {} } as unknown as ChatState })
+    renderWithProviders(<SubagentRunCard launch={{ ids: ['a1'], announced: 1 }} slot={SLOT} />, { store })
+    expect(screen.getByText('review-architecture')).toBeTruthy()
+    expect(screen.getByText('Running')).toBeTruthy()
+    expect(screen.getByText('pi')).toBeTruthy()
+    expect(screen.getByText('/worktrees/review/src')).toBeTruthy()
+    expect(screen.getByText('feature/review')).toBeTruthy()
+    expect(screen.getByText('Launch context')).toBeTruthy()
+  })
+})

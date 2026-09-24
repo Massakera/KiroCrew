@@ -1355,7 +1355,13 @@ export interface ChatMessage {
   decisions_tool_risk?: unknown
 }
 
-export interface SubagentActivity {
+export interface SubagentRunContext {
+  backend?: string
+  /** Observed at launch, not a live shell directory or branch tracker. */
+  workspace?: { cwd?: string; worktree?: string; branch?: string; head?: string }
+}
+
+export interface SubagentActivity extends SubagentRunContext {
   id: string; task: string; agent: string
   /** Model the live session actually resolved to serve, '' when unknown. Folded
    *  from the `model` field on the `subagent_spawn`/`subagent_done`/snapshot WS

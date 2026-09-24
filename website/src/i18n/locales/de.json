@@ -10516,6 +10516,13 @@
         "rate_right": "Jev hat diese Verdichtung richtig eingeschätzt",
         "rate_wrong": "Jev hat diese Verdichtung falsch eingeschätzt",
         "not_scored": "(+{{count}} nicht bewertet)"
+      },
+      "subagentLocation": {
+        "at_start": "Startkontext",
+        "unavailable": "Startverzeichnis nicht verfügbar",
+        "status_unknown": "Status nicht verfügbar",
+        "detached": "Losgelöster HEAD · {{head}}",
+        "worktree": "Arbeitsverzeichnis: {{path}}"
       }
     },
     "chatPage": {

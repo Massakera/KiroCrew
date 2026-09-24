@@ -10660,6 +10660,13 @@
         "rate_right": "Jev a bien lu ce compactage",
         "rate_wrong": "Jev a mal lu ce compactage",
         "not_scored": "(+{{count}} non évalués)"
+      },
+      "subagentLocation": {
+        "at_start": "Contexte au démarrage",
+        "unavailable": "Emplacement de démarrage indisponible",
+        "status_unknown": "État indisponible",
+        "detached": "HEAD détachée · {{head}}",
+        "worktree": "Arbre de travail : {{path}}"
       }
     },
     "chatPage": {

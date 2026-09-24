@@ -10660,6 +10660,13 @@
         "rate_right": "O Jev leu bem esta compactação",
         "rate_wrong": "O Jev leu mal esta compactação",
         "not_scored": "(+{{count}} não avaliadas)"
+      },
+      "subagentLocation": {
+        "at_start": "Contexto de início",
+        "unavailable": "Local de início indisponível",
+        "status_unknown": "Estado indisponível",
+        "detached": "HEAD destacado · {{head}}",
+        "worktree": "Worktree: {{path}}"
       }
     },
     "chatPage": {

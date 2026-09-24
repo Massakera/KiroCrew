@@ -10516,6 +10516,13 @@
         "rate_right": "Jev ने यह संक्षेपण सही आँका",
         "rate_wrong": "Jev ने यह संक्षेपण गलत आँका",
         "not_scored": "(+{{count}} की जाँच नहीं हुई)"
+      },
+      "subagentLocation": {
+        "at_start": "आरंभ का संदर्भ",
+        "unavailable": "आरंभ का स्थान उपलब्ध नहीं है",
+        "status_unknown": "स्थिति उपलब्ध नहीं है",
+        "detached": "अलग HEAD · {{head}}",
+        "worktree": "कार्य ट्री: {{path}}"
       }
     },
     "chatPage": {
