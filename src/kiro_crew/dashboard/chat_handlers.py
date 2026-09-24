@@ -7311,6 +7311,10 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # which is exactly when the optimistic write is load-bearing).
         workspace = slot.workspace or "default"
         assignment_resolved = False
+        # Set only after a Pi profile is confirmed, and applied AFTER this try:
+        # the workspace block below derives a kiro binding and would otherwise
+        # retarget the conversation at that fallback.
+        pi_profile = False
         try:
             cfg = KiroCrewConfig.load()
             # Resolve by the name being STORED, which is exactly the name dispatch
@@ -7355,6 +7359,25 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     if denied is not None:
                         return denied
             assignment_resolved = bindings.requested_resolved
+            # A Pi profile is not a kiro template, so resolution reports it as
+            # unhonored and the stated-kind check below would 409. pi-acp does
+            # not advertise agent profiles as session modes (those modes are
+            # thinking levels), so the name is stored on the slot and kept
+            # across turns. It does not rewrite AGENTS.md and it does not
+            # enable the Crew droid backend.
+            if not assignment_resolved and agent_name:
+                from kiro_crew.acp_backends import ACP_BACKEND_PI
+                from kiro_crew.pi_agents import is_pi_user_profile
+
+                if getattr(cfg.agent, "acp_backend", "") == ACP_BACKEND_PI and (
+                    await asyncio.to_thread(is_pi_user_profile, agent_name)
+                ):
+                    pi_profile = True
+                    bindings.requested_resolved = True
+                    bindings.selection_kind = (
+                        agent_kind if agent_kind in ("member", "template") else "template"
+                    )
+                    bindings.kiro_agent = agent_name
             ws_name = _workspace_name_for_dir(cfg, bindings.workspace_dir)
             new_workspace = ws_name
             workspace = ws_name
@@ -7462,6 +7485,13 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             raise
         except Exception:
             logger.warning("Failed to resolve agent bindings for %r", agent_name, exc_info=True)
+
+        if pi_profile:
+            assignment_resolved = True
+            new_workspace = pre_await_workspace
+            new_project = pre_await_project
+            new_memory_store = pre_await_memory_store
+            workspace = pre_await_workspace or workspace
 
         if agent_kind and not assignment_resolved:
             # A stated namespace never falls back to whoever answers by default.

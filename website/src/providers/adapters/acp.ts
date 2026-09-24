@@ -1,4 +1,5 @@
 import { api } from '../../api/client'
+import { isModelCatalogUnavailable } from '../../api/apiError'
 import modelTokensRaw from '../../model_tokens.json'
 import { markModelsDegraded } from '../modelListHealth'
 import { isPricedMultiplier } from '../modelList'
@@ -399,7 +400,14 @@ export class AcpAdapter implements ProviderAdapter {
       writeCachedModels(result) // remember this good live list for next hiccup
       markModelsDegraded(this.id, false) // live success → self-heal can stop polling
       return result
-    } catch {
+    } catch (err) {
+      // A backend that has no catalog (Pi before the first session/new) must
+      // not collapse to auto, and must not serve a cached list from another
+      // harness. The picker renders the error state instead of Default.
+      if (isModelCatalogUnavailable(err)) {
+        markModelsDegraded(this.id, true)
+        throw err
+      }
       // Transient backend failure (503 / network): NOT live — keep polling.
       // Serve the last-good live list if we have one, else auto-only. Never
       // surface canonical registry keys — the ACP CLI rejects them (-32603).

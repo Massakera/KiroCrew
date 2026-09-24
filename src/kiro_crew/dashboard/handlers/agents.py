@@ -27,6 +27,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_DROID,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_PI,
     model_registry_namespace,
     selectable_backend_values,
 )
@@ -2291,6 +2292,36 @@ async def api_models(request: web.Request) -> web.Response:
     if backend == ACP_BACKEND_CLAUDE:
         return web.json_response(
             _cc_models(request, configured_default=_scoped_default(cfg, backend))
+        )
+    if backend == ACP_BACKEND_PI:
+        # Pi accepts only the ids its own session advertised (provider/model,
+        # including Factory models discovered by pi-droid-sdk). kiro-cli's
+        # --list-models is a different vocabulary, and a cold install that has
+        # never completed session/new has no list to offer. An empty answer is
+        # a 503, not a synthetic "auto" row the picker renders as Default.
+        namespace = model_registry_namespace(backend)
+        live = _advertised_cc_models(request, namespace)
+        cached = model_registry.advertised_models(namespace)
+        real = [
+            name
+            for name in (
+                *(entry.get("model_name", "") for entry in live),
+                *cached,
+            )
+            if _normalize_model_key(str(name)) not in ("", "auto")
+        ]
+        if not real:
+            return web.json_response(
+                {
+                    "error": "Pi has not advertised a model catalog for this install.",
+                    "code": "model_catalog_unavailable",
+                },
+                status=503,
+            )
+        return web.json_response(
+            _adapter_advertised_models(
+                request, backend, configured_default=_scoped_default(cfg, backend)
+            )
         )
     if backend in (ACP_BACKEND_CODEX, ACP_BACKEND_DROID):
         return web.json_response(

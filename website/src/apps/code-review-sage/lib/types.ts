@@ -294,6 +294,8 @@ export interface SettingsResponse {
   namespaces: string[]
   reviewer?: ReviewerInfo | null
   max_concurrent_max: number
+  /** Pi advertised nothing yet. The model list is empty on purpose. */
+  models_unavailable?: boolean
 }
 
 export interface LearnedPattern {

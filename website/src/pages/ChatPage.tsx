@@ -253,7 +253,8 @@ import {
 import WelcomeView from '../components/WelcomeView'
 import { openPanelView, claimAppAutoOpen } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
-import { useAvailableModels } from '../hooks/useAvailableModels'
+import { useAvailableModelsQuery } from '../hooks/useAvailableModels'
+import { isModelCatalogUnavailable } from '../api/apiError'
 import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
 import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
@@ -876,7 +877,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // transcripts. So the client must not OFFER them here either — same predicate
   // and same `executor` keying `selectContinuable` already uses for Resume.
   const activeSlotRemoteBound = slotIsRemoteBound(slots.find(s => s.key === activeSlot))
-  const { agents: installedAgents, choices: catalogChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  const { agents: installedAgents, choices: catalogChoices, defaultAgent, error: agentsCatalogError, reload: reloadAgents, reloading: agentsReloading } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
   // The picker lists every catalog row (a member and a template of one name
   // are two rows). A roster source that exposes only the folded list -- one
   // row per name -- is still a complete, if namespace-blind, catalog.
@@ -920,7 +921,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [dispatch])
   const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(effectiveAgents)
   const filteredAgents = filteredAgentsByName
-  const localModels = useAvailableModels()
+  const localModelsQuery = useAvailableModelsQuery()
+  const localModels = localModelsQuery.data
+  const localCatalogMissing = !remoteCrew.isRemote && isModelCatalogUnavailable(localModelsQuery.error)
   // A peer-bound session's shelf must offer the PEER's rosters. Both hooks above
   // read THIS machine same-origin, so a remote session left on them would list
   // crews and models that do not exist over there — accepted by the picker, then
@@ -7918,7 +7921,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   <Input ref={agentInputRef} type="text" aria-label={i18nT('pages.chatPage.filter_agents')} placeholder={i18nT('pages.chatPage.type_to_filter')} value={agentFilter} onChange={e => setAgentFilter(e.target.value)} className="w-full px-2 py-1 text-[13px]" />
                 </div>
                 <div role="listbox" aria-label={i18nT('pages.chatPage.agent_list')} className="overflow-y-auto max-h-[280px]">
-                <AgentDropdownList agents={filteredAgents} activeAgent={activeAgentName} activeKind={currentSlot?.agent_kind} defaultAgent={defaultAgent} onSelect={(name, kind) => { switchAgent(name, kind); setAgentDropdown(false) }} filter={agentFilter} />
+                <AgentDropdownList agents={filteredAgents} activeAgent={activeAgentName} activeKind={currentSlot?.agent_kind} defaultAgent={defaultAgent} onSelect={(name, kind) => { switchAgent(name, kind); setAgentDropdown(false) }} filter={agentFilter} loadFailed={!remoteCrew.isRemote && agentsCatalogError && catalogChoices.length === 0} onRetry={reloadAgents} retrying={agentsReloading} />
                 </div>
                 {/* Embedded chat gets neither half of the default-agent affordance: it has
                     no /capabilities route for the footer, and the footer is what carries the
@@ -7940,9 +7943,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 activeModel={jevRouteShownModel(shownModel, currentSlot)}
                 onSelectModel={pickModel}
                 modelsLoading={remoteCrew.modelsPending}
-                modelsFailed={remoteCrew.failed}
-                retryingModels={remoteCrew.retrying}
-                onRetryModels={() => remoteCrew.refetch()}
+                modelsFailed={remoteCrew.failed || localCatalogMissing}
+                retryingModels={remoteCrew.retrying || (localCatalogMissing && localModelsQuery.isFetching)}
+                onRetryModels={() => { if (remoteCrew.isRemote) remoteCrew.refetch(); else void localModelsQuery.refetch() }}
                 filter={modelFilter}
                 setFilter={setModelFilter}
                 onClose={() => setModelDropdown(false)}

@@ -616,6 +616,48 @@ class TestClientBackend(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.shutdowns, 1)  # type: ignore[attr-defined]
         self.assertEqual(FakeRuntime.instances, [])
 
+    async def test_pi_send_passes_the_saved_model_and_effort(self):
+        orig_backend = rp.configured_review_backend
+        rp.configured_review_backend = lambda: "pi"  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(rp, "configured_review_backend", orig_backend))
+        orig_settings = rp._get_review_settings
+        rp._get_review_settings = lambda: {  # type: ignore[method-assign]
+            "model": "factory/claude-opus-5-5",
+            "effort": "high",
+        }
+        self.addCleanup(lambda: setattr(rp, "_get_review_settings", orig_settings))
+
+        created: list[object] = []
+
+        class FakeClient:
+            def __init__(self, **kw):
+                self.kw = kw
+                self._session_id = "sess-pi"
+                created.append(self)
+
+            async def stream_events(self, message, timeout=None):
+                del message, timeout
+                yield _ev(rp.EVENT_COMPLETE, stop_reason="end_turn")
+
+            async def approve_tool(self, request_id, option_id=None, always=False):
+                del request_id, option_id, always
+
+            async def shutdown(self):
+                return None
+
+        import kiro_crew.acp.client as acp_client
+
+        orig_client = acp_client.AcpClient
+        acp_client.AcpClient = FakeClient  # type: ignore[misc, assignment]
+        self.addCleanup(lambda: setattr(acp_client, "AcpClient", orig_client))
+
+        pool = ReviewPool(work_dir=_work_dir(self))
+        await pool.begin_batch()
+        await pool.send("review this")
+        await pool.end_batch()
+        self.assertEqual(created[0].kw["model"], "factory/claude-opus-5-5")  # type: ignore[attr-defined]
+        self.assertEqual(created[0].kw["reasoning_effort"], "high")  # type: ignore[attr-defined]
+
     async def test_pi_send_records_the_session_id_for_a_later_question(self):
         orig_backend = rp.configured_review_backend
         rp.configured_review_backend = lambda: "pi"  # type: ignore[method-assign]
