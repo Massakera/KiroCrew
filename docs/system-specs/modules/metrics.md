@@ -1016,14 +1016,12 @@ back at the session that spawned it, so it can be neither listed nor attributed.
 The consequence is deliberate and worth stating: these totals are the totals of the
 sessions the panel lists, NOT of the account.
 
-**Pi and Droid children hang on the parent slot.** A pi-subagents child,
-including one whose model is `factory/...`, is not a `subagent:*` slot. Its
-row is written on the parent session's slot with `surface=subagent` and
-`provider` `pi` or `droid`, so that session's turn drilldown lists it and the
-Session Breakdown tree shows the child while the socket frame is live. Token
-fields the child did not report are omitted. A `factory/...` row records the
-extension's published cost, which is 0. The coordinator's own Pi turn still
-depends on pi-acp emitting usage; that wire is unchanged.
+**Pi and Droid usage.** Crew-managed subagents use the standard subagent usage
+path. Extension-owned child results are not interpreted as usage or live System
+tasks. Historical child rows remain readable, including optional `total_tokens`
+without an input/output split. Completed Droid turns retain the `droid` provider
+label; the Pi coordinator keeps its provider seam and depends on pi-acp reporting
+usage.
 
 **Read side.** `usage.context_occupancy(days)` aggregates these rows into
 per-turn occupancy percentiles plus a per-session peak ranking (own

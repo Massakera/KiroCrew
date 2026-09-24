@@ -17,6 +17,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_DROID, ACP_BACKEND_PI
 from kiro_crew.dashboard.handlers import usage as usage_mod
 from kiro_crew.dashboard.handlers.telemetry import api_usage_turns
 from kiro_crew.dashboard.handlers.usage import TURN_USAGE_FIELDS, slot_turn_usage
@@ -354,3 +355,8 @@ class TestExtremeTimestamps:
         )
         turns = slot_turn_usage("chat-1")
         assert len(turns) == 1
+
+
+def test_droid_turn_label_does_not_relabel_the_pi_coordinator():
+    assert usage_mod.provider_for_completed_turn("acp", ACP_BACKEND_DROID) == ACP_BACKEND_DROID
+    assert usage_mod.provider_for_completed_turn("acp", ACP_BACKEND_PI) == "acp"

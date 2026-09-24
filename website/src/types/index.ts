@@ -1386,7 +1386,7 @@ export interface SubagentActivity {
    *  `started`, and `subagent_done` carries `elapsed`. */
   startedAtAssumed?: boolean
   toolCount?: number      // observed tool calls (incl. auto-approved) — running-card progress
-  /** Token counts a pi-subagents child already reported. Absent when that
+  /** Token counts a child already reported. Absent when that
    *  child did not publish the dimension — a missing count is not zero. */
   inputTokens?: number
   outputTokens?: number

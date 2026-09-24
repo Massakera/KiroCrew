@@ -25,10 +25,8 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from kiro_crew import mcp_apps_render, session_directive
-from kiro_crew.acp.pi_subagent_usage import parse_pi_subagent_children
 from kiro_crew.acp.types import (
     EVENT_PERMISSION_REQUEST,
-    EVENT_PI_CHILD_USAGE,
     EVENT_TEXT_CHUNK,
     EVENT_THINKING_CHUNK,
     EVENT_TODO_UPDATE,
@@ -2654,22 +2652,6 @@ def parse_session_update(
                     todo=todo,
                 )
             )
-        children = parse_pi_subagent_children(update)
-        if children:
-            host = next((event for event in events if event.kind == EVENT_TOOL_RESULT), None)
-            if host is None and events:
-                host = events[0]
-            if host is not None:
-                host.pi_children = children
-            else:
-                events.append(
-                    AcpEvent(
-                        kind=EVENT_PI_CHILD_USAGE,
-                        tool_call_id=str(update.get("toolCallId") or ""),
-                        tool_status=str(update.get("status") or ""),
-                        pi_children=children,
-                    )
-                )
         return events
     return events
 

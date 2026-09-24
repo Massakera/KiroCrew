@@ -1,9 +1,0 @@
-{
-  "sessionUpdate": "tool_call_update",
-  "toolCallId": "call-bash",
-  "status": "completed",
-  "rawOutput": {
-    "toolName": "bash",
-    "details": {"stdout": "ok", "model": "should-not-match"}
-  }
-}

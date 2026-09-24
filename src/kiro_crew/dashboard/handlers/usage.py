@@ -18,6 +18,7 @@ from aiohttp import web
 
 from kiro_crew import model_registry
 from kiro_crew.acp.types import TurnUsage
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_DROID
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.context_blocks import USER_LABEL
 from kiro_crew.hooks import validate_file_path
@@ -591,8 +592,7 @@ TURN_USAGE_FIELDS: tuple[str, ...] = (
     "duration_ms",
     "context_used",
     "context_window",
-    # Async pi-subagents children publish one total and no input/output split.
-    # Absent on every other row; the reader omits the key when the shard did.
+    # Preserve totals in historical rows without inventing an input/output split.
     "total_tokens",
 )
 
@@ -1584,22 +1584,15 @@ async def persist_token_record_async(
         logger.debug("Failed to persist token record for slot %s", slot_key, exc_info=True)
 
 
-async def append_usage_record_async(record: dict[str, Any]) -> None:
-    """Append a prebuilt usage row, keeping only the keys the caller set.
+def provider_for_completed_turn(seam: str, backend: str) -> str:
+    """Provider label for a turn that already has a usage frame.
 
-    :func:`_build_token_record` zero-fills every dimension. A pi-subagents
-    child does not have every dimension, and a missing count is not a
-    measured zero. ``None`` values are dropped before the write. This path
-    does not emit the turn histogram: a child is not a dashboard turn.
+    A droid ACP turn is ``droid``. Every other backend, including the Pi
+    coordinator, keeps the seam it already persisted under.
     """
-    now = datetime.now().astimezone()
-    row = {key: value for key, value in record.items() if value is not None}
-    row["_type"] = "tokens"
-    row["ts"] = now.isoformat()
-    try:
-        await asyncio.to_thread(_write_token_record, row, now)
-    except Exception:
-        logger.debug("Failed to append usage record", exc_info=True)
+    if backend == ACP_BACKEND_DROID:
+        return ACP_BACKEND_DROID
+    return seam
 
 
 def _emit_turn_histogram(
