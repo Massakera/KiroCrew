@@ -511,6 +511,36 @@ class TestReadConfig:
             await worker.start()
         assert mk.call_args.kwargs["sandbox_mode"] == "auto"
 
+    @pytest.mark.asyncio
+    async def test_start_passes_configured_backend_to_client(self, tmp_path):
+        config = tmp_path / ".kirocrew" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text('{"agent": {"acp_backend": "pi"}}')
+        mock_client = AsyncMock()
+        mock_client.is_ready = True
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk:
+            worker = AcpWorker()
+            await worker.start()
+        assert mk.call_args.kwargs["acp_backend"] == "pi"
+
+    @pytest.mark.asyncio
+    async def test_start_defaults_backend_to_kiro(self, tmp_path):
+        mock_client = AsyncMock()
+        mock_client.is_ready = True
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk:
+            worker = AcpWorker()
+            await worker.start()
+        assert mk.call_args.kwargs["acp_backend"] == ""
+
+    def test_unselectable_backend_falls_back_to_default(self):
+        from kiro_crew.knowledge.llm_pool import _get_acp_backend
+
+        assert _get_acp_backend({"agent": {"acp_backend": "pi"}}) == "pi"
+        assert _get_acp_backend({"agent": {"acp_backend": "no-such-harness"}}) == ""
+        assert _get_acp_backend({"agent": "acp"}) == ""
+
 
 # ---------------------------------------------------------------------------
 # Tests: Pool start (mocked workers)
@@ -879,7 +909,7 @@ class TestLLMPoolEffort:
         with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
             result = await pool._create_worker()
 
-        worker_type.assert_called_once_with(sandbox_mode="auto", effort="high")
+        worker_type.assert_called_once_with(sandbox_mode="auto", effort="high", acp_backend="")
         assert result is fake_worker
 
     @pytest.mark.asyncio
@@ -891,7 +921,7 @@ class TestLLMPoolEffort:
         with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
             await pool._create_worker()
 
-        worker_type.assert_called_once_with(sandbox_mode="auto", effort=None)
+        worker_type.assert_called_once_with(sandbox_mode="auto", effort=None, acp_backend="")
 
     @pytest.mark.asyncio
     async def test_fetch_sized_pool_ignores_extraction_size_config(self):

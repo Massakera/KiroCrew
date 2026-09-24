@@ -26,7 +26,8 @@ same `kirocrew-knowledge` agent and preserve the existing model resolution:
 The extraction effort is a Knowledge policy, independent of
 `agent.role_efforts.background`, which controls other background workers. For the
 Kiro ACP backend, the worker applies the requested level through the `/effort`
-command; Claude ACP uses its advertised session config option. Capability
+command; harnesses whose effort is a session config option (Claude, pi, droid)
+use their advertised option. Capability
 negotiation may select the highest supported level at or below `high`, while an
 unsupported model or rejected command falls back to provider default.
 
@@ -391,7 +392,7 @@ user confirms, and no code path treats it as a bound.
 
 Both entity extraction (`EntityExtractor`) and internal-URL fetch (`agent_fetch.fetch_url_content`) acquire workers from a shared `LLMPool` — a provider-agnostic, bounded pool (`DEFAULT_POOL_SIZE` = 3) of **long-lived** ACP workers. A `Worker` ABC has two concrete paths:
 
-- **Default (kiro-cli)** — `AcpWorker` drives the `kirocrew-knowledge` agent over ACP (`AGENT_NAME`). That agent is installed by `agent.py:_install_knowledge_agent` (model `claude-haiku-4.5`, kirocrew-core tools only — no internal MCP wiring in the OSS fork).
+- **ACP (default)** — `AcpWorker` drives the `kirocrew-knowledge` agent over ACP (`AGENT_NAME`) on the configured `agent.acp_backend` (`_get_acp_backend`, through the same `resolve_selected_backend` gate the config loader applies; kiro-cli when unset). That agent is installed by `agent.py:_install_knowledge_agent` (model `claude-haiku-4.5`, kirocrew-core tools only — no internal MCP wiring in the OSS fork).
 - **`agent.provider="claude_code"` (legacy seam)** — `CCWorker` drives a long-lived `claude` CLI subprocess over stream-json I/O (haiku model, `bypassPermissions`); URL-fetch tools are opt-in via `KIROCREW_KNOWLEDGE_FETCH_TOOLS`. KiroCrew's provider enum is `["acp"]`, so this branch is dormant in practice.
 
 ### Sweep shielding + audit source

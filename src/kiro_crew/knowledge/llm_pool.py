@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.acp_backends import resolve_selected_backend
 from kiro_crew.agent_sdk.backends import (
     effort_config_option_id,
     effort_config_option_value,
@@ -136,6 +137,17 @@ def _get_provider_type(config: Optional[dict] = None) -> str:
     data = _read_config() if config is None else config
     provider = _section(data, "agent").get("provider", "acp")
     return provider if isinstance(provider, str) and provider else "acp"
+
+
+def _get_acp_backend(config: Optional[dict] = None) -> str:
+    """Configured ``agent.acp_backend``, through the loader's selectability gate.
+
+    Workers must spawn the same harness the rest of Crew runs; without this an
+    install on a non-kiro backend (pi, droid, ...) spawned ``kiro-cli`` here and
+    every extraction failed with "kiro-cli not found".
+    """
+    data = _read_config() if config is None else config
+    return resolve_selected_backend(_section(data, "agent").get("acp_backend"))
 
 
 def _get_sandbox_mode(config: Optional[dict] = None) -> str:
@@ -276,11 +288,13 @@ class AcpWorker(Worker):
         *,
         sandbox_mode: Optional[str] = None,
         effort: Optional[str] = None,
+        acp_backend: Optional[str] = None,
     ) -> None:
         self._client: Optional[AcpClient] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
         self._sandbox_mode = sandbox_mode
+        self._acp_backend = acp_backend
         self._effort = _normalize_effort(effort)
         self._effective_effort: Optional[str] = None
         # PID currently shielded from the gateway orphan sweep (see module note).
@@ -311,9 +325,21 @@ class AcpWorker(Worker):
             if self._sandbox_mode is not None
             else await asyncio.to_thread(_get_sandbox_mode)
         )
-        logger.info("AcpWorker: starting with agent=%s", AGENT_NAME)
+        acp_backend = (
+            self._acp_backend
+            if self._acp_backend is not None
+            else await asyncio.to_thread(_get_acp_backend)
+        )
+        logger.info(
+            "AcpWorker: starting with agent=%s backend=%s",
+            AGENT_NAME,
+            acp_backend or "kiro",
+        )
         self._client = AcpClient(
-            agent=AGENT_NAME, sandbox_mode=sandbox_mode, audit_source="subagent"
+            agent=AGENT_NAME,
+            sandbox_mode=sandbox_mode,
+            audit_source="subagent",
+            acp_backend=acp_backend,
         )
         self._effective_effort = None
         await self._client.ensure_ready()
@@ -339,11 +365,9 @@ class AcpWorker(Worker):
         client) and an identity branch: it sent every non-claude harness down the
         ``/effort`` slash command, including one that has no such command.
 
-        This pool constructs its client with the DEFAULT backend and never passes
-        ``acp_backend``, so the answer here is the kiro one and both spellings
-        agree on it; ``test_agent_sdk_capabilities`` pins that, so a future pool
-        that does select a backend gets the capability answer rather than an
-        identity guess.
+        The client follows the configured ``agent.acp_backend``, so the answer
+        is per harness: kiro takes the ``/effort`` command, while pi and droid
+        take a session config option under their own id.
         """
         client = self._client
         requested = self._effort
@@ -638,6 +662,7 @@ class LLMPool:
         self._started = False
         self._provider_type: str = ""
         self._sandbox_mode: str = "auto"
+        self._acp_backend: str = ""
         self._config: dict = {}
         self._start_lock = asyncio.Lock()
         # Idle-TTL scale-to-zero (see DEFAULT_IDLE_TTL_SECS). Set from config in
@@ -741,6 +766,7 @@ class LLMPool:
             config = await asyncio.to_thread(_read_config)
             self._provider_type = _get_provider_type(config)
             self._sandbox_mode = _get_sandbox_mode(config)
+            self._acp_backend = _get_acp_backend(config)
             # Allow config to override pool size (knowledge.extraction_pool_size).
             # Only applies when the key is explicitly set in config (not the
             # fallback default), so callers that pass a specific pool_size to the
@@ -793,6 +819,7 @@ class LLMPool:
             worker = AcpWorker(
                 sandbox_mode=self._sandbox_mode,
                 effort=self._effort,
+                acp_backend=self._acp_backend,
             )
         await worker.start()
         return worker

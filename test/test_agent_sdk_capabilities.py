@@ -644,14 +644,12 @@ class TestAForeignProviderIsClassifiedThePreviousWay:
         assert SubagentManager._is_cc_provider(self._foreign_provider()) is False
 
 
-def test_the_knowledge_pool_client_takes_the_default_backend() -> None:
-    """Pins why swapping ``_is_claude`` for the effort capability changed nothing.
+def test_the_knowledge_pool_client_follows_the_configured_backend() -> None:
+    """The knowledge pool selects the configured harness and asks capabilities.
 
-    ``AcpWorker`` constructs its ``AcpClient`` without ``acp_backend``, so the
-    backend is the kiro default and both the old identity read and the new
-    capability answer False. If a future pool starts selecting a backend this
-    fails, which is the moment to check the effort channel deliberately rather
-    than inherit whichever arm the old branch left behind.
+    ``AcpWorker`` passes ``acp_backend`` to its ``AcpClient``, so the effort
+    channel in ``_apply_effort`` must come from the capability table: kiro takes
+    the ``/effort`` command, pi and droid a session config option.
     """
     tree = _tree("knowledge/llm_pool.py")
     constructions = [
@@ -662,8 +660,10 @@ def test_the_knowledge_pool_client_takes_the_default_backend() -> None:
     assert constructions, "llm_pool no longer constructs an AcpClient; re-check this pin"
     for call in constructions:
         passed = {kw.arg for kw in call.keywords}
-        assert "acp_backend" not in passed, (
-            f"llm_pool.py:{call.lineno} now selects a backend; decide the effort "
-            f"channel for it instead of relying on the kiro default"
+        assert "acp_backend" in passed, (
+            f"llm_pool.py:{call.lineno} spawns the kiro default regardless of "
+            f"agent.acp_backend"
         )
     assert capabilities_for("").effort_via_config_option is False
+    assert capabilities_for("pi").effort_via_config_option is True
+    assert capabilities_for("droid").effort_via_config_option is True
