@@ -287,6 +287,9 @@ def build_report(records: list[dict], config: dict | None = None) -> dict:
             "blast": rec.get("blast_radius", {}).get("rating", "SMALL"),
             "red": counts.get("red", 0), "yellow": counts.get("yellow", 0),
             "deep_reviewed": rec.get("deep_reviewed", False),
+            # What the reviewer could see beyond the diff ("" for records that
+            # predate repository context); lets the reader weigh design findings.
+            "repo_context": str((rec.get("repo_context") or {}).get("status", "")),
             # str() for the same reason as the fields below: the renderer
             # html.escape()s this, which raises on a non-string.
             "gate_verdict": str(rec.get("phase1", {}).get("gate_verdict", "PASS")),
@@ -540,6 +543,11 @@ def _row_html(r: dict) -> str:
         counts.append(_pill(f"{r['yellow']} should-fix", yc, ybg))
     badges = (f"{_pill('design ' + str(r['design_risk']), 'var(--muted)', _NEUTRAL_BG)} "
               f"{_pill('blast ' + str(r['blast']), 'var(--muted)', _NEUTRAL_BG)}")
+    ctx = r.get("repo_context", "")
+    if ctx == "used":
+        badges += " " + _pill("repo context", "var(--muted)", _NEUTRAL_BG)
+    elif ctx == "unavailable":
+        badges += " " + _pill("diff only (repo context failed)", yc, ybg)
     link = (f"<a href='{e(_safe_href(r['url']))}' target='_blank' rel='noopener noreferrer' "
             f"style='color:{_LINK};text-decoration:none;font-weight:600'>{e(r['change_id'])}</a>")
     gate = ("" if r["deep_reviewed"] else

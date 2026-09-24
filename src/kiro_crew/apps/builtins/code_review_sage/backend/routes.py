@@ -64,6 +64,7 @@ from sage_lib import (  # noqa: E402,E501
     followup,
     learning,
     pipeline,
+    repo_context,
     report,
     results,
     review_driver,
@@ -2475,6 +2476,14 @@ def register_routes(app: web.Application) -> None:
                 logger.info("code-review-sage: reaped %d orphan run dir(s)", reaped)
         except Exception:  # pragma: no cover - never break startup
             logger.debug("code-review-sage: orphan reap failed", exc_info=True)
+        try:
+            # Throwaway review checkouts whose run died before cleanup (see
+            # sage_lib/repo_context.py).
+            swept = await asyncio.to_thread(repo_context.sweep_stale)
+            if swept:
+                logger.info("code-review-sage: swept %d stale review checkout(s)", swept)
+        except Exception:  # pragma: no cover - never break startup
+            logger.debug("code-review-sage: checkout sweep failed", exc_info=True)
 
     app.on_startup.append(_reap_on_startup)
 

@@ -116,6 +116,12 @@ DEFAULT_CONFIG: dict[str, object] = {
     },
     "sensitive_globs": DEFAULT_SENSITIVE_GLOBS,
     "rule_packs": DEFAULT_RULE_PACKS,
+    # Maps "<host>/<owner>/<repo>" to an absolute path of a local clone. A mapped
+    # repo gets a throwaway checkout of the PR head per review (see
+    # sage_lib/repo_context.py) so the reviewer can read code outside the diff.
+    # Edited by hand in config.json — there is deliberately no settings-UI write
+    # path: a path typed into a web form is a filesystem access grant.
+    "repo_checkouts": {},
     # GitHub-compatible hosts (github.com + optional GitHub Enterprise Server).
     "github_hosts": DEFAULT_GITHUB_HOSTS,
     # Settled-change filtering defaults.

@@ -397,7 +397,7 @@ class TestReviewDriver(unittest.TestCase):
         # `build_review_task` fails CLOSED when the link's host does not
         # revalidate. Patched rather than reached through a crafted URL so the
         # test pins THIS site's payload, not the host-allowlist rules.
-        def refuse(link):
+        def refuse(link, repo_ctx=None):
             raise D.pipeline.adapters.AdapterError("host is not allowed")
 
         with mock.patch.object(D, "build_review_task", refuse):

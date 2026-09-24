@@ -109,3 +109,30 @@ gh auth login --hostname ghe.example.com
 
 Hosts are matched exactly against the parsed URL hostname — never as a
 substring — so lookalike hosts are refused.
+
+### Repository context (optional)
+
+By default a review sees only the PR's diff hunks, metadata and comments. To let
+the reviewer read code outside the diff (existing helpers, callers, tests,
+project rules), map a repository to a local clone in
+`~/.kiro/crew/apps/code-review-sage/data/config.json`:
+
+```json
+"repo_checkouts": {"github.com/owner/repo": "/absolute/path/to/clone"}
+```
+
+For a mapped repository, each review prepares a throwaway `git clone --shared`
+of the local clone under `data/tmp/checkouts/`, fetches the PR's exact head
+commit into it when missing (over HTTPS, authenticated by the same `gh` login),
+checks it out detached, and removes it when the review ends. Your clone is never
+modified. The checkout is read-only for the reviewer: it may search and read git
+history, but never modify it or run the repository's tests, build or scripts,
+and project-rule files (AGENTS.md, ARCHITECTURE.md) are read from the PR's base
+revision, not the author's. Design, simplicity, duplication and
+pattern-consistency findings must cite existing code outside the diff or they
+are dropped in self-critique.
+
+Any failure (repo unmapped, fetch without credentials, missing commit) degrades
+to a diff-only review; the result record and the report show `repo_context` as
+`used`, `unavailable` or `disabled`. The key is edited by hand — there is no
+settings-UI write path for it.
