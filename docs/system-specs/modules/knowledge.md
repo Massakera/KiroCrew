@@ -18,17 +18,21 @@ files / uploads / artifacts / URLs
 
 Knowledge ingestion and URL-content acquisition use separate long-lived worker
 pools. The extraction pool uses `knowledge.extraction_pool_size` and requests
-Knowledge-specific reasoning effort `high`; the URL-fetch pool has one worker and
+Knowledge-specific reasoning effort `knowledge.extraction_effort` (empty means
+`high`), re-read at each pool start; the URL-fetch pool has one worker and
 sends no explicit effort, so it retains the provider default. Both pools drive the
 same `kirocrew-knowledge` agent and preserve the existing model resolution:
-`knowledge.extraction_model` → `agent.model` → provider/`auto`.
+`knowledge.extraction_model` → `agent.model` → provider/`auto`. kiro-cli reads
+that pin from the installed spec; because other harnesses never see a spec's
+`model`, `AcpWorker` also sends `knowledge.extraction_model` as the session
+model when it is set.
 
 The extraction effort is a Knowledge policy, independent of
 `agent.role_efforts.background`, which controls other background workers. For the
 Kiro ACP backend, the worker applies the requested level through the `/effort`
 command; harnesses whose effort is a session config option (Claude, pi, droid)
 use their advertised option. Capability
-negotiation may select the highest supported level at or below `high`, while an
+negotiation may select the highest supported level at or below the requested one, while an
 unsupported model or rejected command falls back to provider default.
 
 Separate pools make the different workload policies structural for long-lived

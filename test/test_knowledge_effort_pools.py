@@ -22,9 +22,11 @@ class _FakePool:
         effort: str | None = None,
         use_config_pool_size: bool = True,
         track_config_pool_size: bool | None = None,
+        track_config_effort: bool = False,
     ) -> None:
         self.pool_size = pool_size
         self.effort = effort
+        self.track_config_effort = track_config_effort
         self.use_config_pool_size = use_config_pool_size
         # Mirrors LLMPool: an explicit value wins, else it follows the seed flag.
         self.track_config_pool_size = (
@@ -89,8 +91,10 @@ class TestKnowledgePoolSetup:
         # Seeded from config, so it must follow a later write to that key; the
         # fetch pool is a fixed single worker and must not.
         assert extraction.track_config_pool_size is True
+        assert extraction.track_config_effort is True
         assert fetch.pool_size == 1
         assert fetch.effort is None
+        assert fetch.track_config_effort is False
         assert fetch.use_config_pool_size is False
         assert fetch.track_config_pool_size is False
         assert extractor_calls[0]["pool"] is extraction

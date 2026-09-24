@@ -541,6 +541,26 @@ class TestReadConfig:
         assert _get_acp_backend({"agent": {"acp_backend": "no-such-harness"}}) == ""
         assert _get_acp_backend({"agent": "acp"}) == ""
 
+    @pytest.mark.asyncio
+    async def test_start_passes_extraction_model_to_client(self, tmp_path):
+        config = tmp_path / ".kirocrew" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text('{"knowledge": {"extraction_model": " gpt-6-luna "}}')
+        mock_client = AsyncMock()
+        mock_client.is_ready = True
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk:
+            worker = AcpWorker()
+            await worker.start()
+        assert mk.call_args.kwargs["model"] == "gpt-6-luna"
+
+    def test_extraction_model_unset_or_auto_is_no_pin(self):
+        from kiro_crew.knowledge.llm_pool import _get_extraction_model
+
+        assert _get_extraction_model({}) == ""
+        assert _get_extraction_model({"knowledge": {"extraction_model": "auto"}}) == ""
+        assert _get_extraction_model({"knowledge": {"extraction_model": 7}}) == ""
+
 
 # ---------------------------------------------------------------------------
 # Tests: Pool start (mocked workers)
@@ -909,7 +929,9 @@ class TestLLMPoolEffort:
         with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
             result = await pool._create_worker()
 
-        worker_type.assert_called_once_with(sandbox_mode="auto", effort="high", acp_backend="")
+        worker_type.assert_called_once_with(
+            sandbox_mode="auto", effort="high", acp_backend="", model=""
+        )
         assert result is fake_worker
 
     @pytest.mark.asyncio
@@ -921,7 +943,33 @@ class TestLLMPoolEffort:
         with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
             await pool._create_worker()
 
-        worker_type.assert_called_once_with(sandbox_mode="auto", effort=None, acp_backend="")
+        worker_type.assert_called_once_with(
+            sandbox_mode="auto", effort=None, acp_backend="", model=""
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("track", "knowledge", "expected"),
+        [
+            (True, {"extraction_effort": "medium"}, "medium"),
+            (True, {"extraction_effort": ""}, "high"),
+            (True, {"extraction_effort": "bogus"}, "high"),
+            (False, {"extraction_effort": "medium"}, "high"),
+        ],
+    )
+    async def test_start_resolves_configured_effort_and_model(
+        self, track, knowledge, expected
+    ):
+        pool = LLMPool(pool_size=1, effort="high", track_config_effort=track)
+        config = {"knowledge": {"extraction_model": "gpt-6-luna", **knowledge}}
+        with patch("kiro_crew.knowledge.llm_pool._read_config", return_value=config), \
+             patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=AsyncMock()) as worker_type:
+            await pool.start()
+            await pool.shutdown()
+
+        kwargs = worker_type.call_args.kwargs
+        assert kwargs["effort"] == expected
+        assert kwargs["model"] == "gpt-6-luna"
 
     @pytest.mark.asyncio
     async def test_fetch_sized_pool_ignores_extraction_size_config(self):

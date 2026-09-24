@@ -2888,6 +2888,7 @@ def setup_knowledge_routes(app: web.Application) -> None:
         extraction_pool = LLMPool(
             pool_size=cfg.knowledge.extraction_pool_size,
             effort=DEFAULT_EXTRACTION_EFFORT,
+            track_config_effort=True,
             use_config_pool_size=False,
             # Seeded from knowledge.extraction_pool_size above, so it follows a
             # later write to that key (applied at the next idle boundary).

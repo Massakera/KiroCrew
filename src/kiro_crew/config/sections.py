@@ -2496,6 +2496,17 @@ class KnowledgeConfig:
             "without changing your chat default.",
         ),
     )
+    extraction_effort: str = field(
+        default="",
+        metadata=_meta(
+            "Extraction Effort",
+            "Reasoning effort for document extraction workers. Empty uses "
+            "'high'. Lower it for a cheap model where extraction is simple and "
+            "throughput matters. Applies when the pool next starts (after it "
+            "scales to zero when idle).",
+            enum=["", *EFFORT_LEVELS],
+        ),
+    )
     extraction_pool_size: int = field(
         default=3,
         metadata=_meta(

@@ -3016,6 +3016,7 @@ def _build_knowledge_config(knowledge_data: dict) -> KnowledgeConfig:
             knowledge_data.get("embed_rate_limit", 120), 120, EMBED_RATE_LIMIT_MAX
         ),
         extraction_model=str(knowledge_data.get("extraction_model", "")).strip(),
+        extraction_effort=coerce_effort(knowledge_data.get("extraction_effort", "")),
         extraction_pool_size=max(
             EXTRACTION_POOL_SIZE_MIN,
             min(

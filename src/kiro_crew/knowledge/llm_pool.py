@@ -150,6 +150,26 @@ def _get_acp_backend(config: Optional[dict] = None) -> str:
     return resolve_selected_backend(_section(data, "agent").get("acp_backend"))
 
 
+def _get_extraction_model(config: Optional[dict] = None) -> str:
+    """``knowledge.extraction_model`` as a session model pin; ``""`` for none.
+
+    kiro-cli also reads the pin from the installed ``kirocrew-knowledge`` spec,
+    but other harnesses never see a spec's ``model``, so the worker sends it on
+    the session itself.
+    """
+    data = _read_config() if config is None else config
+    value = _section(data, "knowledge").get("extraction_model")
+    if isinstance(value, str) and value.strip() and value.strip() != "auto":
+        return value.strip()
+    return ""
+
+
+def _get_extraction_effort(config: Optional[dict] = None) -> Optional[str]:
+    """``knowledge.extraction_effort``; ``None`` when unset or invalid."""
+    data = _read_config() if config is None else config
+    return _normalize_effort(_section(data, "knowledge").get("extraction_effort"))
+
+
 def _get_sandbox_mode(config: Optional[dict] = None) -> str:
     """OS-level sandbox mode for knowledge-worker subprocesses.
 
@@ -289,12 +309,14 @@ class AcpWorker(Worker):
         sandbox_mode: Optional[str] = None,
         effort: Optional[str] = None,
         acp_backend: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> None:
         self._client: Optional[AcpClient] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
         self._sandbox_mode = sandbox_mode
         self._acp_backend = acp_backend
+        self._model = model
         self._effort = _normalize_effort(effort)
         self._effective_effort: Optional[str] = None
         # PID currently shielded from the gateway orphan sweep (see module note).
@@ -330,13 +352,20 @@ class AcpWorker(Worker):
             if self._acp_backend is not None
             else await asyncio.to_thread(_get_acp_backend)
         )
+        model = (
+            self._model
+            if self._model is not None
+            else await asyncio.to_thread(_get_extraction_model)
+        )
         logger.info(
-            "AcpWorker: starting with agent=%s backend=%s",
+            "AcpWorker: starting with agent=%s backend=%s model=%s",
             AGENT_NAME,
             acp_backend or "kiro",
+            model or "auto",
         )
         self._client = AcpClient(
             agent=AGENT_NAME,
+            model=model or None,
             sandbox_mode=sandbox_mode,
             audit_source="subagent",
             acp_backend=acp_backend,
@@ -642,9 +671,15 @@ class LLMPool:
         effort: Optional[str] = None,
         use_config_pool_size: bool = True,
         track_config_pool_size: Optional[bool] = None,
+        track_config_effort: bool = False,
     ):
         self._pool_size = pool_size
         self._effort = _normalize_effort(effort)
+        # With track_config_effort, knowledge.extraction_effort overrides this
+        # default at each start(), so a write applies at the next idle boundary.
+        self._default_effort = self._effort
+        self._track_config_effort = track_config_effort
+        self._model: str = ""
         self._use_config_pool_size = use_config_pool_size
         # Whether a LATER write to knowledge.extraction_pool_size retargets this
         # pool. Separate from use_config_pool_size, which only governs the read
@@ -767,6 +802,9 @@ class LLMPool:
             self._provider_type = _get_provider_type(config)
             self._sandbox_mode = _get_sandbox_mode(config)
             self._acp_backend = _get_acp_backend(config)
+            self._model = _get_extraction_model(config)
+            if self._track_config_effort:
+                self._effort = _get_extraction_effort(config) or self._default_effort
             # Allow config to override pool size (knowledge.extraction_pool_size).
             # Only applies when the key is explicitly set in config (not the
             # fallback default), so callers that pass a specific pool_size to the
@@ -820,6 +858,7 @@ class LLMPool:
                 sandbox_mode=self._sandbox_mode,
                 effort=self._effort,
                 acp_backend=self._acp_backend,
+                model=self._model,
             )
         await worker.start()
         return worker
