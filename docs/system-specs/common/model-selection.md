@@ -162,7 +162,15 @@ send is still a wire decision, so no turn runs the wrong model.
 The vocabulary side and the spelling side fold ids with ONE function. A pin can be
 native to a harness while spelled in another namespace's provider-id form:
 `global.anthropic.claude-opus-4-8[1m]` folds through `catalog_key` onto kiro's
-advertised `claude-opus-4.8`, so `namespace_vocabulary` calls it native. The wire
+advertised `claude-opus-4.8`, so `namespace_vocabulary` calls it native. The same
+holds for a harness that fronts several providers behind one process: pi
+advertises `openai-codex/gpt-6-sol` but accepts the bare `gpt-6-sol` on the wire,
+so `catalog_key` also folds the provider-directory prefix — without it the bare
+pin matched no advertised id, and once a second harness's catalog claimed the
+bare id the scope layer dropped the pin as foreign to the very harness that
+served it. The fold lives in `catalog_key` alone: the dedup and seed paths still
+compare through `_normalize_advertised_key`, which keeps provider variants
+distinct. The wire
 then has to send the ADVERTISED spelling, and `resolve_pin_spelling` answers it:
 after the literal match and the one `<namespace>::` peel miss, it folds both sides
 with the same `catalog_key` and returns the advertised id, tie-breaking several

@@ -1021,6 +1021,22 @@ def catalog_namespaces() -> frozenset[str]:
     return frozenset(_CANONICAL_INDEX) | frozenset(_ADVERTISED_MODELS)
 
 
+# Provider-directory prefixes a harness prepends to the ids it advertises when
+# one process fronts several model providers: pi advertises
+# ``openai-codex/gpt-6-sol`` while accepting the bare ``gpt-6-sol`` on the wire.
+# Folded away in ``catalog_key`` ONLY, so a bare pin meets the advertised
+# spelling in vocabulary and spelling-resolution questions, while the dedup and
+# seed paths that compare ids through ``_normalize_advertised_key`` keep
+# provider variants distinct.
+_PROVIDER_DIR_PREFIXES: tuple[str, ...] = (
+    "openai-codex/",
+    "opencode-go/",
+    "anthropic/",
+    "cursor/",
+    "factory/",
+)
+
+
 def catalog_key(model_id: str) -> str:
     """One comparison key for a model id, for matching two catalogs' spellings.
 
@@ -1032,13 +1048,24 @@ def catalog_key(model_id: str) -> str:
     folded with this same function or the two spellings never meet; a normalizer
     applied to only one side is the shape of bug it exists to prevent.
 
+    A provider-directory prefix (``openai-codex/gpt-6-sol``) folds here for the
+    same reason: the harness that advertises the prefixed spelling accepts the
+    bare one, so a bare pin IS native vocabulary. Without the fold the pin
+    matches no advertised id, and once a second harness's catalog claims the
+    bare id the scope layer drops the pin as foreign to the harness that served
+    it all along.
+
     ``""`` for an empty id and for the ``auto`` sentinel: neither names a model.
     """
     s = model_id.strip()
     if not s or s == "auto":
         return ""
     base, _effort = split_effort_suffix(s)
-    return _normalize_advertised_key(base or s)
+    key = _normalize_advertised_key(base or s)
+    for pfx in _PROVIDER_DIR_PREFIXES:
+        if key.startswith(pfx):
+            return key[len(pfx) :]
+    return key
 
 
 def namespace_vocabulary(
