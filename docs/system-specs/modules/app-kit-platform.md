@@ -1,5 +1,33 @@
 # App Kit platform contracts (agents, MCP scoping, window entries)
 
+## Optional local investigations extension
+
+`packages/service-investigations` is an external, locally installed App Kit
+package, not a builtin app. Build its UI with
+`node packages/service-investigations/build.mjs` after installing the website
+dependencies, then run `kirocrew app install /absolute/path/to/packages/service-investigations`
+and `kirocrew app enable service-investigations`. Local installation copies the
+built bundle. Reinstall after updating it; the gateway package must also contain
+the matching investigation modules. New agent sessions receive the extension's
+`investigation` MCP tool.
+
+The page and tool share durable IDs, saved service context, findings and native
+app-owned chat slots. Service context stores local repository, AWS profile and
+expected account, Kubernetes context and expected API server/namespaces, log
+sources, database references and instructions; never credential values.
+The UI uses the host's native conversation and exact pending approval cards.
+Services are configured through the page; investigators report only on their
+own live run. Eligible owner conversations may start, inspect, resume and cancel
+runs. Private/member and ineligible cross-session callers retain host refusals.
+
+Investigations are on demand. V1 adds no scheduled monitoring, release babysit,
+automatic remediation, IAM/RBAC provisioning or cloud-hosted runtime.
+The gateway must stay running. AWS device sign-in exposes a local sign-in prompt
+without opening a browser automatically, then re-verifies identity before resume.
+V1 execution requires the Kiro CLI backend; other harnesses are refused without
+switching the configured backend. The app uses a dedicated investigator spec with
+harness pre-approvals removed, leaving the operator's normal agent unchanged.
+
 Everything here is **generic App Kit surface**, not one app's arrangement: each
 item is what the FIRST app to need it exposed, and every later app builds on the
 same contract. The manifest field reference lives in

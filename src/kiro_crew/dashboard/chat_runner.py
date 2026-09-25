@@ -3559,6 +3559,10 @@ def _persistable_session_policy(slot: Any, yolo_active: bool) -> str:
     consult this value. They go through :func:`_slot_is_trusted` per event, which
     re-checks the scope each time.
     """
+    from kiro_crew.investigation_policy import APP_NAME as _INVESTIGATION_APP
+
+    if getattr(slot, "_app", "") == _INVESTIGATION_APP:
+        return ""
     if yolo_active or getattr(slot, "_trust", False):
         return "auto"
     return ""
@@ -8821,6 +8825,17 @@ async def _run_chat(
     # suspended and reset _stop_state to idle before continuation processing.
     # The monotonic generation preserves that user intent across the whole call.
     _stop_gen_at_entry = slot._stop_generation
+    from kiro_crew.investigation_policy import APP_NAME as _INVESTIGATION_APP, prepare_turn
+
+    if getattr(slot, "_app", "") == _INVESTIGATION_APP:
+        try:
+            await prepare_turn(state, slot)
+        except Exception as exc:
+            slot.append("error", _redact_display_text(str(exc)), "msg msg-err")
+            state.broadcast_ws("chat_done", await chat_done_payload(state, slot))
+            return
+        if slot._stop_generation != _stop_gen_at_entry:
+            return
     # Dispatch appends the triggering row before entering this runner. Freeze
     # that row now, before await points, prompt expansion or new deliveries.
     _current_replay_message = _current_message
@@ -10559,6 +10574,12 @@ async def _run_chat(
         # us, so drop the lock and claim again with the normal lease wait.
         for _claim in (0, 1):
             try:
+                if slot._app == _INVESTIGATION_APP:
+                    from kiro_crew.investigation_policy import require_agent
+
+                    # The canonical execution record can override slot.agent.
+                    # Check the actual allocation, not its UI label.
+                    require_agent(state, slot, str(_allocation_kwargs.get("agent") or ""))
                 client, is_new, resumed = await state.sessions.get_or_create(
                     session_key, wait_if_busy=_wait_if_busy, **_allocation_kwargs
                 )
@@ -10593,6 +10614,8 @@ async def _run_chat(
                 state.sessions.allocation_requested_model(session_key) or _requested_model
             )
         _acquired = True
+        if slot._app == _INVESTIGATION_APP:
+            require_agent(state, slot, read_effective_agent(client))
         # A fresh provider can still owe Kiro Crew history after its one-shot
         # ``is_new`` observation was consumed by a slash command. Keep that debt
         # separate from provider creation: slash commands bypass ContextBuilder,
@@ -13324,6 +13347,15 @@ async def _run_chat(
                     assistant_text = ""
                     _turn_flushed_visible_text = True
                 _pre_tool_hooks_fired = False
+                from kiro_crew.investigation_policy import (
+                    APP_NAME as _INVESTIGATION_APP,
+                    diagnostic_read,
+                )
+
+                # Metadata may restrict a restored slot, but only a live host
+                # binding can grant semantic diagnostic access.
+                _investigation = slot._app == _INVESTIGATION_APP
+                _diagnostic_grant = False
                 # Backend-subagent request whose SECURITY context is absent
                 # (structured params missing, or shell with no recoverable
                 # command — see AcpEvent.child_low_fidelity): every
@@ -13387,6 +13419,7 @@ async def _run_chat(
                         # maps to a concrete kiro agent, so it must never decide
                         # which builtin app an agent belongs to.
                         resolved_agent=read_effective_agent(client),
+                        classifier_only=_investigation,
                     )
                     if tool_result.action == TOOL_DENY:
                         # Surface WHY: carry the deny reason into the pill so
@@ -13446,6 +13479,15 @@ async def _run_chat(
                         # fragments, paths, or credentials.
                         _refusal_reasons.append((_deny_title, _deny_msg))
                         continue
+                    if _investigation:
+                        # Re-evaluate every otherwise permitted call, including
+                        # read allowlists: these also need the selected target.
+                        _diagnostic_grant = await diagnostic_read(state, slot, event)
+                        tool_result = (
+                            ToolHookResult.auto_approve(read_only=True)
+                            if _diagnostic_grant
+                            else ToolHookResult(action=TOOL_ALLOW)
+                        )
                     if _child_low_fidelity:
                         # Backend-subagent origin whose tool_call frames never
                         # reached us (cache miss): command bytes are absent, so
@@ -13487,7 +13529,7 @@ async def _run_chat(
                                 event.mcp_server_name,
                                 event.tool_name,
                             )
-                    if tool_result.action == TOOL_AUTO_APPROVE:
+                    if tool_result.action == TOOL_AUTO_APPROVE and not _diagnostic_grant:
                         # The hook layer granted this by NAME (its
                         # `auto_approve_tools` globs, or the read-only allowlist).
                         # Ask off-loop whether the names still identify the
@@ -13667,7 +13709,8 @@ async def _run_chat(
                 # predicate is False no matter the trust flags, so the tool falls
                 # through to the normal interactive/trust gate below.
                 if (
-                    _native_crew_should_auto_approve(_native_tracker, state, slot)
+                    not _investigation
+                    and _native_crew_should_auto_approve(_native_tracker, state, slot)
                     and _child_grant_eligible
                 ):
                     logger.debug(
@@ -13721,7 +13764,8 @@ async def _run_chat(
                 # boolean the unconditional grants below read — bound once above
                 # as _child_grant_eligible, so it cannot drift here.
                 if (
-                    slot._trusted_patterns
+                    not _investigation
+                    and slot._trusted_patterns
                     and _child_grant_eligible
                     and not event.tool_input_redacted
                 ):
@@ -13833,7 +13877,8 @@ async def _run_chat(
                 # logs that, which must happen once per event, not twice.
                 slot_trusted = _slot_is_trusted(slot)
                 if (
-                    slot._trust_reads
+                    not _investigation
+                    and slot._trust_reads
                     and not slot_trusted
                     and not yolo_active
                     and cmd
@@ -13900,7 +13945,7 @@ async def _run_chat(
                 # verified identity falls through to the interactive card;
                 # children WITH cached bytes take these branches exactly like
                 # the main agent (mode parity).
-                if (slot_trusted or yolo_active) and _child_grant_eligible:
+                if not _investigation and (slot_trusted or yolo_active) and _child_grant_eligible:
                     try:
                         validated_tool = _validate_tool_name(
                             event.title,
@@ -14121,7 +14166,8 @@ async def _run_chat(
                 # secret itself and prevents two different hidden commands
                 # from collapsing to one durable trust pattern.
                 _command_grantable = (
-                    bool(_full)
+                    not _investigation
+                    and bool(_full)
                     and bool(_trust_key)
                     and not event.tool_input_redacted
                     and _safe_full == _full
@@ -14151,7 +14197,7 @@ async def _run_chat(
                 # ``child_unconditional_grant_eligible``, where trust-all is an
                 # unconditional grant and only content-matching paths need the
                 # canonical command.
-                perm_meta["trust_grantable"] = "1"
+                perm_meta["trust_grantable"] = "" if _investigation else "1"
                 _base = _extract_base_command(_trust_key) if event.is_shell else ""
                 _safe_base, _ = redact_exfiltration_urls(_base)
                 _safe_base, _ = redact_credentials(_safe_base)
@@ -14166,6 +14212,10 @@ async def _run_chat(
                 loop = asyncio.get_running_loop()
                 fut: asyncio.Future[str] = loop.create_future()
                 slot._approval_futures[str(event.request_id)] = fut
+                if _investigation:
+                    from kiro_crew.investigation_policy import awaiting_approval
+
+                    awaiting_approval(state, slot)
                 # Push via global SSE AFTER registering the future, so the
                 # slot dict reflects pending_approval=true and Board cards
                 # move into the Blocked lane without a browser refresh.

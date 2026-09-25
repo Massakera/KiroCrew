@@ -1,5 +1,35 @@
 # Security Module
 
+## Local investigation approvals
+
+The optional `service-investigations` extension uses a live host binding to opt
+its native chat slots into semantic diagnostic review (`investigation_policy.py`).
+Agent-writable history metadata alone never creates an automatic grant.
+The dashboard runner first applies hard denials and governance, then evaluates
+actual arguments through a tool-free background call on the configured ACP
+harness. Unknown, redacted, missing, ambiguous or unavailable assessments use
+the normal exact approval card. Script hooks still run before execution.
+Investigation slots bypass session trust, trusted patterns, native crew grants
+and YOLO so those grants cannot auto-approve an effective change.
+
+V1 uses the existing Kiro CLI derived-spec mechanism to remove harness-side
+`allowedTools`, MCP `autoApprove`, global MCP inclusion, per-tool grants and
+automatic lifecycle scripts before the first tool runs. Its dedicated app agent
+explicitly mounts the investigation MCP. Each turn checks the binding and spec
+digest; changed specs retire the warm runtime. The stored subagent approval
+policy remains interactive. Other ACP harnesses are refused visibly, without
+changing the user's selected backend, until their pre-approval surfaces have
+equivalent coverage. This shares the existing `ACP_BACKENDS_SIDE_READONLY`
+capability boundary rather than assuming all harnesses emit permission requests.
+
+This is best-effort local classification, not remote read-only enforcement.
+Existing local credentials retain their real permissions. No IAM/RBAC changes
+are installed. Inline scripts allow their source to be reviewed; unknown script
+files and helpers need approval. Scratch analysis writes are allowed in the run's
+scratch directory. Existing sandbox and governance ceilings remain authoritative.
+Target account/API-server checks precede dispatch, and the classifier receives
+the selected service context. Cancellation during review revokes its result.
+
 ## Overview
 
 Bulk skill enumeration still validates every canonical path against fresh sensitive

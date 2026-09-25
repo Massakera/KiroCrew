@@ -1,5 +1,14 @@
 # MCP Server Architecture
 
+The optional `service-investigations` App Kit package contributes
+`kiro_crew.mcp_investigations` through its manifest. Its single `investigation`
+tool is a stateless HTTP proxy with strict caller identity support, including
+pooled MCP transports. The app routes own caller eligibility, run state and
+authorization. `list`, `start`, `status`, `cancel` and `resume` serve eligible
+owner conversations; `report` is confined to the investigator's own live run.
+Service configuration and AWS sign-in are page actions. Disabling the app removes
+its routes/tools and prevents new semantic diagnostic grants.
+
 How MCP (Model Context Protocol) servers are configured, merged, probed and
 loaded, plus the two invariants every new Kiro Crew MCP tool must satisfy: it
 ships as an MCP tool (not only a CLI command), and it holds no per-caller state.

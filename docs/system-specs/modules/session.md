@@ -1,5 +1,23 @@
 # Session Manager Module
 
+## Independent investigation sessions
+
+The optional local investigations extension creates `investigation-<uuid>` slots
+owned by `service-investigations`. Each run snapshots its request and service
+context in app-local SQLite storage and uses the ordinary background-turn cap,
+chat transcript, pending approval cards and stop mechanism. Closing the origin
+conversation does not stop the investigation. Eligible live origin conversations
+receive a completion/attention link; the investigation page remains the durable
+inbox if the origin is gone.
+
+After restart, in-flight records become `interrupted`. Explicit resume verifies
+target identity, restores the same transcript and rebinds the live slot. Merely
+opening a stored transcript does not restore semantic approval authority.
+The gateway must remain running; V1 has no daemon or scheduled monitor outside it.
+Cancellation also cancels a turn waiting for background capacity. The app's
+disable hook awaits its preparation and turn tasks before allowing teardown;
+interrupted records can be resumed after re-enable.
+
 ## Overview
 
 Maps thread keys to LLMProvider instances (`session.py`). Each thread gets

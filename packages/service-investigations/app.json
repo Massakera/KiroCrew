@@ -1,0 +1,22 @@
+{
+  "name": "service-investigations",
+  "version": "0.1.0",
+  "displayName": "Investigações",
+  "description": "On-demand investigations using your existing local service access",
+  "author": "Massakera",
+  "tags": ["operations", "investigations"],
+  "agents": ["agents/investigator.json"],
+  "backend": {"hooks": {"routes": "backend.routes:register_routes"}},
+  "mcpServers": {
+    "investigations": {"command": "python", "args": ["-m", "kiro_crew.mcp_investigations"]}
+  },
+  "ui": {
+    "entry": "dist/index.mjs",
+    "pages": [{"route": "/apps/service-investigations", "label": "Investigações", "icon": "Search"}]
+  },
+  "permissions": {
+    "api": ["/api/apps/service-investigations/*", "/api/chat", "/api/chat/*", "/api/approvals", "/api/approvals/*"],
+    "events": [],
+    "sessionApproval": true
+  }
+}
