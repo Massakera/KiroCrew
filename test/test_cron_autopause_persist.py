@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from kiro_crew.cron import _AUTO_PAUSE_THRESHOLD, CronJob, CronSchedule, CronService
+from kiro_crew.cron import _AUTO_PAUSE_THRESHOLD, CronJob, CronSchedule, CronService, _RunClaim
 
 
 class TestRecordFailureSuccess:
@@ -248,7 +248,8 @@ class TestAutoPausePersistence:
 
         svc._on_job = retried_twice
         svc._jobs = [job]
-        asyncio.run(svc._run_job_isolated(job))  # every=60s: sub-hourly, no jitter sleep
+        # every=60s: sub-hourly, no jitter sleep
+        asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         svc2 = CronService(base_dir=tmp_path)
         svc2._load()
@@ -457,7 +458,7 @@ class TestExecuteSuccessResetsCounter:
             return None  # gateway cancelled branch: no bookkeeping, no last_status
 
         svc._on_job = cancelled_shape
-        meta = (0.0, "scheduled")  # the marker keys on this tuple's identity
+        meta = _RunClaim(trigger="scheduled", claimed_at=0.0)  # the marker keys on identity
         svc._cancelled_jobs.mark(job.id, meta)
         try:
             asyncio.run(svc._execute(job, meta))
@@ -477,8 +478,8 @@ class TestExecuteSuccessResetsCounter:
             return None
 
         svc._on_job = succeeding
-        prior_run = (0.0, "manual")
-        this_run = (1.0, "manual")
+        prior_run = _RunClaim(trigger="manual", claimed_at=0.0)
+        this_run = _RunClaim(trigger="manual", claimed_at=1.0)
         svc._cancelled_jobs.mark(job.id, prior_run)
         try:
             asyncio.run(svc._execute(job, this_run))

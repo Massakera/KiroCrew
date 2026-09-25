@@ -52,6 +52,40 @@ def _synth_aws_key() -> str:
     return prefix + body
 
 
+def _synth_flagged_media() -> bytes:
+    """Allow-listed media bytes carrying the same synthetic key material.
+
+    ``\\xff\\xfe`` is what makes the UTF-8 decode raise, which routes the file down
+    the binary branch of every gate; the caller names it ``.png`` so the guessed
+    MIME type sits inside ``BINARY_MIME_ALLOWLIST`` and the bytes reach the content
+    scan instead of stopping at the type check.
+    """
+    return b"\x89PNG\r\n\x1a\n\xff\xfe" + _synth_pem().encode() + b"\x80\x81"
+
+
+#: Wide encodings a credential can be written in inside an allow-listed
+#: container. Both widths, both byte orders: an ID3v2 tag in ``audio/mpeg`` is
+#: UTF-16, and a ``application/pdf`` text string is commonly UTF-16BE.
+_WIDE_ENCODINGS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+
+
+def _synth_wide_flagged_media(encoding: str) -> bytes:
+    """Allow-listed media bytes carrying the synthetic key at WIDE spacing.
+
+    Same container and same key material as :func:`_synth_flagged_media`, with
+    the key encoded so its characters arrive separated by NUL bytes. Explicit
+    ``-le``/``-be`` spellings are used so no byte-order mark is prepended and the
+    run starts where this function says it does.
+    """
+    return b"\x89PNG\r\n\x1a\n\xff\xfe" + _synth_aws_key().encode(encoding) + b"\x80\x81"
+
+
+def _synth_wide_clean_media(encoding: str) -> bytes:
+    """Wide-encoded text in the same container with no credential in it."""
+    innocent = "the quick brown fox jumps over the lazy dog"
+    return b"\x89PNG\r\n\x1a\n\xff\xfe" + innocent.encode(encoding) + b"\x80\x81"
+
+
 @pytest.fixture(autouse=True)
 def _isolated_store(tmp_path, monkeypatch):
     """Point the consent store at a tmp dir so no test touches the real one."""
@@ -77,6 +111,14 @@ class TestSynthesizedMaterialActuallyTrips:
     def test_synth_pem_is_detected(self):
         pem = _synth_pem()
         assert security.redact(pem) != pem
+
+    def test_synth_flagged_media_is_detected_through_the_binary_scan(self):
+        from kiro_crew.platform import binary_content_is_flagged
+
+        raw = _synth_flagged_media()
+        with pytest.raises(UnicodeDecodeError):
+            raw.decode("utf-8")
+        assert binary_content_is_flagged(raw)
 
     def test_synth_aws_key_is_detected(self):
         key = _synth_aws_key()
@@ -309,9 +351,93 @@ class TestConsentedDownloadRequiresOwnerIdentity:
         from kiro_crew.dashboard.handlers import files as files_handlers
 
         src = inspect.getsource(files_handlers.api_outbox_download)
-        window = src[src.index("is_granted") : src.index("is_granted") + 400]
+        # Anchored on the conjunction itself rather than on the store read: the
+        # grant is resolved off the event loop at each call site, so the
+        # conjunction lives in the closure and not in the store-read expression.
+        window = src[src.index("return granted") : src.index("return granted") + 200]
         assert " and is_owner_dashboard_request(request)" in window
         assert " or is_owner_dashboard_request(request)" not in window
+
+    def test_consent_store_is_never_read_on_the_event_loop(self):
+        """Every grant read in this coroutine is handed to a thread.
+
+        ``is_granted`` ends in a synchronous store read, and this route is a
+        coroutine on the gateway event loop, so a direct call would hold the loop
+        for the store's full contention window. Asserted on real source because
+        the cost only appears with a second reader on the same home, which a unit
+        test does not reproduce.
+        """
+        import inspect
+
+        from kiro_crew.dashboard.handlers import files as files_handlers
+
+        for fn in (files_handlers.api_outbox_download, files_handlers.api_outbox_notify):
+            src = inspect.getsource(fn)
+            for idx, line in enumerate(src.splitlines()):
+                if "is_granted" not in line or line.lstrip().startswith("#"):
+                    continue
+                preceding = "\n".join(src.splitlines()[max(0, idx - 2) : idx + 1])
+                assert (
+                    "asyncio.to_thread" in preceding
+                ), f"{fn.__name__}: consent read not offloaded -- {line.strip()}"
+
+    def test_identity_discriminates_the_caller_class_the_grant_cannot(self):
+        """Behaviour behind the structural pin: the predicate separates the callers.
+
+        The gate admits any authenticated dashboard user, so the caller the entry
+        must attribute is a Slack allow-listed non-owner: ``app == ""`` with a
+        subject that is not the owner id. The grant cannot tell that caller from the
+        owner, because a refusal in the default no-grant state never reaches the
+        owner check. This asserts the predicate the fix uses does tell them apart,
+        and that it needs no store read to do it.
+        """
+        from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+        assert is_owner_dashboard_request(_consent_request(user="owner-1", owner="owner-1"))
+        # The Slack !dashboard caller: authenticated, app-less, not the owner.
+        assert not is_owner_dashboard_request(
+            _consent_request(user="slack-user-7", owner="owner-1")
+        )
+        # And an app token is not the owner either, grant or no grant.
+        assert not is_owner_dashboard_request(
+            _consent_request(app="an-app", user="owner-1", owner="owner-1")
+        )
+
+    def test_the_refused_entry_says_which_conjunct_refused(self):
+        """One row for both conjuncts would misreport a cross-principal attempt.
+
+        The entry has to separate "the scanner held this back" from "another
+        principal reached for a file your grant covers" -- the second read as the
+        first leaves the cross-principal attempt attributed to nobody. Structural for
+        the same reason as the conjunct tests above: an aiohttp fixture carrying a
+        forged non-owner identity would pin the harness rather than the route, and
+        the entry's own text is asserted behaviourally against the helper.
+
+        The discriminator must be IDENTITY, not the grant. The gate's conjunction
+        short-circuits, so in the default no-grant state a non-owner is refused
+        before the owner check runs; keyed off the grant, that caller would be
+        recorded as an ordinary scanner hold-back in the configuration almost every
+        install runs. Both flagged branches of the leg are checked, since each can
+        be reached by a non-owner.
+        """
+        import inspect
+
+        from kiro_crew.dashboard.handlers import files as files_handlers
+
+        src = inspect.getsource(files_handlers.api_outbox_download)
+        assert '"flagged content, non-owner caller"' in src
+        assert '"flagged content, no grant"' in src
+        assert '"flagged binary content, non-owner caller"' in src
+        assert '"flagged binary content, no grant"' in src
+        assert src.count("cross_principal = _requester_is_not_the_owner()") == 2
+        # The grant must NOT be the discriminator: it cannot answer which conjunct
+        # refused, because the conjunction never evaluates the second one when the
+        # first is false.
+        assert "cross_principal = granted" not in src
+        assert (
+            src.count('caller=str(request.get("user") or "unknown") if cross_principal else ""')
+            == 2
+        )
 
 
 def _consent_request(*, app: str = "", user: str = "owner-1", owner: str = "owner-1", query=None):
@@ -1113,6 +1239,191 @@ class TestFileSendHonoursTheGrant:
         assert "/api/outbox/notify" in posted
         assert not any("upload-file" in p for p in posted)
 
+    def test_without_a_grant_a_flagged_MEDIA_file_is_refused_too(self, tmp_path):
+        """The same credential inside a PNG gets the same answer as inside text.
+
+        An allow-listed media type says the browser can render the bytes safely,
+        not that no secret is sitting in them, so the type check cannot stand in
+        for the content scan.
+        """
+        src = tmp_path / "shot.png"
+        src.write_bytes(_synth_flagged_media())
+        out = self._call(src)
+        assert "sensitive data" in out and "aborted" in out
+
+    def test_with_a_grant_a_flagged_MEDIA_file_also_skips_both_upload_legs(self, tmp_path):
+        from kiro_crew import mcp_core
+
+        src = tmp_path / "shot.png"
+        src.write_bytes(_synth_flagged_media())
+        _grant()
+        posted: list[str] = []
+
+        def _fake_post(path, *a, **kw):
+            posted.append(path)
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_fake_post):
+            out = self._call(src)
+        assert "File sent" in out
+        assert "Slack and channel upload skipped" in out
+        assert not any("upload-file" in p for p in posted)
+
+    def test_a_failed_outbox_copy_records_no_consented_delivery(self, tmp_path):
+        """A delivery record must not outlive the copy it claims.
+
+        A full outbox or a read-only workspace is an ordinary operational
+        condition, and only ``FileExistsError`` is recovered, so any other write
+        error leaves the tool without a delivery. Recording the release of flagged
+        content that never left is the one direction an incident review cannot
+        correct: there is no retraction entry.
+        """
+        import pathlib
+
+        from kiro_crew import file_delivery_consent as fdc
+        from kiro_crew import mcp_core
+
+        src = tmp_path / "device.conf"
+        src.write_text(_synth_pem())
+        _grant()
+        outbox = tmp_path / "outbox"
+        outbox.mkdir()
+        recorded: list[str] = []
+        real_open = pathlib.Path.open
+
+        def _no_space(self, *a, **kw):
+            if outbox in self.parents:
+                raise OSError(28, "No space left on device")
+            return real_open(self, *a, **kw)
+
+        with (
+            patch.object(mcp_core, "outbox_dir", return_value=outbox),
+            patch.object(pathlib.Path, "open", _no_space),
+            patch.object(
+                fdc, "audit_decision", side_effect=lambda *a, **kw: recorded.append(kw["outcome"])
+            ),
+        ):
+            with pytest.raises(OSError):
+                self._call(src)
+        assert "delivered" not in recorded
+
+    def test_a_clean_media_file_still_needs_no_grant(self, tmp_path):
+        """The scan must not turn ordinary media into a consent prompt."""
+        from kiro_crew import mcp_core
+
+        src = tmp_path / "clean.png"
+        src.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe" + b"\x00" * 200)
+        with patch.object(mcp_core, "_post", return_value={"ok": True}):
+            out = self._call(src)
+        assert "File sent" in out
+        assert "consent" not in out
+
+
+class TestOneBinaryScanForEveryGate:
+    """All four gates read one scanner, so none can drift from the others again.
+
+    The gate this module's docstring calls structural -- the upload leg that no
+    grant can reach -- carried the only binary content scan, and the three
+    owner-facing ones skipped it, so a credential inside an allow-listed media type
+    was refused on one leg and accepted on the other three. Sharing the function is
+    what makes that state unreachable rather than merely fixed once.
+    """
+
+    def test_no_gate_hand_rolls_its_own_binary_decode(self):
+        from kiro_crew.dashboard.handlers import files as files_handlers
+        from kiro_crew.mcp_tools import messaging
+
+        gates = (
+            messaging.file_send,
+            files_handlers.api_outbox_notify,
+            files_handlers.api_outbox_download,
+            files_handlers._gate_upload_file,
+        )
+        for gate in gates:
+            src = inspect.getsource(gate)
+            assert "binary_content_is_flagged" in src, gate.__name__
+            # A second decode here would be a second answer to the same question.
+            assert 'decode("latin-1")' not in src, gate.__name__
+
+    def test_the_shared_scan_routes_through_the_context_shim(self):
+        """A companion's extra credential regexes must apply to binary too."""
+        from kiro_crew.platform import context as platform_context
+
+        src = inspect.getsource(platform_context.binary_content_is_flagged)
+        assert "redact_via_context" in src
+
+    def test_the_upload_leg_still_refuses_flagged_media_outright(self):
+        """Sharing the scanner must not have softened the unconditional refusal.
+
+        Whether that gate can read the store at all is pinned separately, on the
+        same source, by ``TestThirdPartyLegsCanNeverBeGranted``.
+        """
+        from kiro_crew.dashboard.handlers import files as files_handlers
+
+        src = inspect.getsource(files_handlers._gate_upload_file)
+        assert "binary_credential_detected" in src
+        assert "is_granted" not in src
+
+
+class TestWideEncodedCredentialsReachTheScan:
+    """A credential written at UTF-16/UTF-32 spacing must flag like a narrow one.
+
+    The scan's decode is total, so nothing escapes it by failing to decode. That
+    is a different property from seeing the content: a single-byte projection of
+    UTF-16 reads the key as characters separated by NUL, which no credential
+    grammar matches. Wide text inside these containers is ordinary output from
+    standard writers -- an ID3v2 UTF-16 tag in ``audio/mpeg``, a UTF-16BE string
+    in ``application/pdf`` -- so this is reachable input, not a crafted one.
+
+    A negative answer from the scan skips the owner conjunct on the download
+    route entirely, so a miss here does not degrade to "owner only": the bytes
+    leave to any authenticated caller, including the Slack allow-listed non-owner
+    that conjunct exists to stop. The first test below is what keeps the rest
+    honest -- it asserts the material really is invisible to a single-byte
+    projection, so a scan that only did the narrow pass would fail them.
+    """
+
+    @pytest.mark.parametrize("encoding", _WIDE_ENCODINGS)
+    def test_the_wide_key_is_invisible_to_a_single_byte_projection(self, encoding):
+        raw = _synth_wide_flagged_media(encoding)
+        narrow = raw.decode("latin-1")
+        assert security.redact(narrow) == narrow
+
+    @pytest.mark.parametrize("encoding", _WIDE_ENCODINGS)
+    def test_a_wide_key_in_allow_listed_media_is_flagged(self, encoding):
+        from kiro_crew.platform import binary_content_is_flagged
+
+        raw = _synth_wide_flagged_media(encoding)
+        with pytest.raises(UnicodeDecodeError):
+            raw.decode("utf-8")
+        assert binary_content_is_flagged(raw)
+
+    @pytest.mark.parametrize("encoding", _WIDE_ENCODINGS)
+    def test_innocent_wide_text_is_not_flagged(self, encoding):
+        """The wide pass must discriminate on content, not on wide text existing."""
+        from kiro_crew.platform import binary_content_is_flagged
+
+        assert not binary_content_is_flagged(_synth_wide_clean_media(encoding))
+
+    def test_media_with_no_wide_run_pays_no_extra_answer(self):
+        """Binary holding no wide run at all stays unflagged.
+
+        Striding the whole buffer instead of matching a run would hand the
+        detectors a second stream of high-entropy bytes, and this is the case that
+        would show it.
+        """
+        from kiro_crew.platform import binary_content_is_flagged
+
+        raw = b"\x89PNG\r\n\x1a\n\xff\xfe" + bytes(range(256)) * 8 + b"\x80\x81"
+        assert not binary_content_is_flagged(raw)
+
+    def test_both_widths_and_both_byte_orders_are_covered(self):
+        """One projection per (width, byte order); a missing one is a silent hole."""
+        from kiro_crew.platform import context as platform_context
+
+        strides = {(offset, stride) for _, offset, stride in platform_context._WIDE_PROJECTIONS}
+        assert strides == {(0, 2), (1, 2), (0, 4), (3, 4)}
+
 
 class TestAuditDecisionRedactsBeforeTruncate:
     """``audit_decision`` must redact ``detail`` BEFORE clipping it to 200 chars.
@@ -1167,3 +1478,230 @@ class TestAuditDecisionRedactsBeforeTruncate:
 
         assert len(calls) == 1
         assert calls[0]["resources"] == file_delivery_consent.CLASS_OWNER_DASHBOARD
+
+
+class TestARefusalNamesTheFileItHeldBack:
+    """A held-back file has to be NAMED somewhere the owner can read.
+
+    The error string a refused caller receives is returned to the AGENT, so it
+    cannot serve an owner who is being asked to allow delivery: they would be
+    deciding without knowing which of their files the scanner stopped. The
+    consent audit trail already names a flagged file that went OUT under a grant,
+    and it is served over the security event log, so the refusal belongs in the
+    same place under the same name.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch):
+        import kiro_crew.sel as sel_mod
+
+        calls: list[dict] = []
+
+        class _Recorder:
+            def log_api_access(self, **kwargs) -> None:
+                calls.append(kwargs)
+
+            def log_tool_invocation(self, **kwargs) -> None:
+                """Absorbed: the tool-invocation lane is not what this asserts."""
+
+        monkeypatch.setattr(sel_mod, "sel", lambda: _Recorder())
+        return calls
+
+    @staticmethod
+    def _refusals(calls: list[dict]) -> list[str]:
+        return [
+            c["resources"] for c in calls if c.get("operation") == "file_delivery_consent.refused"
+        ]
+
+    def test_the_helper_records_the_outcome_the_leg_the_name_and_the_reason(self, monkeypatch):
+        calls = self._capture(monkeypatch)
+
+        file_delivery_consent.audit_refusal(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            leg="file_send",
+            name="device.conf",
+            reason="flagged content",
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["operation"] == "file_delivery_consent.refused"
+        assert calls[0]["outcome"] == "refused"
+        assert calls[0]["resources"] == (
+            f"{file_delivery_consent.CLASS_OWNER_DASHBOARD}: "
+            "file_send (flagged content): device.conf"
+        )
+
+    def test_the_helper_names_the_caller_when_a_leg_admits_more_than_one(self, monkeypatch):
+        """``audit_decision`` stamps every refusal ``gateway``, the process not the requester.
+
+        So a leg an authenticated non-owner can reach has to carry the requester in
+        the entry itself, or the row cannot say WHICH identity reached for the file.
+        """
+        calls = self._capture(monkeypatch)
+
+        file_delivery_consent.audit_refusal(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            leg="download",
+            name="device.conf",
+            reason="flagged content, non-owner caller",
+            caller="slack-user-7",
+        )
+
+        assert calls[0]["resources"] == (
+            f"{file_delivery_consent.CLASS_OWNER_DASHBOARD}: "
+            "download (flagged content, non-owner caller) caller=slack-user-7: device.conf"
+        )
+
+    def test_the_helper_omits_the_caller_clause_on_a_single_principal_leg(self, monkeypatch):
+        """The negative: the clause must be absent, not present-and-empty.
+
+        Four of the six call sites serve one principal, and an entry trailing a
+        bare ``caller=`` would read as an identity the log failed to capture.
+        """
+        calls = self._capture(monkeypatch)
+
+        file_delivery_consent.audit_refusal(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            leg="file_send",
+            name="device.conf",
+            reason="flagged content",
+        )
+
+        assert "caller=" not in calls[0]["resources"]
+
+    def test_a_long_name_cannot_clip_the_reason_or_the_caller(self, monkeypatch):
+        """The name is the only unbounded field, so it is the one truncation may eat.
+
+        ``audit_decision`` clips the detail at 200 characters and an outbox name has
+        no length bound -- it comes from the request path and is only resolved inside
+        the outbox. Composed name-first, a long enough name pushes the reason and the
+        caller off the end and what survives reads exactly like a plain scanner
+        hold-back, which is the reading this entry exists to prevent. So the assertion
+        is on the surviving fields, not on the name.
+        """
+        calls = self._capture(monkeypatch)
+
+        file_delivery_consent.audit_refusal(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            leg="download",
+            name="a" * 4000,
+            reason="flagged content, non-owner caller",
+            caller="slack-user-7",
+        )
+
+        row = calls[0]["resources"]
+        assert "(flagged content, non-owner caller)" in row
+        assert "caller=slack-user-7" in row
+        # And the row is still clipped, so this is not passing by the clip being gone.
+        assert len(row) < 4000
+
+    def test_the_primary_tool_refusal_names_the_file(self, tmp_path, monkeypatch):
+        """The leg the owner actually meets: an agent sends a flagged file, unigranted."""
+        from kiro_crew.mcp_tools.messaging import file_send
+
+        calls = self._capture(monkeypatch)
+        src = tmp_path / "device.conf"
+        src.write_text(_synth_pem())
+
+        out = file_send("file_send", {"path": str(src)})
+
+        assert "sensitive data" in out and "aborted" in out
+        refusals = self._refusals(calls)
+        assert len(refusals) == 1, calls
+        assert refusals[0] == (
+            f"{file_delivery_consent.CLASS_OWNER_DASHBOARD}: "
+            "file_send (flagged content): device.conf"
+        )
+
+    def test_a_granted_delivery_records_no_refusal(self, tmp_path, monkeypatch):
+        """The negative direction: the entry must mean refused, not merely flagged."""
+        from kiro_crew import mcp_core
+        from kiro_crew.mcp_tools.messaging import file_send
+
+        src = tmp_path / "device.conf"
+        src.write_text(_synth_pem())
+        _grant()
+        calls = self._capture(monkeypatch)
+
+        with patch.object(mcp_core, "_post", side_effect=lambda path, *a, **kw: {"ok": True}):
+            out = file_send("file_send", {"path": str(src)})
+
+        assert "File sent" in out
+        assert self._refusals(calls) == []
+
+    def test_a_flagged_name_is_recorded_without_reproducing_it(self, tmp_path, monkeypatch):
+        """A name that IS the credential must not be copied verbatim into the log."""
+        from kiro_crew.mcp_tools.messaging import file_send
+
+        key = _synth_aws_key()
+        calls = self._capture(monkeypatch)
+        src = tmp_path / f"notes-{key}.txt"
+        src.write_text("no credential in the body")
+
+        out = file_send("file_send", {"path": str(src)})
+
+        assert "filename contains sensitive content" in out
+        refusals = self._refusals(calls)
+        assert len(refusals) == 1, calls
+        assert "flagged name" in refusals[0]
+        assert key not in refusals[0]
+        assert key[:8] not in refusals[0]
+
+
+class TestEveryScannerRefusalRecordsTheName:
+    """The claim is about the SET of refusal sites, so it is one test, not many.
+
+    A refusal leg added later without an entry has to redden something, and a
+    per-leg test would simply not exist for it. Asserted on the source because
+    three of these legs are reached through aiohttp handlers whose fixtures would
+    cost more than they prove: what is at stake is whether the call is THERE.
+    """
+
+    @staticmethod
+    def _sources():
+        from kiro_crew.dashboard.handlers import files as files_mod
+        from kiro_crew.mcp_tools import messaging as messaging_mod
+
+        return {
+            "file_send": inspect.getsource(messaging_mod.file_send),
+            "notify": inspect.getsource(files_mod.api_outbox_notify),
+            "download": inspect.getsource(files_mod.api_outbox_download),
+            "upload gate": inspect.getsource(files_mod._gate_upload_file),
+        }
+
+    def test_each_leg_records_every_scan_it_can_refuse_on(self):
+        # file_send scans the NAME and the text CONTENT. notify and download each
+        # scan name or text content AND binary content, and every one of those scans
+        # honours the grant, so each refuses separately and each needs its own entry
+        # -- a leg that scans three ways and records twice leaves a refusal the owner
+        # cannot see. The shared upload gate scans the name, binary content, text
+        # content and wide-encoded content, and records through its OWN audit helper
+        # rather than the consent module, so its entries are counted by the name they
+        # carry.
+        sources = self._sources()
+        counted = {
+            leg: (
+                src.count("{filename}") + src.count("{redact(filename)}")
+                if leg == "upload gate"
+                else src.count("audit_refusal(")
+            )
+            for leg, src in sources.items()
+        }
+        assert counted == {"file_send": 2, "notify": 3, "download": 2, "upload gate": 4}
+
+    def test_only_the_gate_scanner_refusals_name_the_file(self):
+        # A shape refusal flags no file, so naming one would claim the scanner
+        # stopped something it never looked at. Pinning WHICH entries carry the
+        # name is what makes a new shape refusal that copies the wrong neighbour
+        # redden.
+        naming = {
+            line.strip()
+            for line in self._sources()["upload gate"].splitlines()
+            if "_audit_denial(" in line and "filename" in line
+        }
+        assert naming == {
+            '_audit_denial(f"sensitive_filename_rejected: {redact(filename)}")',
+            '_audit_denial(f"binary_credential_detected: {filename}")',
+            '_audit_denial(f"content_redacted: {filename}")',
+            '_audit_denial(f"wide_credential_detected: {filename}")',
+        }

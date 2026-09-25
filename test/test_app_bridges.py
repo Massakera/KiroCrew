@@ -1673,7 +1673,7 @@ class TestStdioInterpreterResolution:
             setup=_fake_venv_python,
         )
         assert entry["command"] == sys.executable
-        assert entry["args"][:3] == ["-s", "-m", "kiro_crew"]
+        assert entry["args"][:4] == ["-s", "-P", "-m", "kiro_crew"]
 
     def test_an_http_entry_is_unaffected(self, tmp_path, app_env, monkeypatch):
         import kiro_crew.apps.backend as backend_mod

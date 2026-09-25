@@ -54,6 +54,7 @@ from kiro_crew.instances.constants import (
     RECOVER_BACKOFF_MAX_CEILING_SECS as _RECOVER_BACKOFF_CEILING,
 )
 from kiro_crew.instances.constants import WARM_SET_CAP_AUTO as _WARM_SET_CAP_AUTO
+from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX
 from kiro_crew.stt.limits import DEFAULT_IDLE_EVICT_SECS as _STT_DEFAULT_IDLE_EVICT_SECS
 from kiro_crew.stt.limits import DEFAULT_PARTIAL_INTERVAL_MS as _STT_DEFAULT_PARTIAL_INTERVAL_MS
 from kiro_crew.stt.limits import DEFAULT_SILENCE_MS as _STT_DEFAULT_SILENCE_MS
@@ -225,6 +226,61 @@ def coerce_role_efforts(raw: object) -> dict[str, str]:
         if isinstance(val, str) and val.strip() and is_valid_effort(val.strip()):
             out[role] = val.strip()
     return out
+
+
+def deepseek_env_plaintext_keys(raw: object) -> tuple[str, ...]:
+    """Env-var names in an ``agent.deepseek_env`` shape whose value is NOT a reference.
+
+    The one rule about this mapping that is enforced at WRITE time rather than at
+    spawn: a value is a ``secret://<vault name>`` reference, and anything else is a
+    provider key about to be persisted in ``config.json`` — the exposure the whole
+    route exists to avoid. ``write_config_atomically`` refuses to publish a document
+    whose write INTRODUCES one, or changes the mapping while one stays in it
+    (:class:`kiro_crew.config.loader.ConfigWriteRefused`), so a plaintext typed into
+    ``config set`` never reaches disk; a plaintext an older build already landed,
+    left untouched by a write to some other field, publishes with the key named on
+    the log, and the spawn-time validator repeats the check as the second line for
+    a file edited by hand.
+
+    Returns NAMES only, sorted, never values: the result is destined for an error
+    message that must be safe on a terminal and in a log. A non-dict shape has no
+    entries and returns empty; :func:`coerce_deepseek_env` is what drops it.
+    """
+    if not isinstance(raw, dict):
+        return ()
+    return tuple(
+        sorted(
+            str(key)
+            for key, value in raw.items()
+            if not (isinstance(value, str) and value.startswith(SECRET_URI_PREFIX))
+        )
+    )
+
+
+def coerce_deepseek_env(raw: object) -> dict[str, str]:
+    """Normalize ``agent.deepseek_env`` to a plain env-var-name -> value mapping.
+
+    TYPE coercion ONLY, and that split is deliberate. What a name may BE for this
+    mapping — a POSIX identifier, inside the harness's own child-environment scrub
+    class, not a name Kiro Crew or the harness owns — is checked at SPAWN, in the
+    DeepSeek arm, where a bad entry REFUSES the session with a message naming the
+    offending env-var key (``acp/client.py``). Dropping such an entry here instead
+    would hand the operator a harness with no provider key, a config file whose
+    entry silently disappeared on the next write, and no error naming why. So the
+    only thing refused here is a shape the dataclass cannot hold. The VALUE rule —
+    a ``secret://`` reference, never a plaintext key — is the exception, enforced
+    earlier still, at the publish floor (:func:`deepseek_env_plaintext_keys`),
+    because a plaintext that reaches disk is already the defect.
+
+    Nothing is stripped either: a name with surrounding whitespace is not a POSIX
+    identifier, and the spawn-time refusal says so by name rather than quietly
+    repairing it into a different variable than the operator wrote.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: value for key, value in raw.items() if isinstance(key, str) and isinstance(value, str)
+    }
 
 
 def coerce_effort(raw: object) -> str:
@@ -1038,6 +1094,29 @@ class AgentConfig:
         default="",
         metadata=_meta("Default Agent", "Default agent name for new sessions."),
     )
+    deepseek_env: dict[str, str] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "DeepSeek Harness provider keys",
+            "Provider keys handed to the DeepSeek Harness ('deepseek' backend) as "
+            "environment variables at spawn, mapping an environment-variable NAME "
+            "to a 'secret://<vault name>' reference. The harness resolves a "
+            "provider credential from its inherited environment above its own "
+            "credential files, so this is how it reaches a hosted model without "
+            "Kiro Crew leaving those files readable inside the sandbox. Store the "
+            "key under Settings > Secrets, then map it here, e.g. "
+            '{"DEEPSEEK_API_KEY": "secret://my-dsh-key"}. Any provider name the '
+            "harness knows works (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...). A "
+            "plaintext value is REFUSED at write time -- the config write itself "
+            "fails, so no credential is ever stored in config.json -- and so, at "
+            "spawn, is a name the harness would forward to its own shell "
+            "children, a name Kiro Crew owns, or one Kiro Crew's agent "
+            "environment scrub strips; the DeepSeek session is refused before it "
+            "starts with a message naming the offending key. Empty means no key: "
+            "a model served locally on this machine needs none. Ignored by every "
+            "other backend.",
+        ),
+    )
     sweep_agents_backups: bool = field(
         default=False,
         metadata=_meta(
@@ -1665,6 +1744,27 @@ class AgentConfig:
             "same fence that binds it when Session Control is on.",
         ),
     )
+    crew_panel: bool = field(
+        default=True,
+        metadata=_meta(
+            "Crew Dashboard",
+            "Let a crew member publish its own webview, shown in that member's "
+            "drawer on the Crew page. A member sends a JSON object and names a "
+            "template that renders it, so a long-running crew can say what it is "
+            "holding, which worker is stuck and what needs a decision, to someone "
+            "who is not reading its transcript. On by default, because a crew that "
+            "cannot be watched is the thing this surface exists to fix. The tools "
+            "come from the kirocrew-panel MCP server, so the grant follows the "
+            "same rule as every other MCP server: an agent that does not mount it "
+            "never has them. Turn this off to withdraw the capability from every "
+            "member at once without editing each spec, and the withdrawal is "
+            "immediate: the publish route reads this switch on every call, so a "
+            "member whose session was already running loses the panel too. A "
+            "member writes only its OWN panel: the server resolves the publishing "
+            "crew from the calling session and takes no crew or session argument, "
+            "and a subagent has no panel to write.",
+        ),
+    )
     subagent_cost_gb: float = field(
         default=0.5,
         metadata=_meta(
@@ -1817,6 +1917,10 @@ class AgentConfig:
         self.role_efforts = coerce_role_efforts(self.role_efforts)
         self.subagent_backend_fallback = coerce_backend_fallback(self.subagent_backend_fallback)
         self.subagent_backend_limits = coerce_backend_limits(self.subagent_backend_limits)
+        # Same defensive TYPE coercion for the DeepSeek provider-key map. What its
+        # names and values may BE is refused at spawn, by name -- see
+        # coerce_deepseek_env.
+        self.deepseek_env = coerce_deepseek_env(self.deepseek_env)
         # Same defensive coercion for the throttle-fallback model: normalize to
         # ""/"auto"/acp id, so consumers can trust the stored shape.
         self.fallback_model = coerce_fallback_model(self.fallback_model)
@@ -2090,11 +2194,15 @@ class MemoryConfig:
         metadata=_meta(
             "Embedding Threads",
             "CPU threads for an explicit memory query or user-started re-embedding. "
-            "Defaults to 4, capped one core below the machine's core count -- never "
-            "below one thread, so a single-core host still embeds -- to leave the "
+            "Defaults to 4, capped one core below the CPUs this process may run on -- "
+            "never below one thread, so a single-core host still embeds -- to leave the "
             "event loop a core wherever there is one to spare; 4 means that default, "
-            "so pinning threads on a 4-core host takes another number. Any other "
-            "setting is honoured up to the core count. All memory stores share one "
+            "so pinning threads where the process may use 4 or fewer CPUs takes "
+            "another number. Any other "
+            "setting is honoured up to that count, which a CPU-set restriction "
+            "(--cpuset-cpus, taskset) narrows; a CFS quota (--cpus, cpu.max) sets "
+            "no mask and is not seen, while a limit a scheduler turns into an "
+            "exclusive cpuset is. All memory stores share one "
             "model and inference worker. "
             "V2 message context does not run an embedding search; V1 retains "
             "its session-start retrieval.",
@@ -2111,7 +2219,7 @@ class MemoryConfig:
             "use fewer resources rather than finish early. Both classes share one "
             "inference worker; waiting interactive queries take priority. 0 means "
             "inherit Embedding Threads. Explicit settings are honoured up to "
-            "the machine's core count.",
+            "the CPUs this process may run on.",
         ),
     )
     embedding_bulk_duty: float = field(
@@ -3108,6 +3216,17 @@ class DashboardConfig:
             restart=True,
         ),
     )
+    crewmate_threads: bool = field(
+        default=False,
+        metadata=_meta(
+            "Reply threads on crewmate chat messages",
+            "Let any message in a crewmate's chat carry its own reply thread, "
+            "opened in the side panel while the main chat stays visible. Off by "
+            "default: the thread routes answer not-found, no thread frame is sent, "
+            "and the dashboard draws no Reply in thread control. Takes effect on "
+            "the next request; no restart.",
+        ),
+    )
     qr_session_until_restart: bool = field(
         default=True,
         metadata=_meta(
@@ -3321,19 +3440,6 @@ class DashboardConfig:
             "model outputs, so each linked site sees a request from your IP "
             "address. When false the /api/link-meta endpoint fetches nothing and "
             "returns 403.",
-        ),
-    )
-    usage_text_scrape_enabled: bool = field(
-        default=False,
-        metadata=_meta(
-            "Spend Credits To Read The Credit Meter",
-            "Let the credit pill fall back to a `kiro-cli /usage` chat turn when "
-            "the free usage API returns no plan. That fallback is a REAL billed "
-            "LLM turn on whichever model the lite agent resolves, and it repeats "
-            "on every refresh interval for as long as any dashboard tab is open, "
-            "so it is off by default: a meter that reports spending must not "
-            "itself spend. While it is off the pill shows whatever the free API "
-            "returned and hides when the API has nothing to show.",
         ),
     )
     tail_fork_enabled: bool = field(
@@ -3623,6 +3729,16 @@ class DashboardConfig:
             "opt-out, and a ping sent before the offer makes the offer meaningless.",
         ),
     )
+    crewmates_onboarded: bool = field(
+        default=False,
+        metadata=_meta(
+            "Crewmates Onboarded",
+            "Whether the user has finished or dismissed the first-run Meet CrewMates "
+            "flow (the four-step introduction that creates the first crewmate). "
+            "Server-backed like the other first-run flags so a second machine does "
+            "not replay it. Also set when the flow is re-run from the Crewmates page.",
+        ),
+    )
     user_role: str = field(
         default="",
         metadata=_meta(
@@ -3810,6 +3926,17 @@ class KiroCrewAgentConfig:
             "its role effort). A per-session pick still overrides this. Only "
             "reasoning-capable models accept a level; on any other model the pin "
             "is ignored, exactly as the global default is.",
+        ),
+    )
+    display_name: str = field(
+        default="",
+        metadata=_meta(
+            "Display Name",
+            "Optional label the dashboard shows instead of the agent's name. "
+            "Purely presentational: the name stays the immutable identity — it "
+            "keys this record, addresses /api/agents/{name}, and is what "
+            "dispatch, crons and spawn resolve — so renaming the label never "
+            "breaks a binding. Empty means the dashboard shows the name itself.",
         ),
     )
     description: str = field(
@@ -4639,10 +4766,24 @@ class ChannelConfig:
         )
 
 
-#: The provider an unusable ``stt.provider`` degrades to, and the default. It is
-#: the only one with no precondition: recognition runs in this process on every
-#: supported OS, with no account, no platform floor, and no separate install.
+#: The default provider, and the one a RETIRED ``stt.provider`` degrades to. It is
+#: the only recogniser with no precondition: recognition runs in this process on
+#: every supported OS, with no account, no platform floor, and no separate install.
 STT_PROVIDER_LOCAL = "local"
+
+#: No recogniser at all. Selectable, so that "turn speech off" has a value a user
+#: can write from the CLI, and the value an UNKNOWN ``stt.provider`` degrades to.
+#: The distinction from ``enabled=False`` is only where it is set: both leave
+#: every speech path answering "disabled", nothing is loaded and nothing bills.
+#:
+#: Degrading an unknown value onto ``local`` instead would put a typo, or a value
+#: a bot guessed at, onto the one provider that links a native library into this
+#: process: a user told to set ``stt.provider off`` while that library is
+#: crashing on model load gets the crashing engine back, and learns it only from
+#: a WARNING line (kirodotdev/KiroCrew#13179). A value the loader cannot honour
+#: fails closed: whatever was meant, "run nothing" is the one reading that cannot
+#: make things worse.
+STT_PROVIDER_OFF = "off"
 
 #: Local Whisper can detect the spoken language; forcing English corrupts
 #: multilingual dictation before the recogniser can choose the right tokens.
@@ -4653,7 +4794,9 @@ STT_LANGUAGE_FALLBACK = "en-US"
 #: ``apple`` uses macOS 26+ on-device recognition, and ``transcribe`` sends audio
 #: to AWS Transcribe (billed, and gated on the AWS consent prompt). All three
 #: produce partial results, so streaming is not a per-provider capability.
-_VALID_STT_PROVIDERS = (STT_PROVIDER_LOCAL, "apple", "transcribe")
+#: ``off`` selects no recogniser; it is deliberately absent from
+#: ``stt_stream._STREAMING_PROVIDERS``, which grants by positive membership.
+_VALID_STT_PROVIDERS = (STT_PROVIDER_LOCAL, "apple", "transcribe", STT_PROVIDER_OFF)
 
 #: Providers a stored config may still name. Each of these needed an out-of-band
 #: install the user had to perform themselves (a whisper CLI on ``PATH``, or an
@@ -4691,24 +4834,47 @@ def stt_provider_is_coerced(value: object) -> bool:
     return value not in _VALID_STT_PROVIDERS
 
 
+def stt_provider_resolution(value: object) -> str:
+    """The provider a stored ``stt.provider`` of *value* runs as. Pure; never logs.
+
+    Where an unusable value degrades TO depends on what is known about it. A
+    retired name lands on ``local``: that user had local recognition and keeps
+    it. Anything else lands on :data:`STT_PROVIDER_OFF`: a value nobody can
+    account for must not select the provider that links a native library into
+    the gateway. A JSON ``null`` names nothing, so it is the ABSENT key, not a
+    wrong one: it takes the default the way a missing key does.
+
+    Separate from :func:`_validated_stt_provider` so a surface that only needs
+    the answer -- ``kirocrew config defaults --adopt`` deciding what to write --
+    can ask without triggering, or having to suppress, the load-time notice.
+    """
+    if value in _VALID_STT_PROVIDERS:
+        return str(value)
+    if value is None or value in _RETIRED_STT_PROVIDERS:
+        return STT_PROVIDER_LOCAL
+    return STT_PROVIDER_OFF
+
+
 def _validated_stt_provider(value: object) -> str:
-    """Return *value* if it is selectable, else degrade to ``local`` with a reason.
+    """:func:`stt_provider_resolution`, with the load-time notice for a degrade.
 
     Degrades and logs; never raises. This value arrives from ``config.json``, so
-    an unusable one must leave voice input working the way
+    an unusable one must leave the load working the way
     :func:`_normalize_acp_backend` degrades an unusable persisted backend, rather
     than failing the load that read it.
 
     The notice names the command that removes the dead value. A load never writes,
     so without that pointer the line repeats on every invocation forever -- and
     unlike a superseded default there is nothing here to preserve, since the stored
-    value cannot take effect either way.
+    value cannot take effect either way. A ``null`` says nothing: it is the absent
+    key, not a wrong one.
     """
-    if value in _VALID_STT_PROVIDERS:
-        return str(value)
+    resolved = stt_provider_resolution(value)
+    if value in _VALID_STT_PROVIDERS or value is None:
+        return resolved
     seen = repr(value)
     if seen in _WARNED_STT_PROVIDERS:
-        return STT_PROVIDER_LOCAL
+        return resolved
     _WARNED_STT_PROVIDERS.add(seen)
     if value in _RETIRED_STT_PROVIDERS:
         logger.warning(
@@ -4717,17 +4883,19 @@ def _validated_stt_provider(value: object) -> str:
             "recognising the same speech. Run 'kirocrew config defaults --adopt' "
             "to drop the stored value and this notice.",
             value,
-            STT_PROVIDER_LOCAL,
+            resolved,
         )
     else:
         logger.warning(
-            "Unknown STT provider %r; using %r instead. Selectable providers: %s. "
-            "Run 'kirocrew config defaults --adopt' to drop the stored value.",
+            "Unknown STT provider %r; using %r instead, so no recogniser runs until "
+            "the value is fixed. Selectable providers: %s. Run "
+            "'kirocrew config set stt.provider <provider>' to choose one, or "
+            "'kirocrew config defaults --adopt' to drop the stored value.",
             value,
-            STT_PROVIDER_LOCAL,
+            resolved,
             ", ".join(_VALID_STT_PROVIDERS),
         )
-    return STT_PROVIDER_LOCAL
+    return resolved
 
 
 def _validated_stt_model(value: object) -> str:
@@ -5065,7 +5233,8 @@ class SttConfig:
             "account (it downloads one model the first time you dictate), `apple` "
             "uses the on-device recogniser built into macOS 26 and later, and "
             "`transcribe` sends your audio to AWS Transcribe, which bills your AWS "
-            "account.",
+            "account. `off` runs no recogniser at all, the same as turning speech "
+            "input off.",
             enum=list(_VALID_STT_PROVIDERS),
         ),
     )
@@ -5983,6 +6152,24 @@ class NudgeWakeConfig:
         ),
     )
 
+    quiet_streak_floor: int = field(
+        default=0,
+        metadata=_meta(
+            "Quiet ticks before firing anyway",
+            "How many QUIET verdicts in a row end the run of skipped turns. The Nth "
+            "consecutive QUIET tick FIRES regardless of its own verdict, so this many "
+            "quiet verdicts skip one fewer turn than the number suggests, and a judge "
+            "that is wrong about a subject costs a late turn rather than silence. 0, "
+            "the default, means inherit the shipped floor -- the same number the typed "
+            "probe path uses, spelled once in the loop engine so the two cannot drift. "
+            "A negative value also reads as inherit. This knob only ever SHORTENS the "
+            "silence window: the shipped floor is the ceiling, and a larger value is "
+            "clamped back down to it, because config.json is writable by an "
+            "auto-approved agent shell and a raised floor would silence a watch with "
+            "no new code, only a number.",
+        ),
+    )
+
     @classmethod
     def from_raw(cls, section: object) -> "NudgeWakeConfig":
         """Normalize rather than reject, the posture the whole section takes.
@@ -6005,6 +6192,12 @@ class NudgeWakeConfig:
             # cannot use would make the saved config disagree with what the operator
             # wrote, and the bound that matters is at the call that names a model.
             llm_model=raw_model.strip() if isinstance(raw_model, str) else "",
+            # Absent, malformed and negative all read as 0, which the engine resolves
+            # to its shipped floor. The ceiling is NOT clamped here: it is the engine's
+            # own constant, and importing it would invert this module's dependency on
+            # the loop engine (which imports ``config.loader`` at module scope). The
+            # engine clamps on every read, so an over-large value never takes effect.
+            quiet_streak_floor=_safe_int(section.get("quiet_streak_floor", 0), 0, 0),
         )
 
 
@@ -6132,8 +6325,9 @@ class DecisionsConfig:
         default_factory=NudgeWakeConfig,
         metadata=_meta(
             "Wake judge",
-            "Per-point settings for nudge.wake: which judge answers, and the model "
-            "id for the small-model lane. The Jev lane still needs this point's "
+            "Per-point settings for nudge.wake: which judge answers, the model "
+            "id for the small-model lane, and how long a judge may keep a loop "
+            "quiet before one fires anyway. The Jev lane still needs this point's "
             "consent scope on the Decisions card; the small-model lane needs no "
             "consent row, because it sends to the model provider your sessions "
             "already use, so picking it here is what runs it.",

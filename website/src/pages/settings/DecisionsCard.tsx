@@ -371,11 +371,13 @@ export function DecisionsCard() {
     tool_args: i18nT('pages.developer.featurePreviewsTab.decisions_tool_args'),
     compaction: i18nT('pages.developer.featurePreviewsTab.decisions_compaction'),
     memory_text: i18nT('pages.developer.featurePreviewsTab.decisions_memory_text'),
+    nudge_evidence: i18nT('pages.developer.featurePreviewsTab.decisions_nudge_evidence'),
   }
   const SCOPE_DESC: Record<string, string> = {
     tool_args: i18nT('pages.developer.featurePreviewsTab.decisions_tool_args_desc'),
     compaction: i18nT('pages.developer.featurePreviewsTab.decisions_compaction_desc'),
     memory_text: i18nT('pages.developer.featurePreviewsTab.decisions_memory_text_desc'),
+    nudge_evidence: i18nT('pages.developer.featurePreviewsTab.decisions_nudge_evidence_desc'),
   }
   const TIER_LABEL: Record<string, string> = {
     simple: i18nT('pages.developer.featurePreviewsTab.decisions_tier_simple'),
@@ -406,6 +408,7 @@ export function DecisionsCard() {
     tool_args: view.toolArgs,
     compaction: view.compaction,
     memory_text: view.memoryText,
+    nudge_evidence: view.nudgeEvidence,
   }
 
   const nameOf = (id: string) => POINT_NAME[id] ?? id

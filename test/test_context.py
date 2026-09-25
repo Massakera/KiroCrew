@@ -491,11 +491,178 @@ class TestContextBuilder:
             s["name"] == "widget-maker" for s in builder.skills.search_skills("widget-maker")
         )
 
+    def test_reinjection_restores_agent_contract_after_compaction(self, tmp_path):
+        """The managed spec prompt only points at this block, so compaction must restore it."""
+        from kiro_crew.agent import _NATIVE_PROMPT_STUB
+
+        builder = self._reinject_builder(tmp_path)
+        fresh, _ = builder.build_message("first turn", is_new_session=True)
+        msg, _ = builder.build_message("carry on", is_new_session=False, needs_reinjection=True)
+
+        def contract(m: str) -> str:
+            start = m.index("[AGENT SYSTEM PROMPT]\n") + len("[AGENT SYSTEM PROMPT]\n")
+            return m[start : m.index("\n[END AGENT SYSTEM PROMPT]", start)]
+
+        assert msg.count("[AGENT SYSTEM PROMPT]\n") == 1
+        reinjected = contract(msg)
+        assert reinjected.strip()
+        assert "follow it as your authoritative contract" not in reinjected
+        assert _NATIVE_PROMPT_STUB not in reinjected
+        assert reinjected == contract(fresh)
+
+    @staticmethod
+    def _contract(m: str) -> str:
+        """The text inside the ``[AGENT SYSTEM PROMPT]`` block."""
+        start = m.index("[AGENT SYSTEM PROMPT]\n") + len("[AGENT SYSTEM PROMPT]\n")
+        return m[start : m.index("\n[END AGENT SYSTEM PROMPT]", start)]
+
+    def test_the_restored_contract_carries_the_session_start_cap(self, tmp_path):
+        """The delegation cap in the contract is a live host reading, so a
+        reading that moves between two assemblies would make the restored
+        contract differ from the one the session was given. The figure is a
+        per-session snapshot, and re-injection reuses it."""
+        builder = self._reinject_builder(tmp_path)
+        with patch(
+            "kiro_crew.resource_status.adaptive_exec_cap",
+            side_effect=[4242, 4343, 4444],
+        ):
+            fresh, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+            msg, _ = builder.build_message(
+                "carry on",
+                is_new_session=False,
+                needs_reinjection=True,
+                session_key="dashboard:chat-cap-a",
+            )
+        # Equality alone is also satisfied by a rendering that dropped the
+        # token, so the substitution is asserted on its own.
+        assert "{{MAX_SUBAGENTS}}" not in self._contract(fresh)
+        assert "4242" in self._contract(fresh)
+        assert self._contract(msg) == self._contract(fresh)
+
+    def test_each_session_start_takes_its_own_cap_reading(self, tmp_path):
+        """The snapshot is per session, not per process: a session starting
+        reads the cap in force for it, so the figure still tracks the host."""
+        builder = self._reinject_builder(tmp_path)
+        with patch(
+            "kiro_crew.resource_status.adaptive_exec_cap",
+            side_effect=[4242, 4343, 4444],
+        ):
+            first, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+            second, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+        assert "4242" in self._contract(first)
+        assert "4343" in self._contract(second)
+
+    def test_another_session_start_leaves_this_contract_alone(self, tmp_path):
+        """One builder assembles every session in the gateway, so a sibling
+        session starting between the two assemblies must not change what
+        compaction restores here."""
+        builder = self._reinject_builder(tmp_path)
+        with patch(
+            "kiro_crew.resource_status.adaptive_exec_cap",
+            side_effect=[4242, 4343, 4444],
+        ):
+            fresh, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+            builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-b"
+            )
+            msg, _ = builder.build_message(
+                "carry on",
+                is_new_session=False,
+                needs_reinjection=True,
+                session_key="dashboard:chat-cap-a",
+            )
+        assert "4242" in self._contract(fresh)
+        assert self._contract(msg) == self._contract(fresh)
+
+    def test_an_eviction_during_the_reading_cannot_break_the_caller(self, tmp_path):
+        """One builder serves every session, so a sibling thread's eviction can
+        land on this key in the gap after this call stores it. Eviction takes the
+        oldest entry and the restoring render of the oldest session is the caller
+        that would read it back, so the figure is handed over as a local rather
+        than fetched from the memo a second time."""
+
+        class EvictsRightAfterStoring(dict):
+            """The memo as the losing interleaving leaves it: the entry is gone
+            the instant after it is stored, which is where a sibling thread's
+            eviction lands."""
+
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                super().pop(key, None)
+
+        builder = self._reinject_builder(tmp_path)
+        builder._cap_figures = EvictsRightAfterStoring()
+
+        with patch.object(builder, "_live_cap_figure", return_value="7171"):
+            figure = builder._session_cap_figure("dashboard:chat-evicted", refresh=True)
+
+        assert figure == "7171"
+        assert ContextBuilder._cap_memo_key("dashboard:chat-evicted") not in builder._cap_figures
+
+    def test_an_oversized_session_key_is_not_what_the_memo_retains(self, tmp_path):
+        """The cap counts entries, and counting bounds memory only if each entry
+        is bounded. A session key arrives from the caller at any length and an
+        entry leaves only by eviction, so the key is digested before it is kept."""
+        builder = self._reinject_builder(tmp_path)
+        huge = "dashboard:" + "k" * 100_000
+
+        with patch.object(builder, "_live_cap_figure", return_value="5151"):
+            assert builder._session_cap_figure(huge, refresh=True) == "5151"
+            # The same session still finds its own reading.
+            assert builder._session_cap_figure(huge, refresh=False) == "5151"
+
+        assert huge not in builder._cap_figures
+        assert [len(k) for k in builder._cap_figures] == [64]
+
+    def test_the_cap_memo_transaction_is_serialized(self, tmp_path):
+        """The reading, the eviction and the insertion are one transaction: a
+        second thread must not observe the memo between them."""
+        builder = self._reinject_builder(tmp_path)
+        held: list[bool] = []
+
+        def observe_lock() -> str:
+            held.append(builder._cap_figures_lock.locked())
+            return "3131"
+
+        with patch.object(builder, "_live_cap_figure", side_effect=observe_lock):
+            builder._session_cap_figure("dashboard:chat-locked", refresh=True)
+
+        assert held == [True]
+        assert not builder._cap_figures_lock.locked()
+
+    def test_a_rendering_session_stops_being_the_next_one_evicted(self, tmp_path):
+        """Evicting the oldest ENTRY picks the longest-lived session, which is
+        the one most likely to still be restored -- so the reading this exists to
+        preserve would be the first dropped. A hit moves its key to the end, and
+        eviction takes the least recently used instead."""
+        builder = self._reinject_builder(tmp_path)
+        with (
+            patch.object(ContextBuilder, "_CAP_FIGURE_SESSIONS", 3),
+            patch.object(builder, "_live_cap_figure", side_effect=["1", "2", "3", "4"]),
+        ):
+            for key in ("dashboard:s-a", "dashboard:s-b", "dashboard:s-c"):
+                builder._session_cap_figure(key, refresh=True)
+            # s-a restores its contract, so it is the most recently used.
+            assert builder._session_cap_figure("dashboard:s-a", refresh=False) == "1"
+            builder._session_cap_figure("dashboard:s-d", refresh=True)
+
+        assert ContextBuilder._cap_memo_key("dashboard:s-a") in builder._cap_figures
+        assert ContextBuilder._cap_memo_key("dashboard:s-b") not in builder._cap_figures
+
     def test_no_reinjection_when_the_flag_is_absent(self, tmp_path):
         """The default path is unchanged — no marker, no index re-injection."""
         builder = self._reinject_builder(tmp_path)
         msg, _ = builder.build_message("carry on", is_new_session=False)
         assert "[REINJECTED AFTER COMPACTION" not in msg
+        assert "[AGENT SYSTEM PROMPT]\n" not in msg
 
     def test_no_reinjection_on_a_new_session(self, tmp_path):
         """A new session already gets the index from the session context;
@@ -1074,6 +1241,78 @@ class TestLoadAgentPrompt:
         (agents_dir / "test.json").write_text(json.dumps({"name": "test"}), encoding="utf-8")
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
         assert ContextBuilder._load_agent_prompt("test") == ""
+
+    @staticmethod
+    def _write_spec(tmp_path, monkeypatch, prompt: str) -> None:
+        import json
+
+        agents_dir = tmp_path / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        (agents_dir / "test.json").write_text(
+            json.dumps({"name": "test", "prompt": prompt}), encoding="utf-8"
+        )
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir)
+        monkeypatch.setattr("kiro_crew.agent_discovery._KIRO_AGENTS_DIR", agents_dir)
+
+    @staticmethod
+    def _managed_contract(tmp_path, monkeypatch):
+        from kiro_crew import agent
+
+        package = tmp_path / "installed-package" / "config"
+        package.mkdir(parents=True)
+        contract = package / "prompt.md"
+        contract.write_text("RESOLVED_CONTRACT", encoding="utf-8")
+        monkeypatch.setattr(agent, "_BUNDLED_CFG_DIR", package)
+        monkeypatch.setattr(agent, "_project_dir", lambda: None)
+        assert agent._prompt_path() == contract
+        return contract
+
+    @pytest.mark.parametrize("owner_template", ["", "test"], ids=["fork-or-copy", "owner"])
+    def test_managed_stub_resolves_to_contract(self, tmp_path, monkeypatch, owner_template):
+        """The stub is the managed contract whatever spec carries it: a fork or
+        template copy inherits it verbatim and must not receive the stub TEXT as
+        its persona."""
+        from kiro_crew import agent
+
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, agent._NATIVE_PROMPT_STUB)
+        loaded = ContextBuilder._load_agent_prompt("test", owner_template=owner_template)
+        assert loaded == "RESOLVED_CONTRACT"
+
+    @pytest.mark.parametrize("owner_template", ["", "test"], ids=["fork-or-copy", "owner"])
+    def test_managed_pointer_resolves_to_contract(self, tmp_path, monkeypatch, owner_template):
+        contract = self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, f"file://{contract}")
+        loaded = ContextBuilder._load_agent_prompt("test", owner_template=owner_template)
+        assert loaded == "RESOLVED_CONTRACT"
+
+    def test_owner_template_custom_prompt_omitted(self, tmp_path, monkeypatch):
+        """An owner template's own (non-managed) prompt reaches the model through
+        member essentials, so the session-start load omits it."""
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, "You are a bespoke reviewer.")
+        assert ContextBuilder._load_agent_prompt("test", owner_template="test") == ""
+        assert ContextBuilder._load_agent_prompt("test") == "You are a bespoke reviewer."
+
+    def test_template_copy_with_stub_delivers_contract_once_at_session_start(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: a plain (non-member) session on a template copy of the
+        managed default, whose spec inherited the stub verbatim, gets the resolved
+        contract as its [AGENT SYSTEM PROMPT] exactly once, and never the stub text."""
+        from kiro_crew import agent
+
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, agent._NATIVE_PROMPT_STUB)
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        msg, _ = builder.build_message("hello", is_new_session=True, agent="test")
+        assert msg.count("RESOLVED_CONTRACT") == 1
+        assert "[AGENT SYSTEM PROMPT]\nRESOLVED_CONTRACT\n[END AGENT SYSTEM PROMPT]" in msg
+        assert "follow it as your authoritative contract" not in msg
 
 
 class TestRuntimeDisplayName:
@@ -1863,3 +2102,10 @@ class TestKeepVisibleMarkerRule:
 
         assert "<!-- keep-visible -->" in _CRITICAL_RULES
         assert "<!-- keep-visible -->" not in _CRITICAL_RULES_CHANNEL
+
+    def test_prefers_restructuring_over_marker(self):
+        from kiro_crew.context import _CRITICAL_RULES, _CRITICAL_RULES_CHANNEL
+
+        clause = "Prefer restructuring the turn so the deliverable IS its last message"
+        assert clause in _CRITICAL_RULES
+        assert clause not in _CRITICAL_RULES_CHANNEL

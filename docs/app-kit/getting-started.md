@@ -259,10 +259,24 @@ use the toggle methods instead. Foreign and missing job IDs are refused.
 ## Shared React Query
 
 Externalize `@tanstack/react-query` when bundling your app. The dashboard import
-map resolves that specifier to the host's module instance, so hooks such as
-`useQuery`, `useMutation` and `useQueryClient` use the dashboard's existing
-provider. Do not bundle a second copy of React Query. Use `useAppApi()` inside
-query and mutation functions to retain scoped transport and host session binding.
+map resolves that specifier to the host's module instance, so `useQuery`,
+`useMutation` and `useQueryClient` work with no provider of your own. Do not
+bundle a second copy of React Query. Use `useAppApi()` inside query and mutation
+functions to retain scoped transport and host session binding.
+
+The module is shared; the cache is not. `useQueryClient()` returns a client the
+host creates for your app, so your keys, `clear()` and `invalidateQueries()` reach
+only your app's cache, and dashboard keys are neither readable nor writable from
+your bundle. That client is kept per app AND per host session for as long as the
+dashboard page lives, so returning to your page under the same host surface reuses
+the same cache rather than a fresh one. Your app mounted in two places bound to
+different sessions -- its own page and a chat side panel, or two panels -- gets one
+cache each, so a key you write in one never answers a read in the other. An
+individual query inside it still expires on React Query's own `gcTime` once
+nothing observes it, which is the default five minutes unless your query sets a
+longer one; the dashboard's thirty-minute app retention window is registered for
+builtin pages only. Dashboard data is available through `useAppApi()` under the
+paths your `app.json` declares.
 
 ## Permissions
 

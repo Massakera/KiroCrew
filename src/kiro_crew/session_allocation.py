@@ -10,6 +10,7 @@ are supplied through :class:`AllocationDeps`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 import time
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from kiro_crew.agent_spec_format import iter_agent_spec_files
+from kiro_crew.kiro_prerequisite import pre_spawn_identity, spawn_pid, stamp_spawn_identity
 from kiro_crew.metrics.sessions import (
     END_REASON_EVICTED,
     discard_session_start,
@@ -139,6 +141,11 @@ class SessionRegistryState:
     ownership_generations: dict[str, int] = field(default_factory=dict)
     subagent_runtimes: dict[str, Any] = field(default_factory=dict)
     subagent_runtime_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    #: Busy wrong-account companion runtimes displaced out of
+    #: ``subagent_runtimes`` by the spawn-identity gate: unclaimable while
+    #: parked (a fresh acquisition spawns a replacement under the live
+    #: account), so their in-flight work drains before the reap kills them.
+    draining_subagent_runtimes: list[Any] = field(default_factory=list)
     continuable_keys: set[str] = field(default_factory=set)
     capability_failures: dict[str, dict[str, str]] = field(default_factory=dict)
     continuable_fallback: Callable[[str], bool] | None = None
@@ -391,6 +398,14 @@ class SessionAllocationService:
         self.state.subagent_runtime_locks = value
 
     @property
+    def _draining_subagent_runtimes(self) -> list[Any]:
+        return self.state.draining_subagent_runtimes
+
+    @_draining_subagent_runtimes.setter
+    def _draining_subagent_runtimes(self, value: list[Any]) -> None:
+        self.state.draining_subagent_runtimes = value
+
+    @property
     def _continuable_keys(self) -> set[str]:
         return self.state.continuable_keys
 
@@ -530,6 +545,15 @@ class SessionAllocationService:
                 )
                 kwargs = self._owner._parent_runtime_kwargs(parent_session_key)
                 runtime = runtime_type(agent=selected_agent, **kwargs)
+                # Bracket the spawn with identity reads so this runtime carries
+                # a spawn stamp: every subagent session demuxed onto it
+                # inherits its credential, and the registry pass in
+                # ``flag_identity_stamp_mismatches`` can only compare a stamp
+                # that was recorded. The stamp lands on the runtime object
+                # itself (the gate reads ``runtime.spawn_identity`` directly).
+                pre_spawn = await pre_spawn_identity(
+                    getattr(self._owner, "spawn_identity_reader", None)
+                )
                 try:
                     await runtime.spawn()
                 except runtime_dead:
@@ -544,7 +568,33 @@ class SessionAllocationService:
                         exc_info=True,
                     )
                     continue
-                self._subagent_runtimes[parent_session_key] = runtime
+                # Best-effort spawn-account record; see flag_identity_stamp_mismatches.
+                # A cancellation landing in this read would leak the spawned
+                # runtime before it reaches the registry below, so tear it
+                # down on the way out. The read is also a suspension point
+                # before the registry (the orphan sweep's companion-PID union)
+                # can see this runtime, so shield its PID for the span.
+                starting_pid = spawn_pid(runtime)
+                if starting_pid is not None:
+                    self._starting_pids.add(starting_pid)
+                try:
+                    try:
+                        await stamp_spawn_identity(
+                            getattr(self._owner, "spawn_identity_reader", None),
+                            runtime,
+                            pre_spawn=pre_spawn,
+                        )
+                    except BaseException:
+                        with contextlib.suppress(Exception):
+                            await runtime.kill(
+                                expected=True,
+                                reason="spawn-stamp interrupted before registration",
+                            )
+                        raise
+                    self._subagent_runtimes[parent_session_key] = runtime
+                finally:
+                    if starting_pid is not None:
+                        self._starting_pids.discard(starting_pid)
                 return runtime
 
     async def release_subagent_runtime(self, parent_session_key: str) -> None:
@@ -590,33 +640,73 @@ class SessionAllocationService:
             if existing is not None and existing.is_alive():
                 return existing
             provider = owner._provider_factory(parent_session_key, agent=agent, cwd=cwd)
+            pre_spawn = await pre_spawn_identity(getattr(owner, "spawn_identity_reader", None))
             await provider.start()
-            session_provider = getattr(provider, "_client", None)
-            runtime = getattr(session_provider, "_runtime", None)
-            if session_provider is not None and runtime is not None:
+            # The stamp read below suspends before this provider's runtime is
+            # visible to the orphan sweep's companion-PID union -- shield the
+            # freshly-published PID for the whole start-to-registration span.
+            starting_pid = spawn_pid(provider)
+            if starting_pid is not None:
+                self._starting_pids.add(starting_pid)
+            try:
+                # Record which account the store held as this runtime spawned:
+                # every session later demuxed onto it inherits this credential, so
+                # the stamp lives on the runtime's wrapping provider and is read
+                # back through the ``_runtime`` fallback in
+                # ``flag_identity_stamp_mismatches``. Best-effort; an unstamped
+                # runtime keeps the pre-stamping protections. A cancellation
+                # landing in this read would leak the started provider before it
+                # reaches the registry below, so kill it on the way out.
                 try:
-                    session_provider._owns_runtime = False
-                except Exception:
-                    self._deps.logger.debug("run runtime ownership transfer failed", exc_info=True)
-                self._subagent_runtimes[parent_session_key] = runtime
-                try:
-                    handle = getattr(session_provider, "_handle", None)
-                    session_id = getattr(handle, "session_id", None) or getattr(
-                        handle, "_session_id", None
+                    await stamp_spawn_identity(
+                        getattr(owner, "spawn_identity_reader", None), provider, pre_spawn=pre_spawn
                     )
-                    if session_id:
-                        await runtime.terminate_session(session_id)
+                except BaseException:
+                    owner._dispatch_hard_kill(provider)
+                    raise
+                session_provider = getattr(provider, "_client", None)
+                runtime = getattr(session_provider, "_runtime", None)
+                if session_provider is not None and runtime is not None:
+                    # Sessions demuxed onto this runtime wrap it as ``_runtime``
+                    # on their own providers, so the stamp must live on the
+                    # runtime object itself for the ``_runtime`` fallback in
+                    # ``flag_identity_stamp_mismatches`` to find it.
+                    spawn_stamp = getattr(provider, "spawn_identity", "")
+                    if spawn_stamp:
+                        try:
+                            runtime.spawn_identity = spawn_stamp
+                        except Exception:
+                            self._deps.logger.debug(
+                                "run runtime refused the spawn identity stamp", exc_info=True
+                            )
+                    try:
+                        session_provider._owns_runtime = False
+                    except Exception:
+                        self._deps.logger.debug(
+                            "run runtime ownership transfer failed", exc_info=True
+                        )
+                    self._subagent_runtimes[parent_session_key] = runtime
+                    try:
+                        handle = getattr(session_provider, "_handle", None)
+                        session_id = getattr(handle, "session_id", None) or getattr(
+                            handle, "_session_id", None
+                        )
+                        if session_id:
+                            await runtime.terminate_session(session_id)
+                    except Exception:
+                        self._deps.logger.debug(
+                            "run runtime bootstrap-session terminate failed", exc_info=True
+                        )
+                    return runtime
+                try:
+                    await provider.shutdown()
                 except Exception:
                     self._deps.logger.debug(
-                        "run runtime bootstrap-session terminate failed", exc_info=True
+                        "run runtime bootstrap provider shutdown failed", exc_info=True
                     )
-                return runtime
-            try:
-                await provider.shutdown()
-            except Exception:
-                self._deps.logger.debug(
-                    "run runtime bootstrap provider shutdown failed", exc_info=True
-                )
+            finally:
+                if starting_pid is not None:
+                    self._starting_pids.discard(starting_pid)
         return await owner.get_subagent_runtime(parent_session_key, agent=agent)
 
     async def _reacquire_and_validate(
@@ -975,6 +1065,9 @@ class SessionAllocationService:
     def mapped_sid(self, key: str) -> str:
         return self._owner._session_map.mapped_sid(self._owner._fold_key(key))
 
+    def mapped_session_keys(self) -> frozenset[str]:
+        return frozenset(self._owner._session_map.mapped_sids_by_key())
+
     def seed_conversation(
         self,
         key: str,
@@ -1120,14 +1213,33 @@ class SessionAllocationService:
             return True
         return False
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Callable[[dict], bool] | None = None) -> None:
         key = self._owner._fold_key(key)
         session = self._sessions.get(key)
-        if session:
+        if session is None:
+            return
+        if owned_by is None:
             for _, _, kwargs in session.queue:
                 self._deps.unlink_queued_temp_paths(kwargs)
             session.queue.clear()
             session.cancelled.clear()
+            return
+        # Partitioned BEFORE anything is mutated, so a predicate that raises leaves the
+        # queue exactly as it was. Every entry is already dequeued nowhere else -- this
+        # runs under the caller's receipt lock -- so the pass costs one walk.
+        dropped = [item for item in session.queue if owned_by(item[2])]
+        if not dropped:
+            return
+        kept = [item for item in session.queue if not owned_by(item[2])]
+        for _, _, kwargs in dropped:
+            self._deps.unlink_queued_temp_paths(kwargs)
+        session.queue.clear()
+        session.queue.extend(kept)
+        # ``cancelled`` is deliberately LEFT ALONE. It holds bare message timestamps a
+        # mid-turn cancel asked ``dequeue`` to skip, with nothing on them saying whose
+        # they are, so clearing it here would un-cancel somebody else's cancel request.
+        # The whole-session branch above may clear it because it empties the queue those
+        # timestamps describe.
 
     async def is_provider_alive(self, key: str) -> bool | None:
         key = self._owner._fold_key(key)
@@ -1613,6 +1725,11 @@ class SessionAllocationService:
         if not pool_decision:
             pool_decision = "hit" if pooled is not None else "miss_empty"
         owner._record_pool_decision(pool_decision, key)
+        # Assigned by the cold-start branch inside its semaphore section (the
+        # spawn-identity stamp read there must already run under the shield);
+        # the pool-claim branch leaves it None and is shielded after the
+        # branches converge below.
+        starting_pid: int | None = None
         if pooled is not None:
             provider = pooled
             cast(Any, provider).memory_mode = memory_mode
@@ -1807,25 +1924,55 @@ class SessionAllocationService:
                         if provider.process_instance:
                             raise CapabilityStartupError("capability_runtime_not_fresh")
                         await asyncio.to_thread(verify_saved, preparation, provider.cwd)
+                    pre_spawn = await pre_spawn_identity(
+                        getattr(owner, "spawn_identity_reader", None)
+                    )
                     await provider.start()
                 except (asyncio.CancelledError, Exception):
                     if preparation.revision:
                         self._remember_capability_failure(key, preparation)
                     owner._dispatch_hard_kill(provider)
                     raise
+                # start() has published the PID, and the stamp read below is a
+                # real suspension point before registry ownership becomes
+                # visible in the lock section further down -- shield the PID
+                # from the periodic orphan sweep for that whole span (on
+                # Windows the sweep has no age grace, so an unshielded child
+                # caught mid-stamp would be killed as an orphan).
+                starting_pid = spawn_pid(provider)
+                if starting_pid is not None:
+                    self._starting_pids.add(starting_pid)
+                # Record which account the store held as this child spawned
+                # (first-stamp-wins, so a warm-pool claim keeps its fill-time
+                # stamp). Best-effort: an unstamped child keeps the
+                # pre-stamping protections. The stamp read is a real
+                # suspension point between start() and PID registration, so a
+                # cancellation landing here must kill the started child the
+                # same way the start guard above would -- otherwise the
+                # provider leaks unmanaged until the orphan sweep's grace
+                # window expires.
+                try:
+                    await stamp_spawn_identity(
+                        getattr(owner, "spawn_identity_reader", None),
+                        provider,
+                        pre_spawn=pre_spawn,
+                    )
+                except BaseException:
+                    owner._dispatch_hard_kill(provider)
+                    if starting_pid is not None:
+                        self._starting_pids.discard(starting_pid)
+                    raise
 
-        # start() has published the PID, but registry ownership is not visible
-        # until the lock section below. Shield this narrow orphan-sweep window.
-        starting_pid = getattr(getattr(provider, "client", None), "_pid", None)
-        if not isinstance(starting_pid, int):
-            process = getattr(provider, "_proc", None)
-            starting_pid = (
-                process.pid if process is not None and process.returncode is None else None
-            )
-        if not isinstance(starting_pid, int):
-            starting_pid = None
-        if starting_pid is not None:
-            self._starting_pids.add(starting_pid)
+        # ``starting_pid`` was shielded inside the semaphore section above on
+        # the cold-start path and stays shielded until registry ownership is
+        # visible: the ``finally`` at the end of the registration section
+        # below discards it. A pool-claimed provider took the other branch --
+        # and left ``_pool_pids`` at claim -- so shield it here for the same
+        # start-to-registration span.
+        if starting_pid is None:
+            starting_pid = spawn_pid(provider)
+            if starting_pid is not None:
+                self._starting_pids.add(starting_pid)
 
         won_race_session: Any | None = None
         duplicate_provider: LLMProvider | None = None

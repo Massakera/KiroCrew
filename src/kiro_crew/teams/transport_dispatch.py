@@ -74,6 +74,7 @@ from kiro_crew.messaging.link import (
 from kiro_crew.messaging.queue_drain import (
     drain_until_quiet,
     entry_channel,
+    owner_token,
     register_drain,
     tag_entry,
 )
@@ -228,17 +229,30 @@ def _inbound_origin(inbound: "TeamsInbound") -> _QueuedOrigin:
     )
 
 
+def _entry_owner(inbound: "TeamsInbound") -> str:
+    """The neutral token naming the principal *inbound* came from.
+
+    Built from ``sender_key``, the same value that decides whether two queued messages
+    may share one turn, so "whose entry is this" and "may these collapse together" can
+    never answer differently. ``/stop`` compares it to drop one person's queued messages
+    and leave everybody else's.
+    """
+    return owner_token(_CHANNEL, _inbound_origin(inbound).sender_key)
+
+
 def _origin_kwargs(inbound: "TeamsInbound") -> dict[str, str]:
     """This message's origin as prefixed queue-entry keyword arguments.
 
     The neutral channel tag rides with them because a drain must be able to tell an
     entry it owns from one another transport recorded BEFORE it reads any
     channel-specific field, and because the value names which peer drain to wake for a
-    foreign entry.
+    foreign entry. The owner rides with them for the mirror reason on the clear side:
+    ``/stop`` must tell one person's entries from another's across every transport on
+    the queue, and the prefixed fields below are unreadable to it on a foreign entry.
     """
     origin = _inbound_origin(inbound)
     recorded = {f"{_ORIGIN_PREFIX}{name}": value for name, value in origin._asdict().items()}
-    return tag_entry(recorded, _CHANNEL)
+    return tag_entry(recorded, _CHANNEL, owner_token(_CHANNEL, origin.sender_key))
 
 
 def _wake_template(origin: _QueuedOrigin) -> "TeamsInbound":
@@ -977,7 +991,10 @@ class TeamsDispatcher:
             # An upload with no caption has no text; a placeholder keeps it from
             # showing as a blank line in the receipt.
             await self._queue.create_or_grow_locked(
-                session_key, self._receipt_surface(inbound), text or ATTACHMENT_PLACEHOLDER
+                session_key,
+                self._receipt_surface(inbound),
+                text or ATTACHMENT_PLACEHOLDER,
+                _entry_owner(inbound),
             )
             return True
 
@@ -1152,7 +1169,7 @@ class TeamsDispatcher:
     # ── /stop ──────────────────────────────────────────────────────────────
 
     async def _handle_stop(self, inbound: "TeamsInbound", resumed_key: str | None = None) -> None:
-        """Hard cancel: abort the in-flight turn and clear the queue.
+        """Hard cancel: abort the in-flight turn and clear THIS caller's queued messages.
 
         ``resumed_key`` is the session the ROUTING decision resolved, and it has to be
         threaded in rather than recomputed: a resumed conversation's turns run under the
@@ -1162,12 +1179,18 @@ class TeamsDispatcher:
         The cooperative-cancel contract, the lock ordering across ``clear_queue``
         and the receipt finalize, and both replies live once in
         ``messaging.commands``; only the address-bound receipt surface is ours.
+
+        The owner token comes from this inbound, recorded the same way their queued
+        entries were, so the clear matches their entries and no one else's: under
+        ``dm_scope = "unified"`` this queue also holds other people's messages, and on
+        another transport too.
         """
         reply = await stop_running_turn(
             self.sessions,
             resumed_key or self._session_key(self._identity(inbound)),
             queue=self._queue,
             surface=self._receipt_surface(inbound),
+            owner=_entry_owner(inbound),
         )
         await self._reply(inbound, reply)
 

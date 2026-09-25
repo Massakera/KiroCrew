@@ -236,7 +236,20 @@ def broadcast_thread_reply(
     conversation. Same channel discipline as ``chat.side_result`` -- a receiver
     that does not subscribe never sees it, so thread frames stay out of the main
     transcript by construction.
+
+    Sent only while ``dashboard.crewmate_threads`` is on. The routes refuse
+    before any turn starts, so this guard covers the one turn that was already
+    running when the flag went off: its frames are dropped, and the reply it
+    stores is served again once the flag is back on. The watcher's snapshot is
+    the read (a plain attribute, never a disk load on the loop); before the
+    watcher has one, the frame is dropped too -- the flag is off by default and
+    a frame nobody can act on is the cheaper mistake.
     """
+    from kiro_crew.config import live
+
+    cfg = live.snapshot()
+    if cfg is None or not cfg.dashboard.crewmate_threads:
+        return
     payload: dict[str, object] = {
         "slot": slot_key,
         "mid": mid,

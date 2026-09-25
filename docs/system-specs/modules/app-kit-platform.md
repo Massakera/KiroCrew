@@ -50,8 +50,8 @@ The registry key `@kirocrew/ui` is internal to the host registry,
 not a browser import-map specifier.
 
 `@tanstack/react-query` resolves through the import map to a vendor stub backed
-by the host's existing module instance. Its hooks, providers and context are
-shared with the dashboard; apps must externalize this dependency rather than
+by the host's existing module instance. Its hooks, provider component and context
+are shared with the dashboard; apps must externalize this dependency rather than
 bundle a second copy. Runtime export parity and identity are regression-tested
 against the pinned dependency. That runtime export surface is app-facing: a
 dependency upgrade must preserve those names and their behavior, or ship an
@@ -61,6 +61,39 @@ Apps needing a newly added export declare `minKiroCrewVersion` for the first
 host release supplying it; this minimum-version gate is not protection against
 future incompatible removals. No independent dependency-version negotiation is
 introduced.
+
+The module is shared; the CACHE is not. An external app renders inside a
+host-mounted provider holding a client of that app's own, so `clear()`, the four
+`*Queries` methods with an absent filter, `setQueryData` and an empty-prefix
+`setQueryDefaults` all reach that app's keys only, and no host key is readable
+from an app bundle. The boundary is the client rather than a guarded wrapper
+because a missing filter means every key on four separate methods, so a separate
+cache answers the whole surface at once instead of a list that must stay complete.
+A builtin app keeps the dashboard's client, matching the namespace `useTrustedAppId()`
+already grants it: builtin pages are host code and share key prefixes with the
+dashboard deliberately. The client is held per app id AND per host session binding,
+so the cache an app returns to under one binding is the one it left, two installed
+apps cannot read each other's, and two mounts of ONE app under different bindings
+cannot either. The binding belongs in that identity because the same app id is
+hosted under several at once -- `AppPage` as `dashboard:ui`, a chat side panel as
+`dashboard:<slot>` per slot -- while the binding travels only as the `X-Session-Key`
+header `scopedApi` sends and an external app's query key is passed through
+unprefixed, since `useTrustedAppId()` refuses it a namespace. Without the binding in
+the key, two panels reading one key under two sessions share one entry and
+`staleTime: Infinity` serves the first session's value to the second panel with no
+error surface. A host that passes no binding shares one entry under a sentinel no
+app id can spell. Holding the
+client is not a retention guarantee for the queries in it: `resolveCacheRetention`
+returns `null` for an external app, so its queries expire on the client's own
+`gcTime` and the thirty-minute `APP_CACHE_RETENTION_MS` window belongs to builtin
+pages, which `BuiltinAppRoute` mounts `AppCacheRetention` for.
+Each app client registers with `registerRecoverableQueryClient`, and the host's
+post-lapse recovery invalidation runs through `invalidateAcrossQueryClients`, so a
+query an app lost to a session lapse heals on recovery like a dashboard query.
+That direction is host to app: it refreshes an app's own failed query and reaches
+no host key from an app bundle.
+The dashboard's own client is reachable from host code only; it is absent from
+the import map and from every vendor stub, which is what the boundary rests on.
 
 ## Host-mediated chat launch and cron toggles
 
@@ -690,6 +723,10 @@ Writer: `dashboard/server.py::discover_app_window_entries`
 (`APP_WINDOW_URL_PREFIX = "app-windows"`);
 exclusion: `dashboard/token_auth.py::register_app_window_paths`.
 
+The dashboard service worker also declines every `/app-windows/` request. These are standalone top-level documents, not SPA routes, so a failed app-window navigation must never fall back to the cached dashboard shell. In Electron that fallback can put the full dashboard inside a frameless, non-focusable, full-display overlay with no close controls.
+
+Full-display window hosts additionally fail closed on their own network result. Mochi and Crew Companion hide an overlay whose main-frame navigation completes with a 4xx/5xx response or fails at the transport; Crew Companion also keeps its hidden notification owner inert on either failure. The shared latch classifies completed responses, transport failures, sub-frames, and superseded navigations; each host retains its own visibility, credential, retry, and ownership policy. The corresponding reconcile loop alone may reload failed windows after a gateway probe accepts the current credential. A failed page never performs its reveal or ownership handshake, and retries stay bounded by the reconcile cadence. Writers: `website/public/sw.js`, `website/electron/app-window-error-latch.js`, `website/electron/mochi/petOverlays.js`, `website/electron/crew-companion/petOverlay.js`; executable contracts: `website/src/test/serviceWorkerSkipRules.test.ts`, `website/electron/test/app-window-error-latch.test.js`, `website/electron/mochi/test/petOverlays.test.js`, `website/electron/crew-companion/test/petOverlay.test.js`.
+
 ## 7. Enabled-app resources are reconciled at startup
 
 Registration used to happen ONLY in the enable path, so an app that gained
@@ -880,9 +917,18 @@ sync.
 Uninstall is irreversible, so the whole sequence runs inside the per-app
 lifecycle lock and the one step that can safely refuse runs FIRST:
 
-1. **Cron cleanup** (gateway-managed apps). Owned jobs are removed in one atomic
-   transaction. A contended store aborts the uninstall with a retryable 409
-   having changed nothing. This must precede everything else: past this point
+1. **Cron cleanup** (every app). Owned jobs are removed in one atomic
+   transaction. `resources` does not gate this step: that field is app-written
+   metadata, so gating teardown on it would hand a trusted app a switch for its
+   own cleanup, and it would not describe ownership even if it were trustworthy —
+   an `app:<name>` job is persisted in the GATEWAY's cron store and fired by the
+   gateway's own `CronService`, which applies no app-admission check at fire time.
+   A contended store aborts the uninstall with a retryable 409 having changed
+   nothing, and so does an unexpected write failure: the removal reports that
+   rather than answering with the `0` that also means "this app owned nothing",
+   and the rows cannot be re-counted to tell the two apart because a failing save
+   leaves them filtered out of the in-memory job list until a reload. This must
+   precede everything else: past this point
    deregistration drops the per-app cron manifest and the final step deletes the
    app directory, so still-enabled owned jobs become permanent orphans that the
    scheduler keeps firing with nothing left that knows they belong to a removed
@@ -890,9 +936,156 @@ lifecycle lock and the one step that can safely refuse runs FIRST:
    is itself a store mutation needing the very lock that is contended.
 2. `onUninstall` script, reached only once cron cleanup succeeded, so a
    non-idempotent teardown never runs on an uninstall that will be retried.
-3. Backend stop and resource deregistration (gateway-managed only).
+3. Backend stop (every app), then resource deregistration (gateway-managed only).
+   The stop is ungated for the same reason as step 1, and the port recorded for
+   the app is observed after it: a port still accepting connections is REPORTED,
+   because the stop's own boolean answers `False` both for "there was nothing to
+   stop" and for "something is running that I did not stop", and `True` only for
+   "the process I was tracking is gone", which is silent about a worker the app
+   spawned for itself. The report reaches both `warnings` and the uninstall log,
+   whose consumers are disjoint. Unlike steps 1 and 2 this one does not abort: the
+   non-idempotent `onUninstall` has already run by here, so refusing would strand
+   a half-removed app, and an app that cannot be uninstalled is a worse outcome
+   than one whose port is named as still in use. Deregistration still honors
+   `resources`, because an app that registered its own agents, skills and crons
+   owns their lifecycle and the gateway must not delete them.
 4. Dependency cleanup (see §11).
 5. File removal, preserving `data/` unless the caller asked to purge.
+6. Resume pointers dropped for every conversation the app owned, on success only.
+
+Step 6 exists because an app's slot key is often DETERMINISTIC — one slot per object
+it tracks, named after that object — and `session.py` resumes a slot's previous
+kiro-cli conversation by that key. Correct while the app is installed; wrong once it
+is gone, since a reinstall would open the same key and resume a transcript from the
+previous installation.
+
+Ownership is read from each conversation's own metadata line, which every save —
+including the save that closes a tab — stamps with `app`. Read through
+`get_metadata_status`, not `get_metadata`: the latter answers `{}` for both "no `app`"
+and "could not read the record", and those are different answers. An unreadable record
+is neither claimed (that would sweep up a conversation this app may not own, worse than
+the pointer it leaves) nor dropped in silence — the keys are logged with a count, and
+completion is not refused, because an uninstall the user asked for does not fail over
+bookkeeping. It has to be a record that
+outlives the tab: a closed app slot is the mainline state before an uninstall, and
+both live `_ChatSlot._app` and `open_slots.json` are gone by then (the latter tracks
+tabs to REOPEN, while the resume pointer deliberately survives close). The scan is
+scoped to session-map keys that still hold a sid, so the index is exactly as wide as
+the pointer problem.
+
+**Known residual, and why it is left open.** An allocation that RESERVES after the
+scan is not in the enumeration, so the conversation it goes on to publish keeps its
+pointer. Closing that window means holding turn admission against this app's keys for
+the duration of the uninstall, and the only admission gate on `SessionManager` is
+`pause_turn_admission_for_update`, which sets `_closing` PROCESS-WIDE: it would refuse
+turns for every app and every conversation while one app uninstalls. A per-key
+admission gate is a change to the allocation boundary, not to this cleanup step. The
+cost of the residual is one stale pointer on one key of an app the user has already
+removed, and the next cold start under that key self-corrects once the suppression
+flag is consumed — so it is stated rather than approximated by a retry loop that would
+read as though the window were closed.
+
+Who performs the write differs by path, because `SessionMap`'s rule 3 makes a
+throwaway instance READ-ONLY — two instances that loaded `_data` independently do not
+merge, each write being a whole-file rewrite of one snapshot:
+
+- **In-gateway** (the uninstall route) both ENUMERATES and clears through the LIVE
+  map. It clears via `SessionManager.discard_conversation`, which also tears the live
+  session down, so a still-open tab of the uninstalled app cannot re-record a sid from
+  the session it was holding. It enumerates via
+  `SessionManager.mapped_session_keys() | session_keys()` rather than a detached read,
+  for the same reason stated from the other side: the file lags the live map by
+  whatever it has not flushed, so a detached enumeration can omit a key whose pointer
+  already exists and the clear then leaves that pointer for a reinstall to resume
+  (`session_keys()` covers an allocation still in flight). One pass: see the residual
+  above for what that leaves and why the alternative is worse. It runs INSIDE
+  `app_lifecycle_lock`, because a step of
+  the uninstall released before the clear lands lets a concurrent reinstall be serving
+  the same slot key again — and the pointer dropped is then the new installation's.
+- **Gateway-less** (`kirocrew app uninstall`) writes through its own `SessionMap`
+  while HOLDING `GatewayLock` across the scan and the write, and declines when it
+  cannot take it. Asking whether a gateway is up cannot establish this: one starting
+  between the question and the write lands in exactly the excluded case. Holding the
+  lock the gateway itself takes makes the exclusion real both ways, and it is also
+  what makes this path's detached READ sound — it is the one path that knows no live
+  map exists. Cost: a gateway starting inside that window is refused as by any other
+  holder.
+
+  `uninstall` IS routed through a running gateway, the way `enable` and `disable`
+  are, and that SUPERSEDES the earlier contract recorded here, under which it
+  deliberately stayed in the CLI process and the decline was therefore an ORDINARY
+  outcome. With a gateway reachable the uninstall is performed by the in-gateway
+  path above, whose clear runs through the live map and so never has to decline at
+  all. The decline remains reachable, and its text remains correct, on the
+  platforms where delegation cannot happen: `unix_socket_urlopen` raises where
+  AF_UNIX is unavailable, the lifecycle client maps that to "no gateway", and the
+  CLI then takes this path while a gateway may well be running — which is why the
+  file-only backend warning names RESTARTING the gateway rather than starting it.
+  Two things follow, and both are part of the contract rather than
+  polish. The clear returns `SessionPointerCleanup(dropped, declined, failed)` because
+  `dropped == 0` is otherwise "owned nothing", "did not try", and "could not write",
+  which need different messages — `failed` covers an ENOSPC or permission error on the
+  write, where the pointer is still on disk and the default result would have said the
+  app owned nothing. And the CLI prints both non-clear cases to stderr naming the
+  consequence and the recovery, because the operator who can act on it is standing at
+  the command that otherwise printed a success tick; they get different text because
+  they need different actions — stop the gateway, versus fix the storage error. The recovery is re-running
+  `kirocrew app uninstall <name>` with the gateway stopped, which works because the
+  bookkeeping half also runs when `uninstall_app` fails with *not installed* — the
+  pointers outlive the app, so that is the one failure whose cleanup is still owed.
+  Every other failure leaves the app whole and must keep its pointers.
+
+Dropping the pointer is only half of "a reinstall starts fresh". `clear_sid` stops
+the NATIVE resume; the transcript stays on disk on purpose, so a cold start under the
+same slot key would still have `build_session_replay` inject the removed app's history
+into the next installation's first turn — the same user-visible bug through a second
+channel. So both paths also set `SUPPRESS_REPLAY_FLAG` on every key they clear:
+
+- Persisted on the session-map entry, not held in memory, because the two writers are
+  different processes (the gateway-less CLI has no live manager) and because a gateway
+  restart between the uninstall and the reinstall must not lose it.
+- Honoured at one chokepoint, `SessionManager.consume_replay_suppression`, so the flag
+  cannot be respected on one path and ignored on the other. The persisted marker is
+  consumed there UNCONDITIONALLY, never as the `elif` tail of the in-memory branch: the
+  in-gateway path sets both markers, so a chain that stopped at the first hit would
+  leave the durable one standing and make a later cold start of the NEW installation
+  start empty — a fix for stale history turned into amnesia about live history.
+- One-shot: read and cleared together, matching the in-memory branch. Left set, every
+  later cold start on that key — an idle-timeout expiry, a restart — would be silently
+  amnesiac, which an uninstall never asked for.
+- A member of `_DURABLE_FLAGS`, because `prune` deletes a sid-less entry that nothing
+  holds back — and after the clear the entry is exactly that. Losing it there would
+  lose it in the case the flag exists for: clear the pointer, restart the gateway,
+  reinstall. The constant's "grows without bound" cost does not apply, since one-shot
+  consumption makes the row collectable again at the first cold start.
+- The in-gateway path additionally passes `replay=False` to `discard_conversation`.
+  That is not belt-and-braces against the default: `replay=True` actively DISCARDS a
+  standing suppression, so omitting the keyword is worse than neutral.
+
+Durability is ordered, not incidental. The CLI path flushes before releasing
+`GatewayLock`; the in-gateway path `await`s `sessions.aflush()` after all the clears
+and BEFORE the uninstall reports success, because `clear_sid` on the loop only
+schedules a debounced flush — without it the handler answers 200 while the drop is
+still only in memory, and a restart inside that window brings the stale sid back with
+the app already gone. Both flushes are REPORTED on failure, never raised: the files
+are gone by then, so an ENOSPC there must not skip the teardown that follows it —
+`invalidate_app_secret_cache`, `_unregister_notification_channels`, `forget_app_hooks`
+— and a stale slot-close hook makes the removed app's leftover tabs undismissable. The
+CLI path says so as `SessionPointerCleanup(failed=True)`, the route as a `uninstall_log`
+line naming the pointer that did not persist; neither reports the sweep as clean.
+
+Deliberately NOT part of step 3: deregistration also runs on **disable**, and App
+Store Sync is a disable/enable pair, so clearing there would discard every
+long-lived conversation's accumulated context on every sync. `clear_sid`, not
+`delete` — the entry keeps its Slack linkage and the dropped value is stashed as
+`discarded_sid`.
+
+Stated cost: the index stays keyed on "still holds a sid", so a conversation whose
+pointer was already dropped by something else (a provider switch, a poisoned-
+conversation escalation) keeps its transcript and is not flagged. Widening to every
+transcript an app owns means enumerating transcripts rather than session-map rows — a
+different and much wider index, and a separate decision. The narrow answer fails
+toward the pre-existing behaviour.
 
 The lock spans the script deliberately: the script may itself be destructive, so
 holding the lock across it stops a racing enable or update from starting a

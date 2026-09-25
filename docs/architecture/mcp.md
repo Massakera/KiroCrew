@@ -1112,6 +1112,25 @@ the caller block and the policy read sends it, so its calls do not land there. T
 for admitting a reason here is that it means ONE thing, because a refusal derived from an
 ambiguous reason is wrong for half the callers it hits.
 
+One missing identity reaches a reader through three refusals -- this
+`identity_unattested` text when a key is declared, the strict-identity diagnosis behind
+`memory_recall` and every other reflexive tool when none is, and the lesson writers'
+(`learn_add`, `learn_remove`) answer to the gateway's `400 missing_session_key` (mapped
+onto the same established-session refusal instead of echoing the header name). When the
+process carries neither the session token nor a launcher host pid
+(`mcp_shared.spawned_without_gateway_identity`), nothing the gateway does at spawn
+happened to it, and all three append the same `mcp_shared.external_client_identity_note`:
+a server started outside a Kiro Crew session (an editor's own MCP config) has no identity
+channel and its identity-bearing tools are not supported; `KIROCREW_SESSION_KEY` is a
+gateway-injected fallback, not a credential, and set by hand it turns the partial
+refusals into `identity_unattested` on every call; the read-only tools work without it;
+the supported editor direction is connecting into a Kiro Crew session rather than
+spawning the server, and that server's entry in `~/.kiro/settings/mcp.json` is the
+leftover state the design invariant at the top of this document names. The note
+decorates a denial and never grants: which calls are refused is unchanged, and a server
+the gateway did spawn keeps its existing wording (token present, or the quoted spawn
+denial below).
+
 `resolution_failed` -- no usable answer, meaning nothing came back, a `5xx` said the
 gateway is broken, or the resolve itself raised -- passes that test and refuses. Every
 `4xx` returns before that arm, decided by status class, so the reason means the policy
@@ -1191,11 +1210,21 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger`, `cron_secret_request` |
 | `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
-| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `session_create`, `session_send`, `session_read_message`, `session_stop`, `session_close` |
+| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `session_create`, `session_fork`, `session_send`, `session_read_message`, `session_stop`, `session_close` |
 | `kirocrew-work` | `kirocrew mcp-work` (`mcp_work.py`) | `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_record` |
 | `kirocrew-crew-log` | `kirocrew mcp-crew-log` (`mcp_crew_log.py`) | `crew_log_list`, `crew_log_read`, `crew_log_projection` |
 | `kirocrew-debug` | `kirocrew mcp-debug` (`mcp_debug.py`) | `debug_gateway`, `debug_refusals`, `debug_threads`, `debug_processes`, `debug_snapshots` |
 | `kirocrew-panel` | `kirocrew mcp-panel` (`mcp_panel.py`) | `panel_publish`, `panel_templates` |
+
+`kirocrew-panel` is opt-in and reaches a crew member's DM session the way
+`kirocrew-dashboard` does: as a session-level `mcpServers` entry carrying that
+session's identity (`members.member_panel_session_server`), plus
+`@kirocrew-panel` in `tools` and `_MEMBER_PANEL_GRANTS` in `allowedTools` on the
+KAS projection. Neither the Capabilities editor nor any emitted spec can grant
+it -- that list is built from configured connections, and an opt-in managed
+server is not one -- so this mount is the only path to it. The operator ceiling
+is `agent.crew_panel`; see the session-control module spec for the grant
+reasoning and the fail-closed behaviour.
 
 `kirocrew-dashboard` is one transport carrying **two** authorization models, which is
 what makes its assignment decision larger than its name suggests. The
@@ -1208,7 +1237,7 @@ is their spec and carries that reasoning.
 The consequence to know before granting: an agent handed the whole server for folder
 organization has the session verbs too. Whether they prompt depends on how the grant
 is spelled — `_mcp_pattern` maps a bare `@kirocrew-dashboard` entry to a one-level
-glob, so it auto-approves all fourteen, while naming tools individually leaves the rest
+glob, so it auto-approves all fifteen, while naming tools individually leaves the rest
 to `hooks.on_tool_call`. `_CONDUCTOR_DASHBOARD_GRANTS` and
 `_MEMBER_DASHBOARD_GRANTS` (`agent.py`) are the shipped examples of the individual
 form, and they differ from each other on exactly this axis: the member's list
@@ -1941,8 +1970,20 @@ and `mcp_core._session_token_header` reads the gateway-injected caller's token
 before falling back to `KIROCREW_STUB_SESSION_TOKEN`. The name alone does not
 earn the token: the server name arrives in the stub's register frame while the
 spawn target resolves separately from the spec-derived
-`KIROCREW_MCP_TARGET_<NAME>` mapping, so a spec could declare a third-party
-command under a reserved name. At spawn, `gatewayd._spawns_own_control_plane`
+`KIROCREW_MCP_TARGET_<NAME>` mapping. That mapping is not the spec's word for a
+reserved name, though. The rewriter re-derives every stubbed `kirocrew-*` entry,
+whether an agent spec declares it or `settings/mcp.json` injects it, from
+`agent.managed_mcp_spec_entry` before it resolves, hashes or bakes anything
+(`rewriter._repair_control_plane_entry`), and holds the entry's
+declared `env` to the managed-entry ownership rule the disk writer
+(`agent._enforce_managed_mcp_ownership`) and the ACP element
+(`session_mcp._managed_element_env`) apply -- reserved `KIROCREW_*` keys, loader
+channels, home-deriving and launcher-exec keys dropped. So a spec that spells the
+launcher the only way a hand can (`"command": "kirocrew"`, which resolves to the
+shared Toolbox dispatcher, not the versioned binary) or pins a path an upgrade
+has since reaped still runs our binary, and a third-party command declared under
+a reserved name runs our binary too, never its own. The gate below is unchanged;
+the repair is what makes an honest spec pass it. At spawn, `gatewayd._spawns_own_control_plane`
 compares the command actually exec'd (by real path) and its args against the
 invocation `agent.managed_mcp_spec_entry` emits for that name and records the
 verdict as `Backend.control_plane`; the handler forwards the token on that flag
@@ -2012,7 +2053,13 @@ spec entry, a different binary, different args, a non-empty `PYTHON*` / `LD_*` /
 or a root that shadows `kiro_crew` (named in the message, so per-user site-packages
 is distinguishable from the local one) — so an
 install that trips the check has more to read than every cron tool answering
-403.
+403. The same reason rides to the denied backend itself: the spawn site records it
+as `Backend.control_plane_denial`, `_caller_for_backend` copies it onto the frames
+it forwards to that backend as `CallerContext.identity_denial` (`identityDenial`
+in the caller block, emitted only when set), and the backend's
+`identity_unattested` refusal quotes it. Without that channel the only record was
+`logs/mcp-gatewayd.stdout`, which no session surfaces, and the refusal's generic
+text pointed at the token and the spec when the cause was neither.
 
 `CONTROL_PLANE_BACKENDS` is named in gatewayd itself (importing
 `acp.session_mcp` would put `kiro_crew.agent` on the daemon's boot path; the

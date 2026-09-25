@@ -26,13 +26,24 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NoReturn
 from zoneinfo import ZoneInfo
 
-from kiro_crew import __version__, app_lifecycle_client, beacon, platform_compat
+from kiro_crew import (
+    __version__,
+    app_lifecycle_client,
+    beacon,
+    crew_teams,
+    model_registry,
+    platform_compat,
+)
 from kiro_crew.agent import reset_agent_model
+from kiro_crew.apps.backend import recorded_backend_port
 from kiro_crew.apps.bridges import (
+    SessionPointerCleanup,
     deregister_app,
     deregister_app_crons_from_service,
+    discard_app_session_pointers,
     register_app,
     register_app_crons_with_service,
 )
@@ -40,6 +51,7 @@ from kiro_crew.apps.manager import (
     disable_app,
     enable_app,
     get_app,
+    get_app_manifest,
     install_app,
     list_apps,
     trust_grant_removal_blocked,
@@ -71,12 +83,18 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.cron import (
+    _JOB_TIMEOUT_SECS,
+    _SUBPROC_CLEANUP_ALLOWANCE_SECS,
     CronSchedule,
     CronService,
+    CronStoreBusy,
     CronStoreUnreadable,
     format_schedule,
+    get_local_tz,
     lookup_cron_folder_id,
+    parse_time_string,
 )
+from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.cron_trigger import trigger_cron_job
 from kiro_crew.dashboard import tailnet, tailnet_serve
 from kiro_crew.dashboard.origin import parse_dashboard_url
@@ -93,6 +111,11 @@ from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.mcp_cron import (
+    _vet_cron_capability_governance,
+    _vet_script_file,
+    _vet_shell_command,
+)
 from kiro_crew.member_memory_auth import require_member_memory_creation
 from kiro_crew.memory import MemoryStore
 from kiro_crew.memory_stores import (
@@ -109,6 +132,7 @@ from kiro_crew.memory_stores import (
     resolve_declared_store,
     retire_unpublished_allocation,
 )
+from kiro_crew.platform import redact_log_via_context
 from kiro_crew.port_resolution import resolve_client_port_ex
 from kiro_crew.project_scope import scope_is_admissible, scope_selector_is_inadmissible
 from kiro_crew.secrets.migrate import (
@@ -130,8 +154,11 @@ from kiro_crew.sel import sel
 from kiro_crew.terminal_safe import _TERMINAL_CTRL_RE, safe_terminal_line
 from kiro_crew.validation import (
     _AGENT_NAME_RE,
+    _MODEL_NAME_RE,
     CHANNEL_ID_RE,
     CHANNEL_MAX_LEN,
+    CRON_ADD_SCHEMA,
+    MAX_SHORT_STRING,
     WORKSPACE_NAME_RE,
     normalize_lesson_category,
 )
@@ -250,8 +277,9 @@ def _format_schedule(schedule: object, *, tz_name: str = "") -> str:
             if tz_name:
                 dt = datetime.fromtimestamp(schedule.at_ts, ZoneInfo(tz_name))
                 return f"at {dt:%Y-%m-%d %H:%M %Z}"
-            dt = datetime.fromtimestamp(schedule.at_ts)
-            return f"at {dt:%Y-%m-%d %H:%M}"
+            _, configured_tz = get_local_tz()
+            dt = datetime.fromtimestamp(schedule.at_ts, configured_tz)
+            return f"at {dt:%Y-%m-%d %H:%M %Z}"
         except Exception:
             # Same degrade-on-render posture as cron.format_schedule: an
             # extreme stored at_ts (beyond year 9999, epoch milliseconds)
@@ -401,7 +429,9 @@ class _CliConflict(Exception):
     """
 
 
-def _locked_config_write(mutate, *, cleanup_conflict=None, cleanup_failure=None) -> None:
+def _locked_config_write(
+    mutate, *, cleanup_conflict=None, cleanup_failure=None, after_write=None
+) -> None:
     """Run one config delta under the sidecar flock; exit(1) on a conflict.
 
     A load -> mutate dataclass -> ``cfg.save()`` shape cannot be used here: its
@@ -415,11 +445,13 @@ def _locked_config_write(mutate, *, cleanup_conflict=None, cleanup_failure=None)
     ``cleanup_conflict`` runs before the exit(1) on a refused precondition;
     ``cleanup_failure`` runs when the write itself fails -- the workspace
     create passes its staging-drop / install-rollback handlers here.
+    ``after_write`` runs inside the lock once the write has committed (see
+    ``update_config_locked``).
     """
     from kiro_crew.config import loader as _loader
 
     try:
-        _loader.update_config_locked(_loader.config_path(), mutate=mutate)
+        _loader.update_config_locked(_loader.config_path(), mutate=mutate, after_write=after_write)
     except _CliConflict as exc:
         if cleanup_conflict is not None:
             cleanup_conflict()
@@ -755,10 +787,12 @@ def _handle_workspace(args: argparse.Namespace) -> None:
         print("Usage: kirocrew workspace {list|create|update|delete}")
 
 
-def _run_app_action_through_gateway(action: str, app_name: str) -> bool:
+def _run_app_action_through_gateway(
+    action: str, app_name: str, *, payload: dict[str, object] | None = None
+) -> bool:
     """Return true when a live gateway handled an app lifecycle request."""
     try:
-        result = app_lifecycle_client.toggle_app(app_name, action)
+        result = app_lifecycle_client.toggle_app(app_name, action, payload=payload)
     except app_lifecycle_client.AppGatewayTimeout as exc:
         # The outcome is unknown, not negative: the gateway may still be applying
         # the action, so this is neither a refusal nor an invitation to retry.
@@ -784,6 +818,44 @@ def _print_file_only_app_result(app_name: str, *, enabled: bool) -> None:
         "this takes effect at the next gateway start (on Windows and in sandboxed "
         "shells the CLI always uses this path). If a gateway is running now, apply "
         "it live from the dashboard."
+    )
+
+
+def _app_declares_backend(app_name: str) -> bool:
+    """Whether *app_name*'s manifest declares a backend process.
+
+    One of the two positive signals the file-only uninstall's warning fires on, and
+    sound only as one of two. A DECLARATION is a positive property of the app, so
+    record-absence must not silence the warning: an app with no persisted record is
+    exactly the case where nothing may be concluded. But this answer is read from
+    the app's own ``app.json``, writable by any app trusted to run code, so
+    manifest-absence must not silence it either — an app that drops its
+    ``entryPoint`` would otherwise hide the process it is still running. The caller
+    therefore also reads the gateway-owned recorded port, which the app cannot
+    reach, and warns on either. An unreadable or missing manifest answers ``True``
+    for the same reason both halves exist: not knowing is not the same as knowing
+    there is nothing to stop.
+    """
+    try:
+        manifest = get_app_manifest(app_name)
+    except Exception:  # noqa: BLE001 - a malformed manifest must not fail an uninstall
+        return True
+    if manifest is None:
+        return True
+    return bool(getattr(getattr(manifest, "backend", None), "entryPoint", ""))
+
+
+def _warn_backend_not_stopped(app_name: str) -> None:
+    """Report that a file-only uninstall could not stop the app's backend."""
+    print(
+        f"⚠️  No running gateway was reached, so {app_name}'s backend was not "
+        "stopped: signalling a process another gateway started is not something "
+        "the CLI can do from out here (on Windows and in sandboxed shells the CLI "
+        "always uses this path, so a gateway may well be running). If one is still "
+        "running it holds its port until the next gateway start, which terminates "
+        "backends left behind by a previous generation. To stop it now, restart the "
+        "gateway, or uninstall from the dashboard instead.",
+        file=sys.stderr,
     )
 
 
@@ -1009,6 +1081,47 @@ def _handle_app_import(args: argparse.Namespace) -> None:
     print(f"\n   Run: kirocrew app enable {result.name}")
 
 
+def _app_already_gone(result: object) -> bool:
+    """Whether an uninstall failed only because the app is not installed.
+
+    Matched on the message `uninstall_app` produces for that case rather than on a
+    code, because `AppResult` carries no code; kept narrow on purpose — every other
+    failure leaves the app whole, and clearing the pointers its slots are still
+    entitled to resume would be the bug this whole path exists to prevent.
+    """
+    return "is not installed" in str(getattr(result, "error", "") or "")
+
+
+def _print_pointer_cleanup(name: str, cleanup: SessionPointerCleanup) -> None:
+    """Say what happened to the app's resume pointers, including nothing.
+
+    A clear that did not happen cannot stay quiet, whether it declined or failed.
+    Either way it leaves a pointer keyed by a name a reinstall reuses, so the next
+    installation's first turn resumes the removed app's transcript — and the
+    operator who would have to notice that is standing right here, at a command
+    that otherwise printed a success tick. The two get different text because they
+    need different actions: stop the gateway, versus fix the storage error.
+    """
+    if cleanup.dropped:
+        print(f"   dropped {cleanup.dropped} conversation pointer(s) — a reinstall starts fresh")
+    elif cleanup.declined:
+        print(
+            f"   ⚠️  left {name}'s conversation pointers in place: a running gateway owns "
+            f"session_map.json, and a second writer would drop rows it has not flushed. "
+            f"Reinstalling under this name may resume the removed app's transcript. "
+            f"Stop the gateway and run `kirocrew app uninstall {name}` again to clear them.",
+            file=sys.stderr,
+        )
+    elif cleanup.failed:
+        print(
+            f"   ⚠️  could not clear {name}'s conversation pointers: the session map "
+            f"could not be read or written (see the log for the error). Reinstalling "
+            f"under this name may resume the removed app's transcript. Fix the cause "
+            f"and run `kirocrew app uninstall {name}` again to clear them.",
+            file=sys.stderr,
+        )
+
+
 def _handle_app(args: argparse.Namespace) -> None:
     """Dispatch app subcommands: install, list, enable, disable, uninstall, info."""
     action = getattr(args, "app_action", None)
@@ -1100,6 +1213,24 @@ def _handle_app(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     elif action == "uninstall":
+        # Ask a running gateway first, exactly as enable and disable do above.
+        # Uninstall has to stop the app's backend, and out here it cannot: the
+        # gateway is a DIFFERENT process and holds the only live handle on that
+        # child. Doing the whole uninstall locally deleted the app's files while
+        # its backend kept running -- holding its port, its app secret and its
+        # proxied routes -- and still printed success. The gateway's own handler
+        # runs the same trust-grant and cron preconditions before anything
+        # destructive, so nothing is skipped by handing the work over.
+        #
+        # The purge flag travels in the body because the handler defaults an
+        # absent one to "preserve data"; without it a delegated `--purge-data`
+        # would quietly keep the data it was told to destroy.
+        if _run_app_action_through_gateway(
+            "uninstall",
+            args.name,
+            payload={"purge_data": bool(getattr(args, "purge_data", False))},
+        ):
+            return
         # Precondition before anything destructive: the same reason the dashboard
         # handler checks here rather than inside uninstall_app. deregister_app()
         # below is irreversible, so a grant that cannot be dropped has to abort
@@ -1118,10 +1249,38 @@ def _handle_app(args: argparse.Namespace) -> None:
         _cleanup_app_crons_from_scheduler(args.name)
         deregister_app(args.name)
         keep_data = not getattr(args, "purge_data", False)
+        # Read BEFORE the uninstall, and read BOTH: either one alone can be made to
+        # say "no backend here" when there is one. The declaration is the app's own
+        # `app.json`, writable by any app trusted to run code, so an app that drops
+        # its `entryPoint` would silence the warning about the process it is still
+        # running. The recorded port is gateway-owned -- the pidfile lives under
+        # KIROCREW_HOME, not in the app directory -- but its ABSENCE proves nothing,
+        # since a backend this gateway never tracked leaves no row. So the warning
+        # fires on either positive signal, and stays quiet only when neither says a
+        # backend exists.
+        declares_backend = _app_declares_backend(args.name)
+        recorded_port = recorded_backend_port(args.name)
         result = uninstall_app(args.name, keep_data=keep_data)
         if result.ok:
+            # AFTER success, matching this function's trust-grant reasoning: a
+            # failed uninstall leaves nothing changed, so a still-installed app
+            # keeps the pointers its slots are still entitled to resume.
+            cleanup = discard_app_session_pointers(args.name)
             print(f"✅ {result.message}")
+            _print_pointer_cleanup(args.name, cleanup)
+            if declares_backend or recorded_port is not None:
+                _warn_backend_not_stopped(args.name)
         else:
+            # The pointers outlive the app, so "already gone" is the one failure
+            # whose bookkeeping half is still worth doing. It is also the residual's
+            # only self-correction: the clear runs under `GatewayLock` and declines
+            # while a gateway owns `session_map.json`, so an uninstall done with the
+            # gateway up leaves pointers behind — and re-running this command with
+            # the gateway stopped is what clears them. That recovery only exists if
+            # the clear does not require the app to still be installed, which is why
+            # it runs here rather than only on the success path.
+            if _app_already_gone(result):
+                _print_pointer_cleanup(args.name, discard_app_session_pointers(args.name))
             print(f"❌ {result.error}", file=sys.stderr)
             sys.exit(1)
 
@@ -1264,6 +1423,11 @@ def _handle_agent(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        # A crew that carried this name before may still be listed on a team
+        # (every removal path drops it best-effort). persist_member_config
+        # purges that INSIDE the registry's locked mutation, right before the
+        # name is registered, on every create path; a purge that cannot be made
+        # refuses the create (TeamsUnavailable, answered below).
         cfg.agents[args.name] = KiroCrewAgentConfig(
             kiro_agent=args.kiro_agent,
             workspace=args.workspace,
@@ -1285,6 +1449,15 @@ def _handle_agent(args: argparse.Namespace) -> None:
                     previous_store=previous_store,
                     previous_member_id=previous_member_id,
                 )
+            if isinstance(exc, crew_teams.TeamsUnavailable):
+                print(
+                    f"Error: cannot create agent '{args.name}': a previous crew of that "
+                    f"name may still be on a team and the crew-teams store is unavailable "
+                    f"({exc}); fix or remove {crew_teams.teams_path()} (an absent file "
+                    "reads as no teams), then retry",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             if not isinstance(exc, (OSError, UnknownMemoryStore)):
                 raise
             print(f"Error: {exc}", file=sys.stderr)
@@ -1351,8 +1524,20 @@ def _handle_agent(args: argparse.Namespace) -> None:
             del agents[args.name]
             return doc
 
+        # Same best-effort drop as the dashboard delete route, and in the same
+        # place: AFTER the registry write has committed and still INSIDE its
+        # lock. After the commit, so a config write that fails leaves the
+        # membership as it was (the crew stays, on its team); inside the lock,
+        # so a same-name create in another process (which needs this lock)
+        # cannot land between the delete and the drop. A stale team entry is
+        # hidden by every reader and never turns a committed delete into a
+        # failure; the recreate-under-the-same-name harm is closed on the
+        # create path (release_name), not here.
+        def _drop_from_team() -> None:
+            crew_teams.drop_member(args.name)
+
         with memory_store_namespace_lock():
-            _locked_config_write(_mutate_agent_delete)
+            _locked_config_write(_mutate_agent_delete, after_write=_drop_from_team)
         print(f"Deleted agent: {args.name}")
 
     elif action == "reset-model":
@@ -1399,6 +1584,334 @@ def _agent_reset_model(args: argparse.Namespace) -> None:
     else:
         print(f"✅ {name} had no pinned model in {str(spec_path)!r}")
     print("   It now tracks the shipped default; restart the gateway to apply.")
+
+
+def _cron_add_bounds(field_name: str) -> tuple[int, int]:
+    """Numeric bounds of a ``cron add`` field, read from ``CRON_ADD_SCHEMA``.
+
+    The MCP ``cron_add`` tool validates its input against that schema; the
+    CLI enforces the same range by reading it rather than repeating the
+    literals, so the two surfaces cannot drift apart.
+    """
+    spec = next(s for s in CRON_ADD_SCHEMA.fields if s.name == field_name)
+    assert spec.min_val is not None and spec.max_val is not None, field_name
+    return int(spec.min_val), int(spec.max_val)
+
+
+def _cron_add_fail(msg: str, *, audit_kind: str = "") -> NoReturn:
+    """Refuse a ``cron add`` on stderr with exit 1.
+
+    Every refusal takes this one path so a headless installer can rely on a
+    single contract: nothing is written, the reason is on stderr, and the exit
+    status is non-zero. A refusal on stdout with exit 0 is indistinguishable
+    from success to a script, which is why none of the checks below prints
+    its own message.
+
+    ``audit_kind`` names the job kind (``agent`` / ``script`` / ``command``)
+    when the refusal is a SECURITY decision: the ``cron:cli_add`` capability
+    gate denying authoring outright (any kind), a vetted command body, or a
+    script path outside the crons root. A blocked job never reaches the
+    kiro-cli permission/hook flow that would otherwise leave the audit
+    trail, so the
+    denial is recorded in the SEL here, as ``cron_add`` (``_log_cron_denial``)
+    and the apps SDK do for their surfaces. Plain input validation (a bad
+    flag combination, an unparseable time) is not a permission decision and
+    leaves no event. The audited copy of the message is passed through
+    ``redact_log_via_context`` here -- the gate-side log spelling, which
+    applies a loaded companion's stricter pass and never raises -- so the
+    invariant holds whoever produced the message: the vets already redact,
+    but the script-resolution and identifier refusals relay a raw exception
+    or the caller's own argument.
+    """
+    text = msg if msg.startswith("Error: ") else f"Error: {msg}"
+    if audit_kind:
+        # The refusal contract outranks the audit trail; denial logging is
+        # best-effort, matching mcp_cron._log_cron_denial.
+        try:
+            sel().log_api_access(
+                caller="cli",
+                operation="cron.add",
+                outcome="denied",
+                source="cli",
+                resources=f"kind={audit_kind}",
+                error=redact_log_via_context(text),
+            )
+        except Exception:
+            logging.getLogger(__name__).debug("cron add denial audit emit failed", exc_info=True)
+    print(text, file=sys.stderr)
+    sys.exit(1)
+
+
+def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
+    """``kirocrew cron add``: validate every field, then ONE locked ``add_job``.
+
+    The CLI is a thin front-end over ``CronService.add_job`` -- the same single
+    writer the dashboard POST, the MCP ``cron_add`` tool and the apps SDK
+    converge on. Every field is resolved here and handed to that one locked
+    build+persist, so the job lands on disk fully-formed. The old shape --
+    ``add_job`` with a subset, then ``job.agent_id = ...`` / ``job.silent = True``
+    and a second, unlocked ``svc._save()`` -- was a data-loss window: the bare
+    save could clobber a job another writer had appended between the two
+    writes, and a crash between them left a job missing its agent.
+
+    Job kind is exactly one of agent (the default), ``--script`` or
+    ``--command``; schedule is exactly one of ``--every``, ``--cron`` or
+    ``--at``. Schedule/timeout coupling is split by who can see it: when both
+    ``--timeout`` and ``--timeout-secs`` are given, ``_build_job`` at the
+    persistence owner validates the pair and the CLI surfaces its
+    ``ValueError``; when ``--timeout-secs`` is omitted the CLI passes ``0``,
+    which ``_build_job`` reads as "no wake budget given", so the CLI itself
+    checks ``--timeout`` against the default wake budget it knows will apply.
+
+    A ``--script`` file must already live under ``<config_dir>/crons/``
+    (``resolve_script_path`` enforces containment) -- the CLI registers, it
+    does not stage. Script bodies and shell commands go through the same
+    storage-time security vet the MCP tool and the apps SDK apply
+    (``_vet_script_file`` / ``_vet_shell_command``). The gateway re-vets at
+    fire time regardless, so this is fail-fast for the caller, not the only
+    guard: a job that would be refused at every wake is refused once, here,
+    with a non-zero exit, instead of being stored and silently never running.
+    """
+    every = getattr(args, "every", None)
+    cron_expr = (getattr(args, "cron_expr", None) or "").strip() or None
+    at_raw = str(getattr(args, "at", None) or "").strip()
+    tz = (getattr(args, "timezone", "") or "").strip()
+    channel = (getattr(args, "channel", None) or "").strip() or None
+    approval_mode = getattr(args, "approval_mode", "") or ""
+    agent = (getattr(args, "agent", "") or "").strip()
+    script = (getattr(args, "script", "") or "").strip()
+    command = (getattr(args, "shell_command", "") or "").strip()
+    model = (getattr(args, "model", "") or "").strip()
+    silent = bool(getattr(args, "silent", False))
+    hide_in_chat = bool(getattr(args, "hide_in_chat", False))
+    timeout = getattr(args, "timeout", None)
+    timeout_secs = getattr(args, "timeout_secs", None)
+    folder_ref = (getattr(args, "folder", "") or "").strip()
+    message = args.message or ""
+
+    # ── Job kind: exactly one of agent / script / command ──
+    if script and command:
+        _cron_add_fail("--script and --command are mutually exclusive")
+    if agent and (script or command):
+        _cron_add_fail("--agent cannot be combined with --script or --command")
+    zero_token = bool(script or command)
+    if not message and not zero_token:
+        _cron_add_fail("message is required for an agent job (only --script/--command may omit it)")
+    if agent and not _AGENT_NAME_RE.match(agent):
+        _cron_add_fail("invalid agent name (alphanumeric, hyphens, underscores; 1-64 chars)")
+    if timeout is not None:
+        if not zero_token:
+            _cron_add_fail("--timeout applies only to a --script or --command job")
+        lo, hi = _cron_add_bounds("timeout")
+        if not lo <= int(timeout) <= hi:
+            _cron_add_fail(f"--timeout must be within {lo}..{hi}, got {timeout}")
+    if timeout_secs is not None:
+        lo, hi = _cron_add_bounds("timeout_secs")
+        if not lo <= int(timeout_secs) <= hi:
+            _cron_add_fail(f"--timeout-secs must be within {lo}..{hi}, got {timeout_secs}")
+    effective_timeout_secs = int(timeout_secs) if timeout_secs is not None else _JOB_TIMEOUT_SECS
+    if (
+        zero_token
+        and timeout is not None
+        and timeout_secs is None
+        and int(timeout) + _SUBPROC_CLEANUP_ALLOWANCE_SECS > effective_timeout_secs
+    ):
+        _cron_add_fail(
+            f"--timeout {timeout} plus cleanup exceeds the {effective_timeout_secs}s "
+            "wake budget; pass a larger --timeout-secs"
+        )
+
+    # ── Schedule: exactly one of --every / --cron / --at ──
+    given = [
+        flag for flag, val in (("--every", every), ("--cron", cron_expr), ("--at", at_raw)) if val
+    ]
+    if len(given) != 1:
+        _cron_add_fail("provide exactly one of --every, --cron or --at")
+    # --timezone governs how a --cron expression's hour/minute fields are read.
+    # An interval (--every) has no wall clock to interpret, and a time string
+    # given to --at is resolved by parse_time_string in the configured timezone
+    # with its confirmation rendered in that same timezone -- a per-job value
+    # would change only the render. Either pair is refused rather than
+    # persisted as a field the schedule never consults.
+    if tz and not cron_expr:
+        _cron_add_fail(
+            "--timezone applies to --cron only; a time string given to --at is read "
+            "in the configured timezone"
+        )
+    at_ts: float | None = None
+    if at_raw:
+        if len(at_raw) > 64:
+            _cron_add_fail("--at must be at most 64 characters")
+        try:
+            try:
+                at_ts = float(at_raw)
+            except ValueError:
+                parsed = parse_time_string(at_raw)
+                if isinstance(parsed, str):
+                    _cron_add_fail(parsed)
+                at_ts = parsed
+            if at_ts > 4102444800:
+                _cron_add_fail(
+                    "--at must resolve to a timestamp at or before 4102444800 (year 2100)"
+                )
+            # Guard against a past instant from either spelling, as cron_add does:
+            # an `at` job in the past would fire immediately and vanish.
+            if at_ts < _time.time():
+                # Render in the zone parse_time_string resolved the value in,
+                # so the refusal echoes a wall clock the operator recognises.
+                _, configured_tz = get_local_tz()
+                local = datetime.fromtimestamp(at_ts, configured_tz)
+                _cron_add_fail(
+                    f"resolved time {local.strftime('%Y-%m-%d %I:%M %p %Z')} is in the past"
+                )
+        except (OverflowError, OSError, ValueError):
+            _cron_add_fail("--at is outside the supported timestamp range")
+
+    # ── Fields validated up front so an invalid value never strands a job ──
+    if channel and (len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel)):
+        _cron_add_fail(f"invalid channel ID format (expected {CHANNEL_ID_RE.pattern.strip('^$')})")
+    if model:
+        if len(model) > MAX_SHORT_STRING or not _MODEL_NAME_RE.match(model):
+            _cron_add_fail("invalid model format")
+        # Same normalisation as the dashboard and cron_add: the "auto" inherit
+        # sentinel resolves to no pinned provider id and is stored as unset.
+        if model_registry.to_provider_id(model, "claude_code") == "":
+            model = ""
+    # Resolve BEFORE add_job so a typo'd folder never leaves an orphaned
+    # job behind. Existing folders only: cron_folders.json is owned by the
+    # dashboard (its state rewrites the file wholesale), so a CLI-side
+    # create could be silently clobbered by the next Schedule-page folder
+    # operation.
+    folder_id = ""
+    if folder_ref:
+        found = lookup_cron_folder_id(folder_ref)
+        if found.error:
+            _cron_add_fail(found.error)
+        folder_id = found.folder_id
+
+    if script:
+        kind = "script"
+    elif command:
+        kind = "command"
+    else:
+        kind = "agent"
+
+    # ── Governance: the capabilities.cron on/off gate, at authoring time ──
+    # The gateway re-vets every job at fire time, so a job authored under a
+    # disabled capability can never run -- but without this fail-fast the CLI
+    # would persist it and print "Added job", and the caller would only learn
+    # otherwise from the job's error status at its first wake. Same call
+    # cron_add makes before it stores anything. The `cron:` key classifies as
+    # the cron surface (sel._infer_source), so the profile that governs cron
+    # jobs decides authoring too -- a CLI-surface bind does not, by design:
+    # what is being gated is the cron capability, not the CLI as a whole.
+    cap_err = _vet_cron_capability_governance("cron:cli_add")
+    if cap_err:
+        _cron_add_fail(cap_err, audit_kind=kind)
+
+    # ── Storage-time security vet for the two zero-token kinds ──
+    if command:
+        err = _vet_shell_command(command)
+        if err:
+            _cron_add_fail(err, audit_kind="command")
+    if script:
+        # Two leading path separators in any mix (`\\`, `//`, `/\`, `\/`) name
+        # a UNC/network path: Windows normalises the alternate separator
+        # first, so Path.resolve() would do an outbound host lookup before
+        # containment is checked. Refuse the shape before it reaches
+        # resolve_script_path; CRON_ADD_SCHEMA's script regex in validation.py
+        # excludes the same shape (^(?![\\/]{2})).
+        if re.match(r"^[\\/]{2}", script):
+            _cron_add_fail(
+                "--script must be a local path, not a UNC/network path (leading \\\\ or //)",
+                audit_kind="script",
+            )
+        try:
+            script_file, func = resolve_script_path(script)
+        except (PermissionError, FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+            _cron_add_fail(str(exc) or "could not resolve script path", audit_kind="script")
+        # Reject malformed entry points before reading the script body.
+        if not func.isidentifier():
+            _cron_add_fail(
+                f"--script function name {func!r} must be a valid Python identifier "
+                "(expected FILE.py:FUNC)",
+                audit_kind="script",
+            )
+        err = _vet_script_file(script_file)
+        if err:
+            _cron_add_fail(err, audit_kind="script")
+        # Persist the RESOLVED absolute spec, not the caller's raw one. A
+        # relative --script resolves against the CLI's CWD here; the gateway
+        # re-vets at fire time against ITS CWD, so a raw relative spec would
+        # fail every wake. An already-absolute spec round-trips unchanged.
+        script = f"{script_file}:{func}"
+
+    # ── Session shape: the store's defaults, exactly as cron_add and the
+    # dashboard POST forward them. One defaulting policy across every create
+    # surface, so the same --command job means the same job whichever door it
+    # came through; a caller that wants a fresh minimal wake says so with
+    # --no-persistent-session --minimal-context (the help text recommends
+    # both for a --script/--command job).
+    persistent_session = bool(getattr(args, "persistent_session", True))
+    minimal_context = bool(getattr(args, "minimal_context", False))
+
+    try:
+        job = svc.add_job(
+            name=args.name,
+            message=message,
+            every_secs=every,
+            cron_expr=cron_expr,
+            at_ts=at_ts,
+            # One-shot: derived from the schedule, never caller-supplied, exactly
+            # as cron_add and the dashboard derive it -- a job with a single fire
+            # time that never leaves the store is one the scheduler cannot re-run.
+            delete_after_run=bool(at_ts),
+            channel=channel,
+            approval_mode=approval_mode,
+            agent_id=agent,
+            model=model,
+            silent=silent,
+            timezone=tz,
+            hide_in_chat=hide_in_chat,
+            folder_id=folder_id,
+            command=command,
+            script=script,
+            persistent_session=persistent_session,
+            minimal_context=minimal_context,
+            timeout=int(timeout) if timeout else 0,
+            timeout_secs=int(timeout_secs) if timeout_secs else 0,
+        )
+    except CronStoreBusy:
+        # The store lock stayed contended past its timeout (another writer --
+        # the gateway, a dashboard create -- holds it). Nothing was written;
+        # the same retryable refusal cron_add returns, not a traceback.
+        _cron_add_fail("cron store busy, please retry")
+    except ValueError as e:
+        _cron_add_fail(str(e))
+    except OSError as e:
+        # The store write failed (disk full, permissions, a vanished config
+        # dir). _save is tmp-then-rename, so the store is untouched and the
+        # refusal contract still holds: reason on stderr, exit 1, nothing
+        # written -- not a traceback an installer cannot classify.
+        _cron_add_fail(f"could not write the cron store: {e}")
+    sched_desc = _format_schedule(job.schedule, tz_name=job.timezone or "")
+    # Once add_job persists, the caller-facing contract is the printed id and exit 0.
+    # An audit failure must not turn a committed job into a spurious non-zero exit
+    # that an installer retries into a duplicate.
+    try:
+        sel().log_api_access(
+            caller="cli",
+            operation="cron.add",
+            outcome="allowed",
+            source="cli",
+            resources=(
+                f"job_id={job.id} kind={kind} approval_mode={approval_mode or 'default'} "
+                f"agent={agent or 'default'} silent={silent}"
+            ),
+        )
+    except Exception:
+        logging.getLogger(__name__).debug("cron add success audit emit failed", exc_info=True)
+    print(f"Added job: {job.id} ({job.name}) [{sched_desc}]")
 
 
 def _cron(args: argparse.Namespace) -> None:
@@ -1530,83 +2043,7 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             )
 
     elif action == "add":
-        every = getattr(args, "every", None)
-        cron_expr = getattr(args, "cron_expr", None)
-        channel = (getattr(args, "channel", None) or "").strip() or None
-        approval_mode = getattr(args, "approval_mode", "") or ""
-        agent = (getattr(args, "agent", "") or "").strip()
-        silent = getattr(args, "silent", False)
-        folder_ref = (getattr(args, "folder", "") or "").strip()
-        # Resolve BEFORE add_job so a typo'd folder never leaves an orphaned
-        # job behind. Existing folders only: cron_folders.json is owned by the
-        # dashboard (its state rewrites the file wholesale), so a CLI-side
-        # create could be silently clobbered by the next Schedule-page folder
-        # operation.
-        folder_id = ""
-        if folder_ref:
-            found = lookup_cron_folder_id(folder_ref)
-            if found.error:
-                print(f"Error: {found.error}", file=sys.stderr)
-                sys.exit(1)
-            folder_id = found.folder_id
-        if agent and not _AGENT_NAME_RE.match(agent):
-            print(
-                "Error: invalid agent name (alphanumeric, hyphens, underscores; 1-64 chars)",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        if channel and (len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel)):
-            print(
-                f"Error: invalid channel ID format (expected {CHANNEL_ID_RE.pattern.strip('^$')})"
-            )
-            return
-        try:
-            if cron_expr:
-                job = svc.add_job(
-                    name=args.name,
-                    message=args.message,
-                    cron_expr=cron_expr,
-                    channel=channel,
-                    approval_mode=approval_mode,
-                    folder_id=folder_id,
-                )
-            elif every:
-                job = svc.add_job(
-                    name=args.name,
-                    message=args.message,
-                    every_secs=every,
-                    channel=channel,
-                    approval_mode=approval_mode,
-                    folder_id=folder_id,
-                )
-            else:
-                print("Provide --every or --cron")
-                return
-        except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-        # agent_id and silent are CronJob fields but not add_job kwargs;
-        # mirror the MCP cron_add post-create mutation pattern so they
-        # are persisted with the job.
-        if agent:
-            job.agent_id = agent
-        if silent:
-            job.silent = True
-        if agent or silent:
-            svc._save()
-        sched_desc = _format_schedule(job.schedule, tz_name=job.timezone or "")
-
-        sel().log_api_access(
-            caller="cli",
-            operation="cron.add",
-            outcome="allowed",
-            source="cli",
-            resources=(
-                f"job_id={job.id} approval_mode={approval_mode or 'default'} "
-                f"agent={agent or 'default'} silent={silent}"
-            ),
-        )
-        print(f"Added job: {job.id} ({job.name}) [{sched_desc}]")
+        _cron_add(svc, args)
 
     elif action == "update":
         kwargs: dict = {}
@@ -1954,18 +2391,44 @@ def _security(args: argparse.Namespace) -> None:
             print(f"No security events recorded{window}.")
             return
         print(f"📋 Last {len(events)} security event(s){window}:\n")
+
+        def _safe(key: str, default: str = "") -> str:
+            """One row field, coerced to text and stripped of live controls.
+
+            Two separate hazards meet here. The row can hold CALLER text: SEL's own
+            ``_REDACTED_TEXT_FIELDS`` names ``operation``, ``resources`` and
+            ``error``, and ``log_api_access`` documents ``outcome`` the same way
+            because an installed app reaches it through ``ctx.audit``. Those passes
+            police credentials and length, never control sequences, so an ESC/OSC
+            payload would execute in the owner's terminal -- the one place this
+            trail is read. And the row need not be a string at all: the log is
+            sandbox read-write (``_CREW_SANDBOX_VISIBLE_LEAVES``) while ``recent()``
+            validates only that each line is a dict, so a forged line with a
+            non-string field would abort the whole command inside ``re.sub``.
+            Coercing before sanitizing answers both, and keeps one field's bad
+            value from hiding every other event.
+            """
+            value = e.get(key, default)
+            return safe_terminal_line(value if isinstance(value, str) else str(value))
+
         for e in events:
-            ts = e.get("timestamp", "?")[:19]
-            etype = e.get("event_type", "?")
-            op = e.get("operation", "?")
-            outcome = e.get("outcome", "?")
-            src = e.get("source", "?")
-            caller = e.get("caller_identity", "?")
+            ts = _safe("timestamp", "?")[:19]
+            etype = _safe("event_type", "?")
+            op = _safe("operation", "?")
+            outcome = _safe("outcome", "?")
+            src = _safe("source", "?")
+            caller = _safe("caller_identity", "?")
             print(f"  {ts}  [{src}] {etype}: {op} → {outcome}  (caller: {caller})")
             if e.get("error"):
-                print(f"    error: {e['error'][:120]}")
+                print(f"    error: {_safe('error')[:120]}")
+            # ``resources`` names WHAT the decision was about -- the file a scanner
+            # held back, the destination class a grant covered. Without it the line
+            # says a refusal happened and never says what was refused, which is the
+            # one thing the owner reading this is trying to learn.
+            if e.get("resources"):
+                print(f"    resources: {_safe('resources')[:120]}")
             if e.get("downstream_service"):
-                print(f"    downstream: {e['downstream_service']}")
+                print(f"    downstream: {_safe('downstream_service')}")
     elif action == "verify":
 
         # detailed=True: a segment dir that refused to pin (or was swapped

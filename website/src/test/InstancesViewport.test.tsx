@@ -708,6 +708,116 @@ describe('InstancesViewport', () => {
     __resetFocusMode()
   })
 
+  describe('off-window cursor relay (mc-cursor-away-watch)', () => {
+    // An embedded pane's focus-mode reveal is dismissed on the cursor's DISTANCE
+    // from the window, which only the Electron main process can measure — and a
+    // cross-origin pane has no preload to ask it. The host watches on its behalf.
+    function installBridge() {
+      const bridge = {
+        watches: 0,
+        stops: 0,
+        reply: null as ((away: boolean) => void) | null,
+      }
+      ;(window as Window & { electronAPI?: unknown }).electronAPI = {
+        watchCursorAway: (cb: (away: boolean) => void) => {
+          bridge.watches += 1
+          bridge.reply = cb
+          return () => { bridge.stops += 1; bridge.reply = null }
+        },
+      }
+      return bridge
+    }
+    afterEach(() => { delete (window as Window & { electronAPI?: unknown }).electronAPI })
+
+    const frameFor = (port: number) =>
+      [...document.querySelectorAll('iframe')].find(f => f.src.includes(`:${port}`)) as HTMLIFrameElement
+    const send = (data: unknown, port: number, source: Window | null) =>
+      act(async () => {
+        window.dispatchEvent(new MessageEvent('message', {
+          data, origin: `http://127.0.0.1:${port}`, source,
+        }))
+      })
+    async function renderTwoPanes() {
+      mockConnectedCd1()
+      const store = createTestStore({
+        instances: {
+          warm: { 'cd-1': { port: 7778, token: 'tok' }, 'cd-2': { port: 7779, token: 'tok2' } },
+          activeId: 'cd-1', mru: ['cd-1', 'cd-2'], unread: {}, ready: { 'cd-1': true, 'cd-2': true },
+        },
+      })
+      const view = renderWithProviders(<InstancesViewport />, { store })
+      await waitFor(() => expect(frameFor(7778)).toBeDefined())
+      await waitFor(() => expect(frameFor(7779)).toBeDefined())
+      // happy-dom never loads a cross-origin frame, so give each iframe a stand-in
+      // window the host can address and a message can name as its source.
+      const fakeWindow = (el: HTMLIFrameElement) => {
+        const w = { postMessage: vi.fn() } as unknown as Window
+        Object.defineProperty(el, 'contentWindow', { configurable: true, get: () => w })
+        return w
+      }
+      const w1 = fakeWindow(frameFor(7778))
+      const w2 = fakeWindow(frameFor(7779))
+      const post1 = vi.mocked(w1.postMessage)
+      const post2 = vi.mocked(w2.postMessage)
+      return { store, view, w1, w2, post1, post2 }
+    }
+    const watch = (id: string) => ({ type: 'mc-cursor-away-watch', v: 1, id })
+
+    it('watches for the active pane and forwards the one answer to its own origin', async () => {
+      const bridge = installBridge()
+      const { w1, post1 } = await renderTwoPanes()
+
+      await send(watch('w-1'), 7778, w1)
+      expect(bridge.watches).toBe(1)
+      expect(post1).not.toHaveBeenCalled()
+
+      act(() => { bridge.reply!(true) })
+      expect(post1).toHaveBeenLastCalledWith(
+        { v: 1, id: 'w-1', type: 'mc-cursor-away', away: true }, 'http://127.0.0.1:7778',
+      )
+      // Never broadcast: every post is addressed to the pane's exact origin.
+      for (const call of post1.mock.calls) expect(call[1]).not.toBe('*')
+    })
+
+    it('ignores a background pane and a request from the wrong frame', async () => {
+      const bridge = installBridge()
+      const { w1, w2, post1, post2 } = await renderTwoPanes()
+
+      // cd-2 is not the pane on screen: no watch, no answer.
+      await send(watch('w-bg'), 7779, w2)
+      // cd-1's origin, but the message came from another frame's window.
+      await send(watch('w-spoof'), 7778, w2)
+      // Right frame, unknown protocol version.
+      await send({ ...watch('w-v2'), v: 2 }, 7778, w1)
+      expect(bridge.watches).toBe(0)
+      expect(post1).not.toHaveBeenCalled()
+      expect(post2).not.toHaveBeenCalled()
+    })
+
+    it('disarms on the pane\'s cancel and on a pane switch', async () => {
+      const bridge = installBridge()
+      const { store, w1 } = await renderTwoPanes()
+
+      await send(watch('w-1'), 7778, w1)
+      // A cancel naming a different watch leaves the live one alone.
+      await send({ type: 'mc-cursor-away-cancel', v: 1, id: 'other' }, 7778, w1)
+      expect(bridge.stops).toBe(0)
+      await send({ type: 'mc-cursor-away-cancel', v: 1, id: 'w-1' }, 7778, w1)
+      expect(bridge.stops).toBe(1)
+
+      await send(watch('w-2'), 7778, w1)
+      expect(bridge.watches).toBe(2)
+      await act(async () => { store.dispatch(setActiveId('cd-2')) })
+      expect(bridge.stops).toBe(2)
+    })
+
+    it('stays silent without a native bridge', async () => {
+      const { w1, post1 } = await renderTwoPanes()
+      await send(watch('w-1'), 7778, w1)
+      expect(post1).not.toHaveBeenCalled()
+    })
+  })
+
   it('applies the incoming pane\'s chrome state on switch instead of the outgoing one\'s', async () => {
     // A switch necessarily happens from a PEEKED header — the tab bar lives on
     // it — so the window store holds `true` at that moment. The incoming pane's

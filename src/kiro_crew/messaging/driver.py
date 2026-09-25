@@ -18,6 +18,8 @@ Slack-specific rendering lives in the Slack ``Renderer``
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import re
 from typing import Any, Awaitable, Callable
@@ -33,8 +35,27 @@ from kiro_crew.acp.types import (
     EVENT_THINKING_CHUNK,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
+    STOP_CLASS_CANCELLED,
+    STOP_REASON_COMPACTION_FAILED,
+    STOP_REASON_REFUSAL,
+    STOP_REASON_TOOL_STALL,
+    classify_stop_reason,
 )
-from kiro_crew.constants import _STEERING_TAIL_PREFIX_RE
+from kiro_crew.constants import (
+    _STEERING_TAIL_PREFIX_RE,
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    STEER_NOTICE_BOUND_SECS,
+)
+from kiro_crew.deny_notice import steer_refusal_notice
+from kiro_crew.messaging.empty_turn_copy import (
+    EMPTY_TURN_NOTICE,
+    EMPTY_TURN_NOTICE_AFTER_WORK,
+    EMPTY_TURN_NOTICE_ERROR,
+    EMPTY_TURN_NOTICE_ERROR_AFTER_WORK,
+    EMPTY_TURN_NOTICE_REFUSAL,
+    EMPTY_TURN_NOTICE_UNCLOSED,
+    EMPTY_TURN_NOTICE_UNCLOSED_AFTER_WORK,
+)
 from kiro_crew.messaging.renderer import (
     COMPACTION,
     DONE,
@@ -66,7 +87,22 @@ APPROVAL_INTERACTIVE = "interactive"
 #: A decision callback: given a permission-request event, return True to
 #: approve. Used for the interactive ladder (each channel supplies its own,
 #: e.g. by awaiting a button click). Returns None/False => deny.
+#:
+#: A decider MAY also carry ``last_deny_cause``: set on every call, ``""`` for a
+#: human's own answer (or no answer worth explaining) and a ``DENY_CAUSE_*``
+#: name from ``kiro_crew.constants`` when the denial was the host's doing.
+#: Today that is :data:`DENY_CAUSE_APPROVAL_TIMEOUT`, recorded by every shipped
+#: decider when its prompt expires unanswered. The driver reads it after a
+#: denial and steers the cause into the running turn BEFORE it rejects, so the
+#: model is not left with kiro-cli's generic "User denied tool execution" for a
+#: call nobody answered. A plain callable without the attribute is a denial
+#: with no cause, exactly as before.
 ApprovalDecider = Callable[[Any], Awaitable[bool]]
+
+#: Strong references to the teardown-time orphan rejects scheduled by
+#: :meth:`TurnDriver._steer_deny_cause`: asyncio holds tasks weakly, and these
+#: are created exactly while the turn is unwinding.
+_orphan_rejects: "set[asyncio.Task[Any]]" = set()
 
 #: A synchronous predicate: given the PERMISSION EVENT, return True to
 #: auto-approve that tool regardless of the interactive ladder. The caller
@@ -83,6 +119,83 @@ AutoApprovePredicate = Callable[[Any], bool]
 #: session key (keeping the driver channel-neutral), typically
 #: ``messaging.dispatch.build_directive_consumer``.
 DirectiveConsumer = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+# ── Empty-turn verdict ─────────────────────────────────────────────────────
+#
+# A turn can close with no assistant text at all: the backend answers the
+# prompt with a bare terminal (a reasoning-only generation, a model that
+# returned an empty completion), runs a tool and stops without a closing
+# reply, or ends on an ``error:``-family terminal the ACP layer synthesised.
+# ``run()`` then returns ``""`` exactly as it does for a cancelled turn, and
+# a renderer that keys only on "is the body empty" cannot tell a reply that
+# was never produced from a turn that carried its text in an earlier segment.
+# So the driver, which sees the whole stream, states the verdict ONCE and both
+# consumers read it: the renderer receives it on the ``DONE`` event
+# (``OutputEvent.notice``) and posts it in place of its bare placeholder, and
+# the dispatcher reads ``TurnDriver.empty_turn_notice`` to persist the
+# same sentence as a ``notice`` row. The two cannot disagree because neither
+# derives its own.
+#
+# The sentences live in :mod:`kiro_crew.messaging.empty_turn_copy`, shared with
+# the dashboard runner (``chat_runner``), so a user who sees a channel thread
+# mirrored into the dashboard reads one story. Each sentence tells the user
+# what to DO, and the remedy is split by whether the turn did work first: a
+# turn whose tool already ran is never told to resend, because a resend runs
+# the side effect twice. The ``error:`` label interpolated into the error
+# sentences comes from :data:`_ERROR_STOP_LABELS` -- fixed copy for a closed
+# protocol value, never the wire string, which a backend authors and which
+# would otherwise reach the channel and the transcript unredacted.
+
+_ERROR_STOP_PREFIX = "error:"
+#: The ``error:``-family terminals the ACP layer itself synthesises, each with
+#: the words the notice uses for it. Any other ``error:`` reason -- the family
+#: is open on the wire -- takes the generic label, so no backend prose is ever
+#: interpolated into user-facing copy.
+_ERROR_STOP_LABELS: dict[str, str] = {
+    STOP_REASON_TOOL_STALL: "tool stall",
+    STOP_REASON_COMPACTION_FAILED: "compaction failed",
+}
+_ERROR_STOP_GENERIC_LABEL = "backend error"
+
+
+def empty_turn_notice(
+    accumulated: str,
+    *,
+    completed: bool,
+    stop_reason: str,
+    productive: bool,
+) -> str:
+    """The sentence a turn that produced no assistant text owes the user, or ``""``.
+
+    ``""`` means the turn is NOT an empty reply: it produced text (a whitespace-
+    only accumulation counts as none -- the steer-boundary separator is a
+    ``"\\n"``), or the user cancelled it, in which case the cancel is the answer
+    and a notice would contradict it. Every other textless close gets one, chosen
+    by the terminal's class: refusal, the ``error:`` family (named through
+    :data:`_ERROR_STOP_LABELS`, generic for a value the map does not know), a
+    stream that never closed, and the plain end-of-turn.
+
+    *productive* -- the turn ran a tool or reasoned before it ended -- selects
+    the remedy on EVERY branch but the refusal: work whose side effects already
+    landed must never be answered with "send your message again", because the
+    resend runs it twice (``STOP_REASON_TOOL_STALL`` in particular is
+    synthesised only after a tool ran). A productive turn is told to continue
+    from where it stopped; a turn that did nothing keeps the resend wording.
+    """
+    if accumulated.strip():
+        return ""
+    if not completed:
+        return EMPTY_TURN_NOTICE_UNCLOSED_AFTER_WORK if productive else EMPTY_TURN_NOTICE_UNCLOSED
+    reason = stop_reason or ""
+    if classify_stop_reason(reason).name == STOP_CLASS_CANCELLED:
+        return ""
+    if reason == STOP_REASON_REFUSAL:
+        return EMPTY_TURN_NOTICE_REFUSAL
+    if reason.startswith(_ERROR_STOP_PREFIX):
+        template = EMPTY_TURN_NOTICE_ERROR_AFTER_WORK if productive else EMPTY_TURN_NOTICE_ERROR
+        return template.format(reason=_ERROR_STOP_LABELS.get(reason, _ERROR_STOP_GENERIC_LABEL))
+    return EMPTY_TURN_NOTICE_AFTER_WORK if productive else EMPTY_TURN_NOTICE
+
 
 # kiro-cli embeds this protocol frame in ordinary agent_message_chunk text when
 # it folds a mid-turn steer. It is transport metadata, not assistant speech.
@@ -406,6 +519,18 @@ class TurnDriver:
         # re-injection bookkeeping (no completion: the prompt never landed; an
         # empty reason: a normal end of turn), so the presence is kept apart.
         self.completion_observed: bool = False
+        # The empty-turn verdict of the last run() (see :func:`empty_turn_notice`):
+        # the sentence the dispatcher persists as a ``notice`` row when the turn
+        # closed with no assistant text, ``""`` when it produced text or the
+        # user cancelled. The same sentence rides the DONE event to the renderer,
+        # so the bubble and the transcript can never tell two stories.
+        self.empty_turn_notice: str = ""
+        # The channel-safe assistant text run() has accumulated SO FAR -- the
+        # same value run() returns once the stream ends, kept current at every
+        # growth site so it survives an exception. A dispatcher whose run() raised
+        # reads it to record the reply the renderer was already handed (and the
+        # user already saw), instead of filing the turn as if it produced nothing.
+        self.partial_text: str = ""
         # Synchronous pre-registration shutdown gate, supplied by the dispatcher
         # as a zero-arg closure over its SessionManager and session key. It lives
         # HERE rather than at each call site because the only placement that is
@@ -418,6 +543,12 @@ class TurnDriver:
     async def run(self, message: str) -> str:
         """Drive one turn; return the accumulated channel-safe assistant text."""
         accumulated = ""
+        self.empty_turn_notice = ""
+        self.partial_text = ""
+        # Whether this turn did work a reply could be missing FROM: a tool call
+        # or a reasoning chunk. Decides between the two end-of-turn notices; a
+        # replayed message would re-run what these already did.
+        productive = False
         # Protocol framing runs BEFORE credential redaction. A steering marker
         # may split at any byte boundary; parsing it first ensures neither its
         # UUID nor its internal summary is ever committed to a renderer. The
@@ -468,6 +599,7 @@ class TurnDriver:
             safe = stream_redactor.feed(text)
             if safe:
                 accumulated += safe
+                self.partial_text = accumulated
                 await self.renderer.dispatch(OutputEvent(kind=TEXT_CHUNK, text=safe))
 
         async def flush_redactor() -> None:
@@ -475,6 +607,7 @@ class TurnDriver:
             tail = stream_redactor.flush()
             if tail:
                 accumulated += tail
+                self.partial_text = accumulated
                 await self.renderer.dispatch(OutputEvent(kind=TEXT_CHUNK, text=tail))
 
         async def dispatch_frames(frames: list[tuple[str, str]]) -> None:
@@ -516,6 +649,7 @@ class TurnDriver:
                 if filtered:
                     await dispatch_frames(steering_filter.feed(filtered))
             elif kind == EVENT_THINKING_CHUNK:
+                productive = True
                 await self.renderer.dispatch(OutputEvent(kind=THINKING, text=_redact(event.text)))
             elif kind == EVENT_STEER_CONSUMED:
                 # kiro-cli emits both a typed lifecycle event and an inline
@@ -527,6 +661,7 @@ class TurnDriver:
                 else:
                     pending_steer_events += 1
             elif kind == EVENT_TOOL_CALL:
+                productive = True
                 # Native handle_message treats every EVENT_TOOL_CALL uniformly
                 # (complete previous task + start new), regardless of tool_final;
                 # emit a single tool_call event so the renderer matches it.
@@ -768,6 +903,11 @@ class TurnDriver:
                 if approved:
                     await self.provider.approve_tool(event.request_id)
                 else:
+                    # Steer FIRST, reject SECOND: while the permission request
+                    # is unanswered the turn is provably in flight, so a
+                    # host-caused denial (an expired prompt) can be explained
+                    # to the model in-band instead of arriving as "User denied".
+                    await self._steer_deny_cause(event)
                     await self.provider.reject_tool(event.request_id)
                 sel().log_api_access(
                     caller="turn_driver",
@@ -809,7 +949,43 @@ class TurnDriver:
                 for _ in range(pending_steer_events):
                     await self.renderer.dispatch(OutputEvent(kind=STEER_CONSUMED))
                 pending_steer_events = 0
-                await self.renderer.dispatch(OutputEvent(kind=DONE, stop_reason=event.stop_reason))
+                # After the flushes: ``accumulated`` is final only now, and the
+                # verdict must read the same text the renderer was handed.
+                self.empty_turn_notice = empty_turn_notice(
+                    accumulated,
+                    completed=True,
+                    stop_reason=event.stop_reason or "",
+                    productive=productive,
+                )
+                await self.renderer.dispatch(
+                    OutputEvent(
+                        kind=DONE, stop_reason=event.stop_reason, notice=self.empty_turn_notice
+                    )
+                )
+        if not self.completion_observed:
+            # The stream ended without a terminal. The text is not final yet: the
+            # compaction filter, the steering filter and the stream redactor each
+            # hold back a tail (the redactor withholds a whole trailing letter
+            # run, so a last chunk of "Done" is still in its buffer), and only the
+            # terminal branch above flushed them. Flush the same trio in the same
+            # order here, or the verdict below reads a buffer and tells the user
+            # the turn ended without a reply while the reply sits unflushed --
+            # and the dispatcher, which reads ``accumulated`` for the transcript,
+            # files the same wrong story. The unmatched steer boundaries are
+            # dispatched as the terminal branch dispatches them. No DONE is
+            # dispatched: the dispatcher's ``finally`` (or its own synthetic DONE)
+            # closes the renderer; the verdict is still owed to the transcript.
+            pending = compaction_filter.flush()
+            if pending:
+                await dispatch_frames(steering_filter.feed(pending))
+            await dispatch_frames(steering_filter.flush())
+            await flush_redactor()
+            for _ in range(pending_steer_events):
+                await self.renderer.dispatch(OutputEvent(kind=STEER_CONSUMED))
+            pending_steer_events = 0
+            self.empty_turn_notice = empty_turn_notice(
+                accumulated, completed=False, stop_reason="", productive=productive
+            )
         return accumulated
 
     async def _consume_directive(
@@ -930,6 +1106,61 @@ class TurnDriver:
             # The consumer is injected code applying a side effect; a failure
             # there must never abort the rest of the turn's stream.
             logger.warning("session-directive consumer failed for %r", tool, exc_info=True)
+
+    async def _steer_deny_cause(self, event: Any) -> None:
+        """Explain a host-caused denial to the model before the reject goes out.
+
+        Reads the decider's ``last_deny_cause`` (see :data:`ApprovalDecider`).
+        Only :data:`DENY_CAUSE_APPROVAL_TIMEOUT` is steered: a human's Deny is a
+        real decision the generic tool result already describes correctly, and
+        deny-by-default with no decider is a configuration the model cannot act
+        on. Best-effort and bounded through
+        :func:`kiro_crew.deny_notice.steer_refusal_notice`; a failure there
+        never blocks the reject that follows.
+
+        Cancellation mid-steer (turn teardown) must still answer the wire: a
+        stranded ``session/request_permission`` blocks the subprocess forever and
+        wedges every later turn behind it. The reject is scheduled as a strongly
+        referenced task and awaited through ``asyncio.shield`` so it is stepped
+        while this coroutine unwinds; the denial is then audited exactly as the
+        normal path audits it (the re-raise skips the caller's audit row, and a
+        rejection that reached the wire but not the SEL trail is a gap in a
+        security control), and the cancellation re-raises.
+        """
+        cause = getattr(self.decider, "last_deny_cause", "") if self.decider is not None else ""
+        if cause != DENY_CAUSE_APPROVAL_TIMEOUT:
+            return
+        try:
+            await steer_refusal_notice(
+                self.provider,
+                str(getattr(event, "title", "") or ""),
+                "the tool-approval prompt went unanswered until its window closed",
+                cause=cause,
+                bound_secs=STEER_NOTICE_BOUND_SECS,
+            )
+        except asyncio.CancelledError:
+            reject = asyncio.ensure_future(self.provider.reject_tool(event.request_id))
+            _orphan_rejects.add(reject)
+            reject.add_done_callback(_orphan_rejects.discard)
+            rejected = False
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(reject)
+                rejected = True
+            if rejected:
+                with contextlib.suppress(Exception):
+                    sel().log_api_access(
+                        caller="turn_driver",
+                        operation="tool_permission",
+                        outcome="denied",
+                        source="messaging",
+                        resources=(
+                            f"request_id={event.request_id} mode={self.approval_mode} "
+                            "reason=approval_timeout_cancelled_mid_steer"
+                        ),
+                    )
+            raise
+        except Exception:
+            logger.debug("approval-timeout steer notice failed; rejecting anyway", exc_info=True)
 
     async def _approve(self, event: Any) -> bool:
         """Apply the approval ladder to a permission-request event."""

@@ -233,7 +233,7 @@ class _Sessions:
     def dequeue(self, key: str) -> tuple[str, str, dict[str, Any]] | None:
         return self.queued.pop(0) if self.queued else None
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Any = None) -> None:
         self.queued.clear()
 
     async def try_acquire(self, key: str) -> bool:

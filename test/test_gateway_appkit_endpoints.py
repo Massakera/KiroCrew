@@ -2415,6 +2415,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default
@@ -2445,6 +2449,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default
@@ -2747,6 +2755,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default

@@ -81,8 +81,19 @@ _RUN_DIR_ARTIFACTS: dict[str, tuple[str, ...]] = {
     # The run sweep accepts pi artifacts as well as sandbox launchers.
     _PI_GATE_ARTIFACT_PREFIX: _PI_GATE_ARTIFACT_SUFFIXES,
 }
+# The DeepSeek Harness gate shares the pi-gate leaf: the sealed plugin
+# (``kirocrew_dsh_gate_<pid>.mjs``), its per-launch patch
+# (``kirocrew_dsh_gate_<pid>.patch.yml``) and the mkstemp stages both are
+# renamed from (``kirocrew_dsh_gate_<pid>_*.tmp`` / ``kirocrew_dsh_patch_<pid>_*.tmp``).
+# Like the pi artifacts they are written once per gateway process and reused, so
+# the PID in the name is the owner's own and liveness, not age, decides staleness.
+_DSH_GATE_ARTIFACT_PREFIX = "kirocrew_dsh_gate_"
+_DSH_PATCH_ARTIFACT_PREFIX = "kirocrew_dsh_patch_"
+_DSH_GATE_ARTIFACT_SUFFIXES: tuple[str, ...] = (".mjs", ".patch.yml", ".tmp")
 _PI_GATE_DIR_ARTIFACTS: dict[str, tuple[str, ...]] = {
     _PI_GATE_ARTIFACT_PREFIX: _PI_GATE_ARTIFACT_SUFFIXES,
+    _DSH_GATE_ARTIFACT_PREFIX: _DSH_GATE_ARTIFACT_SUFFIXES,
+    _DSH_PATCH_ARTIFACT_PREFIX: (".tmp",),
 }
 
 # Bind-mount SOURCES staged by the namespace launcher (empty dirs/files bound
@@ -325,6 +336,31 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # as a second such window, so ``$KIROCREW_SCRATCH`` names one place for the
     # whole tree. Siblings from other trees stay hidden either way.
     "scratch",
+    # The cross-process work root (``work_root``): ``<home>/work/<key>``, for
+    # state that must OUTLIVE the process that created it. Masked as a whole and
+    # given NO window, which is the difference from ``scratch`` above: the only
+    # caller that may allocate is UNSANDBOXED gateway code (the maintenance
+    # sweep), and no environment variable names the root. The other two classes
+    # that plausibly want durable state do NOT qualify and must not be told
+    # otherwise -- a script cron's ``boot_platform()`` shares the agent's mount
+    # namespace (see the reconciliation note above) and an app backend is itself a
+    # sandboxed spawn -- so each is served the way the Notes state files below
+    # are: whatever SPAWNS it allocates host-side and passes that one key
+    # directory back as a window, never a lift of the mask. Leaving the mask
+    # window-less is what keeps the failure honest: on Linux the mask is a
+    # WRITABLE empty tmpfs bind, so an in-sandbox allocation would otherwise
+    # succeed and lose its bytes with the namespace.
+    # Keys are deterministic by design -- an
+    # issue or pull-request number, so a later run finds the directory again --
+    # so an unmasked root would let one session tree guess a name and rewrite
+    # another job's in-flight clone, a sharper hazard than the random-suffixed
+    # scratch names carry. The mask alone would be VACUOUS here, which is why this
+    # leaf appears in two more places: the root is created lazily by the first
+    # ``allocate_work`` call, so it is also in ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES``
+    # (the loop below binds nothing over an absent name), and it is in
+    # ``security.paths`` so the file tools refuse it too. All three, because each
+    # one alone leaves a different path open.
+    "work",
     # The Notes state files below are OWNED by the md-notebook backend, which is itself
     # a sandboxed spawn (`apps/backend.py`), so the mask alone would break the app: the
     # registry write's final rename gets EPERM and attach/clone always fails.
@@ -436,6 +472,15 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # is SKIPPED, which on a fresh install is exactly the disposition this entry
     # exists to deny.
     "crew-panels",
+    # Crewmate teams (``crew_teams.py``): which crewmates are on which team. The
+    # same shape as ``crew-panels`` and for the same reason it is not under
+    # ``trust/``: a team is the OWNER's grouping, so the crewmates it groups must
+    # not be able to rewrite it, and ``trust`` stays sandbox read-write. Two
+    # owner-invoked writers open it, neither sandboxed: the gateway (the
+    # owner-gated ``/api/teams`` routes, the crew create/delete/package-sync
+    # hooks) and ``kirocrew agent create`` / ``delete`` from the operator's shell. Whole
+    # directory: ``atomic_write`` publishes through a sibling temp.
+    "crew-teams",
     # Auth stores and signing keys owned by the gateway web server alone.
     "token_signing.key",
     "refresh_chains.json",
@@ -1135,10 +1180,14 @@ def carveout_shadowed_by_foreign_mask(path: str, mode: str = "standard") -> bool
     crew-home carve-out the entire credential tree. Both EQUALITY-shaped
     crew-home carve-out producers call this before adding a spelling —
     :func:`app_backend_visible_targets` and the policy-cache site in
-    ``apps/backend.py``. (The aws-control per-call staging carve-out is the
-    ANCESTOR-LIFT shape — its temp dir is a proper descendant of its own mask
-    by design — so this guard as written would refuse it on every layout, and
-    it has no own-ancestor-exempt variant.) On refusal the mask stays
+    ``apps/backend.py``. The aws-control per-call staging carve-out is the
+    ANCESTOR-LIFT shape instead: its temp dir is a proper descendant of the mask
+    entry the lift cancels, so asking about that dir refuses on every layout,
+    the default one included. It asks about the staging ROOT instead — the mask
+    entry itself, which the equality rule below exempts while every OTHER masked
+    ancestor still refuses. Same verdict, no parameter: no mask entry can sit
+    between a root and the per-call dir minted directly inside it, and that dir
+    is a fresh random name no list carries. On refusal the mask stays
     and the carve-out's consumer fails closed (EPERM for an app backend's own
     state, an unreadable cache for a cache-only backend), which is strictly
     safer than unmasking a foreign tree. The refusal is logged with the
@@ -1171,7 +1220,8 @@ def carveout_shadowed_by_foreign_mask(path: str, mode: str = "standard") -> bool
 
     Equality is not shadowing — carve-out spellings ARE masked entries, and
     unhiding exactly themselves is the carve-out's whole job; only a PROPER
-    ancestor is foreign.
+    ancestor is foreign. An ancestor-lift producer therefore asks about the mask
+    entry it lifts, never about the descendant it hands to the spawn.
 
     Fails toward refusal, never raises: when home (or the path itself) cannot
     be resolved the mask universe cannot be checked, so the spelling is
@@ -1534,6 +1584,38 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     # otherwise the first sandbox spawned before the first grant write sees an
     # unmasked leaf appear later.
     "tag-grants",
+    # The crewmate-teams store is created on the first team the owner makes, so a
+    # sandbox spawned before that finds the name absent and the mask is vacuous
+    # for its lifetime; materialised empty at 0700 so the bind always has a
+    # target.
+    "crew-teams",
+    # The cross-process work root, and it needs this entry MORE than the stores
+    # above rather than less: it is created lazily by the first ``allocate_work``
+    # call, so on a fresh home the leaf is absent at every spawn until some job
+    # allocates, the ``isdir``-guarded ``SENSITIVE_DIRS`` loop skips what does not
+    # exist, and the mask is vacuous for the life of those sandboxes. The
+    # ``scratch`` sibling carries no entry because every spawn allocates one, so
+    # that root exists by construction; nothing allocates a work directory for a
+    # spawn. Left absent, a sandboxed agent could itself create the directory at a
+    # key it expects a job to use -- keys are deterministic by design -- and, since
+    # the allocation marker that distinguishes this module's own tree is a name in
+    # the code, plant that too, so ``allocate_work`` rejoins the planted tree rather
+    # than refusing it. Materialised empty at 0700 before every spawn so the bind
+    # always has a target.
+    "work",
+    # The refused-inbound spool root, and its consequence is the sharpest kind: the
+    # store is created by its own first write, so on a host where no inbound message
+    # has been refused the name is absent, the ``isdir``-guarded ``SENSITIVE_DIRS``
+    # loop skips it, and the mask is vacuous for the life of every sandbox spawned
+    # first. One of those can create the directory ITSELF and leave an entry the
+    # gateway reads on the next start and quotes verbatim, as the operator's own
+    # words, into a conversation the egress recheck still authorizes. The module's
+    # own refusals do not reach this shape -- they refuse a LINK at the directory,
+    # the leaf or the lock, and a directory an agent created is a real directory
+    # holding a plain single-linked file. Materialised empty at 0700, which is what
+    # the spool's own ``restrict_to_owner=True`` writes already require of it; its
+    # readers open the leaf inside, so an empty root reads exactly as an absent one.
+    "inbound-spool",
 )
 
 #: The masked md-notebook leaves materialised before a namespace spawn, and what each
@@ -1734,6 +1816,8 @@ _CREW_NO_ALIAS_LEAVES: frozenset[str] = frozenset({"crew-panels", "panel-templat
 #: relocation the product offers:
 #:
 #: * ``scratch`` -- ``agent_scratch.scratch_root()`` is ``config_dir() / "scratch"``;
+#: * ``work`` -- ``work_root.work_root()`` is ``config_dir() / "work"``, and the module
+#:   refuses a linked root at allocation and sweeps nothing through one;
 #: * ``backup`` -- no resolver in the tree reads an override for it either.
 #:
 #: The HARDLINK shape is tolerated for every leaf, which is why it is a property of the
@@ -4444,6 +4528,13 @@ def _hidden_path_contains_visible_path(
 # Sensitive env var prefixes to scrub from the child environment.
 # Scrubbed in ALL modes (standard + strict) — credential_process reads
 # from ~/.aws/config, not env vars, so scrubbing is always safe.
+#
+# NOTE (applies to this list AND ``_AGENT_DENIED_ENV_KEYS`` below): inherited
+# ``ANTHROPIC_*`` / ``CLAUDE_CODE_*`` variables must keep flowing to
+# claude-harness children — the gateway's env-passthrough contract in
+# docs/system-specs/modules/claude-code-provider.md (its env-passthrough
+# section). Adding either namespace here silently breaks the custom-endpoint
+# auth documented in docs/guides/custom-llm-backend.md.
 _SENSITIVE_ENV_PREFIXES: list[str] = [
     "AWS_SECRET",
     "AWS_SESSION",
@@ -8121,9 +8212,9 @@ def cleanup_stale_sandbox_profiles(*, data_home: Path, legacy_dir: str | None = 
                     continue
                 filepath = os.path.join(artifact_dir, entry)
                 # Age check first — handles the spawner-PID design flaw. Not for the
-                # pi gate artifacts: those are written once per gateway process and
-                # REUSED by every later spawn of that process, so their age says
-                # nothing, and the PID in their name is the owner's own.
+                # gate artifacts (pi and dsh): those are written once per gateway
+                # process and REUSED by every later spawn of that process, so their
+                # age says nothing, and the PID in their name is the owner's own.
                 try:
                     if artifact_fd is None:
                         mtime = os.stat(filepath).st_mtime
@@ -11271,6 +11362,25 @@ def scrub_env(
     prefixes = _SPAWN_SCRUB_ENV_PREFIXES + (extra_prefixes or [])
     src = os.environ if env is None else env
     return {k: v for k, v in src.items() if not any(k.startswith(p) for p in prefixes)}
+
+
+def agent_env_scrub_prefixes() -> tuple[str, ...]:
+    """Name prefixes :func:`scrub_agent_subprocess_env` drops from an agent child.
+
+    DERIVED from the two lists that scrub actually composes, so a caller checking
+    "would this variable survive the scrub?" cannot drift from the scrub itself.
+    That question has one caller today: the ``agent.deepseek_env`` validator in
+    ``acp/client.py`` refuses to inject a name the scrub would strip, because the
+    injection happens BEFORE the scrub and the operator would otherwise get a
+    harness with no provider key and no error naming why.
+
+    Deliberately NOT the whole truth about a given spawn: ``forward_ssh_auth_sock``
+    re-admits ``SSH_AUTH_SOCK`` for an opted-in agent child, so a name matching
+    that prefix is reported as scrubbed here even though one spawn shape keeps it.
+    The caller's use is a refusal, so answering conservatively refuses a name that
+    might have worked rather than accepting one that silently would not.
+    """
+    return tuple(_SPAWN_SCRUB_ENV_PREFIXES) + tuple(_PYTHON_ENV_PREFIXES)
 
 
 def scrub_agent_denied_env(env: dict[str, str]) -> dict[str, str]:

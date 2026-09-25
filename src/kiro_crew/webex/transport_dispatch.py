@@ -88,7 +88,9 @@ from kiro_crew.messaging.link import (
 from kiro_crew.messaging.pre_turn import resolve_pre_turn
 from kiro_crew.messaging.queue_drain import (
     drain_until_quiet,
+    entries_queued_by,
     entry_channel,
+    owner_token,
     register_drain,
     tag_entry,
 )
@@ -206,6 +208,19 @@ class _QueuedPlace(NamedTuple):
         conversation it did not come from.
         """
         return (self.person_email, self.room_id, self.parent_id)
+
+
+def _entry_owner(inbound: "WebexInbound") -> str:
+    """The neutral token naming the principal *inbound* came from.
+
+    Built from the same three values ``_QueuedPlace.sender_key`` compares -- sender, room
+    and thread root -- so "whose entry is this" and "may these collapse into one turn"
+    can never answer differently. ``/stop`` compares it to drop one person's queued
+    messages and leave everybody else's, which matters under ANY ``dm_scope`` here: a
+    group space routes as ``space:{room_id}``, so every allow-listed member of one space
+    already shares a session key and a queue.
+    """
+    return owner_token(_CHANNEL, (inbound.person_email, inbound.room_id, inbound.parent_id))
 
 
 def _queued_place(kwargs: dict) -> _QueuedPlace | None:
@@ -1271,12 +1286,14 @@ class WebexDispatcher:
                 # carry it could only be replayed onto the opener's routing, which is
                 # a different session key whenever the two differ.
                 webex_room_type=inbound.room_type,
-                # Which CHANNEL recorded this entry. Neutral, and splatted from the
-                # shared helper rather than written as a literal keyword, because the
-                # fields above cannot be read until ownership is known: one session key
-                # is shared by every dispatcher on the host, so this queue also holds
-                # entries no ``webex_`` field describes.
-                **tag_entry({}, _CHANNEL),
+                # Which CHANNEL recorded this entry, and WHOSE it is. Both neutral, and
+                # splatted from the shared helper rather than written as literal
+                # keywords, because the fields above cannot be read until ownership is
+                # known: one session key is shared by every dispatcher on the host, so
+                # this queue also holds entries no ``webex_`` field describes. The owner
+                # is what lets one member's ``/stop`` drop their own queued messages
+                # without discarding the rest of the space's.
+                **tag_entry({}, _CHANNEL, _entry_owner(inbound)),
             ):
                 return False
             await self._queue.create_or_grow_locked(
@@ -1285,6 +1302,7 @@ class WebexDispatcher:
                 # An uncaptioned attachment has no text at all; the receipt still
                 # has to show the user that SOMETHING was received.
                 text or _QUEUED_ATTACHMENT_LABEL,
+                _entry_owner(inbound),
             )
             return True
 
@@ -1475,11 +1493,16 @@ class WebexDispatcher:
     # ── Commands ───────────────────────────────────────────────────────────
 
     async def _handle_stop(self, inbound: "WebexInbound") -> None:
-        """Hard cancel: abort the in-flight turn and clear the queue.
+        """Hard cancel: abort the in-flight turn and clear THIS caller's queued messages.
 
         The cancel is cooperative (ACP cannot force-kill a co-tenant), so the
         turn stops at the next safe point; the ack is sent without waiting for it
         so it stays snappy.
+
+        The clear is scoped to the caller's own entries. One session key here is shared
+        under a unified ``dm_scope`` AND by every member of a group space, so a
+        whole-queue clear discards messages other people sent and are still owed an
+        answer to, and flips their receipt to a cancellation they never asked for.
         """
         session_key = self._session_key(_route_of(inbound))
         # Recorded before the busy check, so a Stop landing while the session is
@@ -1498,8 +1521,11 @@ class WebexDispatcher:
                 except Exception:
                     logger.warning("Webex /stop: cancel failed for %s", session_key, exc_info=True)
         async with self._queue.lock:
-            self.sessions.clear_queue(session_key)
-            await self._queue.finish_cancelled_locked(session_key, self._receipt_surface(inbound))
+            owner = _entry_owner(inbound)
+            self.sessions.clear_queue(session_key, entries_queued_by(owner))
+            await self._queue.finish_cancelled_locked(
+                session_key, self._receipt_surface(inbound), owner
+            )
         await self._reply(
             inbound,
             "🛑 Stopped." if cancelled_turn else "🛑 Nothing was running — queue cleared.",

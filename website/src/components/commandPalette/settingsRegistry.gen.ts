@@ -1491,6 +1491,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "developer.reply-threads-on-crewmate-chat-messages",
+    "label": "Reply threads on crewmate chat messages",
+    "labelKey": "pages.settings.crewmatesSection.reply_threads",
+    "description": "Let any message in a crewmate's chat carry its own reply thread, opened in the side panel while the chat stays visible. Off, the Reply in thread control is not offered and existing threads are hidden, not deleted.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "developer.run-a-local-gateway",
     "label": "Run a local gateway",
     "labelKey": "pages.settings.developerPanel.run_a_local_gateway",
@@ -1634,16 +1643,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "display",
     "type": "buttonGroup",
     "occurrence": 1
-  },
-  {
-    "id": "display.spend-a-few-credits-to-check-your-balance",
-    "label": "Spend a few credits to check your balance",
-    "labelKey": "pages.settings.displayPanel.credit_usage_scrape",
-    "description": "When your usage data is not available for free, your balance can still be checked by sending one billed message, about every 10 minutes while a dashboard tab is open. Each check spends a small number of credits.",
-    "tab": "display",
-    "type": "toggle",
-    "occurrence": 1,
-    "configKey": "dashboard.usage_text_scrape_enabled"
   },
   {
     "id": "display.theme",

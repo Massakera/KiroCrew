@@ -704,7 +704,7 @@ class TestTheContractCoversEveryDrainingChannel:
             for other in readers:
                 if other == owner:
                     continue
-                assert read(tag_entry({}, other)) is None, f"{owner} claimed {other}'s entry"
+                assert read(tag_entry({}, other, "")) is None, f"{owner} claimed {other}'s entry"
 
 
 def _tg_origin_for(user: int, chat: int) -> Any:

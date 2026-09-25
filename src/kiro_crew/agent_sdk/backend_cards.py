@@ -18,9 +18,9 @@ or out -- so nothing about a non-member is legible in the source data, and three
 reasons a reader wants told apart collapse into one absence: cannot do it, does it
 differently, and nobody has measured it. ``ACP_BACKENDS_MEMBER_DISPATCH`` shows the
 collapse: pi is a non-member because a mount there is INERT (the array is accepted
-and never forwarded), deepseek is a non-member on a deliberate refusal -- it has the
-mount, and its routing sits outside ``tool_gate.ENFORCED_ROUTINGS`` -- and KAS is a
-member on a captured mount.
+and never forwarded), deepseek is a non-member on H6 -- it has the mount and, since
+Crew's gate plugin, an enforced routing, but no member-dispatch decision has been
+taken for that harness -- and KAS is a member on a captured mount.
 
 The third level is NOT derived from the sets, because it is not in them. It is
 :data:`DECLARED_UNMEASURED`, a per-harness per-line table carrying a reason per
@@ -43,8 +43,9 @@ projection exists to remove:
   entry the vocabulary does not support, so the table cannot drift away from the
   prose and the threshold is a gate rather than a convention to remember;
 * "a decision is missing" is not this state. deepseek has no member dispatch because
-  mounting Crew's control plane into a session nothing gates is refused, so the
-  feature does not work there today and NOT AVAILABLE is the true mark. Unmeasured is
+  no decision has mounted Crew's control plane into it -- H6 carries nothing over
+  from codex's or opencode's -- so the feature does not work there today and
+  NOT AVAILABLE is the true mark. Unmeasured is
   for a line whose answer is unknown, never for one whose answer is no;
 * an entry may not contradict the projection. A member has demonstrated the
   capability, so :func:`_card_lines` applies an entry only to a line that is already
@@ -331,6 +332,23 @@ OPERATOR_LINES: Tuple[_LineSpec, ...] = (
 #: DEFECT rather than an absent feature, and a card that listed defect classes in
 #: front of someone choosing a harness would be worse than one line shorter.
 OFF_CARD_SETS: Mapping[str, str] = {
+    "ACP_BACKENDS_MEMBER_PANEL": (
+        "whether a member DM session may mount its own webview. Its membership is the "
+        "same as ACP_BACKENDS_MEMBER_DISPATCH's, and the member-thread-tools line "
+        "already answers for that one, so a card line here would repeat a claim the "
+        "reader has read one line earlier and tell them nothing a harness differs on. "
+        "The set exists so the DECISION is opted into per capability (harness-parity "
+        "H6) rather than inherited from session control; if the two memberships ever "
+        "diverge, that divergence is what earns a line"
+    ),
+    "ACP_BACKENDS_HOOKS_LIST": (
+        "which backend's agent may ask its client for the hooks matching a trigger, and "
+        "have the client run one. Nothing a reader choosing a harness can act on: Crew "
+        "does not announce the capability that makes an agent use the channel, so a "
+        "member asks nothing and a non-member loses nothing. A wrong membership would "
+        "answer a backend that never defined the channel, which is a defect rather "
+        "than a shortfall"
+    ),
     "ACP_BACKENDS_HARNESS_OWNED_SESSIONS": (
         "whose disk the transcript sits on. Crew holds a non-member's transcript under "
         "its own sessions tree and a reopened chat restores from there, so the "

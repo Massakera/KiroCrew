@@ -103,6 +103,12 @@ from kiro_crew.dashboard.handlers.appearances import (  # noqa: E402, F401
     api_appearances_petdex_fetch,
 )
 
+# ── Browser view same-origin relay (handlers/browser_view_relay.py) ──
+from kiro_crew.dashboard.handlers.browser_view_relay import (  # noqa: E402, F401
+    api_browser_view_relay,
+    close_relay_client,
+)
+
 # ── Connections OAuth relay (handlers/connections.py) ──
 from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_cancel,
@@ -449,6 +455,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_sessions_search,
     api_sessions_summarize,
     api_sessions_usage,
+    api_sessions_usage_refresh,
 )
 
 # ── Side conversation (extracted to handlers/side.py) ──
@@ -510,6 +517,14 @@ from kiro_crew.dashboard.handlers.taskrunner import (  # noqa: E402, F401
     api_taskrunner_to_chat,
     api_taskrunner_update_plan,
     api_taskrunner_update_task,
+)
+
+# ── Crewmate teams (handlers/teams.py) ──
+from kiro_crew.dashboard.handlers.teams import (  # noqa: E402, F401
+    api_teams_create,
+    api_teams_delete,
+    api_teams_list,
+    api_teams_update,
 )
 
 
@@ -932,8 +947,7 @@ def _build_prompt_base() -> list[dict[str, Any]]:
 
 
 # Paid-AWS-service consent — the operator's confirmation surface for Amazon
-# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant
-# alongside the ``kirocrew aws-consent`` CLI.
+# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant.
 from kiro_crew.dashboard.handlers.aws_consent import (  # noqa: E402, F401
     api_aws_consent_delete,
     api_aws_consent_get,

@@ -22,6 +22,7 @@ from kiro_crew.cron import (
     CronService,
     CronStoreUnreadable,
     _job_tz,
+    _RunClaim,
     compute_next_run_ts,
     cron_expr_matches,
     validate_cron_expr,
@@ -840,7 +841,7 @@ class TestJobCompletionRearmsTimer:
             patch.object(svc, "_execute_with_timeout", return_value=None),
             patch.object(svc, "_arm_timer") as mock_arm,
         ):
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
 
         mock_arm.assert_called_once()
 
@@ -863,7 +864,7 @@ class TestJobCompletionRearmsTimer:
             patch.object(svc, "_execute_with_timeout", return_value=None),
             patch.object(svc, "_arm_timer") as mock_arm,
         ):
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
 
         mock_arm.assert_not_called()
 
@@ -895,7 +896,7 @@ class TestJobCompletionRearmsTimer:
         await asyncio.sleep(0)  # let it actually start sleeping
 
         with patch.object(svc, "_execute_with_timeout", return_value=None):
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
         await asyncio.sleep(0)  # let the cancellation propagate
 
         assert stale_timer_task.cancelled()
@@ -908,17 +909,16 @@ class TestJobCompletionRearmsTimer:
 
 
 class TestRunJobIsolatedPreambleFailure:
-    """A run that dies BEFORE its try/finally must still release its markers.
+    """A run that dies BEFORE its try/finally must still release its claim.
 
-    The timer path adds the job to ``_executing`` and stores the task in
-    ``_running_tasks`` with no awaiter, so the only cleanup those two ever get
-    is ``_run_job_isolated``'s own ``finally``. Bookkeeping claimed ahead of the
-    ``try`` -- the start stamps, the fire counter, the jitter -- is outside that
-    protection: an exception there leaves both maps populated, the due-scan
-    skips the job and the manual-run endpoint refuses it with 409 "job is
-    already running", until the reaper sweep, the run route or ``cancel()``
-    meets the finished task and drops the leftovers. The run itself must not
-    leave them.
+    The timer path stores the job's claim -- the job's occupancy, the tracked
+    task -- with no awaiter, so the only release that claim ever gets is
+    ``_run_job_isolated``'s own ``finally``. Bookkeeping ahead of the ``try``
+    -- the generation, the fire counter -- is outside that protection: an
+    exception there leaves the claim stored, the due-scan skips the job and the
+    manual-run endpoint refuses it with 409 "job is already running", until the
+    reaper sweep, the run route or ``cancel()`` meets the finished task and
+    drops the leftovers. The run itself must not leave them.
     """
 
     @pytest.mark.asyncio
@@ -941,24 +941,15 @@ class TestRunJobIsolatedPreambleFailure:
         monkeypatch.setattr("kiro_crew.cron.emit_counter", _boom)
 
         # Exactly what _on_timer leaves for the task: the claim, then no awaiter.
-        svc._executing.add(job.id)
-        claim = svc._job_run_meta[job.id] = (time.time(), "scheduled")
-        task = asyncio.create_task(svc._run_job_isolated(job, claim))
-        svc._running_tasks[job.id] = task
+        claim = svc._claim_run(job.id, "scheduled")
+        claim.task = task = asyncio.create_task(svc._run_job_isolated(job, claim))
         with pytest.raises(RuntimeError, match="fire counter raised ahead of the try"):
             await task
 
-        assert job.id not in svc._executing, (
-            "a run that raised in its preamble left the job in _executing; "
+        assert job.id not in svc._claims, (
+            "a run that raised in its preamble left the job claimed; "
             "every manual run of it is now refused with 409"
         )
-        assert job.id not in svc._running_tasks, (
-            "a run that raised in its preamble left its finished task in _running_tasks"
-        )
-        assert job.id not in svc._job_start_times
-        assert job.id not in svc._job_start_monotonic
-        assert job.id not in svc._job_jitter
-        assert job.id not in svc._job_run_meta
 
     @pytest.mark.asyncio
     async def test_fire_counter_still_counts_once_before_the_jitter_sleep(
@@ -981,7 +972,7 @@ class TestRunJobIsolatedPreambleFailure:
         )
         monkeypatch.setattr(svc, "_compute_jitter", lambda _job: (order.append("jitter"), 0.0)[1])
 
-        claim = svc._job_run_meta[job.id] = (time.time(), "scheduled")
+        claim = svc._claim_run(job.id, "scheduled")
         with patch.object(svc, "_execute_with_timeout", return_value=None):
             await svc._run_job_isolated(job, claim)
 
@@ -992,8 +983,8 @@ class TestRunJobIsolatedPreambleFailure:
 class TestCancelAgainstFinishedTask:
     """``cancel()`` must not act on a run whose task has already finished.
 
-    ``cancel()`` gates on ``_executing`` alone, the marker a finished task can
-    leave standing. Trusting it against a ``done()`` task kills nothing, answers
+    ``cancel()`` gates on the job's claim, which a finished task can leave
+    standing. Trusting it against a ``done()`` task kills nothing, answers
     True, writes a "Cancelled by user after Ns" history row for a run that
     ended long ago, and -- because only the runner's ``finally`` discards
     ``_cancelled_jobs``, and that ``finally`` never runs for the finished task
@@ -1023,12 +1014,13 @@ class TestCancelAgainstFinishedTask:
         stale = asyncio.get_running_loop().create_task(_died_before_cleanup())
         await asyncio.gather(stale, return_exceptions=True)
         assert stale.done()
-        svc._running_tasks[job.id] = stale
-        svc._executing.add(job.id)
-        svc._job_start_times[job.id] = time.time() - 3600
-        svc._job_start_monotonic[job.id] = time.monotonic() - 3600
-        svc._job_jitter[job.id] = 0.0
-        svc._job_run_meta[job.id] = (time.time() - 3600, "scheduled")
+        svc._claims[job.id] = _RunClaim(
+            trigger="scheduled",
+            claimed_at=time.time() - 3600,
+            started_monotonic=time.monotonic() - 3600,
+            jitter=0.0,
+            task=stale,
+        )
 
         with patch("kiro_crew.sel.sel"):
             cancelled = await svc.cancel(job.id)
@@ -1040,12 +1032,7 @@ class TestCancelAgainstFinishedTask:
         assert cancelled is False, "cancel() reported a cancellation with nothing running"
         # The leftovers are released, so the next Run and the next due-scan see
         # the job idle...
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
-        assert job.id not in svc._job_start_times
-        assert job.id not in svc._job_start_monotonic
-        assert job.id not in svc._job_jitter
-        assert job.id not in svc._job_run_meta
+        assert job.id not in svc._claims
         # ...and nothing was recorded for a run that had already ended.
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 0, f"a cancellation was recorded for a finished run: {runs}"

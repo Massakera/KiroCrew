@@ -157,6 +157,7 @@ _SENSITIVE_MASK = "••••••••"
 # arrives.
 _AGENT_UNTRUSTED_TEXT_FIELDS = (
     "member_id",
+    "display_name",
     "description",
     "triggers",
     "kiro_agent",
@@ -604,6 +605,7 @@ def _theme_payload(cfg: KiroCrewConfig) -> dict[str, object]:
         "onboarded": cfg.dashboard.onboarded,
         "import_onboarded": cfg.dashboard.import_onboarded,
         "privacy_acked": cfg.dashboard.privacy_acked,
+        "crewmates_onboarded": cfg.dashboard.crewmates_onboarded,
     }
 
 
@@ -622,8 +624,8 @@ async def api_theme_config(request: web.Request) -> web.Response:
     """GET/PUT /api/config/theme — read or update workspace display settings.
 
     GET returns the current config. PUT accepts
-    {mode?, color?, language?, onboarded?, import_onboarded?} and persists to
-    the workspace config file.
+    {mode?, color?, language?, onboarded?, import_onboarded?, privacy_acked?,
+    crewmates_onboarded?} and persists to the workspace config file.
     """
     if request.method == "GET":
         cfg = KiroCrewConfig.load()
@@ -684,6 +686,13 @@ async def api_theme_config(request: web.Request) -> web.Response:
                 raise web.HTTPBadRequest(text="privacy_acked must be a boolean")
             if cfg.dashboard.privacy_acked != privacy_acked:
                 cfg.dashboard.privacy_acked = privacy_acked
+                changed = True
+        if "crewmates_onboarded" in body:
+            crewmates_onboarded = body["crewmates_onboarded"]
+            if not isinstance(crewmates_onboarded, bool):
+                raise web.HTTPBadRequest(text="crewmates_onboarded must be a boolean")
+            if cfg.dashboard.crewmates_onboarded != crewmates_onboarded:
+                cfg.dashboard.crewmates_onboarded = crewmates_onboarded
                 changed = True
 
         if changed:
@@ -1852,7 +1861,36 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
 
 
 async def api_sel_events(request: web.Request) -> web.Response:
-    """GET /api/sel/events — recent security events."""
+    """GET /api/sel/events — recent security events, owner only.
+
+    The rows are the security audit trail itself, and they name the resources a
+    decision was about: a file held back by the scanner, a service a grant
+    covered. A dashboard session is not by itself the owner -- the messaging
+    bridges mint a presigned token whose subject is the allowed user's own id --
+    so serving these rows to any authenticated session hands one principal the
+    other's audit trail. The check delegates to
+    :func:`is_owner_dashboard_request` rather than re-deriving the rule, so this
+    surface cannot drift from the secrets vault and the delivery-consent gate.
+
+    The gate is :func:`require_owner_dashboard_request`, the one every other
+    owner-only dashboard surface calls, rather than a second spelling of the same
+    rule: it makes the owner decision, audits the refusal, and relabels a session
+    signed before an owner was configured to ``401 stale_session_reauth``, since
+    that caller IS the owner and re-signing in is the remedy. Its denial audit is
+    an enqueue against the singleton warmed at startup, which is the whole reason
+    the shared spelling can stay this small.
+
+    A read that SUCCEEDS is audited too, and that row is this handler's own: a
+    trail carrying only refusals says who was turned away and never says the log
+    was read. It is written where the read is, off the loop, because the first
+    ``_sel()`` call constructs the singleton -- reading the HMAC key and scanning
+    the log tail -- and that must not happen on the event loop. It is written AFTER
+    the rows are captured: ``recent()`` flushes the write queue before it walks the
+    log, so a row enqueued first would be served back as the newest event.
+    """
+    denial = await require_owner_dashboard_request(request, "sel.events.read")
+    if denial is not None:
+        return denial
 
     try:
         limit = min(int(request.query.get("limit", "100")), 1000)
@@ -1868,8 +1906,30 @@ async def api_sel_events(request: web.Request) -> web.Response:
     # _sel() is called INSIDE the callable, not while building it: the first
     # call constructs the singleton, which reads/creates the HMAC key and scans
     # the log tail. Evaluating it here would leave that IO on the loop.
+
+    def _read_then_audit() -> list[dict]:
+        """Serve the read, then record it -- one hop for both, in that order.
+
+        ``recent()`` opens with ``flush()``, so a row enqueued before it is on disk
+        by the time the walk runs and comes back as the newest record: the caller
+        would receive its own audit row in place of a real event, and ``limit=1``
+        would return nothing else at all. So the rows are captured first. The write
+        still shares the hop, because the first ``_sel()`` call constructs the
+        singleton -- reading the HMAC key and scanning the log tail -- and that must
+        not happen on the event loop.
+        """
+        audit = _sel()
+        rows = audit.recent(limit=limit)
+        audit.log_api_access(
+            caller=str(request.get("user") or "owner"),
+            operation="sel.events.read",
+            outcome="allowed",
+            source="dashboard",
+        )
+        return rows
+
     events = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(), lambda: _sel().recent(limit=limit)
+        discovery_executor(), _read_then_audit
     )
     return web.json_response({"events": events, "count": len(events)})
 
@@ -2008,14 +2068,17 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
     if request.method == "PUT":
         caller = request.get("user", "dashboard")
 
-        def _deny(error: str, status: int = 400) -> web.Response:
+        def _deny(error: str, status: int = 400, *, code: str | None = None) -> web.Response:
             _sel().log_api_access(
                 caller=caller,
                 operation="config.update",
                 outcome="denied",
                 error=error,
             )
-            return web.json_response({"error": error}, status=status)
+            payload: dict[str, str] = {"error": error}
+            if code is not None:
+                payload["code"] = code
+            return web.json_response(payload, status=status)
 
         try:
             body = await request.json()
@@ -2031,7 +2094,11 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
         # offloaded to a thread so it neither races concurrent writers (lost-write
         # bug) nor blocks the event loop (event-loop-stall bug).  This mirrors the
         # pattern used by the sibling PATCH handler (~line 2031).
-        from kiro_crew.config.loader import ConfigReadError, update_config_locked  # noqa: F811
+        from kiro_crew.config.loader import (  # noqa: F811
+            ConfigReadError,
+            ConfigWriteRefused,
+            update_config_locked,
+        )
         from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
         # Carry the validation error and result out of the mutate callback.
@@ -2142,6 +2209,13 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
                         {"error": "config.json is corrupt", "code": "config_corrupt"},
                         status=500,
                     )
+                except ConfigWriteRefused as exc:
+                    # The publish floor refused the document this write would land
+                    # (a plaintext ``agent.deepseek_env`` value the write introduces
+                    # or keeps while changing that mapping). The message names
+                    # env-var keys only, never the value, and is the same
+                    # instruction the CLI prints; nothing reached disk.
+                    return _deny(str(exc), 400, code="config_write_refused")
 
                 if _validation_error:
                     msg, status = _validation_error[0]
@@ -2446,15 +2520,11 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # behavior (not a display pref), read by the prevent-sleep poll in
     # dashboard/server.py; off by default.
     "dashboard.prevent_sleep": {"type": "bool"},
-    # Whether the credit pill may fall back to a BILLED `kiro-cli /usage` chat
-    # turn when the free usage API returns no plan. Read by
-    # ``handlers/sessions._text_scrape_enabled`` (fail-closed) and off by
-    # default, and the default is unchanged by being editable here: this entry
-    # only makes the value REACHABLE from the dashboard. Without it the schema
-    # published a label and help text for a setting whose PATCH was refused
-    # ``field not editable``, so the only way to opt in was to know the key
-    # name and edit config.json by hand.
-    "dashboard.usage_text_scrape_enabled": {"type": "bool"},
+    # Reply threads on crewmate chat messages. Read live by
+    # ``dashboard/chat_threads.py`` (routes) and ``dashboard/ws.py`` (the
+    # thread frame); off by default, and the Settings toggle under Crewmates is
+    # the only dashboard door to it.
+    "dashboard.crewmate_threads": {"type": "bool"},
     # User profile (onboarding step 2 + Settings > General > About You).
     # Structured slugs, not free text: context.py maps them to prompt-ready
     # descriptions in its [USER PROFILE] block. "" = unspecified/cleared.
@@ -2683,7 +2753,12 @@ def _tailnet_governance_pinned_off() -> bool:
 
 async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     """PATCH /api/config/kirocrew — update a single config field."""
-    from kiro_crew.config.loader import ConfigReadError, config_path, update_config_locked
+    from kiro_crew.config.loader import (
+        ConfigReadError,
+        ConfigWriteRefused,
+        config_path,
+        update_config_locked,
+    )
 
     caller = request.get("user")
     if not caller:
@@ -2860,26 +2935,6 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                 status=400,
             )
 
-    # ── Enabling the billed credit-meter fallback is owner-only ──
-    # Every other path in the allowlist is a preference, so the route's "any
-    # authenticated caller" bar is the right one for them. It is not the right bar
-    # for this one: enabling it makes the credit pill fall back to a REAL billed
-    # `kiro-cli /usage` turn, and repeat it every refresh interval for as long as
-    # any tab is open. A dashboard token does not imply ownership -- an
-    # allow-listed messaging user holds one -- so without this gate a non-owner
-    # could start recurring spend on the owner's account, and nothing
-    # self-corrects an enabled state.
-    #
-    # Only the ENABLE is gated, exactly like the two telemetry writes below:
-    # turning billing OFF must never require authorization. Refusing that would
-    # leave someone able to see spend they cannot stop, and the narrower choice
-    # always composes.
-    if path_key == "dashboard.usage_text_scrape_enabled" and value is True:
-        denial = await require_owner_dashboard_request(request, "config.patch.usage_text_scrape")
-        if denial is not None:
-            _log_sel("denied", f"{path_key}={value}")
-            return denial
-
     # ── Governance: refuse a write an enterprise ceiling has pinned ──
     # Only re-ENABLING is refused. Writing `false` is always allowed even under a
     # ceiling that already forbids the beacon: the ceiling is a floor on privacy,
@@ -2997,6 +3052,15 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         except ConfigReadError:
             _log_sel("error", f"{path_key}=read_failed")
             return web.json_response({"error": "failed to read config file"}, status=500)
+        except ConfigWriteRefused as exc:
+            # A ``ValueError`` too, so it must be caught before the arm below: the
+            # publish floor refusing a plaintext ``agent.deepseek_env`` value is the
+            # operator's own input being declined (400), not a server failure, and
+            # the message -- env-var keys only, never the value -- is the instruction.
+            _log_sel("denied", f"{path_key}=write_refused")
+            return web.json_response(
+                {"error": str(exc), "code": "config_write_refused"}, status=400
+            )
         except ValueError as exc:
             _log_sel("error", f"{path_key}=section_not_dict")
             return web.json_response({"error": str(exc)}, status=500)
@@ -3062,6 +3126,12 @@ async def api_token_local(request: web.Request) -> web.Response:
     peers are admitted only on a positive kernel same-principal check
     (``_unix_peer_is_self``), which is stronger locality evidence than a
     loopback address. The secret is required on both transports.
+
+    Each of the three refusals carries a machine-readable ``code`` beside its
+    ``error`` — ``loopback_only``, ``invalid_secret``, ``member_owner_token_refused``
+    — mirroring the distinction already in the SEL record, so a caller reports the
+    gate that refused rather than listing the ones that might have. The codes
+    restate what the ``error`` text already says and widen no gate.
     """
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
@@ -3073,7 +3143,7 @@ async def api_token_local(request: web.Request) -> web.Response:
             source="local-bootstrap",
             resources="non-loopback",
         )
-        return web.json_response({"error": "loopback only"}, status=403)
+        return web.json_response({"error": "loopback only", "code": "loopback_only"}, status=403)
 
     expected = request.app.get("local_secret", "")
     if not expected:
@@ -3087,7 +3157,7 @@ async def api_token_local(request: web.Request) -> web.Response:
             source="local-bootstrap",
             resources="invalid-secret",
         )
-        return web.json_response({"error": "invalid secret"}, status=403)
+        return web.json_response({"error": "invalid secret", "code": "invalid_secret"}, status=403)
     from kiro_crew.member_memory_auth import local_owner_bootstrap_allowed
 
     if not await asyncio.to_thread(local_owner_bootstrap_allowed, request):

@@ -98,7 +98,7 @@ The families, from the RFC:
 | knowledge | `crew/finding`, `crew/summary`, `crew/note-*`, `crew/link` | the segment covered |
 | memory | `memory/bound\|copied\|forgotten\|restored` | -- |
 
-Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. `kiro_crew.crew_log.entry_types` now declares and enforces the session kind only; these two crew-kind contracts remain held by review against this section until that module's `ENTRY_TYPES` registry gains crew declarations.
+Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. `kiro_crew.crew_log.entry_types` declares both kinds: `SESSION_ENTRY_TYPES` for the session families and `CREW_ENTRY_TYPES` for these two contracts, keyed into `ENTRY_TYPES` by kind, so `validate_data` answers for the unit the entry is being written into and a crew's `data` is checked on the same append path a session's is. What the registry cannot state stays a writer's obligation: a CONDITIONAL requirement has no spelling in a declaration, so `target`'s exclusive `slot`-or-`name` pairing and `crew/report`'s required `ref` are enforced where the entry is built, and a field one legitimate form omits is declared optional rather than refusing a valid entry.
 
 **`crew/dispatch`** -- a parent asking for an item to be worked.
 
@@ -126,15 +126,21 @@ Two of these families carry a contract with REQUIRED fields. **Required here is 
 | Field | Required | Meaning |
 |---|---|---|
 | `data.item` | yes | The item being reported on. |
-| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`. |
+| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`, `question`. The last is the work board's, and the enum is derived from that writer's own tuple so a status it gains cannot become a refused entry; [crew-types.md](../../reference/crew-log/crew-types.md#crewreport) states why `question` is not folded into `blocked`. |
 | `data.credits` | no | Credits the child spent. Absent is not zero. |
 | `data.summary` | no | One sentence. |
 | `ref` | yes | A segment of the child's crew log: the evidence. |
-| `thread` | when replying | The dispatch's `seq`. |
+| `thread` | when the anchor resolves | The dispatch's `seq`. |
 
 `ref` is required for the same reason `target` is. A report is a CLAIM about work that happened somewhere else, and `board` and `budget` fold status and credits straight off it without opening the child's crew log; the `ref` is what makes that fold checkable rather than trusted. A report with no `ref` is an unfalsifiable claim, permanently, since nothing later can attach the evidence to a line that is already written.
 
 `thread` is the dispatch's `seq` when the report answers one, which is what makes a dispatch and its replies one conversation inside the parent's file. A report volunteered with no dispatch behind it carries no `thread`.
+
+Those two are different facts wearing one shape, and the writer resolves the anchor rather than being told which case it is. A report whose anchor does not resolve is written **unthreaded**, not dropped. The reason is that the dispatch append is best effort, so the anchor can be missing two ways that are not equally recoverable: a transient read failure leaves the dispatch on disk and the item's next report threads normally, while a dispatch whose own append failed leaves no dispatch entry at all -- and refusing the reply then refuses every later report for that item too, so the log reads for good as though the item was never dispatched. An absent history is the worse record: it is unbounded in time and invisible, while an unthreaded report states that the work happened and is only missing its link.
+
+That choice has a real cost and this is where it is written down: an unthreaded report is indistinguishable from a volunteered one, so the ambiguity is one field rather than one item's whole history. The writer logs a warning when it happens, which is what lets a reader tell the two apart.
+
+The refusal that remains is the evidence one: a report with no citable unit is not written at all, because a claim nothing can check is not a record.
 
 Both of these are one type each, not one per writer. The child's identity is `src`, so two children reporting on one item write the same `type` into one file and are told apart by who signed them.
 
@@ -666,6 +672,10 @@ here and the other is not.
 
 ## 9. Scope
 
-The session-log emitter ([crew-log-emitter.md](crew-log-emitter.md)) writes the ACP turn lifecycle behind the `KIROCREW_CREW_LOG` flag. The member event log ([member-event-log.md](member-event-log.md)) independently writes the member kind through `kiro_crew.eventlog`. No crew-kind writer exists yet, so that ownership registry still describes the domains a future crew emitter may write rather than events produced today; a guest app needs no registry entry because its `app:<name>/` prefix is its permission.
+The session-log emitter ([crew-log-emitter.md](crew-log-emitter.md)) writes the ACP turn lifecycle behind the `KIROCREW_CREW_LOG` flag. The member event log ([member-event-log.md](member-event-log.md)) independently writes the member kind through `kiro_crew.eventlog`. The crew kind has one writer, behind the same flag: `crew_log.emit.on_crew_dispatch` and `on_crew_report` record the dispatch family into a crew's own log, driven by the conductor work board's `bind` action and by a worker's report. It covers that family alone, so the ownership registry still describes what a crew MAY write rather than what is produced -- the other six domains have no writer, and a guest app needs no registry entry because its `app:<name>/` prefix is its permission.
+
+Those two entries are BEST EFFORT, and the asymmetry with the session emitter is deliberate. A work-ledger route refuses its own write when the `work/recorded` entry cannot be appended, because the board is a projection of that entry and a cache holding a mutation the log never saw is a divergence. The crew entry is the crew-side record of a fact the board already holds, so a crew log that cannot be written must not fail a ledger write that succeeded: the caller reads a zero seq as "not recorded" and proceeds. Neither entry is routed through the session emitter's write-behind queue, whose every structure is keyed by an ACP session id -- a crew store name handed to it would be looked up as a session unit and dropped as a policy no-op.
+
+Which unit a crew entry belongs to is the DISPATCHING crew, and it is resolved from the conductor slot's member slug. A board driven from an ordinary chat slot therefore records nothing here, which is a refusal rather than a gap: a slot key is not a crew name, and a unit whose header named one would attribute the work to a crew no reader can resolve.
 
 Read and write paths ship together deliberately: the guarantees this format makes -- contiguous seq under a lock, torn-tail repair, refusal before any byte is written -- are each a claim about what a reader sees after a writer acted, so neither half demonstrates them alone. `test/test_crew_log_core.py` exercises them against real files rather than against a mock.

@@ -73,6 +73,7 @@ if TYPE_CHECKING:
         fire_tool_hooks,
         hook_gate_kwargs,
         identity_grant_covers_child,
+        is_runtime_death,
         logger,
         name_grant,
         provider_fallback_active,
@@ -490,7 +491,56 @@ class RunEventCoordinator(ManagerComponent):
                     self._manager._write_tombstone(info, "cancelled")
             logger.info("Subagent %s cancelled", info.id)
         except Exception as exc:
-            if not info.reaped:
+            if info._reap_started and is_runtime_death(exc):
+                # The ECHO of our own teardown, not a fault of the run.
+                # ``_force_reap`` resets the run's session (or shuts its shared
+                # handle) BEFORE it cancels this task, so the in-flight stream
+                # observes the runtime it lives on being killed and raises
+                # ``AcpProcessDied`` -- "killed (provider shutdown)" -- first.
+                # Recording that text as the run's error made every user stop,
+                # every parent end and every deadline reap read as a runtime
+                # death in the tombstone and an ERROR in the gateway log; four
+                # field reports chased it to the provider and the OOM killer.
+                # Only the runtime death is the echo: any OTHER exception under
+                # a reap is a fault of the run that the teardown merely
+                # interrupted, and keeps the traceback below.
+                # The record instead names the stop: a user/parent stop stays
+                # neutral (``error`` unset, ``outcome == "stopped"``), a
+                # deadline reap is a failure that names the deadline, and the
+                # tombstone carries the reap's own cause. Setting ``done`` here
+                # is what wins the first-arrival record over the reaper's own
+                # synthesis (guard 1 in ``_force_reap``), so the whole record --
+                # error, stat, tombstone -- is written HERE, as it was before.
+                origin = info._stop_origin or "the reaper"
+                if not info.done:
+                    # Neutrality follows the FIRST stopper. A Stop that lands
+                    # while a deadline reap already owns the teardown sets
+                    # ``user_stopped`` too; the record still belongs to the
+                    # deadline, so the flag is put back and the failure kept.
+                    neutral = info.stop_is_neutral
+                    if not neutral:
+                        info.user_stopped = False
+                        if not info.error:
+                            info.error = (
+                                f"{origin} — the runtime was torn down before the run finished"
+                            )
+                    if not info.result and info.streaming_text:
+                        info.result = info.streaming_text
+                    info.done = True
+                    if not neutral:
+                        Stats().inc_subagent_failed()
+                    self._manager._write_tombstone(info, info._reap_reason or "reaped")
+                # One attributable line, at the level the action deserves: a
+                # user's own stop is routine; a parent end or a deadline reap
+                # discarded live work the user did not ask to lose.
+                log = logger.info if info._reap_reason == "user_stop" else logger.warning
+                log(
+                    "Subagent %s stopped mid-turn by %s (the stream reported: %s)",
+                    info.id,
+                    origin,
+                    _describe_exception(exc),
+                )
+            else:
                 # Story appended INSIDE the cap: info.error reaches a WS frame
                 # and the Subagents panel, so the rendered total stays bounded
                 # by _MAX_ERROR_DETAIL_LEN exactly as before — and the budget
@@ -508,7 +558,7 @@ class RunEventCoordinator(ManagerComponent):
                 info.done = True
                 Stats().inc_subagent_failed()
                 self._manager._write_tombstone(info, "error")
-            logger.exception("Subagent %s failed", info.id)
+                logger.exception("Subagent %s failed", info.id)
         finally:
             # Guard 3 of 3 — the terminal REPORT, owned by the finalize claim.
             # Taken (and the report task SPAWNED) before the teardown awaits

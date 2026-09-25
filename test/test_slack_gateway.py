@@ -2425,6 +2425,31 @@ class TestSubagentDoneStoppedClassification:
         assert "partial notes so far" in body
 
     @pytest.mark.asyncio
+    async def test_a_parent_end_stop_is_not_announced_as_the_users(self):
+        """The status line and the detail sentence both read the record's own
+        stop origin: a run a parent end cancelled is announced as that, never as
+        a Stop the user pressed."""
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = _mock_context_builder()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.dashboard_state.get_slot = MagicMock(return_value=None)  # slot gone
+        on_done = self._capture_on_done(orch)
+        info = self._stopped_info()
+        info._stop_origin = "parent conversation ended (retire_kiro_identity_sessions)"
+
+        await on_done(info)
+
+        orch.dashboard_state.notify.assert_called_once()
+        title, body = orch.dashboard_state.notify.call_args.args[1:3]
+        assert "⏹" in title
+        assert "parent conversation ended (retire_kiro_identity_sessions)" in body
+        assert "Stopped by the user" not in body
+        assert "stopped by user" not in body
+        assert "partial notes so far" in body
+
+    @pytest.mark.asyncio
     async def test_stopped_agent_records_neither_success_nor_failure(self):
         """Orchestrator mode: a user stop must not advance orchestration —
         no record_success (killed work is not done work) and no

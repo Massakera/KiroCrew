@@ -317,7 +317,7 @@ async def test_derived_worker_identity_keeps_freshness_and_readiness(
             agent_name="kirocrew-worker",
         )
         wire.runtime._kas_custom_agents.assert_awaited_once_with(
-            "kirocrew-worker", member_dispatch=False, session_key=key
+            "kirocrew-worker", member_dispatch=False, crew_panel=False, session_key=key
         )
         if revoked:
             wire.status("connected", extra_servers=("kirocrew-work",))
@@ -365,7 +365,10 @@ async def test_kas_readiness_delays_prompt_until_active_managed_tools(
             resume, pre_ready=pre_ready, session_key="subagent:readiness-worker"
         )
         wire.runtime._kas_custom_agents.assert_awaited_once_with(
-            "worker", member_dispatch=False, session_key="subagent:readiness-worker"
+            "worker",
+            member_dispatch=False,
+            crew_panel=False,
+            session_key="subagent:readiness-worker",
         )
         # Two pre-mode snapshots must be consumed without satisfying this activation.
         for _ in range(3 if pre_ready else 1):
@@ -1760,6 +1763,21 @@ async def test_cold_start_exception_releases_admission_slot(monkeypatch):
     monkeypatch.setattr(AcpRuntime, "_spawn_admitted", AsyncMock(return_value=None))
     await AcpRuntime().spawn()
     assert admission.active == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_spawn_retries_one_creation_failure_after_backoff(monkeypatch):
+    import kiro_crew.acp.runtime as runtime_mod
+
+    process = MagicMock()
+    sleep = AsyncMock()
+    create = AsyncMock(side_effect=[FileNotFoundError("kiro-cli is being replaced"), process])
+    monkeypatch.setattr(runtime_mod.asyncio, "sleep", sleep)
+
+    assert await runtime_mod._retrying_spawn_factory(create) is process
+
+    assert create.await_count == 2
+    sleep.assert_awaited_once_with(runtime_mod._ACP_RUNTIME_RESPAWN_BACKOFF_S)
 
 
 def test_cold_start_admission_registry_releases_contended_closed_loop(monkeypatch):
@@ -5901,7 +5919,7 @@ class TestRuntimeMemberDispatchDisabled:
         rt, _, _ = _make_runtime()
         seen: list[bool] = []
 
-        async def _capture(_agent, *, member_dispatch=False, session_key=""):
+        async def _capture(_agent, *, member_dispatch=False, crew_panel=False, session_key=""):
             seen.append(member_dispatch)
             return SessionExtras(custom_agents=None, derived_spec_snapshot=None)
 
@@ -5940,14 +5958,26 @@ class TestRuntimeMemberDispatchDisabled:
     async def test_both_paths_pass_that_scope(self, monkeypatch, path):
         """Not just the helper: the value each path actually hands the reader."""
         from kiro_crew.acp import runtime as runtime_mod
+        from kiro_crew.members import MEMBER_DISPATCH_SERVER, MEMBER_PANEL_SERVER
 
-        seen: list[object] = []
+        seen: list[tuple[str, object]] = []
 
-        def _capture(_name, _agent, *, work_dir=None):
-            seen.append(work_dir)
+        def _capture(name, _agent, *, work_dir=None):
+            seen.append((name, work_dir))
             return False
 
+        # The per-tool reader is the THIRD read on these paths and takes the same
+        # scope, so it is captured here too: left real it would be handed the
+        # sentinel below and fail on it, and the property under test is that every
+        # reader gets the decider's answer.
+        tool_scopes: list[object] = []
+
+        def _capture_tools(_agent, *, work_dir=None):
+            tool_scopes.append(work_dir)
+            return frozenset()
+
         monkeypatch.setattr(runtime_mod, "session_mcp_server_is_disabled", _capture)
+        monkeypatch.setattr(runtime_mod, "session_mcp_disabled_tools", _capture_tools)
         rt, _, _ = _make_runtime()
         rt._can_load_session = True
 
@@ -5977,8 +6007,16 @@ class TestRuntimeMemberDispatchDisabled:
                 agent="kirocrew",
                 member_session_key=self.MEMBER_KEY,
             )
-        assert len(seen) == 1, seen
-        assert seen[0] is scope, seen
+        assert {name for name, _ in seen} == {
+            MEMBER_DISPATCH_SERVER,
+            MEMBER_PANEL_SERVER,
+        }, seen
+        # EVERY call, not just the first: all three reads on these paths take the
+        # same switch scope, and one of them resolving its own is the mismatch
+        # this pins shut.
+        assert all(work_dir is scope for _, work_dir in seen), seen
+        assert tool_scopes, "the per-tool switch must be read too"
+        assert all(work_dir is scope for work_dir in tool_scopes), tool_scopes
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("disabled", [True, False])
@@ -6147,7 +6185,7 @@ class TestAcpRuntimeLoadSession:
                 return {"modes": {"currentModeId": "kirocrew"}, "models": []}
             return {}
 
-        async def _fake_agents(agent, *, member_dispatch=False, session_key=""):
+        async def _fake_agents(agent, *, member_dispatch=False, crew_panel=False, session_key=""):
             from kiro_crew.acp.harness import SessionExtras
 
             return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
@@ -6194,7 +6232,7 @@ class TestAcpRuntimeLoadSession:
                 return {"modes": {"currentModeId": "kirocrew"}, "models": []}
             return {}
 
-        async def _fake_agents(agent, *, member_dispatch=False, session_key=""):
+        async def _fake_agents(agent, *, member_dispatch=False, crew_panel=False, session_key=""):
             from kiro_crew.acp.harness import SessionExtras
 
             return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
@@ -6246,7 +6284,7 @@ class TestAcpRuntimeLoadSession:
                 return {"modes": {"currentModeId": "kirocrew"}, "models": []}
             return {}
 
-        async def _fake_agents(agent, *, member_dispatch=False, session_key=""):
+        async def _fake_agents(agent, *, member_dispatch=False, crew_panel=False, session_key=""):
             from kiro_crew.acp.harness import SessionExtras
 
             return SessionExtras(custom_agents=[{"id": agent, "prompt": "p", "tools": []}])
@@ -6281,7 +6319,7 @@ class TestAcpRuntimeLoadSession:
                 return {"modes": {"currentModeId": "kirocrew"}, "models": []}
             return {}
 
-        async def _fake_agents(agent, *, member_dispatch=False, session_key=""):
+        async def _fake_agents(agent, *, member_dispatch=False, crew_panel=False, session_key=""):
             from kiro_crew.acp.harness import SessionExtras
 
             calls.append(agent)
@@ -9027,6 +9065,83 @@ def test_mode_available_helper():
     assert AcpRuntime._mode_available("kirocrew", _new_resp({"availableModes": []})) is False
     # A modes dict WITHOUT an availableModes list → not advertised → attempt.
     assert AcpRuntime._mode_available("kirocrew", _new_resp({"currentModeId": "x"})) is True
+
+
+def test_advertised_mode_origin_reads_the_v3_stamp_and_nothing_else():
+    """The v3 engine stamps ``_meta.kiro.resource.source.origin`` per mode;
+    ``client`` is a definition Crew sent, ``bundled`` the engine's own. Any
+    other shape -- no stamp, an older engine, an odd entry -- reads as ''."""
+    from kiro_crew.acp._dispatch import advertised_mode_origin
+
+    def stamped(mode_id, origin):
+        return {
+            "id": mode_id,
+            "_meta": {
+                "kiro": {"resource": {"resourceType": "agent", "source": {"origin": origin}}}
+            },
+        }
+
+    resp = _new_resp(
+        {"availableModes": [stamped("plan", "bundled"), stamped("kirocrew", "client")]}
+    )
+    assert advertised_mode_origin(resp, "plan") == "bundled"
+    assert advertised_mode_origin(resp, "kirocrew") == "client"
+    assert advertised_mode_origin(resp, "absent") == ""
+    assert advertised_mode_origin(_new_resp({"availableModes": [{"id": "plan"}]}), "plan") == ""
+    assert advertised_mode_origin(_new_resp(None), "plan") == ""
+    assert advertised_mode_origin({}, "plan") == ""
+    odd = _new_resp({"availableModes": [{"id": "plan", "_meta": {"kiro": {"resource": "x"}}}]})
+    assert advertised_mode_origin(odd, "plan") == ""
+
+
+def test_activation_refusal_is_a_harness_seam_kas_reads_the_stamp_kiro_answers_none(caplog):
+    """Guard (C): the runtime asks the harness, never a backend identity. The KAS
+    harness refuses only the MEASURED built-in stamp (``bundled``) on the
+    requested id, in plain words naming the remedy; a stamp it has never
+    measured is logged and let through (kiro-cli is the operator's install,
+    so an unmeasured value must not deny every crewmate); the spawn-time
+    hosts answer None for every response, so the Kiro path carries no
+    branch."""
+    from kiro_crew.acp.harness.kas import KasHarness
+    from kiro_crew.acp.harness.kiro import KiroHarness
+
+    def stamped(origin):
+        return _new_resp(
+            {
+                "availableModes": [
+                    {"id": "plan", "_meta": {"kiro": {"resource": {"source": {"origin": origin}}}}}
+                ]
+            }
+        )
+
+    kas = KasHarness()
+    with caplog.at_level("WARNING", logger="kiro_crew.acp.harness.kas"):
+        refusal = kas.activation_refusal("plan", stamped("bundled"))
+    assert refusal and refusal.startswith("Rename this crewmate's template: “plan” is reserved")
+    assert " -- " not in refusal
+    assert "Agent Template tab" in refusal and "KAS" not in refusal
+    # The raw stamp is logged: the refusal blames the name, so the log is the
+    # only place a changed engine stamping would show as the real cause.
+    assert any(
+        "origin='bundled'" in r.getMessage() and "'plan'" in r.getMessage() for r in caplog.records
+    )
+    # An unmeasured positive stamp is NOT a refusal: logged once, activated.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="kiro_crew.acp.harness.kas"):
+        assert kas.activation_refusal("plan", stamped("custom")) is None
+    assert any(
+        "unmeasured" in r.getMessage() and "origin='custom'" in r.getMessage()
+        for r in caplog.records
+    )
+    caplog.clear()
+    assert kas.activation_refusal("plan", stamped("client")) is None
+    assert not caplog.records
+    assert kas.activation_refusal("plan", stamped("client")) is None
+    assert kas.activation_refusal("plan", _new_resp({"availableModes": [{"id": "plan"}]})) is None
+    assert kas.activation_refusal("absent", stamped("bundled")) is None
+    assert kas.activation_refusal("plan", _new_resp(None)) is None
+    kiro = KiroHarness()
+    assert kiro.activation_refusal("plan", stamped("bundled")) is None
 
 
 def test_parse_session_modes_shapes():

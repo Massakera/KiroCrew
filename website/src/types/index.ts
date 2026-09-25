@@ -1291,6 +1291,16 @@ export interface ChatFolder {
   /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
    *  this folder. Absent = no tags, mirroring the optional `color`. */
   tags?: string[]
+  /** Extra steering directories loaded, in addition to the global and project
+   *  steering, for every chat whose folder is in this folder's subtree.
+   *  ACCUMULATIVE up the parent_id chain (unlike `project_dir`, which is
+   *  nearest-wins). Absent = none, mirroring the optional `tags`. */
+  steering_dirs?: string[]
+  /** Principal that owns the folder: an app's name, `member:<store>` for a
+   *  crew member, absent/empty for the person. Folder steering from an
+   *  ancestor owned by ANOTHER principal is never delivered to this folder's
+   *  chats, so the inherited list filters on it. */
+  owner_app?: string
   /** Channel namespace when this folder was created by per-channel session filing (e.g. 'discord'). */
   channel?: string
 }

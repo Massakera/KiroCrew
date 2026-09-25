@@ -310,9 +310,10 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "aws_consent.py",
         "The stderr of a failed `aws sts get-caller-identity`, run to show the "
         "operator which account a paid AWS service would bill before they confirm "
-        "it. The text reaches TWO surfaces: the Settings > Voice consent card "
-        "(`identityDetail` over `GET /api/aws/consent`) and `kirocrew aws-consent "
-        "show` on stdout. The CLI quotes back what it was resolving, so a failure "
+        "it. The text reaches the Settings > Voice consent card "
+        "(`identityDetail` over `GET /api/aws/consent`), which is the only "
+        "surface that carries it. The AWS CLI quotes back what it was resolving, "
+        "so a failure "
         "can carry a `credential_process` command line, an SSO start URL, or a "
         "role ARN, and an endpoint override can carry an inline-credential URL -- "
         "so the first stderr line goes through the shared credential + "
@@ -1641,6 +1642,13 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # paths in slack/gateway.py and the sub-agent completion path in
         # subagent.py), which are the registered sinks.
         "llm_helpers.py",
+        # Shared in-band deny-notice builder: redacts the provider-authored tool
+        # title ONCE, centrally, before the notice is steered back into the
+        # model's own turn (not to a person). It owns no egress — the steer goes
+        # to the ACP subprocess through the provider, and the display rows a
+        # human sees are appended by dashboard/chat_runner.py and slack/handler.py,
+        # the registered sinks for those surfaces.
+        "deny_notice.py",
         # The app-facing seam: it OWNS no output. It hands the redaction pass to
         # an installed app so the app can scrub content at its own boundary, and
         # the write that follows happens in app code this repo does not inventory.
@@ -1681,6 +1689,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # for memory fields. It owns no output of its own — the handler modules
         # that call it (memory.py, cron.py) are the covered surfaces.
         "dashboard/handlers/_shared.py",
+        # Applies the memory scrubber as a COMPARISON on the write path, never on
+        # the way out: `_require_editable_record` refuses a whole-value edit whose
+        # stored source does not survive the scrub unchanged, because the browser
+        # drafts from the display form and writing that back would replace the
+        # record's content with it. Nothing here is emitted -- the response this
+        # guard protects is served by `dashboard/handlers/memory_edit.py`, the
+        # registered sink for the records surface.
+        "memory_edit.py",
         # Same shape: applies a redactor the CALLER injects, to scan the form a
         # platform will actually render (markup collapsed, ANSI stripped). It owns
         # no output of its own -- the registered sinks are the modules that call
@@ -2089,6 +2105,25 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "apps/builtins/dev_fleet/repository.py",
         "apps/builtins/dev_fleet/live.py",
         "apps/builtins/dev_fleet/worktree_ops.py",
+        # Same Dev Fleet surface: redacts a failed systemd/launchd command's
+        # stderr at the point of capture, before its bounded tail becomes the
+        # cutover failure reason the app's own routes render.
+        "apps/builtins/dev_fleet/gateway_service.py",
+        # Capture-side, not egress: the GitHub Issues provider scrubs `gh`'s
+        # stderr as it captures a failed poll or action, before the bounded tail
+        # becomes the error text. The surfaces that SHOW that text (the app's
+        # routes and dispatch) are the registered sinks.
+        "apps/builtins/ops_mission_control/backend/providers/github_issues.py",
+        # Gate-side log hygiene, same shape as update_provider: the tailnet
+        # probe and mise activation redact a failed CLI's stderr before its
+        # bounded tail is written to the gateway debug log; an auth-key or
+        # registry URL in that stderr must not reach the log ring / /api/logs.
+        "dashboard/tailnet.py",
+        "env.py",
+        # Operator's own terminal during `kirocrew setup`: redacts npm's and
+        # electron-builder's stderr (a registry URL can carry a token) before
+        # the bounded tail is printed. Same classification as cli_commands.py.
+        "cli_setup.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",
         # Live translation redacts the MODEL's answer before writing it to the

@@ -1140,6 +1140,15 @@ it was handed receives the same values. `member-memory.json` and the old
 `memory_meta` rows are left in place. One store's failure is logged and never
 blocks start or another store.
 
+The store migration never touches session records. A member chat written on
+0.7.0.5 carries `{agent, memory_store}` and no `execution_context`, and is
+backfilled at first read instead: `execution_context.read_session_execution`
+derives the carrier from the repaired store's `owner_member_id` when that owner
+is unique and the record's `agent` names it, and persists it with a
+compare-and-set (see [session](session.md), *Agent selection provenance*). A
+record the store migration left unattributed stays refused, with the remedy in
+the message.
+
 V2 labels owner changes as Edit and retained older experiences as Replaced
 experiences. Recall explains which context the member would receive; the record
 list remains available for browsing and editing. Included rules have a summary
@@ -1865,12 +1874,15 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 
 **Shared embedding budget.** Native inference has one shared worker and model.
 The normal interactive default is four native threads, capped at one core below
-the host's CPU count and never below one thread, so the event loop keeps a core
+the count of CPUs the process may run on, which a CPU-set restriction
+(`--cpuset-cpus`, `taskset`) narrows below the host's core count, and never below
+one thread, so the event loop keeps a core
 wherever there is one to spare; background bulk work defaults to one. A normal-thread value equal to that four-thread default reads as
 the default policy rather than as operator intent, because a whole-document config
 save materializes it. Any other explicit normal or bulk thread setting is honored
-within the available CPU count and the existing configuration range of 1–256; a
-bulk value of 0 inherits the ordinary thread setting. At most eight pending native
+within the CPUs the process may run on, inside the existing configuration range
+of 1–256; a bulk value
+of 0 inherits the ordinary thread setting. At most eight pending native
 jobs are retained, with
 two slots reserved for interactive queries; overflow returns `None`, leaving
 unembedded writes eligible for ordinary backfill. Native batch calls contain
@@ -3469,7 +3481,7 @@ so provider timeouts, the 1 MiB response cap, the SSRF denylist, and
 
 | Tool | Endpoint | Returns |
 |------|----------|---------|
-| `skill_discover(query, limit=10≤50, provider?)` | `GET /api/skills/-/discover` | Candidate list — id, name, description, provider, author, install count, and an `installed` flag resolved against the local catalog. Each entry carries a ready-to-paste `skill_fetch(...)` call so the `owner/repo/skill` id survives verbatim. Publisher-controlled fields are clamped per-entry and labelled untrusted in the **header**. |
+| `skill_discover(query, limit=10≤50, provider?)` | `GET /api/skills/-/discover` | Candidate list — id, name, description, provider, author, install count, and an `installed` flag resolved against the local catalog. Each entry carries a ready-to-paste `skill_fetch(...)` call so the `owner/repo/skill` id survives verbatim. Publisher-controlled fields are clamped per-entry and labelled untrusted in the **header**. The endpoint also returns one `provider_outcomes` row (`ok`, `timeout`, or `error`) per attempted provider, so the tool reports a total failure as an error and labels partial results incomplete rather than claiming a complete zero-match search. |
 | `skill_fetch(id, provider="skillsh")` | `GET /api/skills/-/discover/preview` | The skill's instruction file, usable immediately with **no install step**, capped at `_SKILL_FETCH_MAX_CHARS` (32 KiB) for the context budget, prefixed with an untrusted-content warning. |
 
 Both paths are on `server._MIXED_INTERNAL_API_PATHS` (the Skills page calls the
@@ -4495,9 +4507,12 @@ never reach an LLM/agent surface.
 ### `SessionLaneChanged` — board-lane transitions (`_fire_session_lane_changed`)
 
 **Status: this section specifies a PENDING implementation, not the tree as it
-stands.** `SessionLaneChanged` is not a live hook event yet: `HOOK_EVENTS`,
-`ALLOWED_HOOK_EVENTS` and `_VALID_HOOK_EVENTS` carry exactly the five
-turn-lifecycle events, and none of the symbols named below exist in `src/`. Read
+stands.** `SessionLaneChanged` is not a live hook event yet: it is absent from
+`HOOK_EVENTS`, from `ALLOWED_HOOK_EVENTS` and from `_VALID_HOOK_EVENTS`, and none
+of the symbols named below exist in `src/`. The three sets are not the same size:
+`HOOK_EVENTS` and `_VALID_HOOK_EVENTS` carry the five turn-lifecycle events, while
+`ALLOWED_HOOK_EVENTS` carries eleven — the five plus the six Kiro Agent triggers
+in `hooks.HOOK_EVENTS_KAS_ONLY`, which are registrable but fired by nothing. Read
 every present-tense sentence here as the contract the implementation must meet.
 Until it lands, `handlers/hooks.py` and the Hooks page behave as the rest of this
 module already describes.
@@ -4690,8 +4705,11 @@ into two tokens or forging the opposite direction.
   `hooks.HOOK_EVENTS` (dispatchable) and `validation.ALLOWED_HOOK_EVENTS`
   (registrable through the hook create/update API), and deliberately **absent**
   from `agent._VALID_HOOK_EVENTS` — kiro-cli rejects a generated agent config
-  naming an event it does not know. A test pins all three memberships together
-  with this rationale, so the divergence cannot be "fixed" by syncing them.
+  naming an event it does not know, refusing to load that agent at all. A test
+  pins all three memberships together with this rationale, so the divergence
+  cannot be "fixed" by syncing them. The Kiro Agent triggers sit one step further
+  out again: registrable, absent from `_VALID_HOOK_EVENTS` for the same reason,
+  and not dispatchable either.
 
 **The SEL rows this event adds, stated so an auditor can find them and a host can
 budget them.** A lane-dispatch decision writes ONE `log_api_access` row under
@@ -4726,6 +4744,80 @@ User-defined kiro-cli hooks that persist across `kirocrew update`. Follows the
 ```json
 {"agent": {"kiro_hooks": {"preToolUse": [{"matcher": "*", "command": "/path/to/hook.sh"}]}}}
 ```
+
+**Two accepted shapes.** The object above, and the array of hook documents a
+kiro-agent profile carries:
+
+```json
+{"agent": {"kiro_hooks": [
+  {"name": "guard", "trigger": "PreToolUse", "matcher": "*",
+   "action": {"type": "command", "command": "/path/to/hook.sh"}}
+]}}
+```
+
+Each shape has exactly one reader. `normalize_spec_hooks()` in `agent.py` reads
+the array and returns the internal list of hook documents, and
+`hook_documents_to_object_form()` derives the object form handed to kiro-cli. The
+object form is read only by `_merge_kiro_hooks()`, which owns its validation and
+its audit, so its serialized bytes and its error path are unchanged by the array
+form's arrival — re-deriving it from documents would move both. Anything that is
+not an array, an object included, is warned about and SEL-audited by
+`normalize_spec_hooks()`, and the one caller sends an object straight to the
+merge instead of here. So a value that is neither shape is audited rather than
+dropped in silence. The standalone hook-file wrapper
+`{"version": "v1", "hooks": [...]}` is a file format, not a spec value: it is an
+object, so the merge sees `version`/`hooks` as unknown event keys and rejects it.
+
+Array-form rules (implemented in `normalize_spec_hooks()`):
+- `trigger` accepts the whole alias table from the trigger alias table in `kiro-team/kiro-agent` (blob `2d4a3127e32e5e81e68d5c2ea406a6a5728f6d78`, `trigger-names.ts` under its hooks package) — twelve canonical triggers with their PascalCase identity rows, the IDE's
+  legacy camelCase spellings, the CLI aliases and one Open Plugins legacy alias —
+  keyed case-insensitively, which is one deliberate leniency over kiro-agent's
+  own case-sensitive lookup. That blob is the version to re-read when adding a
+  name
+- `action` is `{"type": "command", "command": ...}` or
+  `{"type": "agent", "prompt": ...}`; the type must be a string and the payload a
+  non-empty string within `_MAX_HOOK_PAYLOAD_LEN`
+- `name` and `description` are bounded by `_MAX_HOOK_NAME_LEN` and
+  `_MAX_HOOK_DESCRIPTION_LEN`, `timeout` must be a positive integer, `enabled` and
+  `confirm` must be booleans, and `matcher` follows the object form's rules
+- at most `_MAX_SPEC_HOOK_DOCUMENTS` documents are read from one field
+- a rejected document is warned about and SEL-audited; the documents beside it
+  still load
+- documents are then projected onto the object form and merged by
+  `_merge_kiro_hooks()`, so both shapes meet the same command, matcher, dedup and
+  cap rules
+
+Left out of the kiro-cli emission, kept in the stored spec — and left out for
+that TRIGGER only, since autoimport still discovers a script in the hooks
+directory on its own unless a suppressed document names it: an `action` of type
+`agent`, the seven triggers kiro-cli has no event name for (`SessionEnd`, `PreTaskExec`,
+`PostTaskExec`, `PostFileCreate`, `PostFileSave`, `PostFileDelete`, `Manual`), and
+the per-hook `name`, `description` and `timeout`. `enabled: false` and
+`confirm: true` are NOT in that class: each grants less execution than the object
+form can express, so either one keeps the hook out of the kiro-cli spec entirely,
+with a log line and a SEL audit naming which. `hook_documents_suppressed_commands()`
+maps the resolved command of every entry carrying those two fields to the CAUSE the
+audit line reports — read from the RAW array, before validation, so a document that
+says `enabled: false` and is then rejected for an unrelated field still keeps its
+script out of the scan. One filter serves both causes, so the cause travels with the
+command rather than being assumed: a confirmation-gated hook is not recorded as one
+the author disabled, and `enabled: false` outranks `confirm: true` on one document
+and across two naming the same command. Bypassing the validator means carrying its
+bounds: the same `_MAX_SPEC_HOOK_DOCUMENTS` slice, so a document the log calls
+ignored cannot still delete a script, and `_MAX_HOOK_PAYLOAD_LEN` on the retained
+command. On Windows, a UNC or device-shaped command outside the shares
+`unc_probe_allowed()` admits is refused before THIS resolution, because
+`Path.resolve()` on one is an outbound SMB authentication; the shape is judged on the
+authored string and on its user-expanded form. `_validate_hook_command()` does not
+ask: the object form has always resolved its command there and autoimport hands it a
+path already resolved, so a refusal there would prevent no probe while un-installing
+every hook on a host whose hooks directory lives on a share. Each script left out of
+the scan is SEL-audited, because an off-document that validation rejected never
+reaches the emission path's own audit — and
+`_apply_user_kiro_hooks()` subtracts them from what autoimport discovered before
+the single merge pass — otherwise a document naming a script under
+`~/.kiro/hooks` is dropped here and rediscovered there, landing on autoimport's
+default event rather than the one the document named.
 
 Merge rules (implemented in `_merge_kiro_hooks()` in `agent.py`):
 - Bundled hooks from `config/defaults.json` are always present and always first

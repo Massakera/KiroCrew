@@ -15,6 +15,7 @@ const {
 } = require("./fullscreen-transition-watch");
 const { createDisplayMediaHandler } = require("./display-media");
 const { applyFocusModeChrome } = require("./focus-chrome");
+const { createFocusCursorWatch } = require("./focus-cursor");
 const {
   createPermissionRequestHandler,
   createPermissionCheckHandler,
@@ -36,7 +37,10 @@ const { createBrowserOps } = require("./browser-ops");
 const { runAnnotateOp } = require("./browser-annotate");
 const { createAgentCommandChannel } = require("./browser-agent-channel");
 const { attachContextMenu } = require("./context-menu");
-const { validateRemoteSettings } = require("./validation");
+const {
+  parseRemoteCrewFields,
+  saveRemoteCrewConfig,
+} = require("./remote-crew-setup");
 const { getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
 const { openPathHardened } = require("./open-path");
 const { DEFAULT_REMOTE_BIN, DEFAULT_REMOTE_PATH } = require("./remote-token");
@@ -1279,7 +1283,7 @@ function createWindowLifecycle(options) {
         function save() {
           document.title = JSON.stringify({
             host: document.getElementById('h').value.trim(),
-            bin: document.getElementById('b').value.trim(),
+            binPath: document.getElementById('b').value.trim(),
             remotePort: document.getElementById('rp').value.trim(),
             remotePath: document.getElementById('pa').value.trim(),
           });
@@ -1300,40 +1304,29 @@ function createWindowLifecycle(options) {
     });
     promptWin.on("closed", () => {
       try {
-        if (savedTitle && savedTitle.startsWith("{")) {
-          const {
-            host,
-            bin,
-            remotePort: remotePortValue,
-            remotePath,
-          } = JSON.parse(savedTitle);
-          if (host) {
-            const error = validateRemoteSettings(
-              host,
-              bin,
-              remotePortValue,
-              remotePath,
-            );
-            const parent = focused && !focused.isDestroyed() ? focused : null;
-            if (error) {
-              dialog.showMessageBox(parent, {
-                type: "error",
-                title: "Invalid Input",
-                message: error,
-              });
-              return;
-            }
-          }
-          setRemoteHostConfig(store, focusedPort, {
-            host,
-            binPath: bin,
-            remotePort: remotePortValue,
-            remotePath,
-          });
+        const fields = parseRemoteCrewFields(savedTitle);
+        if (fields) {
+          const { host } = fields;
           const parent = focused && !focused.isDestroyed() ? focused : null;
-          const message = host
-            ? `Remote host for :${focusedPort} set to ${host}`
-            : `Remote host for :${focusedPort} cleared (using local token)`;
+          if (!host) {
+            // Clearing belongs to this surface: the shared writer stores a crew
+            // and refuses an empty host.
+            setRemoteHostConfig(store, focusedPort, {});
+            const cleared = `Remote host for :${focusedPort} cleared (using local token)`;
+            console.log(cleared);
+            dialog.showMessageBox(parent, { message: cleared, type: "info" });
+            return;
+          }
+          const { saved, error } = saveRemoteCrewConfig(store, focusedPort, fields);
+          if (!saved) {
+            dialog.showMessageBox(parent, {
+              type: "error",
+              title: "Invalid Input",
+              message: error,
+            });
+            return;
+          }
+          const message = `Remote host for :${focusedPort} set to ${host}`;
           console.log(message);
           dialog.showMessageBox(parent, { message, type: "info" });
         }
@@ -1860,6 +1853,18 @@ function createWindowLifecycle(options) {
     applyFocusModeChrome(win, visible, { positionTrafficLights });
   }
 
+  // Off-window cursor distance for a focus-mode reveal. Every platform, unlike
+  // handleFocusMode's macOS-only traffic lights: the renderer stops receiving
+  // mouse events the moment the pointer crosses a window edge wherever it runs,
+  // so the dismissal distance can only be measured here.
+  const focusCursorWatch = createFocusCursorWatch({ screen, log: glog });
+
+  function handleWatchFocusCursor(sender, watching) {
+    const win = windowForWebContents(sender);
+    if (!win) return;
+    focusCursorWatch.watch(win, watching);
+  }
+
   function handleWindowControl(sender, action, senderFrame) {
     const win = windowForWebContents(sender);
     if (!win) return;
@@ -2175,6 +2180,7 @@ function createWindowLifecycle(options) {
     chrome: {
       setThemeAccent,
       focusMode: handleFocusMode,
+      watchFocusCursor: handleWatchFocusCursor,
       windowControl: handleWindowControl,
       setThemeMode,
       setTitlebarMode,

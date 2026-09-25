@@ -165,6 +165,76 @@ global steering directories also belong to that launch contract, even when no
 resource glob declares them. SOUL is native-owned only when explicitly declared.
 The mirrored steering reference records engine/version differences for conditional
 modes, so Kiro uses the fallback selector instead of claiming full native support.
+
+Folder steering is deliberately NOT part of that launch contract. A chat filed
+into a folder that declares `steering_dirs` (see [config](config.md)) has those
+directories read by `kiro_crew.folder_steering.collect_folder_steering` and the
+resulting documents placed into session-start context by the context builder, for
+EVERY provider — kiro-cli, Claude Code, Codex, KAS, and any config-authored
+harness — with no provider branch on that path. `SpawnContext`, `AcpRuntime` and
+the harnesses carry no folder-steering field, so every harness produces an
+identical `SpawnPlan` for a folder chat and a non-folder chat; delivery cannot be
+lost by adding a provider. A file whose realpath lies under the chat project's
+`.kiro/steering` or under `~/.kiro/steering` is skipped ONLY where the active provider
+already delivers those trees -- kiro-cli loads them natively, the Claude Code seam
+receives the explicit steering load, KAS reports `native_steering` -- so they are
+not sent twice; on a harness with no such path (Codex, OpenCode, Pi, Goose,
+DeepSeek) the folder delivers them like any other document rather than skipping
+rules nothing else would carry. Documents honor the steering
+`inclusion` frontmatter (`always`, or absent, is included; `manual`, `auto` and
+`fileMatch` are skipped and left to their native trigger), and each file is
+admitted against its own declared directory as the trust base, so a symlink can
+never read outside the root the operator pointed at. A root that is, contains,
+or lies inside a memory store (every configured V1 workspace -- the default
+`workspace/` under the crew data home and each `workspaces` entry, wherever its
+directory points -- or the `memory_stores/` tree) is refused by the folder API
+and skipped by the collector (compared casefolded, so an alternate-case spelling on a case-insensitive filesystem is the same silo): a named memory store is a silo, and folder
+steering must not carry one store's Markdown into another store's prompt. The
+fence is built from the configuration's `workspaces` table, and while that table
+cannot be read (an unparseable `config.json` or a non-object `workspaces` value,
+which the loader records as a degraded section rather than repairing to `{}`) the
+fence is INCOMPLETE and fails closed: the folder API refuses to admit any steering
+directory (clearing to `[]` still works), and the collector reads nothing and
+emits a `[FOLDER STEERING OMISSION: ...]` line saying so, until `config.json` is
+repaired -- the default directories alone are not the fence when an operator's
+external workspace may be missing from it. The
+stored value is bounded as STORED (the canonical spelling, after `~` and link
+expansion), and re-validated per entry on every resolve: a directory that has
+since vanished or become refused is skipped with a warning while the rest of the
+chain still steers; only a malformed stored shape fails the resolution.
+The section's own frame,
+`[FOLDER STEERING — …]` / `[END FOLDER STEERING]`, is a prompt-boundary marker in
+the same set as `[CURRENT USER REQUEST —]`: a copy planted in a channel message,
+a memory line or a steering body is neutralized by the session-context scrub and
+by the renderer's body scrub, and the genuine frame is minted AFTER that scrub
+(outside the `[SESSION CONTEXT …]` block on a fresh session, and around the
+already-scrubbed bodies on compaction reinjection), so only the operator-selected
+section ever carries it. The non-member section is
+capped like the existing steering section; a member (private-memory) chat carries
+the documents inside its essentials envelope instead, which applies its own
+document-count and per-source byte bounds; a private-member chat in Temporary
+memory mode receives no folder steering, exactly as that mode withholds the
+member's project documents (the envelope is built with reads blocked), whereas a
+non-member Temporary chat still receives it. Collection itself is bounded twice --
+a 64-document ceiling on what is read and a 4096-entry ceiling per root on what
+is enumerated -- and a ceiling that fires is never silent: the section ends with
+one `[FOLDER STEERING OMISSION: …]` line per fired ceiling stating what the model
+is not seeing in the terms the walk saw it -- unexamined Markdown candidates past
+the document ceiling; and, past the entry ceiling, the Markdown files the listing
+had already produced but will never read (counted as files) separately from the
+directories never listed or entered (counted as directories, a floor) -- and a member
+envelope that had to drop a tail carries the same counts as one extra
+`folder-steering://omitted` essentials document, so a capped tree never reads
+like a complete one. After provider compaction the section is re-injected under
+a `[REINJECTED AFTER COMPACTION — folder steering]` line. The tree is read only
+through descriptor-pinned directory handles (parent chain pinned, each child
+opened relative to its parent with `O_NOFOLLOW`, one descriptor per level of the
+active ancestry); on a platform that cannot open a directory relative to a
+descriptor (native Windows) the folder API refuses a non-empty `steering_dirs`
+before any filesystem call and the collector skips a stored value with a
+warning, because a by-name `isdir`/`realpath` on a swapped junction is itself
+the outbound SMB probe.
+
 KAS inline prompts and file resources come from the actual `customAgents`
 definition sent by `session/new`. File expansion uses that definition, not a
 reread of a possibly different project template. Successful activation publishes
@@ -175,7 +245,14 @@ Exact template and body matches omit initial manual copies. The complete-envelop
 budget is checked BEFORE omission: 64,000 characters including wrappers; reads
 refuse above 256,000 bytes per source, and resource expansion is bounded to 64
 unique documents. KAS's existing registration ceiling is 50 custom agents, not a
-file-body budget. This repository does not establish a universal native model or
+file-body budget. An id in `agent_files.KAS_RESERVED_AGENT_IDS` (`default` and
+the built-in mode ids `vibe`, `spec`, `quick-spec`, `bug-fix`, `plan`,
+`autonomous`; exact, case-sensitive) is refused by the projection before
+`session/new` -- the engine accepts such an entry and either drops it or keeps
+its own built-in under the id, so it would surface only as an unadvertised mode
+or as the built-in running under the crewmate's name -- and the refusal names
+the crewmate-side remedy (`crew-mode.md`, "Template names the harness cannot
+activate"). This repository does not establish a universal native model or
 resource truncation limit; real harness versions still need that integration check.
 Resume and replacement snapshots retain complete text. Frameworks without native steering receive a
 conditional discovery index: the agent reads a guide only after its explicit
@@ -449,7 +526,7 @@ If the parent session is alive but returned no policy, deny-by-default applies �
 
 Provider-level recovery mechanisms that fire automatically without user intervention:
 
-**Interactive transient-5xx retry:** the interactive dashboard/Slack `chat_runner` stream loop retries a transient backend 5xx (InternalServerError / DispatchFailure / ConnectionReset, JSON-RPC `-32603`) through the shared `llm_helpers` transient classifier + backoff, **without** resetting the still-alive session. Auth/validation errors are excluded (fail-fast); on retry-budget exhaustion a clean error surfaces on a still-resumable session. The unattended `stream_and_collect` path retries on the same classifier, so both callers behave alike.
+**Interactive transient-5xx retry:** the interactive dashboard/Slack `chat_runner` stream loop retries a transient backend 5xx (InternalServerError / DispatchFailure / ConnectionReset, JSON-RPC `-32603`) through the shared `llm_helpers` transient classifier + backoff, **without** resetting the still-alive session. Auth/validation errors are excluded (fail-fast); on retry-budget exhaustion a clean error surfaces on a still-resumable session. The unattended `stream_and_collect` path uses the same classifier, but its same-model and fallback-chain retries replay the original prompt only while no assistant text or tool call has occurred across any attempt. Any fired tool call makes a later transient error terminal on that path, including when the tool completed without producing text.
 
 A transient 5xx that arrives *after* the turn already emitted output (the `_turn_emitted` guard is set once any assistant token streams or a tool call fires) no longer drops the turn. Instead it **RECOVERS ONCE**: the streamed partial is preserved as a finalized assistant message, a brief recovery notice is appended, and a *continue* instruction (not the original prompt) is re-queued onto the SAME live ACP session — which still holds the interrupted turn's context (original prompt, streamed partial, and any completed tool results) — so the model resumes from where it stopped rather than restarting. The recovery is one-shot per genuine user turn: the allowance is consumed only when a recovery is actually enqueued and is refreshed at the start of the next real user turn, never on the synthetic recovery turn, so a repeated post-token 5xx during recovery surfaces a clean error instead of looping. When Stop is active or the turn is nested (`_prompt_depth != 0`) the partial + notice are still shown but nothing is re-queued (the allowance is left unconsumed). This recovery **also applies to turns that already fired a tool call** — an ACCEPTED TRADEOFF (owner decision), rather than failing fast: a mid-stream 5xx is rare, and the continue instruction tells the model to resume and not re-run tools that already completed. A residual double-execution risk remains only for a side-effecting/destructive tool that was still *in flight* when the 5xx hit; the owner accepts that narrow risk in favor of recovering the turn.
 

@@ -473,10 +473,10 @@ and use the phase offset for anything longer.
 ### Bounded concurrency
 
 The scheduler will not overlap a job with itself: the due-scan skips any job
-whose id is in `_executing` (`src/kiro_crew/cron.py`), so a slow run delays its
-own next tick rather than doubling up. What is not bounded is what you do inside
-one run. There is no per-app cap on sessions or subagents today; per-app quotas
-are still a draft phase in
+that holds a run claim (`is_running`, `src/kiro_crew/cron.py`), so a slow run
+delays its own next tick rather than doubling up. What is not bounded is what
+you do inside one run. There is no per-app cap on sessions or subagents today;
+per-app quotas are still a draft phase in
 `docs/request-for-change/rfc-app-sandbox-isolation.md`. So a tick that fans out
 one agent session per work item is your bug, paid for by the user's machine and
 the service you called.

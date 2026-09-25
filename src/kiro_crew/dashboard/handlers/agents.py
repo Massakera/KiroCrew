@@ -20,7 +20,9 @@ from typing import Any
 
 from aiohttp import BodyPartReader, web
 
-from kiro_crew import agent_state, model_registry, model_scope
+from kiro_crew import agent_state
+from kiro_crew import crew_teams as teams_mod
+from kiro_crew import model_registry, model_scope
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
@@ -53,6 +55,7 @@ from kiro_crew.agent_discovery import (
     spec_model,
     spec_str,
 )
+from kiro_crew.agent_files import KAS_RESERVED_AGENT_IDS
 from kiro_crew.agent_sdk.capabilities import capabilities_for, capabilities_of
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
@@ -3001,7 +3004,12 @@ async def api_agent_fork(request: web.Request) -> web.Response:
         # ...) are rebuilt on boot; a copy landing on one of those stems while
         # the managed file is absent would be overwritten by that rebuild, so
         # they count as taken whether or not the file exists right now. Same
-        # rule the publish handler applies to a user-chosen name.
+        # rule the publish handler applies to a user-chosen name. The ids the
+        # KAS engine keeps for itself (``KAS_RESERVED_AGENT_IDS``: ``default``,
+        # the seeded first crewmate's own name, and the built-in mode ids) are
+        # taken for the same reason, matched exactly as the engine matches
+        # them: a copy on such a stem binds the crew to a mode KAS never
+        # advertises, or to the engine's own agent instead of the copy.
         managed_stems = {Path(f).stem.lower() for f in OWNED_KIRO_AGENT_FILES}
 
         def _create_record_bind() -> tuple[str, Path]:
@@ -3072,6 +3080,7 @@ async def api_agent_fork(request: web.Request) -> web.Response:
                         copy_name.lower() in taken
                         or copy_name.lower() in bound
                         or copy_name.lower() in managed_stems
+                        or copy_name in KAS_RESERVED_AGENT_IDS
                         or _is_reserved_basename(copy_name)
                         or _spec_stem_on_disk(agents_dir, copy_name)
                     ):
@@ -3205,6 +3214,19 @@ async def api_agent_publish(request: web.Request) -> web.Response:
     if f"{new_name.lower()}.json" in {f.lower() for f in OWNED_KIRO_AGENT_FILES}:
         return web.json_response(
             {"error": f"'{new_name}' is reserved", "code": "template_name_reserved"}, status=400
+        )
+    if new_name in KAS_RESERVED_AGENT_IDS:
+        # The KAS engine keeps its own agent under this id (or drops the entry)
+        # without an error, so a template published under it never runs there.
+        # Exact match, as the engine matches: ``Default`` registers normally.
+        # Its own code, distinct from the runtime-owned stems above, so the
+        # dashboard can say WHOSE name it is rather than "reserved" alone.
+        return web.json_response(
+            {
+                "error": f"'{new_name}' is reserved by the KAS agent engine",
+                "code": "template_name_reserved_by_engine",
+            },
+            status=400,
         )
 
     from kiro_crew.dashboard.handlers.agent_capabilities import inherited_template_action
@@ -3525,6 +3547,50 @@ def _agent_detail_candidates(name: str) -> list[tuple[Path, dict[str, Any]]]:
     return matches
 
 
+def _merge_resources_delta(
+    fresh: dict[str, Any], before: dict[str, Any], after: dict[str, Any]
+) -> None:
+    """Apply this patch's ``resources`` delta to the freshly-read spec, element-wise.
+
+    ``after`` was built from a snapshot taken before the spec lock, so assigning it whole
+    would drop a URI a concurrent writer added into *fresh* since. Only what this patch
+    NAMED -- the URIs it removed and the ones it added -- may move.
+    """
+
+    def _uris(doc: dict[str, Any]) -> list[str]:
+        """URI strings, with a malformed ``resources`` normalised to empty.
+
+        Iterating a STRING yields characters and every one of them is a ``str``, so an
+        unguarded comprehension would rewrite the value as a per-character list.
+        """
+        resources = doc.get("resources")
+        if not isinstance(resources, list):
+            return []
+        return [r for r in resources if isinstance(r, str)]
+
+    before_uris = _uris(before)
+    after_uris = _uris(after)
+    if before_uris == after_uris:
+        # This patch named no resource change, so it may not rewrite the key at all: a
+        # malformed value it never looked at must survive untouched rather than normalised.
+        return
+    removed = [r for r in before_uris if r not in after_uris]
+    added = [r for r in after_uris if r not in before_uris]
+    fresh_entries = fresh.get("resources")
+    if not isinstance(fresh_entries, list):
+        fresh_entries = []
+    # Only the STRINGS this patch named may leave: an entry of any other shape is not
+    # something this merge has an opinion about, so it is carried through unread.
+    kept = [e for e in fresh_entries if not isinstance(e, str) or e not in removed]
+    merged = kept + [r for r in added if r not in kept]
+    if merged:
+        fresh["resources"] = merged
+    else:
+        # Same reason the mapping writer drops the key rather than writing []: an empty
+        # list suppresses the shipped steering defaults.
+        fresh.pop("resources", None)
+
+
 async def api_agent_detail(request: web.Request) -> web.Response:
     """GET/PATCH /api/agents/detail/{name} — view or update agent config."""
     name = request.match_info["name"]
@@ -3754,11 +3820,16 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                             apply_definition_patch(data, patch_body)
                             agent_state.lift_and_strip_bookkeeping(data, agent_name)
                             for key, value in data.items():
+                                if key == "resources":
+                                    # Merged element-wise below: assigning this list
+                                    # whole would drop a concurrent writer's addition.
+                                    continue
                                 if key not in before_patch or before_patch[key] != value:
                                     fresh[key] = value
                             for key in before_patch:
-                                if key not in data:
+                                if key not in data and key != "resources":
                                     fresh.pop(key, None)
+                            _merge_resources_delta(fresh, before_patch, data)
                             sanitize_agent_config_governance(fresh)
                             # Atomic replace: a direct write truncates first,
                             # so ENOSPC mid-write would destroy the existing
@@ -4142,6 +4213,10 @@ def _agent_roster_row(
         "memory_store": _roster_mask(agent_cfg.memory_store),
         "model": _roster_mask(agent_cfg.model),
         "reasoning_effort": _roster_mask(agent_cfg.reasoning_effort),
+        # Presentation label only — masked like every other user-authored string.
+        # The picker and roster render it in place of ``name`` when non-empty;
+        # ``name`` above stays the row's identity and dispatch handle.
+        "display_name": _roster_mask(agent_cfg.display_name),
         "description": _roster_mask(agent_cfg.description),
         "triggers": _roster_mask(agent_cfg.triggers),
         "source": _roster_mask(agent_cfg.source),
@@ -4405,17 +4480,45 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
             # asyncio lock while the worker is mid-write.
             to_add = {n: cfg.agents[n] for n in synced if n in cfg.agents}
 
-            def _write_sync() -> list[str]:
+            def _write_sync() -> tuple[list[str], list[str], list[str]]:
                 retired_stores: list[str] = []
+                # The names _mutate REALLY deleted -- a subset of the snapshot
+                # candidates, because an entry edited between the snapshot and
+                # the lock hold survives (see the comment inside _mutate).
+                deleted_names: list[str] = []
+                # Names this sync could NOT register: their stale team
+                # membership could not be purged (see below).
+                deferred_names: list[str] = []
 
                 def _mutate(doc: dict) -> dict | None:
                     agents = coerce_dict_section(doc, "agents")
                     stores = coerce_dict_section(doc, "memory_stores")
                     changed = False
+                    deferred_names.clear()
                     for aname, acfg in to_add.items():
-                        if aname not in agents:
-                            agents[aname] = dataclasses.asdict(acfg)
-                            changed = True
+                        if aname in agents:
+                            continue
+                        # A discovered name may have been a crew before (its
+                        # package was removed and has come back): purge any
+                        # stale team membership INSIDE this locked mutation,
+                        # right before the name is registered, as every create
+                        # path does. The sync is periodic, so a name whose
+                        # purge cannot be made is left out of THIS sync and
+                        # picked up by the next one -- never registered while
+                        # its old membership could resurface.
+                        try:
+                            teams_mod.release_for_create(aname)
+                        except teams_mod.TeamsUnavailable:
+                            logger.warning(
+                                "sync: deferring agent %r -- its stale team membership "
+                                "could not be purged; retrying next sync",
+                                aname,
+                                exc_info=True,
+                            )
+                            deferred_names.append(aname)
+                            continue
+                        agents[aname] = dataclasses.asdict(acfg)
+                        changed = True
                     # Prune ONLY this sync's snapshot candidates, and only
                     # while the in-lock entry still equals the snapshot entry:
                     # an agent (re)added or edited between the discovery
@@ -4433,18 +4536,34 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
                                     )
                                 retired_stores.append(store_name)
                             del agents[aname]
+                            deleted_names.append(aname)
                             changed = True
                     return doc if changed else None
 
+                def _drop_pruned() -> None:
+                    # A pruned package agent may be on a team; drop it like the
+                    # delete route does -- AFTER the registry write committed,
+                    # still inside its lock. ONLY the names _mutate actually
+                    # deleted: a snapshot candidate that survived (edited
+                    # concurrently) keeps its team. Best-effort: the list route
+                    # reconciles against the registry anyway.
+                    for deleted_name in deleted_names:
+                        teams_mod.drop_member(deleted_name)
+
                 with memory_store_namespace_lock():
-                    update_config_locked(mutate=_mutate)
+                    update_config_locked(mutate=_mutate, after_write=_drop_pruned)
                 from kiro_crew.context import release_cached_memory_store
 
                 for store_name in retired_stores:
                     release_cached_memory_store(store_name)
-                return retired_stores
+                return retired_stores, deleted_names, deferred_names
 
-            retired_stores = await _drained_to_thread(_write_sync)
+            retired_stores, deleted_names, deferred_names = await _drained_to_thread(_write_sync)
+            # A deferred name is NOT a synced name: it leaves `synced` too, so
+            # neither the response nor the audit record reports a registration
+            # that did not happen (a refusal is not a commit).
+            if deferred_names:
+                synced[:] = [n for n in synced if n not in deferred_names]
             if (state := request.app.get("state")) is not None:
                 from kiro_crew.dashboard.handlers._shared import release_markdown_memory_store
 
@@ -4731,6 +4850,23 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    # The crew name must satisfy the same grammar ``GET /api/members`` applies
+    # when it lists the roster (``members.py`` skips any row failing
+    # ``_AGENT_NAME_RE``). Persisting a name that fails it -- a space, a non-ASCII
+    # letter, a leading dash -- would create a crew no roster surface can show or
+    # open; refused here, once, for every client of this route. Same BOUNDARY
+    # as the credential rule above: names already stored are not renamed.
+    if not _AGENT_NAME_RE.match(name):
+        return web.json_response(
+            {
+                "error": (
+                    "Agent name must use letters, digits, '-' or '_' only, "
+                    "start and end with a letter or digit, and be at most 64 characters."
+                ),
+                "code": "invalid_agent_name",
+            },
+            status=400,
+        )
     # The template pointer must be EXPLICIT. Defaulting it to "kirocrew" would
     # make every crew created without naming a template an alias for the DEFAULT
     # agent: dispatch flattens an alias to its `kiro_agent`
@@ -4801,6 +4937,16 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             {"error": effort_reason, "code": "invalid_reasoning_effort"}, status=400
         )
     reasoning_effort = _raw_effort.strip()
+    # Same placement rule as the other pre-lock validations: refused before any
+    # state is touched. Presentation only, but strictly a string — every roster
+    # surface renders it verbatim in place of the name.
+    _raw_display = body.get("display_name", "")
+    if not isinstance(_raw_display, str):
+        return web.json_response(
+            {"error": "display_name must be a string", "code": "invalid_display_name"},
+            status=400,
+        )
+    display_name = _raw_display.strip()
     # Same convention as session_color: a non-empty raw value that the coercer
     # collapses to "no override" is a caller mistake worth a 400, not a silent
     # fallback to the name-derived face. The one exception is a well-formed
@@ -4876,12 +5022,21 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+        # A crew that carried this name before may still be listed on a team
+        # (every removal path drops it best-effort). persist_member_config
+        # purges that INSIDE the registry's locked mutation, right before the
+        # record is published, on every create path: the in-process config
+        # lock keeps this process's team writes out, and the cross-process
+        # sidecar lock keeps `kirocrew agent create` out, so no writer can
+        # create and team the same name between the purge and the registration.
+        # A purge that cannot be made refuses the create (409 below).
         new_agent = KiroCrewAgentConfig(
             kiro_agent=kiro_agent,
             workspace=body.get("workspace", "default"),
             memory_store=memory_store,
             model=model,
             reasoning_effort=reasoning_effort,
+            display_name=display_name,
             description=body.get("description", ""),
             triggers=body.get("triggers", ""),
             source=body.get("source", "kirocrew"),
@@ -4917,6 +5072,16 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": f"Agent '{name}' already exists", "code": "agent_exists"}, status=409
             )
+        except teams_mod.TeamsUnavailable as exc:
+            return web.json_response(
+                {
+                    "error": f"A previous crew named '{name}' may still be on a team and "
+                    f"the crew-teams store is unavailable ({exc}); retry once it is "
+                    "readable and writable.",
+                    "code": "teams_unavailable",
+                },
+                status=409,
+            )
         except (OSError, UnknownMemoryStore) as exc:
             return web.json_response(
                 {"error": str(exc), "code": "member_memory_unavailable"}, status=409
@@ -4934,8 +5099,18 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
         source="dashboard",
         resources=name,
     )
+    # `member_id` is the crew's IMMUTABLE identity (allocated with its member
+    # memory; `member_config_for_id` resolves it and never a name or slug), so a
+    # client that must bind something to the crew it just made -- the Meet
+    # CrewMates flow's schedule -- can do so without going back through the
+    # mutable display name.
     return web.json_response(
-        {"ok": True, "name": name, "memory_store": cfg.agents[name].memory_store}
+        {
+            "ok": True,
+            "name": name,
+            "memory_store": cfg.agents[name].memory_store,
+            "member_id": cfg.agents[name].member_id,
+        }
     )
 
 
@@ -5131,6 +5306,7 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             "source": agent.source,
             "starred": bool(agent.starred),
             "avatar": agent.avatar,
+            "display_name": agent.display_name,
         }
         changed: list[str] = []
         if "kiro_agent" in body:
@@ -5174,6 +5350,17 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         if "description" in body:
             agent.description = body["description"]
             changed.append("description")
+        if "display_name" in body:
+            # Presentation only, but strictly a string: a non-string here would
+            # be stored verbatim and then rendered by every roster surface.
+            # "" is a real value — it clears the label back to the name.
+            if not isinstance(body["display_name"], str):
+                return web.json_response(
+                    {"error": "display_name must be a string", "code": "invalid_display_name"},
+                    status=400,
+                )
+            agent.display_name = body["display_name"].strip()
+            changed.append("display_name")
         if "triggers" in body:
             agent.triggers = body["triggers"]
             changed.append("triggers")
@@ -5338,6 +5525,11 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 "source": normalize_member_source(agent.source),
                 "starred": bool(agent.starred),
                 "avatar": agent.avatar,
+                # Presentation label; ships raw here like its config peers —
+                # the projection delivery path redacts every string before the
+                # browser (`_redact_projection_value`), and the HTTP roster row
+                # masks it independently (`_roster_mask`).
+                "display_name": agent.display_name,
             }
             _ev_changed = [k for k, v in _ev_after.items() if v != _ev_before.get(k)]
             # A save that touched none of the roster fields is not a fact worth
@@ -5501,7 +5693,19 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
                 del agents[name]
                 return doc
 
-            update_config_locked(mutate=mutate)
+            # Drop the crew from its team AFTER the registry write has
+            # committed and still INSIDE its lock. After the commit, so a
+            # config write that fails leaves the membership untouched (the
+            # crew stays, on its team); inside the lock, so a same-name create
+            # in another process (which needs this same sidecar lock) cannot
+            # land between the delete and the drop and have its fresh
+            # membership dropped instead. Best-effort (drop_member swallows
+            # its own failures): a team entry the drop could not remove is
+            # hidden by every reader and purged by the next same-name create.
+            def _drop_from_team() -> None:
+                teams_mod.drop_member(name)
+
+            update_config_locked(mutate=mutate, after_write=_drop_from_team)
             return retired_store
 
         retired_store = await _drained_to_thread(_delete_member)

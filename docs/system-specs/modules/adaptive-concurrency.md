@@ -112,9 +112,12 @@ times: an increase needs a measured `free_mem_mb` at or above the pressure line
 sample is unmeasurable -- `classify` treats it as clear), corroborated
 pressure at the critical line halves the cap, and the spawn gate defers every
 cold start that would not leave `spawn_min_memory_gb` plus the running dedicated
-agents' unobserved growth free (`_startup_memory_reserve_gb`: the greater of
-`subagent_cost_gb` and live dedicated peak RSS, each observed byte replacing a
-reserved one, claims awaiting registration and yielded parents included). CPU
+agents' unobserved growth free (`_startup_memory_reserve_gb`: a start that has
+not settled -- the next one, a claim awaiting registration, a dedicated worker
+fewer than two sweeps have measured -- is priced at the learned per-run p90, never
+below `subagent_cost_gb`, less what it already holds; a settled worker owes only
+the gap between its own peak, floored at `subagent_cost_gb`, and its observed RSS;
+yielded parents included -- see `subagent.md`). CPU
 over-commit only slows work, and slowness is exactly the pressure the loop
 already backs off from. `compute_max_subagents` therefore sizes the AUTO ceiling
 from memory alone as well; `agent.subagent_cpu_cost_cores` is deprecated and
@@ -254,12 +257,18 @@ These are module constants, not settings. Tests and experiments may pass
 `AdaptiveController.state()` carries the enabled flag, mode, effective exec cap
 vs ceiling, the growth regime (`slow_start`), gate
 capacity vs ceiling, paused/probing, decision counts, the applied and pending
-actuator values, the last error and the last sample.
+actuator values, the last error, the last sample, and `recent_decisions`: the
+last 32 cap-changing decisions, newest last, each with its wall-clock time,
+action, reason, the caps the actuators confirmed after it (a gate update the
+daemon did not answer shows the previous gate cap), and the loop lag of the
+sample that produced it. Cap decreases, pauses and resumes are logged at WARNING (growth at INFO)
+so `gateway.log` keeps them.
 `resource_status.adaptive_state()` reads it from the registry and
 `adaptive_summary_lines()` renders it at the end of the `resource_status` MCP
 tool's report ("Execution cap: 8/64   MCP spawn gate: 4/8   Dispatch: active",
 then "Growth toward ceiling: slow start (x2/window)", the last decision and
-its signals, throttled provider scopes).
+its signals, throttled provider scopes, and the last five of
+`recent_decisions` under "Recent cap changes").
 
 **A tool server is not the gateway process,** so that registry is empty there:
 `mcp_tools/spawn.py::_live_adaptive_state` falls back to `GET
@@ -281,11 +290,14 @@ descriptions (`mcp_tools/spawn.py::schemas`, "You can run up to N sub-agents
 concurrently") and the `{{MAX_SUBAGENTS}}` prompt token
 (`context.py::_resolve_prompt_templates`) -- read the in-process registry only,
 through `resource_status.adaptive_exec_cap()`, and never the loopback API: the
-token is resolved on every session assembly, and `schemas()` runs on the
-gateway's own discovery cycle as well as in a tool server. In the gateway that
-read is the live cap (a disabled controller reports the user's max, which is
-then the cap in force; a paused dispatch reads as unknown). Where it is empty
-the configured ceiling is printed and labelled as one -- "N (configured
+prompt token is resolved once per session -- a session start takes the reading
+and the restore of the contract after compaction reuses it, unless the memo has
+since evicted that session, in which case the restore takes a live reading and
+the two renders can differ -- and `schemas()`
+runs on the gateway's own discovery cycle as well as in a tool server. In the
+gateway that read is the live cap (a disabled controller reports the user's max,
+which is then the cap in force; a paused dispatch reads as unknown). Where it is
+empty the configured ceiling is printed and labelled as one -- "N (configured
 ceiling)" in the prompt, "Your configured sub-agent ceiling is N; the cap
 actually in force may be lower" in the tool description.
 

@@ -125,6 +125,17 @@ POINTS_NEEDING_COMPACTION = frozenset({"compaction.keep"})
 #: inert here.
 POINTS_NEEDING_MEMORY_TEXT = frozenset({"memory.recall"})
 
+#: Points whose request carries EVIDENCE GATHERED FROM OTHER SESSIONS AND THIRD
+#: PARTIES -- a watched worker's transcript tail, a bot's review comment body, a
+#: work-ledger event -- and which therefore need the keystone's ``nudge_evidence``
+#: scope (``consent.consented_nudge_evidence``). A FOURTH set rather than a wider
+#: reading of ``compaction``, because the two were reviewed as different things:
+#: that scope is the OWNING session's own transcript, text the owner was present
+#: for, while this is text from conversations the owner was not in and from a
+#: forge they do not control. An install that granted any other scope is inert
+#: here, which is the property every scope on this keystone exists to give.
+POINTS_NEEDING_NUDGE_EVIDENCE = frozenset({"nudge.wake"})
+
 #: The model id sent when the config leaves ``provider.model`` empty -- the same
 #: fallback ``impl_jev`` applies, so the id the scrub clears is the id sent.
 _DEFAULT_MODEL = DECISION_PROVIDER_MODEL_DEFAULT
@@ -340,6 +351,7 @@ POINT_SCOPE_KEYS: dict[str, str] = {
     **{p: _consent.STATE_KEY_TOOL_ARGS for p in POINTS_NEEDING_TOOL_ARGS},
     **{p: _consent.STATE_KEY_COMPACTION for p in POINTS_NEEDING_COMPACTION},
     **{p: _consent.STATE_KEY_MEMORY_TEXT for p in POINTS_NEEDING_MEMORY_TEXT},
+    **{p: _consent.STATE_KEY_NUDGE_EVIDENCE for p in POINTS_NEEDING_NUDGE_EVIDENCE},
 }
 
 
@@ -357,6 +369,10 @@ _POINT_SCOPES: dict[str, tuple[str, str]] = {
     **{
         p: ("consented_memory_text", "the text of recalled memories")
         for p in POINTS_NEEDING_MEMORY_TEXT
+    },
+    **{
+        p: ("consented_nudge_evidence", "evidence from other sessions and third parties")
+        for p in POINTS_NEEDING_NUDGE_EVIDENCE
     },
 }
 
@@ -612,6 +628,35 @@ def _judge_authority(
     except Exception as exc:
         logger.debug("decisions: judge authority unreadable (%s)", type(exc).__name__)
         return LANE_JEV, False
+
+
+def judge_evidence_scope_granted(
+    *, session_key: str | None = None, config: Any | None = None
+) -> bool:
+    """Whether the owner granted :data:`JUDGE_POINT`'s OWN egress scope. Never raises.
+
+    Narrower than :func:`is_enabled` on this point, and deliberately so. ``is_enabled``
+    answers "could any lane serve a tick", which the LLM lane satisfies on the provider
+    key alone -- correct for a loop whose owner armed a brief, because
+    :func:`_judge_authority` documents that spec as half of that lane's authorization.
+    Screening a loop whose owner armed NOTHING has no such half, so it asks the
+    narrower question instead: did this owner grant this point's own egress category.
+
+    Composed from the same two primitives :func:`_judge_authority` uses -- the
+    endpoint consent read and :func:`_point_scope_granted` -- rather than a second
+    rule of its own. Fail-closed: anything unreadable answers False, which leaves the
+    tick firing exactly as an ungated timer would.
+    """
+    try:
+        cfg = config if config is not None else _snapshot()
+        if cfg is None:
+            return False
+        if not _consented_for(cfg, session_key, JUDGE_POINT):
+            return False
+        return _point_scope_granted(JUDGE_POINT, _consent.load_state())
+    except Exception as exc:
+        logger.debug("decisions: judge scope unreadable (%s)", type(exc).__name__)
+        return False
 
 
 def history_budget_chars(config: Any | None = None) -> int:

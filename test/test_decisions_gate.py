@@ -31,6 +31,7 @@ from kiro_crew.config.sections import (
     DECISION_PROVIDER_ENDPOINT_DEFAULT,
     DecisionProviderConfig,
     DecisionsConfig,
+    NudgeWakeConfig,
 )
 from kiro_crew.decisions import consent as consent_mod
 from kiro_crew.decisions import gate as gate_mod
@@ -61,7 +62,12 @@ QUESTIONS = [Choice(id="verdict", prompt="Which skill?", options=["NONE", "DUP"]
 
 
 def _config(
-    *, bucket: int = 100, timeout_ms: int = 1000, endpoint: str = "", model: str | None = None
+    *,
+    bucket: int = 100,
+    timeout_ms: int = 1000,
+    endpoint: str = "",
+    model: str | None = None,
+    judge_provider: str | None = None,
 ):
     """A config object shaped like the one ``decide`` reads off the live snapshot.
 
@@ -71,6 +77,9 @@ def _config(
     it is the keystone, patched by the ``consent`` fixture. An empty *endpoint*
     keeps the dataclass default, which is the one the fixture consents to; a
     ``None`` *model* keeps the dataclass default too.
+
+    *judge_provider* selects which lane serves :data:`gate.JUDGE_POINT`, whose
+    authority is a lane rather than a scope. ``None`` keeps the dataclass default.
     """
     kwargs: dict = {"timeout_ms": timeout_ms}
     if endpoint:
@@ -78,7 +87,10 @@ def _config(
     if model is not None:
         kwargs["model"] = model
     provider = DecisionProviderConfig(**kwargs)
-    return SimpleNamespace(decisions=DecisionsConfig(bucket=bucket, provider=provider))
+    decisions_kwargs: dict = {"bucket": bucket, "provider": provider}
+    if judge_provider is not None:
+        decisions_kwargs["nudge_wake"] = NudgeWakeConfig(provider=judge_provider)
+    return SimpleNamespace(decisions=DecisionsConfig(**decisions_kwargs))
 
 
 @pytest.fixture(autouse=True)
@@ -661,13 +673,22 @@ class TestPointName:
         """The state every install consented before the scopes existed is in.
 
         Driven off the gate's own table so a point added with a new scope is covered
-        without this test being touched.
+        without this test being touched, and with NO point exempted: the assertion is
+        universal or it is not a ratchet.
+
+        :data:`gate.JUDGE_POINT` reaches it by pinning the lane whose authority IS the
+        scope. That point carries two lanes (``is_enabled`` resolves them through
+        ``_judge_authority``): the small-model lane needs no scope, so under the default
+        ``auto`` the point is authorized with nothing recorded, while the Jev lane sends
+        to a third party and needs this point's own scope. Pinning ``jev`` therefore asks
+        the question this ratchet exists to ask, and answers it for the same reason every
+        other row answers it.
         """
         install_impl(_RecordingOracle())
         assert is_enabled("skills.select", config=_config()) is True
         assert is_enabled("message.steer", config=_config()) is True
         for name in gate_mod._POINT_SCOPES:
-            assert is_enabled(name, config=_config()) is False, name
+            assert is_enabled(name, config=_config(judge_provider=gate_mod.LANE_JEV)) is False, name
 
 
 # ---------------------------------------------------------------------------

@@ -2770,6 +2770,184 @@ def on_class_observed(
     _submit(_job, "appending session/class", session_id)
 
 
+class _TreeSettle:
+    """The outcome signal a tree emitter hands to :func:`_submit`.
+
+    Reports what the job DID, not what did not happen to it. ``wrote`` is set inside the
+    job immediately after ``log.append`` returns, and ``after`` -- which ``_submit`` runs
+    for every terminal outcome -- passes that flag on. Inferring success from the absence
+    of a drop hook would be wrong in the arm that matters most: an entry rejected at the
+    buffer's memory ceiling is finished WITHOUT ``on_permanent_drop``, which is exactly
+    the wedged-writer condition the ceiling exists for, and the caller would be told its
+    takeover landed while nothing was appended and the projection never moved.
+
+    ``fail`` remains for the two cases that never reach the job's append at all: a
+    permanent drop, and a job that finds no log to write to.
+    """
+
+    def __init__(self, on_settled: "Callable[[bool], None] | None") -> None:
+        self._on_settled = on_settled
+        self._wrote = False
+        self._told = False
+
+    def wrote(self) -> None:
+        self._wrote = True
+
+    def fail(self) -> None:
+        self._wrote = False
+
+    def after(self) -> None:
+        if self._on_settled is None or self._told:
+            return
+        self._told = True
+        self._on_settled(self._wrote)
+
+
+def _tree_settle_hooks(on_settled: "Callable[[bool], None] | None") -> _TreeSettle:
+    """One :class:`_TreeSettle` per emitted entry. Trivial, and named so the two tree
+    emitters share the wiring rather than repeating it."""
+    return _TreeSettle(on_settled)
+
+
+def on_session_adopted(
+    session_id: str,
+    *,
+    slot: str,
+    parent_slot: str,
+    parent_sid: str = "",
+    previous_parent_slot: str = "",
+    previous_parent_sid: str = "",
+    on_settled: "Callable[[bool], None] | None" = None,
+) -> None:
+    """Record that *parent_slot* has TAKEN OVER the session *session_id*.
+
+    Written on the session that moved, which is the side ``session/opened.parent``
+    already puts a creating edge on -- so the tree reads one axis from one place, and a
+    takeover of a session that has children costs one entry rather than one per
+    descendant, because descendants cite this session's slot and not a path through it.
+
+    Nothing is rewritten, and nothing could be: the log is append-only, and the opening
+    entry states who OPENED the session, which stays true. This entry states who holds
+    it now, and the fold prefers the newest of the two.
+
+    ``previous_parent`` is recorded for a reader of the log and is not folded. It is
+    passed as two plain strings rather than a mapping so this signature says exactly
+    which values it accepts, and the ``sid`` half is omitted when the caller has none:
+    an empty string would read as a parent whose id is blank.
+
+    Returns without waiting, like every other emitter here, and the projection is
+    advanced inside the job AFTER the append succeeds -- durability first, then memory --
+    so the disk can never hold a decision the memory lacks, and a lost write leaves the
+    tree where it was rather than moving it on the strength of an append that did not
+    land.
+
+    ``on_settled`` is how a CALLER waits for that outcome, and this entry point has one
+    where the others do not because the append IS the operation here: a verb that told
+    its caller "adopted" and then lost the write would have reported a takeover that
+    never happened. It is called once, off the caller's thread, with ``True`` when the
+    entry is on disk and ``False`` when the write was given up on or there was no log to
+    write to. Not awaited HERE -- ``_submit`` must never block the loop -- so the waiting
+    is the caller's to bound.
+    """
+    if not session_id or not slot or not parent_slot:
+        # No slot is not a tree edge: the tree is keyed by slot, so an entry with
+        # neither side of the edge names nothing a reader could fold.
+        if on_settled is not None:
+            on_settled(False)
+        return
+    data: dict[str, Any] = {"parent": _parent_citation(parent_slot, parent_sid)}
+    previous = _parent_citation(previous_parent_slot, previous_parent_sid)
+    if previous:
+        data["previous_parent"] = previous
+
+    settle = _tree_settle_hooks(on_settled)
+
+    def _job() -> None:
+        log = _handle(session_id)
+        if log is None:
+            settle.fail()
+            return
+        written = log.append("session/adopted", data, src=_SRC_GATEWAY)
+        settle.wrote()
+        _record_session_tree_decision(session_id, slot, written, parent_slot)
+
+    _submit(
+        _job,
+        "appending session/adopted",
+        session_id,
+        after=settle.after,
+        on_permanent_drop=settle.fail,
+    )
+
+
+def on_session_released(
+    session_id: str,
+    *,
+    slot: str,
+    previous_parent_slot: str = "",
+    previous_parent_sid: str = "",
+    on_settled: "Callable[[bool], None] | None" = None,
+) -> None:
+    """Record that the session *session_id* has been LET GO and is a root again.
+
+    The counterpart of :func:`on_session_adopted` and the only entry that takes a
+    parent edge away. A ``session/opened`` carrying no parent does not: it means that
+    entry did not repeat a creator, which a reader must not read as a retraction, so
+    the retraction needs a record of its own.
+
+    ``previous_parent`` is the parent that let it go, recorded for a reader and not
+    folded. It is optional because the entry's meaning does not depend on it: what this
+    says is that there is no parent NOW.
+
+    ``on_settled`` reports the durable outcome, for the reason it does on
+    :func:`on_session_adopted`: the append is the operation, so a caller that must not
+    claim a release it did not land waits for this.
+    """
+    if not session_id or not slot:
+        if on_settled is not None:
+            on_settled(False)
+        return
+    data: dict[str, Any] = {}
+    previous = _parent_citation(previous_parent_slot, previous_parent_sid)
+    if previous:
+        data["previous_parent"] = previous
+
+    settle = _tree_settle_hooks(on_settled)
+
+    def _job() -> None:
+        log = _handle(session_id)
+        if log is None:
+            settle.fail()
+            return
+        written = log.append("session/released", data, src=_SRC_GATEWAY)
+        settle.wrote()
+        _record_session_tree_decision(session_id, slot, written, None)
+
+    _submit(
+        _job,
+        "appending session/released",
+        session_id,
+        after=settle.after,
+        on_permanent_drop=settle.fail,
+    )
+
+
+def _parent_citation(slot: str, sid: str) -> "dict[str, str]":
+    """One ``{slot, sid?}`` citation, or ``{}`` when there is no slot to cite.
+
+    ``sid`` is omitted rather than written empty, the same distinction
+    :func:`on_session_opened` keeps on its own ``parent``: an empty string would read
+    as a session whose id is blank, and "the gateway had no live handle for it" is a
+    different fact from that.
+    """
+    if not slot:
+        return {}
+    citation: dict[str, str] = {"slot": slot}
+    if sid:
+        citation["sid"] = sid
+    return citation
+
+
 def _candidate_is_same_slot(candidate_sid: str, slot: str) -> bool:
     """Whether *candidate_sid*'s crew log records *slot* as its own.
 
@@ -4750,6 +4928,91 @@ def work_entry_fits(data: dict[str, Any]) -> bool:
     return _entry_line_fits("work/recorded", data, src=_SRC_GATEWAY)
 
 
+def on_panel_published(session_id: str, data: dict[str, Any], *, timeout: float = 5.0) -> bool:
+    """One publish of a crew's webview, appended to its DM session log, acknowledged.
+
+    The write half of the crew panel. A publish REPLACES the whole panel, so the
+    entry carries the document whole rather than the fields that changed: a panel
+    describes one cycle's state, and a partial update would leave last cycle's rows
+    beside this cycle's counters with nothing marking which is which. That is the
+    one way this differs from the session ledger's entry, whose absent field means
+    unchanged.
+
+    WAITS, like ``on_work_recorded``, though not because this record is the panel's
+    only one -- the file is, and the route has already written it. It waits so the
+    caller learns whether THIS publish's history row landed, and so an append the
+    waiter gave up on cannot land later. It returns ``True`` once the writer has
+    appended, and ``False`` when the append was refused, permanently dropped, or not
+    started within *timeout* seconds. ``False`` is FINAL -- an entry the waiter gave
+    up on is abandoned and will not land later even if the writer retries the job.
+    Without that, a slow store could report the row missing and commit it anyway, so
+    one publish would end up with two history rows. An append already STARTED is waited to
+    completion however long the store takes, and its outcome reported truthfully
+    rather than guessed.
+
+    Queued through the same writer as every other entry, for the reason the session
+    ledger gives: an append takes the unit's WRITE OWNERSHIP, and while the emitter
+    holds a running session's handle a second handle in this process is refused, so
+    a store that wrote around the emitter would fail for exactly the crews that are
+    publishing. Going through the writer also orders the entry against the turn the
+    crew published inside.
+
+    *session_id* is the PUBLISHING session's, which is the member's own DM session:
+    the panel tool is mounted nowhere else, so the unit this lands in belongs to
+    that member's slot and the slug-keyed read finds it without a binding of its
+    own. A session with no crew log answers ``False`` here, and the refusal belongs
+    where the crew can be told about it.
+    """
+    if not session_id or not enabled():
+        return False
+    landed = threading.Event()
+    gate = threading.Lock()
+    outcome = {"ok": False, "abandoned": False}
+
+    def _job() -> None:
+        with gate:
+            # A waiter that gave up has abandoned the entry: it must not land later,
+            # or a publish the crew was told failed would reappear on the next fold.
+            # Under the gate the two outcomes cannot cross.
+            if outcome["abandoned"]:
+                return
+            log = _handle(session_id)
+            if log is None:
+                return
+            log.append("panel/published", data, src=_SRC_GATEWAY)
+            # The panel fold spans replacement sessions, and a unit header's clock can
+            # step BACKWARD, which would fold a retired session's publish last and make
+            # it the current panel with history built against the wrong predecessor.
+            # Publish the causal order only after this append has really landed.
+            from kiro_crew import session_ledger
+
+            session_ledger.note_panel_unit_recorded("", session_id)
+            outcome["ok"] = True
+
+    _submit(_job, "appending panel/published", session_id, after=landed.set)
+    if landed.wait(timeout):
+        return outcome["ok"]
+    with gate:
+        if outcome["ok"]:
+            return True
+        outcome["abandoned"] = True
+    return False
+
+
+def panel_entry_fits(data: dict[str, Any]) -> bool:
+    """Whether *data* would fit one ``panel/published`` entry.
+
+    Asked beside the write rather than inside it, because the caller can act on the
+    answer and ``_write`` cannot: an entry over the ceiling by construction can
+    never land, so the panel it would report as published never exists. The store's
+    own byte ceiling bounds the payload, and this bounds the one thing the store
+    cannot see -- the whole serialized line, envelope included. Same serializer,
+    same entry type and src as the append, so the two cannot disagree about what
+    fits.
+    """
+    return _entry_line_fits("panel/published", data, src=_SRC_GATEWAY)
+
+
 def on_work_recorded(session_id: str, data: dict[str, Any], *, timeout: float = 5.0) -> bool:
     """One work-board mutation, appended to the ACTING session's log, acknowledged.
 
@@ -4797,6 +5060,288 @@ def on_work_recorded(session_id: str, data: dict[str, Any], *, timeout: float = 
             return True
         outcome["abandoned"] = True
     return False
+
+
+# --------------------------------------------------------------------------- #
+# The crew kind
+# --------------------------------------------------------------------------- #
+#
+# The first writer for ``crew-log/crews/<store>/``. Deliberately NOT routed
+# through the write-behind queue above: every structure that queue owns is keyed
+# by an ACP SESSION id and ``_handle`` opens its unit with ``_KIND``, so handing
+# it a crew's store name would make it look for a SESSION unit under that name
+# and, failing to find one, drop the entry as a policy no-op. Threading a kind
+# through the batch machinery is a change to the session path, which these two
+# entries do not need: a dispatch is written once per work item and a report once
+# per milestone, both already off the event loop in the route's worker thread.
+#
+# No handle is cached either. A handle holds the unit's write lease until it is
+# dropped, and a cached crew handle would hold one for the process's life --
+# refusing ``remove_unit`` for a unit nothing is writing. Opening per entry costs
+# a bounded tail read, which is what the lease's own refcount makes safe to
+# repeat.
+
+_KIND_CREW = "crew"
+
+CREW_DISPATCH = "crew/dispatch"
+CREW_REPORT = "crew/report"
+
+
+def crew_src(store: str) -> str:
+    """The ``src`` a crew signs its own dispatches with.
+
+    A crew writing into its OWN log is the guest form ``crew:<name>``, and the
+    name is the unit's own id -- so this is derived rather than passed, and no
+    caller can sign a dispatch as a crew it is not.
+    """
+    return f"crew:{store}"
+
+
+def _crew_unit(store: str) -> Any:
+    """An open crew log for *store*, created when it has none. ``None`` if inert.
+
+    Unlike :func:`_handle`, this one CREATES. A session's crew log is created by
+    the turn path, which knows whether the session is real; a crew's has no such
+    moment -- the crew exists in the members store, and the first fact worth
+    recording about its work is the first dispatch. So the first append opens the
+    file, and a crew that dispatches nothing never gets one.
+
+    ``None`` means the flag is off or the store is unnamed, which is a policy
+    no-op. Every other failure is the caller's to treat as "not recorded".
+    """
+    if not store or not enabled():
+        return None
+    subsystem = _crew_log()
+    if subsystem.CrewLog.exists(_KIND_CREW, store):
+        return subsystem.CrewLog.open(_KIND_CREW, store)
+    try:
+        return subsystem.CrewLog.create(_KIND_CREW, store)
+    except subsystem.CrewLogError as exc:
+        # Two threads can pass the ``exists`` check together and both create. The
+        # loser is told ``already_exists``, which is the file it wanted, so it
+        # opens instead of reporting a failure.
+        if exc.code != subsystem.CODE_ALREADY_EXISTS:
+            raise
+        return subsystem.CrewLog.open(_KIND_CREW, store)
+
+
+def _dispatch_target_ok(data: "Mapping[str, Any]") -> bool:
+    """Whether ``target`` names exactly one party, which the registry cannot ask.
+
+    ``target.kind`` decides which of ``slot`` or ``name`` carries the party, and
+    the two forms are EXCLUSIVE -- a target names a session slot or a crew, never
+    both. A declaration has no spelling for a conditional requirement, so the
+    obligation lands here, on the writer, where the entry is built.
+    """
+    target = data.get("target")
+    if not isinstance(target, Mapping):
+        return False
+    kind = target.get("kind")
+    carried = {"session": "slot", "crew": "name"}.get(kind if isinstance(kind, str) else "")
+    if carried is None:
+        return False
+    absent = "name" if carried == "slot" else "slot"
+    return bool(target.get(carried)) and absent not in target
+
+
+def _newest_dispatch_for(log: CrewLog, item: str, start: int) -> "int | None":
+    """The seq of the newest ``crew/dispatch`` naming *item* at or after *start*."""
+    found: int | None = None
+    for entry in log.iter_from(start):
+        if entry.type != CREW_DISPATCH:
+            continue
+        if isinstance(entry.data, Mapping) and entry.data.get("item") == item:
+            found = entry.seq
+    return found
+
+
+def _crew_thread(log: CrewLog, item: Any) -> "int | None":
+    """The seq of the newest ``crew/dispatch`` for *item*, or ``None``.
+
+    What makes a dispatch and its replies one conversation inside the crew's file.
+    Read from the log rather than remembered, because the two writes are separate
+    requests -- often in separate processes -- and an in-memory map would answer
+    ``None`` for every report after a restart while the anchor sat on disk.
+
+    ONE pass, from seq 1, because a narrower start would not be a cheaper read:
+    :meth:`~kiro_crew.crew_log.store.CrewLog.iter_from` walks ``_iter_segments``
+    from the first segment and decodes every entry, dropping the ones below its
+    *seq* after parsing them. So a "recent entries" window costs the same full
+    parse as the whole file, and a window MISS -- the ordinary case for an item
+    whose dispatch has aged out -- would pay for that parse twice. A byte-tail
+    reader like :func:`~kiro_crew.crew_log.store._anchor_exists`'s is what an
+    actual bound would take, and it answers a different question (does this seq
+    exist) than this one (which dispatch named this item).
+
+    Reading the whole file is also what correctness wants, though not because a
+    miss refuses the write: :func:`on_crew_report` records an unthreaded report
+    rather than dropping it. What a miss costs is that the entry becomes
+    indistinguishable from one volunteered with no dispatch behind it, which is a
+    claim about where the work came from that nothing later can correct -- so every
+    anchor the file actually holds is worth finding.
+
+    An unreadable log answers ``None``, so a report still lands.
+    """
+    if not isinstance(item, str) or not item:
+        return None
+    try:
+        return _newest_dispatch_for(log, item, 1)
+    except Exception:  # noqa: BLE001 - an unthreaded report is better than none
+        # Rendered text, never ``exc_info``: ``log`` is a live ``CrewLog`` in this frame,
+        # so a record carrying the traceback carries this frame, and a handler that keeps
+        # records (``caplog``, a ``MemoryHandler``) keeps the handle and its write lease
+        # alive past the drop that should have released it. A string keeps no frames.
+        # The render uses the ``traceback`` module imported above rather than the store's
+        # ``log_exception_text``, because this module is the boot-path import gate (see
+        # ``_crew_log``) and may not import the store at module level -- the same idiom
+        # ``_record_session_tree_edge`` uses. Pinned by test_crew_log_exc_info_sites.py.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "crew log: dispatch anchor lookup failed for %r:\n%s",
+                item,
+                traceback.format_exc().rstrip(),
+            )
+        return None
+
+
+def _crew_append(store: str, entry_type: str, data: dict[str, Any], **envelope: Any) -> int:
+    """Append one crew entry and return its seq, or ``0`` when nothing was written.
+
+    BEST EFFORT, and that is a scope decision rather than laxity: the work board's
+    own authority is the ``work/recorded`` entry in the acting session's log, which
+    its route already refuses to proceed without. This entry is the crew-side
+    record of the same fact, so a crew log that cannot be written must not fail the
+    ledger write that succeeded -- a caller reads ``0`` as "not recorded" and
+    carries on.
+    """
+    try:
+        log = _crew_unit(store)
+        if log is None:
+            return 0
+        return int(log.append(entry_type, data, src=envelope.pop("src"), **envelope).seq)
+    except Exception as exc:  # noqa: BLE001 - see the best-effort note above
+        _report(f"appending {entry_type} for crew {store!r}", exc)
+        return 0
+
+
+def on_crew_dispatch(store: str, data: dict[str, Any]) -> int:
+    """One work item handed to a target, recorded in the dispatching crew's log.
+
+    The OPENER of the dispatch family: the reports for this item thread onto the
+    seq returned here. *data* is the ``crew/dispatch`` payload -- ``item``,
+    ``target``, and an optional ``brief`` -- and the registry checks the rest.
+
+    Returns the appended seq, or ``0`` when nothing was written: the flag is off,
+    the crew is unnamed, or ``target`` does not name exactly one party.
+    """
+    if not _dispatch_target_ok(data):
+        logger.warning(
+            "crew log: refusing a dispatch whose target names no single party (crew=%r)", store
+        )
+        return 0
+    return _crew_append(store, CREW_DISPATCH, data, src=crew_src(store))
+
+
+def _max_ref_span() -> int:
+    """The cited-span cap, read from the module that owns and enforces it.
+
+    ``Ref`` validates a span against ``schema``, so ``schema`` holds the cap and is
+    the single name a caller lowers to change it. The package re-exports the cap and
+    caches the value on first access (:pep:`562`), which makes the re-export a
+    second copy of one number: a reader that goes through the package can hold a
+    value the owner does not have. Reading the owner keeps the clamp this function
+    applies and the bound ``Ref`` enforces the same number.
+
+    Imported per call, for the reason :func:`_crew_log` gives: this module stays
+    free of import-time work. Every caller reaches here with the store already
+    open, so the schema module is loaded by then and the lookup is a dict hit.
+    """
+    from kiro_crew.crew_log import schema
+
+    return int(schema.MAX_REF_SPAN)
+
+
+def on_crew_report(store: str, data: dict[str, Any], *, cite_unit: str) -> int:
+    """One report on a work item, recorded in the DISPATCHING crew's log.
+
+    ``src`` is ``gateway`` rather than a crew guest form: the reporting party here
+    is a session, and the gateway is what writes a session's report into the crew's
+    file.
+
+    *cite_unit* is the reporting session's crew-log unit, and it is what makes the
+    required ``ref`` the writer's obligation rather than the caller's: the span is
+    built here, from that unit's own newest seq, so a report cannot be written
+    without evidence. The span is clamped to the newest ``MAX_REF_SPAN`` lines,
+    which is what the cap is for -- a long run is cited by its relevant span
+    rather than in full. A unit with no readable log yields no citation and the
+    report is not written, because a report with no ``ref`` is an unfalsifiable
+    claim in a file nothing rewrites.
+
+    A report whose dispatch anchor does not resolve is written UNTHREADED rather
+    than dropped. The anchor can be missing for two reasons, and one of them does
+    not heal: a read that failed transiently leaves the dispatch on disk, so the
+    item's next report threads normally, but a dispatch whose own best-effort
+    append failed leaves no dispatch entry at all -- and then refusing the reply
+    refuses every later report for that item too, so the crew log reads for good
+    as though the item was never dispatched. Silence about the work is the worse
+    record: it is unbounded in time and invisible, while an unthreaded report
+    states that the work happened and is merely missing its link.
+
+    What that costs is worth naming, because it is not free. The spec reads a
+    report with no ``thread`` as one volunteered with no dispatch behind it, so an
+    unthreaded report here is indistinguishable from a volunteered one -- one
+    field is ambiguous, rather than one item's whole history being absent. The
+    anomaly is logged when it happens, which is where a reader looks to tell the
+    two apart.
+
+    The refusal that remains is the evidence one above: no citable unit means no
+    write at all, because a report that cannot be checked is a claim, not a record.
+
+    Returns the appended seq, or ``0`` when nothing was written.
+    """
+    subsystem = _crew_log()
+    try:
+        if not cite_unit or not subsystem.CrewLog.exists(_KIND, cite_unit):
+            return 0
+        last = int(subsystem.CrewLog.open(_KIND, cite_unit).last_seq)
+    except Exception as exc:  # noqa: BLE001 - see _crew_append's best-effort note
+        _report(f"citing {cite_unit!r} for a crew report", exc)
+        return 0
+    if last < 1:
+        return 0
+    span = _max_ref_span()
+    evidence = subsystem.Ref(_KIND, cite_unit, max(1, last - span + 1), last)
+    log = None
+    try:
+        log = _crew_unit(store)
+    except Exception as exc:  # noqa: BLE001 - see _crew_append's best-effort note
+        _report(f"opening the crew log for {store!r}", exc)
+    if log is None:
+        return 0
+    thread = _crew_thread(log, data.get("item"))
+    if thread is None:
+        # The OBSERVATION only. What happens next is not known yet: the append below
+        # can fail, and its failure goes through ``_report``, which warns once per
+        # process and is debug-only afterwards -- so a line claiming the report landed
+        # would be the only default-level trace of a write that did not.
+        logger.warning(
+            "crew log: no dispatch to thread %r onto in crew %r",
+            data.get("item"),
+            store,
+        )
+    try:
+        entry = log.append(CREW_REPORT, data, src=_SRC_GATEWAY, thread=thread, ref=evidence)
+        if thread is None:
+            logger.warning(
+                "crew log: recorded the report for %r in crew %r unthreaded, so it reads "
+                "as volunteered with no dispatch behind it",
+                data.get("item"),
+                store,
+            )
+        return int(entry.seq)
+    except Exception as exc:  # noqa: BLE001 - see _crew_append's best-effort note
+        _report(f"appending {CREW_REPORT} for crew {store!r}", exc)
+        return 0
 
 
 def on_session_closed(session_id: str, reason: str) -> None:
@@ -4914,8 +5459,10 @@ __all__ = [
     "on_message_sent",
     "on_model_selected",
     "on_request_configured",
+    "on_session_adopted",
     "on_session_closed",
     "on_session_opened",
+    "on_session_released",
     "on_step_completed",
     "on_step_started",
     "on_tool_called",
@@ -4933,6 +5480,55 @@ __all__ = [
 # ``_ensure_shutdown_hook`` on the first drain pass rather than here, so a launch
 # with the flag unset registers nothing at all. See that function for why first
 # use still puts this handler behind the executor's own.
+
+
+def _record_session_tree_decision(
+    session_id: str,
+    slot: str,
+    entry: Any,
+    parent_slot: "str | None",
+) -> None:
+    """Fold a just-committed ``session/adopted`` or ``session/released`` into the
+    in-memory session tree. ``parent_slot`` of ``None`` is the release.
+
+    Called immediately AFTER the append succeeded, for the reason
+    :func:`_record_session_tree_edge` is: the tree is a projection that applies deltas
+    and never rescans, so this line is what makes a takeover visible without waiting
+    for a cold start.
+
+    *entry* is what ``append`` returned, so its ``seq`` and ``time`` are the values ON
+    DISK. ``seq`` is what orders the decision, and taking it from the written line is
+    what makes the live fold and a cold replay of that same line agree. Reading a clock
+    here instead would order the fold by a moment the log does not record.
+
+    Never raises, and never logs at a level an operator has to act on: the append has
+    already succeeded, so the record is safe on disk whatever happens here, and a missed
+    fold is recovered by the projection's tail replay on the next cold start.
+    """
+    try:
+        from kiro_crew.crew_log.session_tree_projection import record_adopted, record_released
+
+        raw = getattr(entry, "time", 0)
+        at = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+        raw_seq = getattr(entry, "seq", 0)
+        seq = raw_seq if isinstance(raw_seq, int) and not isinstance(raw_seq, bool) else 0
+        if parent_slot:
+            record_adopted(session_id, slot, at, parent_slot, seq)
+        else:
+            record_released(session_id, slot, at, seq)
+    except Exception:  # pragma: no cover -- defensive; both doors guard themselves
+        # Rendered text, never ``exc_info``, for the reason
+        # :func:`_record_session_tree_edge` spells out: this frame names no handle, but
+        # its CALLER is the writer job, which binds ``log`` -- and a retained traceback
+        # reaches that frame through ``tb_frame.f_back``, so a handler that keeps records
+        # would keep the handle and its write lease. Same ``traceback`` idiom, for the
+        # same import-gate reason. Pinned by test_crew_log_exc_info_sites.py.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "session tree projection not advanced for %s:\n%s",
+                session_id,
+                traceback.format_exc().rstrip(),
+            )
 
 
 def _record_session_tree_edge(

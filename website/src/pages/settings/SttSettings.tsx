@@ -713,7 +713,13 @@ export default function SttSettings({ cardIndex }: {
           <div className="flex items-center gap-1.5">
             {available
               ? <Badge variant="ok">{i18nT('pages.settings.sttSettings.ready')}</Badge>
-              : <Badge variant="warn">{i18nT('pages.settings.sttSettings.not_installed')}</Badge>}
+              : status?.code === 'stt_provider_off'
+                // Nothing is missing when the provider is Off: "not installed" would
+                // send the user to an install for a state they chose (or that an
+                // unknown stored value was degraded onto). Neutral, and the reason
+                // line below names the control.
+                ? <Badge variant="muted">{i18nT('pages.settings.sttSettings.status_provider_off')}</Badge>
+                : <Badge variant="warn">{i18nT('pages.settings.sttSettings.not_installed')}</Badge>}
             {/* The engine truth rides on the row a user already reads to answer
                 "is this working", rather than in a section of its own. Three
                 read-only numbers each given a labelled row of their own was the

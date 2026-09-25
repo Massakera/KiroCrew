@@ -673,6 +673,23 @@ def _resolve_chat_folder_id(
 
 async def api_crons_create(request: web.Request) -> web.Response:
     """POST /api/crons — create a cron job."""
+    # Owner identity is a property of a dashboard-user request: ``app == ""`` is
+    # the class ``is_owner_dashboard_request`` can rule on at all. An app token
+    # carries a non-empty name and stays confined to its manifest's declared
+    # paths by ``_enforce_app_scope`` -- ``POST /api/crons`` is one of those
+    # declarable paths (see ``docs/app-kit/api-reference.md``). No
+    # ``internal_auth`` clause: this route has no ``X-Internal-Secret`` caller,
+    # and a clause naming one would exempt a future caller nobody reviewed.
+    if request.get("app") == "":
+        # Body-scope import, like the sibling gates in this package
+        # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+        # reaches back into sibling handler modules, so importing the helper at
+        # module scope from here would close a cycle.
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, "crons.create")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     # Per-route cap: the body carries the job's full agent message/prompt text,
     # whose field bound (MAX_CRON_MESSAGE chars) can exceed the shared 64 KB
@@ -1789,34 +1806,31 @@ async def api_cron_run(request: web.Request) -> web.Response:
     job = await state.crons.get_job_async(job_id)
     if not job:
         return web.json_response({"error": "job not found"}, status=404)
-    # Reject if a run is already in flight. Overwriting _running_tasks[job_id]
-    # would orphan the prior task's handle (it could no longer be
-    # tracked/cancelled/joined) and allow overlapping duplicate runs. The
-    # check-and-set below is atomic: there is no await between the guard and the
-    # assignment, so the single-threaded event loop cannot interleave a second
-    # request into this critical section. (The lookup above awaits, so two
-    # concurrent requests can both reach the guard — but only one can pass it,
-    # because the guard and the assignment are not separated by an await.)
+    # Reject if a run is already in flight: a second overlapping run would
+    # orphan the prior task's handle (nothing could track, cancel
+    # or join it). The check-and-claim below is atomic: there is no await between
+    # the guard, run_job's claim and attach_run_task, so the single-threaded
+    # event loop cannot interleave a second request into this critical section.
+    # (The lookup above awaits, so two concurrent requests can both reach the
+    # guard — but only one can pass it, because the guard and the claim are not
+    # separated by an await.)
     #
     # A tracked task that has already finished is NOT a run in flight, whatever
-    # the markers say: a run whose task ends without reaching
-    # _run_job_isolated's finally leaves _executing and _running_tasks populated
-    # with nothing on that path to clear them, and this guard alone would then
-    # refuse every manual run of the job until the reaper sweep meets the
-    # finished task (it does the same release, once a sweep). Drop such
-    # leftovers first; the call is synchronous, so the check-and-set stays
-    # await-free, and a task still running keeps the 409 below.
+    # the claim says: a run whose task ends without reaching
+    # _run_job_isolated's finally leaves its claim stored with nothing on that
+    # path to release it, and this guard alone would then refuse every manual
+    # run of the job until the reaper sweep meets the finished task (it does
+    # the same release, once a sweep). Drop such leftovers first; the call is
+    # synchronous, so the check-and-claim stays await-free, and a task still
+    # running keeps the 409 below.
     state.crons.discard_finished_run(job_id)
-    if job_id in state.crons._running_tasks or state.crons.is_running(job_id):
+    if state.crons.is_running(job_id):
         return web.json_response({"error": "job is already running"}, status=409)
-    task = asyncio.create_task(state.crons.run_job(job_id))  # type: ignore[arg-type]
-    state.crons._running_tasks[job_id] = task  # type: ignore[assignment]
-
-    def _on_done(t: asyncio.Task, _jid: str = job_id) -> None:  # type: ignore[type-arg]
-        if state.crons._running_tasks.get(_jid) is t:
-            state.crons._running_tasks.pop(_jid, None)
-
-    task.add_done_callback(_on_done)
+    # run_job claims the job synchronously while the call is evaluated; the
+    # wrapper task is handed to the claim on the same line so cancel() can
+    # reach a run still parked in its store refresh.
+    task = asyncio.create_task(state.crons.run_job(job_id))
+    state.crons.attach_run_task(job_id, task)
     state.push_refresh("crons")
     safe_name = redact_credentials(redact_exfiltration_urls(job.name)[0])[0]
     return web.json_response({"ok": True, "name": safe_name})

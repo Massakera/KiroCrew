@@ -524,7 +524,9 @@ class TestLastMessagePreview:
     def test_unpreviewable_markdown_yields_empty(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         log.append("k", "assistant", "text")
-        with patch("kiro_crew.history.strip_markdown_preview", return_value=""):
+        # The preview is built by preview_text.speech_preview, which reads the
+        # stripper from its own module; that is the seam to rebind.
+        with patch("kiro_crew.preview_text.strip_markdown_preview", return_value=""):
             assert log.last_message_preview("k") == ""
 
 
@@ -561,9 +563,9 @@ class TestListSessions:
     def test_metadata_cache_hit_is_used(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         _write(tmp_path / "s1.jsonl", _jsonl({"_type": "metadata"}))
-        mtime = (tmp_path / "s1.jsonl").stat().st_mtime
+        identity = log._cache_identity((tmp_path / "s1.jsonl").stat())
         log._meta_cache["s1"] = (
-            mtime,
+            identity,
             log._cache_gen("s1"),
             {
                 "_type": "metadata",
@@ -600,9 +602,9 @@ class TestListSessions:
     def test_message_cache_supplies_title_fallback(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         _write(tmp_path / "s1.jsonl", _jsonl({"_type": "metadata"}))
-        mtime = (tmp_path / "s1.jsonl").stat().st_mtime
+        identity = log._cache_identity((tmp_path / "s1.jsonl").stat())
         log._msg_cache["s1"] = (
-            mtime,
+            identity,
             log._cache_gen("s1"),
             [
                 {"role": "assistant", "content": "skip"},
@@ -938,6 +940,29 @@ class TestWriteStructuredMemory:
             c._write_structured_memory({"semantic": [{"key": "a", "value": "b"}]}, "k")
         assert "0 written" in caplog.text
         assert "1 refused" in caplog.text
+
+    def test_refusal_logs_the_reason_and_points_at_the_audit_trail(self, caplog) -> None:
+        """A bare reject code cannot say WHICH rule refused the write.
+
+        ``set_semantic`` returns ``(code, reason)`` and the reason carries the
+        specific cause -- here which confidence won. Dropping it left an operator
+        with ``conflict`` and no way to tell a confidence loss from a queued
+        proposal, so the warning must carry the reason and name the table that
+        holds the stored and rejected values.
+        """
+        vs = MagicMock()
+        vs.set_semantic.return_value = (
+            SemanticRejectCode.CONFLICT,
+            "Existing entry has higher confidence (0.90 vs 0.60)",
+        )
+        c = _consolidator(vector_store=vs)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.history"):
+            c._write_structured_memory({"semantic": [{"key": "head_sha", "value": "b"}]}, "k")
+        assert "Existing entry has higher confidence (0.90 vs 0.60)" in caplog.text
+        # The pointer is scoped to audited causes: VALUE_SIZE and VALUE_ENCODING are
+        # outside ``_AUDITABLE_REJECT_CODES``, so a blanket promise of a row would send
+        # an operator to an audit record that was never written.
+        assert "audited causes carry both values in memory_events" in caplog.text
 
     def test_semantic_is_capped(self) -> None:
         vs = MagicMock()

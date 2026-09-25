@@ -691,8 +691,10 @@ class GatewayManager:
         # with no ceiling on a slow or remote home, and this method already
         # offloads a single chmod.
         env["PATH"] = await asyncio.to_thread(mcp_runtime_path, env.get("PATH", ""))
+        # ``-P``: the daemon inherits this process's cwd -- the home directory
+        # under the service unit -- and ``-m`` would put it ahead of the stdlib.
         argv = platform_compat.isolated_python_argv(
-            "-m", _GATEWAYD_MODULE,
+            "-P", "-m", _GATEWAYD_MODULE,
             "--socket", str(self._spec.socket_path),
             # This process is the daemon's one owner: it exits when we are
             # gone (start-time-checked, so a recycled PID does not count)

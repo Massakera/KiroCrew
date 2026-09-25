@@ -6864,7 +6864,13 @@ class TestParentEndCancelsItsChildren:
                 self._admission = _Admission()
                 # A live record is what makes the reap reachable: the drain started this
                 # row, so there is a task to stop rather than a row to unqueue.
-                self._agents = {"started-row": SimpleNamespace(id="started-row", done=False)}
+                self._agents = {
+                    # The fields cancel_for_teardown WRITES before the reap, on
+                    # a record shaped like the real one.
+                    "started-row": SimpleNamespace(
+                        id="started-row", done=False, _reap_reason="", _stop_origin=""
+                    )
+                }
                 self._queue = []
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
@@ -7371,10 +7377,16 @@ class TestParentEndCancelsItsChildren:
         Two methods are exempt, each for a fact about itself rather than by
         convenience. ``close_all`` is gateway shutdown, where
         ``SubagentManager.cancel_all`` runs instead and additionally drains
-        follow-up watchers. ``_retire_kiro_subagent_runtimes`` reaps only IDLE
-        companion runtimes — it skips any runtime answering
-        ``has_active_or_initializing_sessions()`` — so it has no running child to
-        end, and the parent conversation it belongs to continues.
+        follow-up watchers. ``_retire_kiro_subagent_runtimes`` KILLS only IDLE
+        companion runtimes — a runtime answering
+        ``has_active_or_initializing_sessions()`` is never killed; under the
+        spawn-identity predicate a busy wrong-account one is parked to drain
+        (no process ends, its running children finish on the parked process)
+        and the kill happens on a later pass only once it answers idle — so it
+        has no running child to end, and the parent conversation it belongs to
+        continues. Narrower
+        reaps (the spawn-identity stamp gate) delegate to it with a predicate
+        rather than releasing themselves, so this exemption never widens.
 
         ``reset`` is NOT exempt: it calls both halves, under
         ``ends_conversation``. That keyword defaults to False because almost every one of
@@ -7416,7 +7428,10 @@ class TestParentEndCancelsItsChildren:
             f"thing after a rename; found {sorted(releasing)}"
         )
 
-        exempt = {"close_all", "_retire_kiro_subagent_runtimes"}
+        exempt = {
+            "close_all",
+            "_retire_kiro_subagent_runtimes",
+        }
         assert exempt <= set(releasing), (
             "an exempt method no longer releases a companion runtime, so its "
             f"exemption is now unchecked: {sorted(exempt - set(releasing))}"

@@ -35,9 +35,10 @@ import type React from 'react'
 import ThinkingBlock from './ThinkingBlock'
 import ToolCallLine from './ToolCallLine'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
-import RecoveryCard, { resolveInjectCard } from './RecoveryCard'
+import RecoveryCard, { injectOpensTurn, resolveInjectCard } from './RecoveryCard'
 import { SystemNoticeRow, isSystemNoticeRow } from './CompactionCard'
-import { ErrorCard, isAuthRequired, isModelUnentitled } from './ErrorCard'
+import { ErrorCard, isAuthRequired, isModelUnentitled, isUsageLimit } from './ErrorCard'
+import { FEATURE_REQUEST_FORM_URL, isFeatureRequestRow } from '../../prompts/featureRequest'
 import NoticeCard from './NoticeCard'
 import { resolveTransientNotice } from './transientNotice'
 import WorkflowRunCard, { extractWorkflowRunId, isWorkflowRunTool } from './WorkflowRunCard'
@@ -45,10 +46,12 @@ import SubagentRunCard, { extractSpawnRunLaunch, isSpawnRunTool } from './Subage
 import WorkflowCompletionCard, { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
 import SubagentCompletionCard from './SubagentCompletionCard'
 import { isSubagentCompletionMessage, type ParsedSubagentCompletion } from './subagentCompletion'
-import { REASONING_ROLES, hasReasoningContent } from './groupDisplayItems'
+import { REASONING_ROLES, TURN_OPENER_ROLES, hasReasoningContent } from './groupDisplayItems'
 import { FileCard } from '../../components/FileCard'
 import UserMessage from './UserMessage'
-import { formatTs, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
+import CrewmateMessage, { type CrewmateIdentity } from './CrewmateMessage'
+import { crewmateBubbleClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
+import { formatTs, renderAssistantBubble, replyInThreadFor, threadFooterFor, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
 import { renderUserContent } from './ChatPageMessageContent'
 import { fmtMessageTimeFull } from './messageTime'
 import type { ChatMessage } from '../../types'
@@ -141,12 +144,90 @@ export interface TranscriptRendererOptions {
   /** Fix affordance for an `auth_required` row: deep-link to the Kiro sign-in
    *  card in Settings. Omitted on a surface with no settings route. */
   onOpenSignIn?: () => void
+  /** Draw the assistant rows as a CREWMATE speaking: avatar + name + time on
+   *  the first message of a run, one bordered bubble per message, grouped
+   *  corners (components/chat/crewmateBubbles). Set by the Members page for a
+   *  member-mode slot; absent everywhere else, so an ordinary chat keeps the
+   *  SDK's assistant row byte-for-byte. The host also filters the transcript
+   *  with `filterCrewmateChat` — this option only changes how what remains is
+   *  drawn. */
+  crewmate?: CrewmateIdentity
+  /** The UNFILTERED transcript behind a crewmate's chat. The rows the pane
+   *  draws are `ctx.messages`; the rows the pane dropped (the `inject` row a
+   *  policy block writes among them) are only here. Read for the steer-chip
+   *  decision, never for layout. Meaningless without `crewmate`. */
+  crewmateTranscript?: ChatMessage[]
+}
+
+/** Whether `row` OPENS a turn, for the two feature-request scans below. Read
+ *  from the transcript's own row-kind vocabulary, not a role list of this
+ *  module's: the opener ROLES (`TURN_OPENER_ROLES`: a typed row, an auto-nudge
+ *  cycle, a drained sub-agent completion) minus a STEER, plus the inject KINDS
+ *  the gateway stamps as a prompt of their own (`injectOpensTurn`: a cron
+ *  notification, a fan-out synthesis -- a `recovery` or `user_replay` continues
+ *  the request above it, and an unstamped inject dispatches nothing). A steer is
+ *  persisted as a `user` row with `meta.steer` (chat_delivery.py) and appended
+ *  optimistically in the same shape (ChatPage `steer()`), but it was injected
+ *  INTO a running turn, so it cannot begin one. Same answer as the store's
+ *  `isTurnBoundaryUser`, `selectSlotPendingApproval`'s walk and the turn-head
+ *  walk in `app-sdk/turnPolicyBlock.ts`. Every steer row is exempt, the
+ *  optimistic bubble included: a bubble the server turned into a NEW turn is
+ *  reconciled by the echo that carries its `sendId` (the store deletes its
+ *  `steer` flag), and until then a misread here only moves a link between two
+ *  rows -- it never splices content, which is the one reason
+ *  `isTurnBoundaryUser` keeps its optimistic exception. */
+function opensTurn(row: ChatMessage): boolean {
+  if (row.role === 'user') return !row.meta?.steer
+  return TURN_OPENER_ROLES.has(row.role) || injectOpensTurn(row)
+}
+
+/** True when the error row at `index` is the seeded feature-request turn's own
+ *  refusal: the nearest TURN OPENER above it (`opensTurn`) is a user row
+ *  carrying the flow's stamp (`meta.featureRequest: true`,
+ *  `prompts/featureRequest.isFeatureRequestRow`). Stopping at every opener --
+ *  not only a typed row -- is what keeps a later turn's limit its own: a nudge
+ *  that fires after the request was filed, or a cron notification drained after
+ *  it, starts a new turn, so a limit hit below either must get Resume back, not
+ *  the form. Walking PAST a steer is the mirror: the user steering the seeded
+ *  turn does not unmark it, so the form stays and Resume (a retry that replays
+ *  the rejection) stays withheld -- and so does walking past the runtime's own
+ *  retry of the request (a `recovery` or `user_replay` inject). The
+ *  stamp rides the send's `meta`, which the gateway persists verbatim on the
+ *  user row and echoes back, so the rule reads the same before the echo (the
+ *  optimistic bubble), after it, on a reloaded transcript and in a second tab
+ *  -- nothing is asked of the host. A window that no longer holds the marked
+ *  row (paged out) answers false: the form is offered on evidence, never on
+ *  the slot alone. */
+export function isFeatureRequestRefusal(messages: readonly ChatMessage[], index: number): boolean {
+  for (let i = index - 1; i >= 0; i--) {
+    const row = messages[i]
+    if (!opensTurn(row)) continue
+    return row.role === 'user' && isFeatureRequestRow(row.meta)
+  }
+  return false
+}
+
+/** True when the composer's Resume would replay the feature-request refusal:
+ *  the newest error row is a `usage_limit` row that `isFeatureRequestRefusal`
+ *  claims, and neither an assistant row nor a turn opener (`opensTurn`) follows
+ *  it (a later turn is the composer's business, not this row's). ChatPage reads
+ *  it to suppress the composer's Resume and its "press Resume" hint beside a
+ *  card that has just withheld Resume for the same reason -- the two must not
+ *  argue. */
+export function featureRequestRefusalIsNewest(messages: readonly ChatMessage[]): boolean {
+  const idx = lastErrorIndex(messages)
+  if (idx < 0) return false
+  for (let j = idx + 1; j < messages.length; j++) {
+    const row = messages[j]
+    if (row.role === 'assistant' || opensTurn(row)) return false
+  }
+  return isUsageLimit(messages[idx]) && isFeatureRequestRefusal(messages, idx)
 }
 
 /** Index of the last `error` row, so only that one offers Continue. Derived
  *  from the transcript the list already handed us rather than asked of the
  *  host, which would let the two drift apart. */
-function lastErrorIndex(messages: ChatMessage[]): number {
+function lastErrorIndex(messages: readonly ChatMessage[]): number {
   for (let j = messages.length - 1; j >= 0; j--) if (messages[j].role === 'error') return j
   return -1
 }
@@ -172,6 +253,10 @@ export function createTranscriptRenderers(
       true,
     )
   }
+  // Narrowed once here so the crewmate entry below can close over a definite
+  // identity instead of re-asserting `o.crewmate` inside its render.
+  const crewmate = o.crewmate
+  const crewmateTranscript = o.crewmateTranscript
 
   return [
     // ── Shape-matched rows, ahead of anything keyed only by role ──
@@ -345,6 +430,40 @@ export function createTranscriptRenderers(
         true,
       ),
     },
+    // Replaces the SDK's `assistant` entry (same id) ONLY for a crewmate's
+    // chat: the same AssistantMessage (markdown, option chips, hover actions),
+    // placed as a bubble in a run under the crewmate's avatar and name. The
+    // run position is derived from the list the pane already filtered, so the
+    // neighbours it reads are the rows drawn next to it. The two assistant-role
+    // refinements above (system notice, workflow completion) still precede it;
+    // the pane's filter has already dropped both for a crewmate anyway.
+    ...(crewmate
+      ? [{
+          id: 'assistant',
+          roles: ['assistant', 'streaming'],
+          render: (m: ChatMessage, ctx: MessageRenderContext) => {
+            // Run position reads turn boundaries off the UNFILTERED transcript
+            // (a patrol wake between two replies is filtered from `ctx.messages`).
+            const pos = crewmateRunPosition(ctx.messages, ctx.index, crewmateTranscript)
+            // The run ends here (single / end): the row after it is a boundary
+            // the user sees or the turn ended, so this bubble is the one that
+            // carries the hover actions. The policy-block read goes to
+            // the unfiltered transcript — see `crewmateTranscript`; the row is
+            // located by identity, since the filter keeps the same objects.
+            const full = crewmateTranscript
+            const fullIndex = full ? full.indexOf(m) : -1
+            const bubble = renderAssistantBubble(m, ctx, crewmateBubbleClass(pos), {
+              forceFooter: pos === 'single' || pos === 'end',
+              policyBlockTranscript: full && fullIndex >= 0 ? { messages: full, index: fullIndex } : undefined,
+            })
+            if (bubble === null) return null
+            return ctx.row(
+              <CrewmateMessage crewmate={crewmate} pos={pos} ts={m.ts}>{bubble}</CrewmateMessage>,
+              true,
+            )
+          },
+        } satisfies MessageRenderer]
+      : []),
     {
       // Replaces the default's bare div: same text, plus the Continue
       // affordance on the LAST error when a turn was interrupted.
@@ -361,6 +480,15 @@ export function createTranscriptRenderers(
         }
         const unentitled = isModelUnentitled(m)
         const authRequired = isAuthRequired(m)
+        // The form is offered on the seeded turn's own refusal and nowhere else:
+        // a #4198 refused-send row in the same slot carries no kind (the send
+        // never went out, so a retry CAN help); a usage limit under a user row
+        // the pill did not stamp is some other turn's; and a limit hit after
+        // the user typed on in the same slot belongs to THAT turn, so it keeps
+        // today's card, Continue included. The route is a constant of the flow,
+        // never read from the row: the stamp only selects it.
+        const featureRequestFormUrl =
+          isUsageLimit(m) && isFeatureRequestRefusal(ctx.messages, ctx.index) ? FEATURE_REQUEST_FORM_URL : undefined
         return ctx.row(
           <ErrorCard
             content={transient ? transient.text : m.content}
@@ -368,9 +496,9 @@ export function createTranscriptRenderers(
             // A rejection the backend says no retry can fix never offers Continue,
             // even when this row is the newest and the turn was interrupted:
             // resuming would replay the identical rejection (or the same
-            // signed-out wall).
+            // signed-out wall, or the same spent allowance).
             onContinue={
-              !unentitled && !authRequired && o.onContinue && o.continuable && o.interrupted && ctx.index === lastErrorIndex(ctx.messages)
+              !unentitled && !authRequired && !featureRequestFormUrl && o.onContinue && o.continuable && o.interrupted && ctx.index === lastErrorIndex(ctx.messages)
                 ? o.onContinue
                 : undefined
             }
@@ -379,6 +507,7 @@ export function createTranscriptRenderers(
             onOpenDefaultModel={unentitled ? o.onOpenDefaultModel : undefined}
             onOpenSignIn={authRequired ? o.onOpenSignIn : undefined}
             unentitledElsewhere={unentitled}
+            featureRequestFormUrl={featureRequestFormUrl}
           />,
         )
       },
@@ -392,14 +521,18 @@ export function createTranscriptRenderers(
           id: 'user',
           roles: ['user'],
           render: (m: ChatMessage, ctx: MessageRenderContext) => ctx.wrapper(
-            <UserMessage
-              content={m.content}
-              meta={m.meta}
-              timestamp={formatTs(m.ts)}
-              timestampTitle={fmtMessageTimeFull(m.ts)}
-              renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
-              hideSteerBadge
-            />,
+            <>
+              <UserMessage
+                content={m.content}
+                meta={m.meta}
+                timestamp={formatTs(m.ts)}
+                timestampTitle={fmtMessageTimeFull(m.ts)}
+                renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
+                hideSteerBadge
+                onReplyInThread={replyInThreadFor(m, ctx)}
+              />
+              {threadFooterFor(m, ctx, 'end')}
+            </>,
             true,
           ),
         } satisfies MessageRenderer]

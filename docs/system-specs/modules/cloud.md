@@ -72,7 +72,7 @@ claim that a hostile in-process agent is fully contained.
 | `iam.py` | Least-privilege launcher policy generator (applied by the user, never by KiroCrew) + read-only reachability check + the **content-fixed instance permissions-boundary document** (`boundary_policy_document`/`boundary_arn`) and its constants (`BOUNDARY_NAME`). |
 | `ssm.py` | SSM `send-command` run-and-poll (base64-wrapped remote scripts) + `start-session` port-forward; `open_port_forward()` directly spawns the streaming `aws ssm start-session` child because `run_aws` captures output, and calls `aws.assert_human_action()` before doing so; `port_is_free` / `wait_for_local_port`. |
 | `login.py` | `kiro-cli` device-code / social sign-in on the box over SSM, plus `cancel_device_login` — which stops a login this crew started and removes the files holding its code, WITHOUT dropping the box's session, because a cancelled attempt must not sign the crew in later and must not take an older valid session with it — and `logout` — the account switch. `login` short-circuits on an existing session, so `logout` is what makes a different Kiro account reachable without a hand-run SSM command. It kills any still-polling background `kiro-cli login` **and** any live `kiro-cli acp` runtime **before** signing out (otherwise the login re-authenticates the old account, and an ACP runtime keeps serving the old account's in-memory credential until its next 401), removes the login log/PID/FIFO (they hold the previous device-code URL + code, which must never be re-shown as a fresh prompt), and confirms the result with `is_logged_in` rather than the exit code — `kiro-cli logout` exits non-zero when there was no session to drop, which is still the requested state. That confirmation fails CLOSED: it requires a positive signed-out sentinel (`__NOAUTH__`), so an SSM timeout or transport error — where the session may still be active — reports failure rather than a false "signed out". The same fail-closed applies to the cleanup command itself: if that SSM invocation doesn't return `Success`, the kills it was meant to do can't be trusted and logout reports failure without probing. The CLI warns the operator that in-flight chats/cron sessions are stopped (their runtimes are killed). |
-| `connect.py` | SSM port-forward + token mint + open browser; Instances-registry integration; `redact_token`. **`connect_fargate`** is the Fargate lane's counterpart and mints NOTHING: a Fargate task runs the crew container, whose only listener is a front proxy serving a JSON turn API with the backend loopback-only and every control path authorisation-gated and then 404, so there is no mint route to call and no browser to open. It preflights the task's execute-command channel through `ssm.task_exec_readiness`, opens the forward through the shared `ssm.open_port_forward` (which carries the human-action gate and the process-group teardown), and returns the local base URL and turn path on a `FargateConnection`. `is_launched_instance()` prevents the generic instance PATCH endpoint from rewriting a correlated launch’s connection method, SSM target, AWS profile, or region, so Stop/Start/Delete retain the stack address and a running billable instance is not stranded. |
+| `connect.py` | SSM port-forward + token mint + open browser; Instances-registry integration; `redact_token`. **The Fargate lane has no connect verb here.** A Fargate crew is reached by the instances layer's `fargate` connection method, surfaced as **Settings > Remote Crew**, whose card opens the forward and shows the task's turn API URL. What this module contributes to that lane is `FARGATE_TURN_PATH`, the path that forward dials, spelled here rather than imported from an image's source; `FARGATE_HEALTH_PATH` beside it is dialled from nowhere in the gateway and exists so the container-contract test can assert the pair. Nothing mints for a Fargate task: it runs the crew container, whose only listener is a front proxy serving a JSON turn API with the backend loopback-only and every control path authorisation-gated and then 404, so there is no mint route to call and no browser to open. There is no CLI counterpart either, and the asymmetry is the reason -- `cloud connect` addresses a crew by EC2 tag, and `cloud launch` cannot create a Fargate crew at all, because that engine is reachable only through the dashboard's provisioner API -- so `cloud connect`'s no-instance failure names Settings > Remote Crew rather than a verb that would dial a crew the CLI cannot make. `is_launched_instance()` prevents the generic instance PATCH endpoint from rewriting a correlated launch’s connection method, SSM target, AWS profile, or region, so Stop/Start/Delete retain the stack address and a running billable instance is not stranded. |
 | `source.py` | Detect and package an editable local checkout (`git archive`, tarfile fallback) and upload it to a per-account S3 bucket; packaged installs instead use the template's public-repo clone fallback. The secret-excluding filter is shared by both packaging paths. Also **`ensure_instance_boundary`** — creates the shared, immutable `kirocrew-ec2-boundary` managed policy once (create-if-not-exists, never re-versioned) and returns its ARN; `delete_instance_boundary` for admin cleanup. **`ensure_crew_boundary`** and **`ensure_crew_exec_boundary`** do the same for the two Fargate ceilings (`kirocrew-crew-boundary`, `kirocrew-crew-exec-boundary`), and all three route through one `_ensure_boundary` sequence whose ORDER is the security property: an existing policy is verified against the expected content-fixed document BEFORE it is reused, and a lost create race is verified on the way back, so a permissive policy seeded at either name is refused rather than trusted to cap nothing. |
 | `config.py` | Persisted profile / region / tag **plus the optional `fargate` block** (**never credentials**); `load()` tolerates a hand-edited/corrupt `cloud.json` -- bad JSON *or* a non-object shape falls back to defaults rather than crashing every cloud command. The `fargate` field holds the block **exactly as read**, and `fargate_config()` is what judges it. **This module has no writer:** no `save()`, no `apply_update()`, no lock. `profile` / `region` / `last_tag` are still READ here so an install whose pointer predates `launch_state.py` keeps resuming, and `launch_state.py` is where those three are written now. See "The Fargate lane's configuration home" and "Where launch state lives" below. |
 | `launch_state.py` | The product-owned launch record (`cloud_launch_state.json`): the profile, region and tag a LAUNCH decided. One writer, three fields, frozen dataclass, whole-record `atomic_write`. `load()` falls back to the legacy fields in `cloud.json` when the record holds none, read-only, so `cloud resume` works on an install that predates it. `clear_tag(expect)` clears only while the pointer still names the stack `destroy` deleted. See "Where launch state lives" below. |
@@ -204,6 +204,28 @@ existed. The key carries `task` because this lane already has a second TTL an op
 meets, `connect.mint_token`'s `ttl="6h"` session token, and the two bound different
 things. `FargateConfig.task_bounds()` is the one place that key name maps onto the
 engine's `ttl_seconds`.
+
+The bound is enforced at TWO points, and the second is the one that reaches the case
+the first cannot. `provision` sweeps the cluster before it launches, which clears a
+leftover from an earlier launch; it cannot reach a cluster whose last launch has
+already happened, so a task leaked by an owner's final launch bills until someone
+reads an invoice. The launcher therefore also derives the same number into the
+`RunTask` container override as `SMC_TASK_TTL_SECONDS`, and the crew supervisor stops
+its essential container once that deadline passes. The task's own deadline needs no
+scheduler, no further launch, and no gateway running. Both points read one number, so
+they cannot name different lifetimes, and the sweep measures from the task's
+`startedAt` while the in-task deadline starts when the supervisor begins waiting --
+earlier, so where a launch does happen the sweep is the one that fires.
+
+Two things an operator should expect from the in-task half. It takes effect only in an
+image that carries it, and the image is digest-pinned in this file, so a task launched
+against an older digest is bounded by the sweep alone until the pin moves. And a task
+that stops itself leaves its crew record behind for the same reason a crash or an
+out-of-memory stop does: the record lives with the gateway, and a container cannot
+reach it.
+
+A lifetime stop is an ORDERLY stop. The supervisor exits zero on it, so an expiry does
+not appear on the console beside a crash loop; the container log names the reason.
 
 The OTHER half of `TaskBounds` is deliberately not operator-reachable.
 `DEFAULT_MAX_RUNNING_TASKS` stays fixed at the engine's value, because
@@ -513,8 +535,10 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
   to an arbitrary role — otherwise a leaked credential could tag a pre-existing
   unbounded `kirocrew-ec2-*` role `kirocrew:managed=true`, then inline admin +
   pass it. `iam:TagRole` is therefore **not** unconditioned in the role-management
-  statement; it is its own statement gated on
-  `aws:ResourceTag/kirocrew:managed=true` (`IamTagRoleOnManaged`). `TagRole` is
+  statement; it is gated on `aws:ResourceTag/kirocrew:managed=true` in the merged
+  `IamPutRolePolicyAndTagRoleOnManaged` statement (which it shares with
+  `PutRolePolicy` — same Effect, role ARN and Condition, combined to keep the
+  policy under IAM's 6,144-char cap). `TagRole` is
   still *required* because CloudFormation's `CreateRole` passes the role's `Tags`
   inline and AWS authorizes that as `iam:TagRole` (`id_tags_roles.html`). The
   gate works because of an empirically-verified asymmetry (least-privilege
@@ -625,13 +649,14 @@ each is a property of a `dict` that a test can state.
 ### What a revision is keyed on
 
 One task-definition family per crew, one revision per (image digest, secret ARN
-set, cpu architecture, log configuration), registered on demand against a cached
-ARN. The key is dictated by the API, not chosen: `RunTask` can override `cpu`,
-`memory`, `ephemeralStorage`, `taskRoleArn`, `executionRoleArn` and a container's
-`command` and `environment`, and it cannot override `image`, `secrets`,
-`logConfiguration` or `runtimePlatform`. Those four are therefore the only fields
-a launch cannot bend at run time, so they are the only ones that can force a new
-revision. Steady state is one API call, two on the first launch of a new digest.
+set, cpu architecture, log configuration, store), registered on demand against a
+cached ARN. The key is dictated by the API, not chosen: `RunTask` can override
+`cpu`, `memory`, `ephemeralStorage`, `taskRoleArn`, `executionRoleArn` and a
+container's `command` and `environment`, and it cannot override `image`,
+`secrets`, `logConfiguration`, `runtimePlatform`, `volumes` or `mountPoints`.
+Those are therefore the only fields a launch cannot bend at run time, so they are
+the only ones that can force a new revision. Steady state is one API call, two on
+the first launch of a new digest.
 
 Two consequences follow. Keying on size is wrong because size is an override, and
 `TaskDefinitionSpec` carries no size field, so it is absent as an input rather
@@ -666,6 +691,61 @@ must be constant for teardown to match it, and the correlation value must vary f
 a caller to find one launch. `ec2.py` already separates them the same way, tagging
 `kirocrew:managed=true` beside `kirocrew:instance=<tag>`; collapsing both into one
 key let a caller's value displace the marker.
+
+### The data home is a declared volume, or the sessions end with the task
+
+A task's own disk is erased when the task stops, and the only storage knob a
+`RunTask` request can set is `ephemeralStorage`, which is that disk. The image is
+built for the other arrangement: it creates `/var/lib/kirocrew/sessions/archive`,
+`artifacts` and `run`, chowns them to its non-root user, and points
+`KIROCREW_HOME`, `SMC_DATA_HOME` and `SMC_CONFIG_DIR` at that directory, so a crew
+that keeps its data home on the task's disk loses every transcript, the session
+archive and the installed bundle the moment it stops -- and comes back looking
+healthy. `volumes` and `mountPoints` exist only on the task **definition**, so the
+definition is the one place the store can be named.
+
+`StoreSpec` names it: an EFS file system id, and optionally an access point id.
+Both are validated where the store is **constructed**, not where the document is
+built, so an unusable id cannot sit inside a spec whose fingerprint a caller then
+computes -- that would be a key for a document that can never be registered. An
+absent id and a malformed one are both refused, and the refusal names the cost
+rather than only the shape, because the field is not obviously load-bearing. Both
+live id lengths are accepted (8 and 17 hex); a re-cased or space-padded value is
+refused rather than repaired, since the account holds exactly one spelling of an
+id and a value needing repair came from somewhere other than the file system it
+names.
+
+`transitEncryption` and IAM authorization are not caller fields. Both are forced
+on. `transitEncryption` defaults to DISABLED at AWS and the traffic is the crew's
+transcripts. Mount authorization without `iam` falls back to the file system's own
+policy plus network reach, so any task that can reach the mount target can mount
+it; with `iam` ENABLED the mount is authorized against the task role, which is
+derived per crew. `accessPointId` is the only part of `authorizationConfig` that
+varies, and an access point additionally fixes the POSIX user the mount operates
+as and scopes what it can see to the access point's own root directory.
+
+The volume and the container's mount point are produced together, or neither is:
+a declared volume no container mounts registers and changes nothing, which is the
+shape a reviewer cannot see. `CREW_DATA_HOME` is the container path, and a test
+reads the image's own `ENV` to pin the two together, because a mount anywhere else
+backs a directory nothing in the task reads and both sides stay valid alone.
+
+Three obligations this leaves elsewhere, named so they are not discovered at first
+launch. **One store per crew, single writer**: the volume mounts the file system
+root, with no `rootDirectory`, so two crews pointed at one file system -- or two
+concurrent tasks of one crew -- share one data home, and their session archives,
+`run/` state and bundles collide with the same no-signal failure this section
+exists to remove. A refusal cannot live here, because the document builder sees one
+spec at a time and never the other crew's; whatever hands out file system ids owes
+each crew its own file system or its own access point. **Root writability**:
+without an access point the file system's own root must already be writable by the
+container's non-root user, which belongs to whatever creates the file system. **The
+role grant**: the per-crew task role needs `elasticfilesystem:ClientMount` and
+`ClientWrite` for that file system, which belongs to whatever creates the roles.
+
+`store` is `None` on every launch the engine builds today: there is no
+configuration home for a file system id yet, so the engine states the ephemeral
+answer explicitly rather than inventing an id.
 
 ### The credential reaches the container through the definition
 
@@ -715,14 +795,21 @@ The refusals, each stated as a property rather than as the case that prompted it
   thought of is not a guarantee, so the channel is closed by set membership and
   this module writes the derived values itself.
 - A name belongs to the closed set when a caller-supplied value could CONTRADICT
-  what the request already asserts, on one of two limbs: it decides **what the
-  task is**, which the spec's secrets fix through the crew they name, or it
+  what the request already asserts, on one of three limbs: it decides **what the
+  task is**, which the spec's secrets fix through the crew they name, it
   decides **who may reach it**, which is the credential set and the trust-domain
-  declaration. `SMC_CREW_NAME` and `SMC_SINGLE_PRINCIPAL` are derived and written
+  declaration, or it decides **what it may cost**, which is the lifetime the
+  launcher also enforces. `SMC_CREW_NAME`, `SMC_SINGLE_PRINCIPAL` and
+  `SMC_TASK_TTL_SECONDS` are derived and written
   here; `SMC_CONTROL_SECRET`, `KIRO_API_KEY`, `SMC_BUNDLE_DIR` and
   `SMC_FRONT_PORT` are refused and never written. Everything else stays the
   caller's: a bucket cannot contradict the spec, because the spec says nothing
   about buckets.
+- `SMC_TASK_TTL_SECONDS` is derived rather than accepted because a caller who could
+  raise it could keep a task past the bound the sweep enforces, which is opting out
+  of a cost cap rather than configuring it. `0` is written when no lifetime is asked
+  for and the container reads that as unbounded, so the variable is always present
+  and its absence never has to be told apart from a launcher that forgot it.
 - Writing `SMC_CREW_NAME` is what gives the container's own
   `manifest crew_name == SMC_CREW_NAME` refusal something to catch. When both
   values came from the caller they could agree with each other while contradicting

@@ -684,6 +684,13 @@ class McpServerInfo:
     # ``probe_server`` itself, so setting this flag is sufficient no matter which
     # entry point does the probing.
     disabled: bool = False
+    # THIS source's own ``timeout``/``disabled``, verbatim as the scope spec
+    # declares them; an absent key is absent here too. Deliberately separate
+    # from ``disabled`` above, which is an aggregate across every scope: a sync
+    # trigger comparing an aggregate against one generated entry would fire a
+    # sync that can never converge. Keyed by ``agent._SOURCE_OWNED_MCP_KEYS``,
+    # the set ``_merge_source_owned`` can actually reconcile.
+    source_owned: dict[str, Any] = field(default_factory=dict)
     # -- handshake metadata (probe-only; empty on unprobed rows) -----------
     # The server's advertised ``capabilities`` object, verbatim. ``None`` means
     # no handshake happened, which is NOT the same as an empty declaration.
@@ -1043,6 +1050,14 @@ _MANAGED_SERVER_TOOL_MODULES = {
 #: session-bound: either it does not consume the block at all, or it is in
 #: ``_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD`` below.
 #:
+#: ``kirocrew-computer`` qualifies by the second route, and the separation is
+#: NEGOTIATED rather than assumed. It tells its unnamed callers apart by the
+#: per-connection nonce, so a daemon minting none must not serve it pooled:
+#: ``mcp_gateway.gatewayd.REGISTERED_CAPABILITIES`` advertises ``tenant_nonce``
+#: and ``mcp_gateway.stub.must_degrade_nonce_blind`` execs a per-session backend
+#: when a serving daemon omits it. That is what makes the entry safe even where
+#: ``mcp_gateway/manager.py`` adopted a daemon older than this code.
+#:
 #: A NAME SET rather than a runtime read of each module's own constant. Reading the
 #: constant means ``importlib.import_module`` on the request path, which executes
 #: package code the gateway does not otherwise run -- the package directory is
@@ -1061,6 +1076,7 @@ _MANAGED_SERVERS_CALLER_AWARE: frozenset[str] = frozenset(
     {
         "kirocrew-core",
         "kirocrew-cron",
+        "kirocrew-computer",
         "kirocrew-dashboard",
         "kirocrew-work",
         "kirocrew-crew-log",
@@ -1071,31 +1087,35 @@ _MANAGED_SERVERS_CALLER_AWARE: frozenset[str] = frozenset(
 
 #: Managed servers that ADVERTISE the capability but are deliberately withheld
 #: from ``_MANAGED_SERVERS_CALLER_AWARE`` — advertising is necessary for the
-#: not-session-bound classification but not sufficient. ``kirocrew-computer``
-#: consumes the injected caller block (its pooled attribution is correct for
-#: every caller the gateway can name), but a caller the gateway CANNOT name
-#: proceeds under ``unresolved:<pid>`` by product decision — and unnamed is the
-#: NORMAL case on macOS, the only platform with a computer-use driver.
+#: not-session-bound classification but not sufficient. The set is empty: every
+#: managed server that advertises also meets the second condition.
 #:
-#: A per-CONNECTION nonce keeps those unnamed callers from collapsing onto one
-#: ``SnapshotIndex`` namespace on a CURRENT gateway. The
-#: entry stays because that is not the whole precondition. This set feeds
+#: The mechanism stays because that second condition is easy to miss. A name
+#: belongs here when its pooled attribution is right for every caller the gateway
+#: CAN name, yet its UNNAMED co-tenants are not provably separated on every
+#: gateway generation this code can meet. The gap matters because this set feeds
 #: ``managed_server_is_session_bound``, which feeds the shareability verdict,
 #: which ``mcp_gateway/seed.py`` turns into a CONFIG WRITE (``recommend_share``
-#: -> ``apply_seed``): promoting a name here can switch sharing ON for an
-#: operator who never chose it. And the daemon that would then serve those
-#: shared frames is not necessarily the one this code shipped with —
+#: -> ``apply_seed``): a name wrongly absent from here can switch sharing ON for
+#: an operator who never chose it. And the daemon that then serves those shared
+#: frames need not be the one this code shipped with —
 #: ``mcp_gateway/manager.py`` ADOPTS whatever healthy daemon already holds the
 #: socket, so a gatewayd that outlived a package upgrade keeps running and
-#: injects no nonce (which is exactly why ``REGISTERED_CAPABILITIES`` exists).
-#: Promotion therefore has to wait until a nonce-blind gateway cannot serve a
-#: POOLED computer backend at all — negotiated, not assumed.
+#: injects no nonce (which is why ``REGISTERED_CAPABILITIES`` exists).
 #:
-#: Contrast ``kirocrew-dashboard``, which refuses an unidentified caller and is
-#: therefore safe to classify shareable regardless of the daemon's generation.
-#: ``test_mcp_managed_caller_identity.py`` pins this so the entry can neither
+#: Two ways to satisfy the condition, one of each in the tree.
+#: ``kirocrew-dashboard`` REFUSES an unidentified caller, so it is safe to
+#: classify shareable whatever the daemon's generation. ``kirocrew-computer``
+#: NEGOTIATES instead: it separates unnamed co-tenants by the per-connection
+#: nonce, the daemon attests that it mints one, and
+#: ``mcp_gateway.stub.must_degrade_nonce_blind`` execs a per-session backend when
+#: the attestation is missing — so a nonce-blind gateway cannot serve that server
+#: pooled at all. Taking the separation on trust instead is the mistake this set
+#: exists to hold.
+#:
+#: ``test_mcp_managed_caller_identity.py`` pins this so an entry can neither
 #: silently persist past its reason nor silently widen.
-_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD: frozenset[str] = frozenset({"kirocrew-computer"})
+_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD: frozenset[str] = frozenset()
 
 
 def managed_server_is_session_bound(name: str) -> bool:
@@ -2907,6 +2927,31 @@ def _basename_any(cmd: str) -> str:
     return posixpath.basename(cmd)
 
 
+def _declared_source_owned(spec: dict) -> dict[str, Any]:
+    """The source-owned keys *spec* actually declares, verbatim.
+
+    The key set is imported from ``agent`` rather than restated, so the sync
+    trigger cannot drift from the merge again: a key ``_merge_source_owned``
+    stops reconciling stops firing a sync in the same commit.
+    """
+    from kiro_crew.agent import _SOURCE_OWNED_MCP_KEYS  # circular import
+
+    return {k: spec[k] for k in _SOURCE_OWNED_MCP_KEYS if k in spec}
+
+
+def _source_owned_diverged(existing: dict, info: McpServerInfo) -> bool:
+    """True when a key the source DECLARES disagrees with the generated entry.
+
+    Only a declared key is compared, because only a declared key is guaranteed
+    to converge: every scope's merge copies a declared value onto the entry,
+    while a key the source RETIRED is popped by ``_merge_source_owned`` for the
+    kiro-global and provider scopes but left in place by the ``dict.update``
+    merge the kirocrew scope uses. Firing on a retired key would therefore offer
+    a sync that repeats on every poll for a server declared in that scope alone.
+    """
+    return any(existing.get(key) != value for key, value in info.source_owned.items())
+
+
 def discover_servers_to_sync() -> list[McpServerInfo]:
     """Find MCP servers in mcp.json that need syncing to the agent config.
 
@@ -2934,14 +2979,16 @@ def discover_servers_to_sync() -> list[McpServerInfo]:
             scopes=_spec_scopes(spec),
             client_id=_spec_client_id(spec),
             source="discovered",
+            source_owned=_declared_source_owned(spec),
         )
         if name not in agent_names:
             out.append(info)
         else:
-            # Args divergence is intentionally excluded: user-customized
-            # args (e.g. --include-tools additions) are preserved by
-            # install_agent()'s setdefault merge, so triggering a full
-            # rebuild on args-only differences is wasted work.
+            # Args divergence is intentionally excluded because
+            # ``_SOURCE_OWNED_MCP_KEYS`` omits ``args``: it depends on
+            # ``command``, which the merge will not reconcile without a scope
+            # that declares one. Firing on an args-only difference would offer
+            # the operator a sync that reconciles nothing.
             existing = agent_mcp[name]
             if not isinstance(existing, dict):
                 continue
@@ -2960,14 +3007,17 @@ def discover_servers_to_sync() -> list[McpServerInfo]:
                     or existing_headers != info.headers
                     or _spec_scopes(existing) != info.scopes
                     or _spec_client_id(existing) != info.client_id
+                    or _source_owned_diverged(existing, info)
                 ):
                     out.append(info)
                 continue
             existing_env = existing.get("env", {})
             if not isinstance(existing_env, dict):
                 existing_env = {}
-            if not _envs_agree(existing_env, info.env) or _commands_diverged(
-                info.command, existing.get("command", "")
+            if (
+                not _envs_agree(existing_env, info.env)
+                or _commands_diverged(info.command, existing.get("command", ""))
+                or _source_owned_diverged(existing, info)
             ):
                 out.append(info)
     return out

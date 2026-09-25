@@ -57,8 +57,11 @@ SHIPPED_SMOKE = {
     "taskrunner-projects-page-compose",
 }
 SHIPPED = SHIPPED_SMOKE | {
+    "crewmate-chat-clean",
     "crewmate-panel-tabs",
+    "crewmate-reply-thread",
     "knowledge-add-folder-source-and-scan",
+    "meet-crewmates-flow",
     "members-dm-hello",
     "members-private-memory-keeps-thread",
 }
@@ -184,7 +187,10 @@ class TestShippedScenarios:
             ],
             "search": ["search-everywhere-jump-to-setting"],
             "members": [
+                "crewmate-chat-clean",
                 "crewmate-panel-tabs",
+                "crewmate-reply-thread",
+                "meet-crewmates-flow",
                 "members-dm-hello",
                 "members-private-memory-keeps-thread",
             ],
@@ -256,8 +262,12 @@ class TestShippedScenarios:
         assert any('"Crew Members" item appears in the left rail' in s for s in sc.steps)
 
     def test_members_scenarios_hedge_the_card_label(self) -> None:
-        """A seeded member has no display name, so its card shows the id; both members scenarios say so."""
-        for name in ("members-dm-hello", "members-private-memory-keeps-thread"):
+        """A seeded member has no display name, so its card shows the id; every members scenario says so."""
+        for name in (
+            "members-dm-hello",
+            "members-private-memory-keeps-thread",
+            "crewmate-reply-thread",
+        ):
             sc = scenarios.load_scenario(SCENARIOS_DIR / f"{name}.yaml")
             card_steps = [s for s in sc.steps if "Nova Sky" in s]
             assert card_steps, name
@@ -597,7 +607,7 @@ class TestReport:
         md = report.render_features(catalog, _summary(), run_url="https://x/run")
         assert md.startswith("# GUI user-test feature catalog\n")
         assert (
-            f"_18 of {len(scenarios.FEATURES)} features covered · 36 scenarios (32 smoke / 4 nightly)._"
+            f"_18 of {len(scenarios.FEATURES)} features covered · 39 scenarios (32 smoke / 7 nightly)._"
             in md
         )
         assert (

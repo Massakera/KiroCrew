@@ -45,7 +45,7 @@ and this module supplies the two things the kernel cannot know. The IDENTITY BLO
 holds the facts that must match verbatim, which is what the first two below are; the
 WITNESS holds the evidence a live check needs, which is what the last two read. The
 kernel compares the block, refuses a payload from another fold or another state
-shape, and hands the witness to :func:`_admits`.
+shape, and hands the witness to :func:`prefix_admit`.
 
 * the file describes a DIFFERENT log -- a unit removed and recreated under the
   same id restarts its seqs, and once the new file has grown past the stored seq a
@@ -65,7 +65,7 @@ shape, and hands the witness to :func:`_admits`.
   but it is checked on its own because a fold resumed past the end of a file is
   the one state no later read recovers from. Witness, against the live ``last_seq``.
 
-A savepoint written before the witness existed carries none, and :func:`_admits`
+A savepoint written before the witness existed carries none, and :func:`prefix_admit`
 refuses an empty one: it is a payload nothing can check, which this module holds to
 be worse than no payload at all. It is DISCARDED and cold-folded, never migrated --
 and because the file name is unchanged, the next write replaces it rather than
@@ -187,13 +187,23 @@ def _identity_block(handle: CrewLog, origin: str, first_seq: int) -> dict[str, A
     return {"unit": handle.id, "origin": origin, "first_seq": first_seq}
 
 
-def _admits(handle: CrewLog, first_seq: int) -> Admit:
+def prefix_admit(handle: CrewLog, first_seq: int) -> Admit:
     """The conditions that read the LIVE log, judged against a savepoint's witness.
+
+    Public and client-neutral on purpose. Every value it reads is on the ``CrewLog``
+    handle or in the witness the writer stored, so a second client over a crew log
+    evaluates the same condition by calling this rather than by writing its own --
+    two spellings of "are these still the bytes that state came from" would
+    eventually disagree, and the one that said yes too often serves a value no cold
+    fold reproduces for the life of the store.
 
     An EMPTY witness is refused, and that is what retires a payload written before
     the witness existed: it carries no evidence about the bytes its state came from,
     and this module's whole posture is that a savepoint it cannot check is worse than
     none.
+
+    *first_seq* is the oldest surviving entry's seq, which bounds how few raw records
+    a prefix through the witness's seq can possibly hold.
 
     The digest is memoized per record count, because the folds of one read share a
     boundary and hashing it once per fold would walk the same bytes five times.
@@ -246,6 +256,17 @@ def _admits(handle: CrewLog, first_seq: int) -> Admit:
     return admit
 
 
+def witness_mapping(prefix: PrefixWitness) -> dict[str, Any]:
+    """*prefix* as the opaque mapping a savepoint stores beside its identity.
+
+    The three keys :func:`prefix_admit` reads, written in one place so a second
+    client cannot store a witness under names the shared predicate does not look up
+    -- which would read as "carries no evidence" and cost that client every
+    savepoint it ever wrote, silently.
+    """
+    return {"seq": prefix.seq, "prefix_sha": prefix.sha, "prefix_records": prefix.records}
+
+
 def load(handle: CrewLog, names: Iterable[str]) -> SessionProjections | None:
     """The savepoints for *names* as a bundle to resume from, or ``None``.
 
@@ -275,7 +296,7 @@ def load(handle: CrewLog, names: Iterable[str]) -> SessionProjections | None:
         )
         return None
     block = _identity_block(handle, origin, first_seq)
-    admit = _admits(handle, first_seq)
+    admit = prefix_admit(handle, first_seq)
     resumed: dict[str, Checkpoint] = {}
     for name in wanted:
         loaded = _resume_one(store, handle, name, block, admit)
@@ -471,11 +492,7 @@ def save(
         # witness: it is the evidence a later read re-checks against the live file,
         # and it is the one thing equality cannot hold, since a reader cannot name a
         # record count before opening the file that states it.
-        witness = {
-            "seq": prefix.seq,
-            "prefix_sha": prefix.sha,
-            "prefix_records": prefix.records,
-        }
+        witness = witness_mapping(prefix)
         written = 0
         for checkpoint in bundle.checkpoints.values():
             if checkpoint.last_seq != prefix.seq:
@@ -550,7 +567,7 @@ def _resume_one(
     """One fold's savepoint, or ``None`` for every reason not to resume from it.
 
     The kernel decides the envelope, the fold name, the state shape's version and the
-    identity; :func:`_admits` decides the live-log conditions. What is left here is
+    identity; :func:`prefix_admit` decides the live-log conditions. What is left here is
     the crew log's own two: the payload must not disagree with itself about the seq it
     stands at, and the state must satisfy the fold surface's validation.
     """

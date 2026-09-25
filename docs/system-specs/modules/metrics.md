@@ -389,7 +389,7 @@ Tests: `test/metrics/test_resource_attrs.py`.
 | `kirocrew.turn.cost_usd` | histogram (usd) | `model` + `provider` | The same amount on a dollar-billing backend (claude_code / bedrock), same non-zero gate, same owners. Own bucket family `_USD_BUCKETS` (0.001–100). This is the one bucket array with no local calibration — a credit-billing host reports zero for every `cost_usd` row by construction — so it is sized from published per-token pricing against the observed token range and is worth re-checking once a dollar-billing host reports. Reported through `_amount_stats`, which keeps six decimals so a sub-cent turn does not round to `0.0`. |
 | `kirocrew.tool.call.duration` | histogram (ms) | `tool_kind` (`read` / `fetch` / `search` / `edit` / `write` / `create` / `delete` / `move` / `execute` / `think` / `switch_mode` / `client_built_in` / `mcp` / `other`), `outcome` (`completed` / `failed` / `cancelled`) | **Round-trip latency of one tool call, keyed by kind and never by tool name.** The tool NAME is deliberately not an attribute: MCP names are unbounded (any installed server contributes its own) and the recorder caches one instrument per distinct attribute value with no eviction, so a name-valued label is a cardinality bomb. `tool_kind` is the ACP `kind` normalised by `metrics/tool_calls.py::classify_tool_kind` and pinned to the closed `TOOL_KINDS` set; the `kind` field arrives verbatim from the agent, so an unrecognised or agent-authored kind — including an empty one — folds to `other`, which is what stops a tool name minting a series. An MCP-served call is labelled `mcp` whatever kind it reported, decided by the trusted `_meta.kiro.mcpServerName` rather than the reported kind: an MCP server's kind vocabulary is its own, and "this call left the process over MCP" is the more useful fact than a builtin's finer verb. `outcome` carries exactly the three terminal ACP statuses — a non-terminal update (`pending` / `in_progress` / absent) records nothing and leaves the clock running, so no fourth value is reachable. A `<= 0` span skips the emit, the same rule `kirocrew.turn.duration` follows. The clock is `time.perf_counter`, NOT `time.monotonic`: on Windows the latter advances in ~15.6ms ticks, so any call completing inside one tick measured exactly 0.0 and was dropped by that guard — which silently hid every sub-tick tool call on the platform, i.e. most cached reads. `perf_counter` is the highest-resolution monotonic clock available everywhere, so the guard keeps meaning "unmeasurable" rather than "fast". **Site: two parser layers, one registry, one sample per call.** There is no single choke point, because the two backends parse through different code: the shared builders in `acp/_dispatch.py` (`_build_tool_call_event` starts the clock once the trusted MCP identity is resolved; `_build_tool_result_event` stamps the terminal status BEFORE its output parse can return None, so an output-less completion is still measured), where the scope arrives as `cache_scope` forwarded by `acp/session_handle.py` as the frame's `sessionId`; and `acp/client.py::AcpClient._extract_tool_call_update` with its result-extracting sibling, which shape the same frames inline and scope on the client's own `_session_id`. Every other surface consumes the emitted `AcpEvent` stream downstream of these two, so instrumenting both parsers covers all of them. The registry is keyed `scope|tool_call_id`, spelled exactly as `_dispatch`'s own tool-input cache key: a backend-assigned `toolCallId` is unique only WITHIN one backend session while one runtime hosts many, so the scope is what stops two sessions reusing an id from colliding, and a finish in the wrong scope never steals another session's entry. Both layers derive one frame's scope from the same session id, so whichever sees a frame second pops the entry the first opened and the call is sampled once rather than twice — the disjoint-parser assumption failing would then be a harmless miss instead of a double count. A start is idempotent per scoped id (the first start time and kind win, so a `tool_call_update` refinement cannot shrink the span), a finish with no matching start emits nothing, and the registry is bounded (`_MAX_OPEN_CALLS`, dropped wholesale on overflow: missing samples for in-flight calls, never a leak). The watchdog's `acp/liveness.py::ToolCallState.dispatch_ts` is deliberately NOT reused — it is a single last-tool-wins slot, right for stall attribution but wrong for a histogram because interleaved calls overwrite each other, and it exists on only one of the two paths. Own bucket family `_TOOL_CALL_BUCKETS_MS`. Best-effort throughout: a tool call never fails because its telemetry did. |
 | `kirocrew.watchdog.action` | counter | `action` (`deferral` / `probe` / `cancel`), `verdict` (`working` / `dead` / `unknown` / `stuck_input`), `evidence_class` (`established_flat` / `mcp_flat` / `shell` / `shell_absent` / `wait` / `degraded`), `window` (`narrowed` / `extended` / `standard`), `agent_override` (bool) | `acp/session_handle.py::AcpSessionHandle._emit_watchdog_metric`, one point per watchdog DECISION in `_dispatch_events`: `deferral` from `_log_working_deferral` (rides its 10-min rate limit, so an hours-long WORKING build contributes a bounded handful of points, not one per tick), `probe` at the stale-probe send, `cancel` before `_end_stalled_tool`. `evidence_class` is `_watchdog_evidence_class` — a prefix/shape bucket of the free-form oracle evidence (pids/deltas/commands never emitted). `window` encodes the effective window selection: `narrowed` = a tool-branch evidence TAG reduced the suspect window below the build-scale default (1h) — `established_flat` to the model-silent budget (minutes), `shell_absent` to the ordinary silence budget (`stale_window_secs`, 300s) because the shell command has no process to its name; `extended` = model-wait-branch `established_flat` extended the stale window from 300s (`stale_window_secs`) to 900s (`model_silent_probe_secs`) for a non-streamed server-side think; `standard` = ordinary window in all other cases. `agent_override` is the per-agent watchdog-override BOOLEAN from the `WatchdogSettings` snapshot — deliberately NOT the agent name (free-form ⇒ cardinality bomb; per-agent joins happen via the row store's `agent` + `stop_reason` fields below). Guardrail query: `action=cancel, evidence_class=mcp_flat, window=standard` must not increase — the narrowed window may only affect `established_flat` and `shell_absent`. |
-| `kirocrew.watchdog.idle.duration` | histogram (ms) | `action`, `evidence_class` | Same emit helper, same decision points; value = the branch's idle clock (`_tool_idle` / `_stale_idle`) at decision time, converted to ms at the emit site because the dashboard's generic aggregation reports every histogram under `*_ms` keys (a seconds instrument would render 1000x off). Answers whether 900s is right for LLM-shaped stalls (idle-at-action distribution per evidence class). Own bucket family `_WATCHDOG_IDLE_BUCKETS_MS` (1s–4h, densest at the 300/900/3600-second window boundaries). |
+| `kirocrew.watchdog.idle.duration` | histogram (ms) | `action`, `evidence_class` | Same emit helper, same decision points; value = the branch's idle clock (`_tool_idle` / `_stale_idle`) at decision time, converted to ms at the emit site because the dashboard's generic aggregation reports a histogram under `*_ms` keys unless its emitting module declares a non-millisecond unit for it, and this one declares none (a seconds instrument would render 1000x off). Answers whether 900s is right for LLM-shaped stalls (idle-at-action distribution per evidence class). Own bucket family `_WATCHDOG_IDLE_BUCKETS_MS` (1s–4h, densest at the 300/900/3600-second window boundaries). |
 | `kirocrew.watchdog.recovery.outcome` | counter | `mechanism` (`stale_recover` / `tool_stall`), `outcome` (`recovered` / `exhausted`), `attempt_bucket` (1–3) | `dashboard/chat_runner.py::_emit_recovery_outcome`, derived from the per-slot retry budgets the stop-reason branches maintain (`slot._stale_recovery_retries` / `slot._tool_stall_retries`). `exhausted` emits in the stall branches when a budget hits its cap ("start a new chat"); `recovered` emits at the budget-reset block when a turn completes with outcome `ok` while a stall budget is armed — the stall branches return early, so an armed budget reaching that reset is by construction a completed recovery cycle (gated on `ok` so a user cancel of the recovery turn never counts as a recovery). `attempt_bucket` clamps to the 3-attempt cap (closed enum, mirrors the CLI's `attempt_number_bucket`). Every `recovered` point is one prevented hang. Fault accounting for the exhausted case lives on the turn histogram, not here: the final turn of an exhausted cycle labels `stall_exhausted` (see `kirocrew.turn.duration`), so a dead session counts toward `fault_rate` while this counter stays pure mechanism telemetry. |
 | `kirocrew.context.section.duration` | histogram (ms) | `section` (one fixed label per assembled block: `preamble` / `profile` / `workspace` / `docs` / `steering` / `thread_history` / `stop_notes` / `memory` / `skills` / `lessons` / `provenance` / `finalize`, plus `episodic` from the `build_message` site), `custom` (bool) | Two sites, both first-turn only. `context.py::ContextBuilder.build_session_context` emits one point per section from monotonic checkpoints taken as each block is appended; `context.py::ContextBuilder.build_message` emits `section=episodic` for the query-dependent episodic retrieval that runs as that method's sibling rather than one of its sections. **Why per-section:** the block is assembled AFTER the user's message arrives and the caller awaits it before dispatching the prompt, so every section lands directly on time-to-first-token; as one opaque interval the cost is unattributable and diagnosis degrades to guess-and-rebuild. The spread within a single build is the widest of any instrument here — string appends under a millisecond alongside a query-embedding section reaching seconds — which is why it takes `_FAST_BUCKETS_MS` (0.5ms..60s) rather than a startup ladder. `custom` is a bool rather than the agent name deliberately: a populated install has dozens of agents, and one series per agent per section would multiply series count for no diagnostic gain. Sections under 1ms are still recorded as points but omitted from the companion INFO line to keep it readable. |
 | `kirocrew.db.query.duration` | histogram (ms) | `store` (`memory` / `knowledge` / `vector` / `history` / `other`), `op` (`search` / `read` / `write` / `delete` / `migrate` / `connect` / `other`), `outcome` (`ok` / `error`) | `metrics/db_metrics.py`; times logical SQLite store operations rather than SQL statements. Raw SQL and search terms never become attributes. |
@@ -414,7 +414,7 @@ Tests: `test/metrics/test_resource_attrs.py`.
 | `kirocrew.taskq.effective_cap` | histogram (1) | `lane_kind` (`subagents`, `spawn_gate`, or a name a controller registers — code-bounded) | same sampler; the cap currently ENFORCED per lane, equal to the user maximum only when nothing is degraded. |
 | `kirocrew.taskq.pressure_reason` | counter | `reason` (the controller's closed reason enum) | same sampler, one increment per health computation taken while a degrade reason is active. |
 | `kirocrew.host.procs_peak` / `kirocrew.host.fds_peak` / `kirocrew.host.rss_peak_mb` | histogram | — | declared for the host budget's peaks since the previous sample (emitter: the budget snapshot, wave-3 integration). |
-| `kirocrew.loop.lag_ms` | histogram (ms) | `process` (`gateway` / `gatewayd`) | declared for the adaptive controller's loop-lag signal. |
+| `kirocrew.loop.lag_ms` | histogram (ms) | `process` (`gateway` / `gatewayd`) | `adaptive/controller.py::AdaptiveController._sample_and_tick`, one observation per controller sample: how late the `sample_secs` timer fired on the gateway event loop, the same number the controller feeds its `loop_lag` signal. The cap decreases and pauses that signal drives are logged at WARNING. |
 | `kirocrew.recovery.attempts` | counter | `layer` (`L1_tool_call` … `L5_gateway`), `action` (`retry` / `escalate` / `notify` / `give_up`) | `recovery/ladder.py::RecoveryLadder.observe_failure`, one per decision. |
 | `kirocrew.recovery.escalations` | counter | `from_layer`, `to_layer` | same, one per hand-up. |
 | `kirocrew.recovery.duration_secs` | histogram (s) | `layer` | `RecoveryLadder.observe_success`: first failure of the run → the success that closed it. |
@@ -428,6 +428,8 @@ Tests: `test/metrics/test_resource_attrs.py`.
 | `kirocrew.process.memory.rss_bytes` / `.peak_rss_bytes` | gauge (By) | — | Same module; delegate to `platform_compat.proc_rss_bytes` (current) / `proc_peak_rss_bytes` (high-water mark), both cross-platform. A 0 return maps to None: gap, never a fake zero sample. |
 | `kirocrew.process.cpu.seconds` | gauge (s) | — | Same module; `platform_compat.proc_cpu_seconds` process-lifetime user+system CPU. An observable GAUGE, not a counter: as counters these four were the only CUMULATIVE series exported, and one cumulative series forces every consumer into whole-hour stateful aggregation. Listed in `process_gauges.LIFETIME_TOTAL_METRICS`, which the dashboard aggregator reads to reduce them window-relative rather than reporting a lifetime total as a current reading. A 0 return maps to None: gap, never a fake zero (which the reducer would take as a new baseline). |
 | `kirocrew.process.gc.collections` / `.collected` / `.uncollectable` | gauge | `generation` (`0`/`1`/`2`) | Same module; `gc.get_stats()` per generation, process-lifetime totals reported as gauges (see the CPU row). Rules GC in/out of a leak diagnosis (rising uncollectable = reference cycles; flat collected with rising RSS = native leak). |
+| `kirocrew.process.memory.rss_sampled` | histogram (By) | `process` | `adaptive/controller.py::AdaptiveController._emit_process_histograms`, one observation per controller sample, from the `HostSample.rss_mb` the loop already probes for its own decisions. A reading of `0.0` publishes nothing: `platform_compat.proc_rss_bytes` answers `0` on failure by contract rather than raising, so the probe's own `except` never fires and a failed read would otherwise enter a CUMULATIVE distribution as a fabricated zero that no later sample can correct — and a live process never has a true resident set of zero, so the strict predicate discards nothing real. The same quantity as the `rss_bytes` gauge above, kept as a SECOND instrument because merging a gauge across instances retains only min/max/mean — a fleet-wide p90 is not recoverable from it at any storage layer, while histograms sharing bucket boundaries merge element-wise. Recorded from the controller rather than from `process_gauges` because OTEL has no observable histogram: a histogram needs a caller on a timer, and this loop already is one. Own bucket family `_RSS_BUCKETS_BYTES`. |
+| `kirocrew.process.cpu.utilization` | histogram (1) | `process` | Same emitter and cadence; share of the whole machine as a ratio where `1.0` is every logical core saturated. Computed client-side by `process_gauges.cpu_utilization` from two consecutive `HostSample.cpu_seconds` readings over the interval between the instants those two readings were TAKEN at, divided by `read_logical_cores()`. The instant is `HostSample.cpu_clock`, read inside `probe_host` beside the total rather than on the event loop after the worker thread resumes: the resumption delay varies from tick to tick so it does not cancel, and at the one-second floor of `controller_sample_secs` a few hundred milliseconds of it is a double-digit-percent error in a published value nothing downstream can correct. Computed here rather than downstream because `process.cpu.seconds` is a lifetime TOTAL: a consumer would have to difference consecutive samples per process lifetime and detect restarts to recover a rate, and once that gauge is merged across instances there is nothing left to difference. Returns a gap, never a fake zero, when either reading is `<= 0` (a failed probe reads `0.0`), the clock did not advance, the core count is unknown, or the total went backwards (two different processes). The first tick of a process has no predecessor and so publishes nothing. Values above `1.0` are NOT clamped — nothing samples the clock and the kernel's accounting at the same instant — which is why the bucket family carries a bound above saturation. Own bucket family `_CPU_RATIO_BUCKETS`. |
 | `kirocrew.inventory.crons.active` | gauge | — | `metrics/inventory_gauges.py::register_inventory_gauges`, callbacks run only at reader collection. The enabled-count reduction is `cron.enabled_count_from_disk`, a module-level sibling of `unhealthy_jobs_from_disk` that returns `(count, loadable)` and is the single owner of that loop — `CronService.count_enabled_from_disk` calls it too and keeps only the count, so the probe cannot drift from what the scheduler considers enabled, and neither needs a running gateway. Deliberately NOT `list_jobs`: that re-arms the asyncio timer, which from a reader thread with no running loop raises AND cancels the live timer first, stopping every scheduled job. A missing store is a genuine `0` and no fault (a fresh install has no crons). A store that is present but unparseable yields a gap **and increments `probe.failures{probe="crons"}`** — `_read_job_records` calls that case a fault, and a silent gap would be indistinguishable from a host that stopped exporting, which is the confusion the counter exists to resolve. |
 | `kirocrew.inventory.monitor_loops.active` | gauge | — | Same module; `autonudge.get_instance()` then a materialized `list(...)` snapshot of the loop registry counting `active`. The registry is mutated only under an `asyncio.Lock` on the event loop, which gives a reader thread no protection and cannot be acquired from it; the snapshot is safe anyway because each dict op is atomic under the GIL and a gauge stale by one loop is fine. `get_instance()` returning None (spawned agent process, unit test, auto-nudge off) yields a gap — a `0` there would be indistinguishable from a running service with none armed. |
 | `kirocrew.inventory.skills.installed` | gauge | — | Same module; one module-global `SkillsLoader(install_builtins=False)` (`install_builtins=True` would make a metrics probe perform a content-hashing write sync). Listing is a recursive walk, so it is cached for `_EXPENSIVE_TTL_SECS` (300s) — five collection cycles on the default interval. One combined total, NOT a builtin/user split: builtins are copied onto disk into the same tree, so nothing in the listing distinguishes them and a split would be a guess. |
@@ -553,6 +555,8 @@ instrument. Eight families, each sized to its instrument's measured range:
 | `_SESSION_BUCKETS_MS` | 1s – 7d | ms | `session.duration` |
 | `_CREDIT_BUCKETS` | 0.025 – 2500 | credit | `turn.credits` |
 | `_USD_BUCKETS` | 0.001 – 100 | usd | `turn.cost_usd` |
+| `_RSS_BUCKETS_BYTES` | 32MiB – 16GiB | By | `process.memory.rss_sampled` |
+| `_CPU_RATIO_BUCKETS` | 0.001 – 1.25 | 1 | `process.cpu.utilization` |
 
 `_TOOL_CALL_BUCKETS_MS` spans a sub-millisecond builtin read to a multi-minute
 build in one instrument, so it keeps both ends: a `_FAST` ceiling would floor
@@ -566,13 +570,26 @@ teardown paths (`unclaimed`, `destroyed`) are a real population, and carries a
 7-day ceiling so a long-lived tab is not floored into overflow.
 
 **Why the unit map is separate.** The dashboard's generic histogram aggregation
-reports every statistic under `*_ms` keys and the frontend formats those with a
-millisecond suffix, so `_HISTOGRAM_BUCKETS_MS` membership is a claim that the
-instrument really is milliseconds. A credit or a dollar amount registered there
-would make both the claim and the rendered value wrong. The two non-ms
-instruments are instead claimed BY NAME by `_aggregate` ahead of the generic
-branch and reported inside the `turn` block via `_amount_stats`, under
-unit-neutral keys (`p50`, `p90`, `total`, …) each carrying its own `unit`.
+reports a statistic under `*_ms` keys unless the emitting module declares a
+non-millisecond unit for that instrument, and the frontend formats those keys
+with a millisecond suffix, so `_HISTOGRAM_BUCKETS_MS` membership is a claim that
+the instrument really is milliseconds. A credit or a dollar amount registered
+there would make both the claim and the rendered value wrong. The two billing
+instruments are claimed BY NAME by `_aggregate` ahead of the generic branch and
+reported inside the `turn` block via `_amount_stats`, under unit-neutral keys
+(`p50`, `p90`, `total`, …) each carrying its own `unit` — claimed by name because
+the turn block adds a per-model attribution split the generic surface has no
+shape for, not for the unit.
+
+The two sampled process histograms have no dedicated block to be claimed into, so
+the generic branch handles their unit itself: it reads
+`events.NON_MS_HISTOGRAM_UNITS` through `_non_ms_histogram_units()` and routes a
+named instrument through `_amount_stats` instead of `stats()`. That mapping lives
+with the emitter for the same reason `LIFETIME_TOTAL_METRICS` does — the module
+that declares an instrument is the one that knows what its reading means — so no
+unit is re-spelled by a reader. `test_provider_bucket_views.py` fails when an
+entry in `_HISTOGRAM_BUCKETS_BY_UNIT` is missing from that mapping, which is what
+keeps a new non-ms histogram from silently reaching the `*_ms` surface.
 `_amount_stats` also rounds to six decimals rather than one, because a sub-cent
 per-turn cost rounds to `0.0` at the duration family's precision.
 
@@ -1031,25 +1048,48 @@ shard-fingerprint + 30s-TTL cache, same contract as `_parse_token_history`), and
 imports nothing from `dashboard.handlers`, so there is no cycle to dodge).
 `usage.context_trace(slot, days)` is the per-session drill-down: it returns each
 turn's `ctx_blocks` in chronological order plus per-block `totals`,
-`injected_chars`, `user_chars` (the `your_message` label) and
-`estimated_other_chars` — the un-instrumented remainder of the window: kiro-cli's
-own base prompt + tool catalogue + steering AND the conversation transcript and
-tool output accumulated over the session (occupancy is cumulative, `injected` is
-only this turn's injection). It is expressed in characters via
-`_EST_CHARS_PER_TOKEN` (≈4) and clamped to `0` when occupancy is unknown or the
-subtraction would go negative. Because it mixes fixed kiro overhead with the
-growing conversation it is surfaced as **"Not measured"** (never "Kiro built-in")
-and always tagged an estimate — it is not a claim that the bytes are Kiro's or
-unremovable. Rows
+`injected_chars`, `user_chars` (the `your_message` label), and the occupancy
+pair `peak_context_used` (largest `context_used` across the turns, in TOKENS)
+and `context_window` (newest non-zero window size), which the Session Breakdown
+tree turns into a fill ratio. Block sizes are characters and occupancy is tokens;
+the trace carries both as recorded and derives nothing across that unit
+boundary — there is no chars-per-token estimate of the un-instrumented remainder
+on the wire, because a number that mixed fixed kiro-cli overhead with the growing
+conversation had no honest reader. Rows
 predating the field carry no `ctx_blocks` and are skipped, not zero-filled, so
-the trace starts where the recording does. Each turn also carries the row's
-`credits` and `duration_ms` when the shard recorded usable numbers (same
-drop-the-field-not-the-row rule as `TURN_USAGE_FIELDS`): injection and billing
-live on the same shard row, so the trace returns both in one walk rather than
-making the panel re-join through the usage-turns reader what was never apart.
-The chat Activity panel renders them as a per-turn credits column that appears
-only when at least one traced turn carries billing — pre-recorder history stays
-three columns instead of growing an all-dash one.
+the trace starts where the recording does. Billing is not on this payload:
+`slot_turn_usage` (below) is the per-turn reader for `credits` / `duration_ms`,
+and a trace row carries only what was injected.
+
+**How the panel draws it.** The chat Activity panel's Context Breakdown tab
+(`website/src/pages/ContextBreakdownPanel.tsx`) is a **stacked-area chart of what
+each turn sent**: x = turns in order (newest right, at most the newest 30 with an
+"N earlier turns not shown" line beyond that), y = characters, five bands bottom
+to top — *your message*, *memory about you*, *rules you set*, *skill guides*,
+*everything else*. A `session_start` turn is excluded from the chart's x-series
+and y-domain and listed instead as a compact selectable row above it ("Turn 1 ·
+session start · N characters"): it is many times the size of any later turn and
+would pin a linear axis, flattening the rest. X-axis labels are strided from the
+measured plot width (`axisLabelIndices`: every k-th turn plus the selected and the
+last, minus a strided neighbour that would overprint either) so thirty turns in a
+320px side panel still read; when a per-turn hit column falls under 12px, one
+plot-wide pointer surface maps the click to the nearest turn while the per-turn
+buttons keep the keyboard and assistive-tech path. The band a block label lands in is the panel's one
+exported `CATEGORY_OF` table (`your_message`; the three memory labels;
+`lessons` / `critical_rules` / `agent_instructions` / `response_preferences`;
+`skill_index` / `skill_hint` / `loaded_skill`); every other label, including
+the every-turn members and `unclassified`, is *other*, so an unrecognised block
+is never dropped from a turn's total. Each turn is a real button laid over its
+column (arrow keys move the selection, `aria-pressed` marks it); the newest turn
+is selected by default, and the detail below the chart shows the selected turn's
+total, its delta against the previous turn (muted text, both directions), and one
+disclosure row per non-empty band that expands to the raw block labels. The
+panel reads only each turn's `phase`, `blocks` and `total_chars`; the payload
+carries neither billing nor a whole-window estimate, because a per-turn "what was
+sent" view mixed with cumulative window occupancy and billing read as one quantity
+when it was three. Fills come from the
+`--ctx-cat-*` theme tokens (`website/src/index.css`), so the bands stay legible
+in light and dark themes alike.
 `handlers/telemetry.py::api_context_trace`
 serves it as `GET /api/telemetry/context-trace?slot=<session key>` (`400` when
 `slot` is missing or blank), independent of the `telemetry.enabled` switch since
@@ -1158,6 +1198,27 @@ the slot key authoritative; preferring a non-empty `surface` would silently
 misattribute existing history. The stored slot/session key remains stable across
 the write-side correction and is still the compatibility boundary for this
 reader.
+
+**Two origin columns, deliberately, and they are labelled apart.** The page shows
+the session-origin dimension twice, derived two ways, because the two answer
+different questions. Spend's **Origin** column (`session_category`, from the slot
+key) answers WHICH SURFACE OWNS THE SESSION; the Context tab's **Turn surface**
+column (the row's own `surface` field) answers WHICH CODE PATH RAN ONE TURN. So
+the same unattended session reading `all background` on Spend and `heartbeat` on
+Context is correct, not a disagreement, and the two column headers each carry a
+tip naming their own derivation. The ruling that fixes this shape: **a trusted
+`surface` may NOT introduce Spend attribution values that do not exist today, and
+monitor spend stays booked to the conversation it nudged.** A monitor nudge exists
+only to serve one conversation, so moving its credits into a separate `monitor`
+bucket would make that conversation under-report what it actually cost — the one
+number the Spend tab exists to give. The consequence is that the two vocabularies
+are permanently different sets: `monitor` (`slack/gateway.py`) and `webhook`
+(`handlers/hooks.py`) are written as row surfaces and are NOT members of
+`TELEMETRY_CHANNELS`, and nothing in the read path compares one against the other.
+Unifying them is therefore a product decision that has been made and declined, not
+a cleanup: `test/metrics/test_telemetry_column_taxonomy.py` pins the two sets apart with
+those two values as the known non-members, so a later unification has to confront
+this ruling rather than discover it.
 
 **A conversation's `title` is attached by the endpoint, from two sources in
 order.** `cost_breakdown` names nothing — slot keys are all the row store holds.

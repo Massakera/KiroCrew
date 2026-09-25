@@ -58,7 +58,11 @@ export const SKILLS_TIMEOUT_MS = 15_000
 export const SLASH_COMMANDS_TIMEOUT_MS = 15_000
 import { installApiTransport } from './apiTransport'
 import type { SessionSummary } from '../types/sessionSummary'
-import { queryClient, resolveDefaultMemoryMode } from './queryClient'
+import {
+  queryClient,
+  invalidateAcrossQueryClients,
+  resolveDefaultMemoryMode,
+} from './queryClient'
 import { getStoredConsent } from '../utils/themeConsent'
 import { recordError, parseErrorCode, requestPath } from '../utils/errorReport'
 import { i18nT } from '../i18n/t'
@@ -395,6 +399,14 @@ export interface BrowserViewData {
   url: string | null
   port: number | null
   reason: string | null
+  /** Dashboard-origin relay path (`/browser-view/<token>/`) to FRAME the view
+   * through — same origin as the dashboard, so it works over an SSH forward or
+   * tunnel with no second port. The embedded per-instance capability token is
+   * the relay's auth (the panel frames it in an opaque-origin sandbox that
+   * sends no cookies). Null unless running; absent entirely from an older
+   * gateway, in which case the panel falls back to framing the absolute
+   * loopback `url`. */
+  path?: string | null
 }
 
 /** Answer of POST /api/browser/open: the Browser panel's address bar on the
@@ -462,6 +474,14 @@ export interface DecisionsConsentData {
    * conversation, so consent recorded against a message excerpt cannot stand for it.
    */
   memory_text?: boolean
+  /**
+   * Whether the owner consented to sending WAKE EVIDENCE — the transcript tail and
+   * pull-request readings the `nudge.wake` judge screens a tick against. Absent reads
+   * as not consented, on the same terms as the three above: this evidence comes from
+   * sessions the loop WATCHES rather than the one the owner is talking in, so none of
+   * the narrower yeses stands for it.
+   */
+  nudge_evidence?: boolean
   /**
    * One row per decision point this GATEWAY ships, projected from the seam's own
    * registry (`decisions/gate.py`). The card lists these rather than an array
@@ -1849,7 +1869,7 @@ function showSessionExpiredBanner(lead?: string): void {
         // `data === undefined` narrows it to queries that never carried a
         // successful value: exactly the ones the lapse broke, and the only ones
         // with nothing to overwrite a draft with.
-        void queryClient.invalidateQueries({
+        invalidateAcrossQueryClients({
           predicate: (q) => q.state.status === 'error' && q.state.data === undefined,
         })
       })
@@ -2525,13 +2545,8 @@ export interface KiroBonusCreditGrantPayload {
 export interface KiroUsagePayload {
   available?: boolean
   /**
-   * Why usage is unavailable when `available` is false (e.g. `api_key_auth`,
-   * `scrape_disabled`, `signin_required`).
-   *
-   * `signin_required` and `scrape_disabled` are deliberately distinct: the first
-   * is fixed by signing in again and costs nothing, the second by opting into a
-   * billed scrape. Reporting the second for the first told users to spend credits
-   * on a fetch that cannot authenticate.
+   * Why usage is unavailable when `available` is false (`api_key_auth` or
+   * `signin_required`); absent when the gateway simply holds no reading.
    */
   reason?: string
   credits_used?: number
@@ -2548,6 +2563,13 @@ export interface KiroUsagePayload {
   email?: string
   account_type?: string
   start_url?: string
+}
+
+/** `POST /api/sessions/usage/refresh` — the GET envelope plus the declined-scrape marker. */
+export interface KiroUsageRefreshResponse {
+  usage?: KiroUsagePayload
+  skipped?: 'scrape_parked'
+  retry_after?: number
 }
 
 export interface KiroBonusCreditGrant {
@@ -2837,6 +2859,9 @@ export interface MemberRosterRow {
   memory_version?: number
   memory_owner?: string
   model?: string
+  /** Optional presentation label shown in place of `name`. `name` stays the
+   *  identity every per-member route and binding is keyed on. */
+  display_name?: string
   /** Crew origin, NORMALIZED by the server to exactly 'kirocrew' (created in
    *  the crew manager), 'builtin', or 'package' (agent-sync-installed; the
    *  legacy 'aim' spelling and any unknown value collapse to this). */
@@ -3747,6 +3772,16 @@ export const api = {
     history: { t: number; mb: number }[]
   }>,
   sessionsUsage: () => fetch('/api/sessions/usage').then(j) as Promise<{ usage?: KiroUsagePayload }>,
+  /**
+   * Refresh the credit reading now (the account modal's Refresh button). Same
+   * `{usage}` envelope as `sessionsUsage`, so `parseKiroUsagePayload` reads
+   * both. `skipped: 'scrape_parked'` (with `retry_after` seconds) means the
+   * free API returned no plan and the gateway has parked the `/usage` scrape
+   * after repeated failures, so no new reading was fetched: `usage` is a
+   * same-identity prior reading dimmed `stale`, or an unavailable marker. The
+   * one refusal is 409 `refresh_in_flight` while a refresh is already running.
+   */
+  sessionsUsageRefresh: () => post('/api/sessions/usage/refresh').then(j) as Promise<KiroUsageRefreshResponse>,
   providerUsage: () => fetch('/api/usage').then(j),
   mcpProbeCache: () => fetch('/api/mcp/probe').then(j),
   // Agents
@@ -4573,7 +4608,7 @@ export const api = {
   chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
   /** `config` carries the folder settings the create modal collects. Each is
    *  omitted when empty so the backend applies its own default. */
-  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; icon?: string; tags?: string[] }) =>
+  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; icon?: string; tags?: string[]; steering_dirs?: string[] }) =>
     post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
   updateChatFolder: (id: string, body: object) => patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
   /** Set several folders' `order` in ONE atomic request. The sidebar drag
@@ -5014,6 +5049,8 @@ export const api = {
     import_onboarded?: boolean
     /** Gates the gateway's first heartbeat; see `beacon.telemetry_permitted`. */
     privacy_acked?: boolean
+    /** Set once the first-run Meet CrewMates flow was finished or dismissed. */
+    crewmates_onboarded?: boolean
   }) =>
     put('/api/config/theme', body).then(j),
   // Voice

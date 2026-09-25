@@ -439,7 +439,32 @@ the helpers in `kiro_crew/__init__` are private. The accepted shape parses as a
 PEP 440 release wherever the version is compared (`_is_newer` orders `0.6.0.12`
 above `0.6.0` and below `0.6.1`; `release_channel.channel` still reads
 `stable`), and `base_version` — the stable-channel display fold — preserves the
-stamped string, which is what lets the chip show it.
+stamped string, which is what lets the chip show it. The one reader that does
+NOT take the stamp's word is the bug-report resolver
+(`release_channel.provenance`, behind `kirocrew doctor --bundle` and the
+dashboard's Report-a-problem link): because this rule admits a stamp only over
+a bare base, a stamped build has by construction lost whatever prerelease
+marker the release pipeline wrote, so the stamp claims no lane there — a
+prerelease marker in the installed distribution's metadata version (which the
+stamp never rewrites) or the `channel` record decides, and with neither the
+report says `Not sure` rather than Stable. The public `version` field is the
+release the stamp is a build of (`changelog.release_of_build`); the evidence
+the resolver weighed stays in the private bundle, where `versions.txt` and
+`manifest.json` both record the raw stamp (`kirocrew_version`), the folded
+release (`release`), the distribution's metadata version
+(`distribution_version`), the proven lane (`channel`, `unknown` when none) and
+the `channel` record (`channel_record`) — the manifest spells a silent source
+as JSON `null`, the text file as `unavailable` / `absent`. `collect_bundle`
+resolves the provenance exactly ONCE, before it writes the first member, and
+keeps that snapshot on `BundleResult.provenance`: `versions.txt`, the manifest
+and the issue link are all written from it, and the terminal link `kirocrew
+doctor` prints afterwards reads the same field rather than resolving again.
+The resolver reads host state that can change mid-collection — the dashboard's
+`set_release_channel` rewrites the `channel` record on the event loop while
+the collector runs in a worker thread — so a per-member read could leave one
+bundle with a `versions.txt` and a `manifest.json` that disagree about the
+lane, beside a link that explains neither (pinned by
+`test_one_bundle_is_written_from_one_resolution`).
 
 Update lane. A distribution owns its own update path, normally the command
 provider selected by `check_command` / `apply_command` update pins, which never

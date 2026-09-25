@@ -197,6 +197,9 @@ def test_the_install_probe_reads_the_override(tmp_path, monkeypatch):
     monkeypatch.setenv("DROID_BIN", str(tmp_path / "absent"))
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     monkeypatch.setattr(client_mod, "_mise_which", lambda name: None, raising=False)
+    # ``augmented_path`` prepends well-known bins like ~/.local/bin, so a host with
+    # the real harness installed would answer INSTALLED regardless of the empty PATH.
+    monkeypatch.setattr(client_mod, "augmented_path", lambda base="", **_: base)
     missing = backend_install.probe_backend(ACP_BACKEND_DROID)
     assert missing.installed == backend_install.MISSING
     assert "app.factory.ai/cli" in missing.install_command

@@ -204,10 +204,10 @@ def _refusal(exc: sc.SessionControlError) -> web.Response:
     if exc.status == 429:
         return web.json_response({"error": exc.message, "code": exc.code}, status=429)
     if exc.status == 500:
-        # A genuine server-side failure — `close_target` raises this for the three
-        # close-path failures (nudge retire / app hook / history save), each of
-        # which left the tab open with every partial step rolled back. It is not a
-        # client error, so it must not degrade to 400.
+        # A genuine server-side failure: `close_target` raises this for the four
+        # close-path failures (history write running / nudge retire / app hook /
+        # history save), each of which left the tab open with every partial step
+        # rolled back. It is not a client error, so it must not degrade to 400.
         return web.json_response({"error": exc.message, "code": exc.code}, status=500)
     return web.json_response({"error": exc.message, "code": exc.code}, status=400)
 
@@ -254,6 +254,41 @@ async def api_session_control_create(request: web.Request) -> web.Response:
             # many suspensions, and the inline predicate re-derives member status
             # from the mutable config record. Here it decides whether the child
             # may be bound to a member's private store.
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_fork(request: web.Request) -> web.Response:
+    """POST /api/session-control/fork — open a session carrying another's transcript."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        # Strictly typed: this body is model-controlled, and `bool` is an `int`
+        # subclass, so `True` would otherwise read as fork point 1.
+        at_index = body.get("at_message_index")
+        if at_index is not None and (isinstance(at_index, bool) or not isinstance(at_index, int)):
+            raise sc.SessionControlError(
+                "at_message_index must be a non-negative integer", code="invalid_field_type"
+            )
+        source = body.get("source", "")
+        if not isinstance(source, str):
+            raise sc.SessionControlError("source must be a string", code="invalid_field_type")
+        # Warmed AFTER the body read, for the reason `api_session_control_create`
+        # gives: nothing suspends between here and `fork_session`'s own gate.
+        await sc.prewarm_enabled_check()
+        result = await sc.fork_session(
+            state,
+            caller_session_key=_read_session_key(request),
+            source=source,
+            title=str(body.get("title") or ""),
+            folder_id=str(body.get("folder_id") or ""),
+            at_message_index=at_index,
             caller_fenced=_carried_fence(request),
         )
     except sc.SessionControlError as exc:
@@ -330,6 +365,44 @@ async def api_session_control_send(request: web.Request) -> web.Response:
             target=_target(body),
             message=message,
             steer=steer,
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_adopt(request: web.Request) -> web.Response:
+    """POST /api/session-control/adopt — take another session under this one."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        result = await sc.adopt_target(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=_target(body),
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_release(request: web.Request) -> web.Response:
+    """POST /api/session-control/release — let a session out from under its parent."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        result = await sc.release_target(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=_target(body),
             caller_fenced=_carried_fence(request),
         )
     except sc.SessionControlError as exc:

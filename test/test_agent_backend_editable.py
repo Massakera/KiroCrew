@@ -34,24 +34,19 @@ from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
 FIELD = "agent.acp_backend"
 
 #: Known ids the public baseline deliberately does not offer, each entry carrying its
-#: reason in ``test_baseline_ships_every_known_backend``. Empty was the state until the
-#: first exception; an entry is a reasoned exclusion rather than a defect, and it earns
-#: its place by naming what the id fails. ``deepseek`` is the one member today.
-#:
-#: deepseek passes the install-probe half of the selectability bar and fails the
-#: ROUTING half. Its sandbox decides its own tool calls -- an in-policy action runs
-#: silently and an out-of-policy one is denied with the denial in the tool result --
-#: and ``session/request_permission`` carries only a model-initiated request to
-#: escalate past that sandbox, refused outright when the model omits its
-#: justification. Four live captures across its confined and read-only postures raised
-#: no permission request at all. So Crew's PreToolUse gate would not run for what a
-#: session actually does, and the switch would be offering a harness Crew cannot gate.
+#: reason in ``test_baseline_ships_every_known_backend``. An entry is a reasoned
+#: exclusion rather than a defect, and it earns its place by naming what the id fails.
+#: ``deepseek`` was a member while it failed the ROUTING half of the selectability
+#: bar; it left the set when Crew composed its own gate plugin into the harness and
+#: read the plugin's load marker back before the first prompt
+#: (``Routing.VERIFIED_GATE_EXTENSION``), which is the routing half met the way the
+#: exclusion said it had to be.
 #:
 #: droid passes both halves on its handshake -- its ``autonomy_level`` option is the
 #: SESSION_CONFIG route Crew arms -- and fails the EVIDENCE half: no recorded turn yet
 #: shows a write raised as ``session/request_permission`` (its corpus has a
 #: synthesized turn). It is offered only behind ``KIROCREW_EXPERIMENTAL_BACKENDS``.
-NOT_SHIPPED_SELECTABLE: frozenset = frozenset({ACP_BACKEND_DEEPSEEK, ACP_BACKEND_DROID})
+NOT_SHIPPED_SELECTABLE: frozenset = frozenset({ACP_BACKEND_DROID})
 
 
 @pytest.fixture
@@ -193,6 +188,7 @@ def test_baseline_ships_every_known_backend():
             ACP_BACKEND_OPENCODE,
             ACP_BACKEND_PI,
             ACP_BACKEND_GOOSE,
+            ACP_BACKEND_DEEPSEEK,
         ]
     )
     assert baseline == sorted(acp_backends.ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE)

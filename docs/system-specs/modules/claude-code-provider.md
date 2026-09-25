@@ -6,12 +6,11 @@
 `KiroCrewConfig.create_provider_factory()` constructs `AcpProvider`. Harness
 choice is a separate field, `agent.acp_backend`. The public baseline currently
 selects kiro-cli (`ACP_BACKEND_KIRO`, the empty string), Claude, KAS, Codex,
-OpenCode, Pi, and goose. `ACP_BACKENDS_KNOWN` also contains DeepSeek, but that
-harness is deliberately absent from `BASELINE_SELECTABLE_BACKENDS`: live captures
-show its own sandbox handles ordinary tool calls without routing them through
-Crew's host permission gate. `test_baseline_ships_every_known_backend` pins the
-baseline as `ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE`, where DeepSeek is the
-explicit exception.
+OpenCode, Pi, goose and DeepSeek -- every id in `ACP_BACKENDS_KNOWN`. DeepSeek was
+the one exception until Crew's gate plugin routed its tool calls through the host
+permission gate (`Routing.VERIFIED_GATE_EXTENSION`, `agent_sdk/backends.py`);
+`test_baseline_ships_every_known_backend` pins the baseline as
+`ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE`, and that allowlist is empty again.
 
 `DefaultProviderRegistry` registers no extra backend. The protocol hook remains
 for editions, but `register_selectable_backend` accepts only a core-known harness
@@ -199,9 +198,17 @@ and effort selection, the full `session/request_permission` flow) works. So
   overlay is written per agent from the GLOBAL settings file as well as the
   agent's own spec, so it can carry exactly that stub), and a session whose
   permission surface Crew does not own gets no stubs along with no array. The
-  registry filter is the stated residual: the rewriter has no registry
-  awareness, so a stub is not held to it here -- tracked separately, and
-  pre-existing on codex, whose stub filter reads the same two rules. A stub
+  registry ceiling reaches the stubs through that same call: both
+  `pooled_session_servers` and `injection_server_names` withhold a stub under
+  registry mode, because a stub is by construction an UNMARKED entry -- the
+  rewriter refuses to wrap a `type: "registry"` one -- and nothing here can
+  resolve a name against the admin's catalog. Holding the line at that one
+  overlay read covers every mirror that mounts `stub_elements`, codex included,
+  and any future one; it is a no-op for the kiro-cli path, which drops an
+  unmarked injected entry under registry mode by itself. Crew's control plane is
+  exempt there on the same grounds it is exempt above, and the two functions must
+  agree, or a name in the set with no element behind it withholds the spec's only
+  copy of that server. A stub
   for a spec-narrowed server stays mounted, unlike codex: the narrowing rides
   `permissions.deny` in `settings.local.json`, which matches the stub because it
   registers under the same server name.
@@ -318,11 +325,13 @@ naming what is lost.
 
 `_spawn` also merges `extra_env` into the child environment, which is how a
 caller-supplied `CLAUDE_CONFIG_DIR` reaches the adapter
-(`test_spawn_forwards_claude_config_dir_from_extra_env`). The public core does not
-set that variable itself: an isolated CC config root (seeding a Crew-owned
-directory from the user's `~/.claude`, keeping credentials and models while
-stripping inherited `permissions` that would pre-approve past Crew's gate) is
-**not implemented here** — see the known gap below.
+(`test_spawn_forwards_claude_config_dir_from_extra_env`). The gateway contract is
+to forward inherited `ANTHROPIC_*` and `CLAUDE_CODE_*` variables to the harness
+child, so the spawn scrub list must not grow to cover either namespace. The public
+core does not set `CLAUDE_CONFIG_DIR` itself: an isolated CC config root (seeding a
+Crew-owned directory from the user's `~/.claude`, keeping credentials and models
+while stripping inherited `permissions` that would pre-approve past Crew's gate)
+is **not implemented here** — see the known gap below.
 
 ### Known gap: the user's global `~/.claude` is inherited
 

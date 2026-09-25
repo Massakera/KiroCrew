@@ -113,6 +113,18 @@ class CancellationCoordinator(ManagerComponent):
                 # so re-arm the token or the respawned run's finally would no-op
                 # and leave `_running_count` permanently inflated.
                 info._slot_released = False
+                # The respawn is a NEW process: the dead one's RSS readings must
+                # not make the spawn guard treat it as settled (a ~zero gap for
+                # the sweep before it is measured). Its peak stays -- a high-water
+                # mark for the run, and the conservative direction -- but the
+                # sample count and the last reading start over so the fresh
+                # process is priced as warming until the reaper has seen it.
+                # Generation FIRST: a sweep whose off-loop read is in flight
+                # re-checks it after reading, so it must already have moved
+                # before the readings below are cleared.
+                info._rss_generation += 1
+                info._rss_samples = 0
+                info.last_rss_gb = 0.0
                 self._manager._tasks[info.id] = asyncio.create_task(self._manager._run(info))
                 try:
                     await self._manager._fire_event("subagent_recovering", info, {"attempt": 1})
@@ -469,8 +481,12 @@ class CancellationCoordinator(ManagerComponent):
         # verb that ended the conversation, the key, and what the snapshot selected. A
         # parent end cancels work a user may be waiting on, and the ids it took are
         # otherwise only inferable from the absence of a result -- which is how a
-        # cancelled-too-early row reads from the outside. Kept at INFO rather than DEBUG
-        # for that reason: it is the record of an action, not a trace.
+        # cancelled-too-early row reads from the outside. WARNING when the snapshot
+        # names work to discard: the gateway log's default level is WARNING, and at INFO
+        # this line was invisible in every field report of runs "dying at random" --
+        # each of those was a parent end whose only record sat below the level anyone
+        # reads. A childless parent end discards nothing and stays at INFO, so the
+        # warning is a signal rather than one line per closed tab.
         #
         # RESIDUAL, in TWO halves, and this line is where both are visible -- by what it
         # does not name. The teardown arms its mark and takes its snapshot at the one
@@ -495,7 +511,8 @@ class CancellationCoordinator(ManagerComponent):
         # conversation from work a successor under the same key has just started -- which
         # needs a conversation-incarnation counter the session layer does not have.
         # Tracked as a follow-up.
-        logger.info(
+        audit = logger.warning if snapshot_ids else logger.info
+        audit(
             "parent-end teardown: verb=%s key=%s snapshot=%d total=%d snapshot_ids=%s",
             verb or "unnamed",
             parent_session_key or "-",
@@ -518,7 +535,17 @@ class CancellationCoordinator(ManagerComponent):
             info = self._manager._agents.get(agent_id)
             if info is not None and not info.done:
                 # A LIVE run goes through the ordinary reap, which does no store
-                # work of its own.
+                # work of its own. The stop's cause and origin are written on the
+                # record first: the run's own record and log then name the parent
+                # end that stopped it, not the runtime death the reap's teardown
+                # caused, and ``cancel`` carries the cause into the tombstone.
+                # First stopper wins: a user Stop or a stage cancel already in
+                # flight owns the attribution, and this teardown must not rewrite
+                # the record of who actually ended the run.
+                if not info._reap_reason:
+                    info._reap_reason = "parent_end"
+                if not info._stop_origin:
+                    info._stop_origin = f"parent conversation ended ({verb or 'unnamed'})"
                 try:
                     if await self._manager.cancel(agent_id):
                         stopped += 1
@@ -853,6 +880,14 @@ class CancellationCoordinator(ManagerComponent):
             matching.append(info)
             info.user_stopped = True
             info._stage_boundary_cancelled = True
+            # The reap this revocation leads to reads these: the tombstone and
+            # the run's own stop line then say a stage was cancelled, not that
+            # the user pressed Stop. First stopper wins -- a cancel already in
+            # flight keeps its own attribution.
+            if not info._reap_reason:
+                info._reap_reason = "stage_cancel"
+            if not info._stop_origin:
+                info._stop_origin = f"stage cancelled ({boundary_owner})"
             if info.pending_followups:
                 info.pending_followups = []
                 self._manager._audit_followup(info, "followup_suppressed")
@@ -933,6 +968,15 @@ class CancellationCoordinator(ManagerComponent):
         output is preserved on the info record (and remains in result.txt), the
         tombstone is written as ``user_stop``, and the ``subagent_done`` event
         carries ``stopped: true`` so the UI renders a neutral "stopped" card.
+
+        A caller that is NOT the user pressing Stop names itself on the record
+        first: the parent-end teardown and the stage-boundary cancel write
+        ``info._reap_reason`` (the tombstone cause -- ``parent_end``,
+        ``stage_cancel``) and ``info._stop_origin`` (the one-line who/why)
+        before calling here, and both ride into the reap unchanged. Nothing is
+        inferred from the origin text. The run loop reads the same fields when
+        its stream dies under the reap, so it reports that stop rather than the
+        death the stop caused (see ``_run``'s reap-echo arm).
         """
         info = self._manager._agents.get(agent_id)
         if not info or info.done:
@@ -947,6 +991,14 @@ class CancellationCoordinator(ManagerComponent):
                 return True
             return False
         info.user_stopped = True
+        # Recorded BEFORE the reap so the run loop can read them when its stream
+        # dies under the session teardown ``_force_reap`` is about to do. A
+        # caller that already named the cause keeps it; a bare cancel is the
+        # user pressing Stop.
+        if not info._reap_reason:
+            info._reap_reason = "user_stop"
+        if not info._stop_origin:
+            info._stop_origin = "stopped by user"
         # Neutral semantics live in the RECORD, not just the live event: a user
         # stop leaves ``error`` unset so every consumer (reconnect snapshots,
         # tombstones, /api/spawn listing, orphan reconciliation) derives the
@@ -959,7 +1011,10 @@ class CancellationCoordinator(ManagerComponent):
         # _force_reap emits the (single) stopped-aware ``subagent_done`` event
         # and drives _on_done delivery — no second event here.
         await self._manager._force_reap(
-            agent_id, info, time.time() - info.started, reason="user_stop"
+            agent_id,
+            info,
+            time.time() - info.started,
+            reason=info._reap_reason,
         )
         return True
 

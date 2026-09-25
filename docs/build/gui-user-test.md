@@ -89,7 +89,10 @@ image block inside `tool_result`. Both shapes drive the same `x11.perform`, so t
 logs and the scenarios are identical either way. `--tool-mode native|custom` pins one.
 
 The model id is a workflow parameter (`inputs.model`, default
-`us.anthropic.claude-sonnet-4-6`), never a default in code.
+`us.anthropic.claude-opus-5`), never a default in code. The workflow also passes
+`--price-in 15 --price-out 75` (Opus list prices per million tokens) so the run's
+cost figure and the budget gate count real dollars; the harness's own defaults are
+Sonnet prices, for a `-f model=` override to a Sonnet-class model.
 
 ## Adding a scenario
 
@@ -347,7 +350,7 @@ export GUI_OUT="$(mktemp -d)"
 bash scripts/gui-user-test/boot.sh                       # Xvfb :99, gateway, Chromium
 . "$GUI_OUT/target.env"
 python test/gui_user/harness.py --out "$GUI_OUT/results" --base-url "$GUI_BASE_URL" \
-  --model us.anthropic.claude-sonnet-4-6 --tier smoke --budget-usd 2
+  --model us.anthropic.claude-opus-5 --tier smoke --budget-usd 10 --price-in 15 --price-out 75
 bash scripts/gui-user-test/teardown.sh
 ```
 
@@ -362,12 +365,14 @@ owning server is not a virtual one.
 - A 1280x800 screenshot is about 1 365 input tokens (width x height / 750). With three
   screenshots kept, a step costs roughly 6-8k input and ~150 output tokens; a
   10-step scenario on a Sonnet-class model is about $0.25-0.40 and two to four
-  minutes. Budget the nightly tier (every shipped scenario, one retry each in the
-  worst case) at about $0.50 per scenario and the smoke tier at about $0.35. The run
-  stops at `--budget-usd` (default $20 everywhere: the `budget_usd` dispatch input,
-  the nightly schedule's fixed value, and the harness's own fallback when the flag
-  is omitted -- the full nightly tier costs about $8 a night, and the earlier $5
-  dispatch / $8 nightly caps tripped mid-run and skipped the tail of the tier) and
+  minutes; on Opus (the default) about five times that. Budget the nightly tier
+  (every shipped scenario, one retry each in the worst case) at about $1 per
+  scenario on Opus and the smoke tier at about $0.80. The run stops at
+  `--budget-usd` (default $40 everywhere: the `budget_usd` dispatch input, the
+  nightly schedule's fixed value, and the harness's own fallback when the flag is
+  omitted -- the 35-scenario nightly tier cost about $6 on Sonnet, so about $30 on
+  Opus, and the earlier $5 / $8 / $20 caps tripped mid-run and skipped the tail
+  of the tier) and
   marks the remaining scenarios `SKIPPED`; the job's 90-minute timeout is the
   backstop for a hung target, not the budget. Keep the nightly bill well under the
   $20 cap: when a new batch would push a night toward it, move the lowest-value

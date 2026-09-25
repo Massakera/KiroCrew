@@ -80,7 +80,14 @@ class TestBound:
         out, _err = proc.communicate(bomb, timeout=_FAR)
         assert proc.returncode == pdf_extract_child.EXIT_FAILED
         lines = [json.loads(line) for line in out.decode().splitlines() if line]
-        assert lines == [{"error": "memory", "detail": "PdfminerException"}]
+        # WHICH ceiling refuses the inflate is a platform fact the child documents,
+        # not a behaviour this test picks: Linux enforces ``RLIMIT_AS``, so the
+        # refusal arrives as the ``MemoryError`` pdfplumber re-raises wrapped in
+        # ``PdfminerException``; macOS accepts ``RLIMIT_AS`` without enforcing it,
+        # so the child's own peak-RSS watchdog is the ceiling and names itself.
+        # The invariant either way is one ``error: memory`` line and EXIT_FAILED.
+        detail = "rss" if sys.platform == "darwin" else "PdfminerException"
+        assert lines == [{"error": "memory", "detail": detail}]
 
     def test_the_extractor_profile_is_a_fixed_address_space_ceiling(self):
         spec = sandbox._rlimit_spec(sandbox.RLIMIT_PROFILE_EXTRACTOR)

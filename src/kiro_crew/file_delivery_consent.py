@@ -34,6 +34,17 @@ per-invocation grant would report "delivered", render a card, and then refuse th
 download -- worse than today's clean refusal. A durable record is readable at
 every gate, which is why the grant is configuration-time and lives on disk.
 
+Both content kinds reach that rule, and each gate runs two passes rather than one.
+UTF-8 text goes through ``security.redact``; bytes that fail to decode go through
+``platform.binary_content_is_flagged``, the one binary scan all four gates share,
+because a credential can sit inside an allow-listed media type just as easily as
+in a text file. ``platform.wide_content_is_flagged`` runs on both branches at all
+four gates, because a credential written at UTF-16 or UTF-32 spacing is
+NUL-interleaved ASCII: that is valid UTF-8, so it decodes into the text branch,
+and the detectors match contiguous ASCII so they match none of it. What differs
+between the gates is only what a positive result DOES: the three owner-facing ones
+consult the grant recorded here, the upload legs refuse regardless.
+
 Which destinations a grant can EVER cover
 -----------------------------------------
 ``GRANTABLE_CLASSES`` has exactly one member, and that is a security property
@@ -123,8 +134,9 @@ credential the owner did NOT ask for will also be able to put it in the owner's
 outbox. What that buys an attacker is bounded by the audience: the file lands on
 the owner's own disk and in the owner's own authenticated browser, which is where
 the agent could already write it with ordinary file tools. Every delivery under a
-grant is SEL-audited as ``sensitive_content_delivered_with_consent`` so the
-record exists even though the refusal does not.
+grant is SEL-audited as ``sensitive_content_delivered_with_consent``, and a
+refusal is audited beside it and NAMES the file it held back, so the record
+answers both halves of a review: what left, and what did not.
 """
 
 from __future__ import annotations
@@ -186,19 +198,18 @@ CLASS_LABELS: dict[str, str] = {
 #: central promise, so the artifact is removed rather than defended: an agent cannot
 #: hold a lock that does not exist.
 #:
-#: One writer makes this sufficient. ``aws_consent`` needs a cross-process file lock
-#: because it has TWO writers -- its dashboard handler and the ``kirocrew
-#: aws-consent`` CLI. This grant still has exactly one writer of the STORE, the
-#: owner-gated dashboard handler, running in the gateway process. The
-#: ``kirocrew file-delivery approve`` verb does NOT write the store: it consumes
-#: an owner-armed nonce and drives the same in-process handler over loopback, so
-#: it is a step-up that authorizes a write rather than a second writer of it. One
-#: store writer in one process is served by a process-local lock.
+#: One writing PROCESS makes this sufficient. This grant has exactly one writer of
+#: the STORE, the owner-gated dashboard handler, running in the gateway process.
+#: The ``kirocrew file-delivery approve`` verb does NOT write the store: it
+#: consumes an owner-armed nonce and drives the same in-process handler over
+#: loopback, so it is a step-up that authorizes a write rather than a second
+#: writer of it. One store writer in one process is served by a process-local
+#: lock. ``aws_consent._STORE_LOCK`` reaches the same conclusion on the same
+#: grounds, and carries the shared reasoning in full.
 #:
 #: WHAT IS NOT SERIALISED, stated because it is a narrowing: two gateway
 #: processes sharing one data home do not serialise their writes against each
-#: other. That configuration is not served by a cross-process file lock either --
-#: the precedent's cross-process lock exists for the CLI, not for multi-gateway --
+#: other. That configuration is not served by a cross-process file lock either,
 #: and a torn write still cannot widen a grant, because ``read_grant`` refuses any
 #: row whose ``destination_class`` disagrees with its key and ``_read_all`` fails
 #: soft to "no consent" on anything unparseable.
@@ -729,14 +740,17 @@ def public_pending_view(pending: PendingGrant | None) -> dict[str, Any]:
 
 
 def audit_decision(destination_class: str, *, outcome: str, detail: str = "") -> None:
-    """Record a consent state change, a denial, or a consented delivery in the SEL.
+    """Record a consent state change, a denial, a refusal, or a delivery in the SEL.
 
-    Grants, revocations, denials AND deliveries made under a grant are recorded.
-    The delivery entry is the point: the refusal it replaces was self-evident in
-    the tool's error string, whereas a successful consented delivery would
-    otherwise leave no trace that a flagged file left the gate at all. Every
-    entry answers a question an incident review actually asks -- who authorized
-    delivery, when was it withdrawn, and which flagged files went out under it.
+    Grants, revocations, denials, scanner refusals AND deliveries made under a
+    grant are recorded, and the refusal and delivery entries both NAME the file
+    they are about. That pairing is what lets the trail answer an incident
+    review: which flagged files left under a grant, and which ones the scanner
+    held back. A refused caller does get an error string, but that string is
+    returned to the AGENT, while this log is the surface the owner reads, so the
+    refusal has to be recorded here to reach them at all. Every entry answers a
+    question a review actually asks -- who authorized delivery, when it was
+    withdrawn, what went out, and what did not.
 
     Never raises: an audit failure must not be what stops a refusal from being
     enforced. Imported lazily because this module is reached from the MCP stdio
@@ -769,3 +783,49 @@ def audit_decision(destination_class: str, *, outcome: str, detail: str = "") ->
         )
     except Exception:  # pragma: no cover - audit must never break the gate
         logger.debug("could not write the file-delivery consent audit event", exc_info=True)
+
+
+def audit_refusal(
+    destination_class: str, *, leg: str, name: str, reason: str, caller: str = ""
+) -> None:
+    """Record that the scanner held a file back, NAMING the file it held.
+
+    The one spelling of the refusal entry for the legs a grant can cover, so the
+    tool leg and the two dashboard legs cannot drift into several vocabularies an
+    owner would have to learn. *leg* names the delivery path in the same words the
+    delivery entries use (``file_send``, ``notify``, ``download``), *name* is the
+    file, and *reason* says why the delivery stopped -- which scan tripped, and on
+    a leg whose gate has more than one conjunct, which conjunct refused.
+
+    *caller* names the principal on a leg an authenticated non-owner can reach, and
+    is empty elsewhere. :func:`audit_decision` stamps every refusal ``gateway``,
+    which is the process and not the requester, so a leg that admits more than one
+    principal has to carry the requester itself or the entry cannot tell a scanner
+    refusal from one identity reaching for another's file.
+
+    The file name goes LAST, after the leg, the reason and the caller, because
+    :func:`audit_decision` clips the detail to 200 characters and the name is the
+    only field with no length bound -- an outbox name is taken from the request path
+    and resolved inside the outbox, never measured. Composed name-first, a long
+    enough name pushes the reason and the caller off the end, and what survives is a
+    row indistinguishable from a plain scanner hold-back: the one reading this
+    entry's contract exists to prevent. Clipped in this order the name degrades to a
+    prefix, which is honest, while the fields that say WHAT happened and to WHOM
+    always fit.
+
+    The shared channel-upload gate is NOT a caller. It serves only legs a grant
+    can never cover, and its structural guarantee is that it references nothing in
+    this module, so it names its own refused files in the tool-invocation entry it
+    already writes.
+
+    The name is the whole point of the entry, and it costs no new disclosure:
+    this channel already names a flagged file that went OUT under a grant, and
+    both entries land in the same owner-read log. :func:`audit_decision` redacts
+    the full detail before clipping it, so a caller may pass *name* verbatim; a
+    site whose refusal reason IS a flagged name passes the redacted form anyway,
+    so that entry reads the same as the neighbouring tool-invocation line.
+    """
+    detail = f"{leg} ({reason})"
+    if caller:
+        detail = f"{detail} caller={caller}"
+    audit_decision(destination_class, outcome="refused", detail=f"{detail}: {name}")

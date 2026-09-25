@@ -1364,10 +1364,15 @@ def activate_mise(env: MutableMapping[str, str] | None = None) -> list[str]:
         logger.debug("mise activation skipped: %s", type(exc).__name__)
         return []
     if proc.returncode != 0:
+        # Imported here rather than at module scope: the platform package is
+        # heavy and ``env`` is imported during interpreter bootstrap. Redact
+        # the WHOLE stream, then keep the TAIL where mise prints its error.
+        from kiro_crew.platform.context import redact_log_via_context
+
         logger.debug(
             "mise env --json exited %s: %s",
             proc.returncode,
-            proc.stderr.strip()[:200],
+            redact_log_via_context(proc.stderr.strip())[-200:],
         )
         return []
     try:

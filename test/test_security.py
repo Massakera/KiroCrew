@@ -6068,12 +6068,23 @@ class TestAdaptiveHomeTargetsExpiry:
     ) -> None:
         """The other half: without a symlink there is nothing a repoint can stale.
 
-        This is what keeps the fix above from being a blanket revert. When no
-        target's canonical form differs from its lexical one, the set holds no
-        resolution-derived entry, so reaching the stale-credential case requires
+        This is what keeps the fix above from being a blanket revert. When none of
+        the paths the build RESOLVED came back spelled differently, the set holds
+        no resolution-derived entry, so reaching the stale-credential case requires
         first CREATING a symlink inside the crew home -- a write
         ``is_sensitive_write_path`` refuses. The adaptive expiry therefore applies
         in full, which is the availability this PR is for.
+
+        The population that can report a difference is the narrow one
+        ``_BuiltTargets`` enumerates, not the built target set. This test's
+        environment sets ``KIROCREW_HOME`` here and inherits ``XDG_CONFIG_HOME``
+        from the root ``conftest``, but no declared credential leaf under either
+        root is a symlink, so nothing reports a difference. Note what that does NOT
+        say: a
+        symlinked ``goose`` directory UNDER the exported ``XDG_CONFIG_HOME`` would
+        report one, because that leaf is declared. Under this suite's root
+        ``conftest`` that variable points at a tmp dir outside ``HOME``, so
+        ``~/.config/goose`` is not the path any build resolves here.
         """
         from kiro_crew import security
 
@@ -6099,6 +6110,127 @@ class TestAdaptiveHomeTargetsExpiry:
         clock["now"] += security._home_targets_ttl(0.4, resolution_differed=False)
         security._home_dir_targets(security._SENSITIVE_HOME_DIRS)
         assert len(calls) == 2
+
+    def test_only_the_enumerated_classes_of_path_are_resolved_by_a_build(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Pin the resolve memo's population, which five prose sites enumerate.
+
+        ``resolution_differed`` is read off the memo the build fills, so WHICH
+        paths reach that memo is the flag's whole scope -- and the ``differed``
+        comment, the :class:`_BuiltTargets`, :func:`_home_targets_ttl` and
+        :func:`_report_expiry_pin` docstrings and the security spec all state that
+        scope as a closed list. That list of five is the one the failure message
+        below names, so the two stay in step.
+        Prose cannot hold a closed list shut. A future ``resolve_target`` call on a
+        sixth kind of path would widen what the flag reports while all five sites
+        went on describing the old set, which is exactly the documentation defect
+        this change exists to remove, reintroduced one call site later.
+
+        The expectation is DERIVED from the same constants the build reads rather
+        than spelled out here, so adding a sensitive LEAF keeps this passing and
+        adding a resolve CALL SITE fails it.
+        """
+        from kiro_crew.agent_sdk import host_auth
+        from kiro_crew.security import paths as gate
+
+        crew_home = tmp_path / "crew"
+        crew_home.mkdir()
+        kiro_home = tmp_path / "kiro"
+        kiro_home.mkdir()
+        os_home = tmp_path / "oshome"
+        os_home.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(crew_home))
+        monkeypatch.setenv("KIRO_HOME", str(kiro_home))
+        monkeypatch.setenv("KIROCREW_OS_HOME", str(os_home))
+        # Set EVERY harness override root this test asserts on, rather than
+        # inheriting one from an unrelated autouse fixture. The override-anchored
+        # arm only contributes where its root is set, so leaving that to a fixture
+        # written for another purpose makes the fifth class's coverage depend on a
+        # variable no reader of this test can see -- and the assertion at the end
+        # would then pass or go vacuous for reasons outside this file.
+        for _override_env in host_auth.home_override_env_vars():
+            _override_root = tmp_path / f"override-{_override_env.lower()}"
+            _override_root.mkdir(exist_ok=True)
+            monkeypatch.setenv(_override_env, str(_override_root))
+        self._clear()
+
+        # Resolve the roots BEFORE recording and pass them in, so the recorder
+        # sees the BUILD's own resolutions and not the root anchoring ahead of it.
+        roots = gate._resolved_root_key()
+        # The three lists the three callers actually hand the builder: the read
+        # gate passes ``_SENSITIVE_HOME_DIRS``, ``is_sensitive_write_path`` passes
+        # that plus ``_WRITE_PROTECTED_HOME_PATHS``, and
+        # ``_is_keystone_publish_artifact`` passes ``_KEYSTONE_ARTIFACT_PARENTS``.
+        # Both lists carrying ``_SENSITIVE_HOME_DIRS`` admit every
+        # ``_OVERRIDE_ANCHORED_LEAVES`` member, because those leaves are spliced
+        # into it; ``_WRITE_PROTECTED_HOME_PATHS`` on its own and
+        # ``_KEYSTONE_ARTIFACT_PARENTS`` each filter all of them out of BOTH the
+        # recorder and ``expected``, which is how the fifth resolved class can come
+        # to be asserted vacuously.
+        tiers = (
+            gate._SENSITIVE_HOME_DIRS,
+            gate._SENSITIVE_HOME_DIRS + gate._WRITE_PROTECTED_HOME_PATHS,
+            gate._KEYSTONE_ARTIFACT_PARENTS,
+        )
+        adapter_roots = dict(roots.adapter_roots)
+        real = gate._realpath_or_none
+        override_anchored_seen = 0
+
+        for tier in tiers:
+            self._clear()
+            asked: list[str] = []
+
+            def recording(path: str, _sink=asked) -> str | None:
+                _sink.append(path)
+                return real(path)
+
+            monkeypatch.setattr(gate, "_realpath_or_none", recording)
+            gate._home_dir_targets_uncached(tier, roots)
+
+            expected = {roots.home}
+            if roots.os_home:
+                expected.add(roots.os_home)
+            if roots.crew_home:
+                for entry in tier:
+                    for prefix in gate._CREW_HOME_PREFIXES:
+                        if entry == prefix or entry.startswith(prefix + "/"):
+                            leaf = entry[len(prefix) :].lstrip("/")
+                            expected.add(
+                                os.path.join(roots.crew_home, *gate._leaf_segments(leaf))
+                                if leaf
+                                else roots.crew_home
+                            )
+                            break
+            if roots.kiro_home and gate._KIRO_AGENTS_DIR in tier:
+                expected.add(os.path.join(roots.kiro_home, "agents"))
+            for leaf, root_envs, under_root in gate._OVERRIDE_ANCHORED_LEAVES:
+                if leaf not in tier:
+                    continue
+                for env_name in root_envs:
+                    root = adapter_roots.get(env_name)
+                    if root:
+                        expected.add(os.path.join(root, *gate._leaf_segments(under_root)))
+                        override_anchored_seen += 1
+
+            assert set(asked) == expected, (
+                "this build resolved a path outside the classes the prose enumerates, "
+                "so the flag's scope changed: update the differed comment, "
+                "_BuiltTargets, _home_targets_ttl, _report_expiry_pin and the "
+                "security spec together"
+            )
+
+        # The fifth class has to be REACHED, not merely described. Without this the
+        # override-anchored arm can contribute nothing to either side -- which is
+        # what ``_WRITE_PROTECTED_HOME_PATHS`` alone does -- and a widened flag
+        # would still pass while the prose about declared credential leaves went
+        # unasserted.
+        assert override_anchored_seen, (
+            "no declared credential leaf was re-anchored under a harness home "
+            "override, so the resolved class the prose rests on is unasserted: "
+            "check that a harness override variable is set in this environment"
+        )
 
     def test_a_builder_that_reports_nothing_gets_the_floor(self, monkeypatch, tmp_path) -> None:
         """An unknown build is treated as having traversed a symlink.
@@ -6190,18 +6322,21 @@ class TestAdaptiveHomeTargetsExpiry:
     def test_the_pin_is_reported_once_per_transition(self, caplog) -> None:
         """The diagnostic exists so the fix cannot self-disable in silence.
 
-        One line per TRANSITION, not per rebuild: a stow or chezmoi home pins the
-        floor on every build, and a per-build line would be noise that gets
-        filtered, which is the same as having none.
+        One line per TRANSITION of the shared state, not per rebuild: an install
+        whose resolved leaf under a home-override root is a symlink pins the floor
+        on every build that was handed that leaf, and a per-build line would be
+        noise that gets filtered, which is the same as having none.
         """
+        from kiro_crew import security
         from kiro_crew.security import paths as gate
 
+        read_dirs = security._SENSITIVE_HOME_DIRS
         gate._home_targets_pin_state.clear()
         with caplog.at_level(logging.INFO, logger=gate.__name__):
-            gate._report_expiry_pin(True)
-            gate._report_expiry_pin(True)
-            gate._report_expiry_pin(True)
-            gate._report_expiry_pin(False)
+            gate._report_expiry_pin(read_dirs, True)
+            gate._report_expiry_pin(read_dirs, True)
+            gate._report_expiry_pin(read_dirs, True)
+            gate._report_expiry_pin(read_dirs, False)
         lines = [record.getMessage() for record in caplog.records]
         gate._home_targets_pin_state.clear()
 
@@ -6209,6 +6344,124 @@ class TestAdaptiveHomeTargetsExpiry:
         assert "pinned to the" in lines[0]
         assert "symlink" in lines[0]
         assert "cost-tracking expiry in force" in lines[1]
+        # Both halves name the tier, so a reader diagnosing a refusal knows WHICH
+        # gate the line is about rather than reading it as the whole gate's state.
+        assert all("(read tier)" in line for line in lines), lines
+
+    def test_each_tier_dedups_on_its_own_state_not_one_shared_slot(
+        self, monkeypatch, tmp_path, caplog
+    ) -> None:
+        """A host whose builds disagree gets one line per tier, not an alternation.
+
+        The gates hand the builder different lists, so the flag can come back
+        differently for each: a symlinked write-protected crew leaf that holds no
+        secret is in the write gate's list and in neither of the others, which pins
+        the write tier while the keystone-artifact build reports no traversal and
+        selects the cost-tracking expiry. Keyed on one shared slot, each build flips
+        the key the other just set, so both messages repeat for as long as the
+        disagreement lasts and the "in force" half asserts the adaptive expiry
+        applies on a host where a gate IS pinned to the floor -- the exact wrong
+        conclusion for whoever is reading the log to find out why. Keyed per list,
+        each build transitions its own state and says it once.
+
+        Driven through :func:`_home_dir_targets` rather than the reporter, so the
+        wiring that passes the list is pinned and not only the helper.
+        """
+        from kiro_crew import security
+        from kiro_crew.security import paths as gate
+
+        crew_home = tmp_path / "crew"
+        crew_home.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(crew_home))
+        self._clear()
+        gate._home_targets_pin_state.clear()
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(security.time, "monotonic", lambda: clock["now"])
+
+        write_dirs = security._SENSITIVE_HOME_DIRS + security._WRITE_PROTECTED_HOME_PATHS
+        keystone_dirs = security._KEYSTONE_ARTIFACT_PARENTS
+
+        def disagreeing(home_dirs, roots=None):
+            """Report a traversal for the write list alone, the shape of the defect."""
+            clock["now"] += 0.4
+            built = security._BuiltTargets({str(crew_home / "sessions").casefold()})
+            built.resolution_differed = home_dirs == write_dirs
+            return built
+
+        monkeypatch.setattr(security, "_home_dir_targets_uncached", disagreeing)
+
+        with caplog.at_level(logging.INFO, logger=gate.__name__):
+            for _ in range(3):
+                security._home_dir_targets(write_dirs)
+                security._home_dir_targets(keystone_dirs)
+                # Expire both entries, so the next pass is a fresh build for each
+                # tier and reports again rather than being served from the cache.
+                clock["now"] += security._HOME_TARGETS_TTL_MAX_SECS + 1.0
+        lines = [r.getMessage() for r in caplog.records if "anchor cache" in r.getMessage()]
+        gate._home_targets_pin_state.clear()
+
+        assert len(lines) == 2, f"each tier reports once across the three passes: {lines}"
+        pinned = [line for line in lines if "pinned to the" in line]
+        adaptive = [line for line in lines if "cost-tracking expiry in force" in line]
+        assert len(pinned) == 1 and "(write tier)" in pinned[0], lines
+        assert len(adaptive) == 1 and "(keystone-artifact tier)" in adaptive[0], lines
+
+    def test_every_gate_list_handed_to_the_builder_has_a_tier_name(self) -> None:
+        """A new gate must not reach an operator's log as an ``unnamed`` tier.
+
+        :func:`_home_targets_tier` names the lists it knows and answers generically
+        for one it does not, which keeps the dedup correct either way -- so nothing
+        at runtime notices a gate that arrives with no name, and the generic answer
+        would sit in the log unchallenged. This is what notices: every list a call
+        site in the module hands the builder is resolved against the module and must
+        come back named. The expectation is derived from the call sites rather than
+        restated, so it cannot agree with a stale copy of them.
+        """
+        import ast
+
+        from kiro_crew.security import paths as gate
+
+        tree = ast.parse(Path(gate.__file__).read_text(encoding="utf-8"))
+
+        def resolve(expr: ast.expr) -> list[str] | None:
+            """The module list this expression denotes, or None if it is not one."""
+            if isinstance(expr, ast.Name):
+                value = getattr(gate, expr.id, None)
+                return value if isinstance(value, list) else None
+            if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+                left, right = resolve(expr.left), resolve(expr.right)
+                return None if left is None or right is None else left + right
+            return None
+
+        # Where the list sits in each signature: first for the builder, second for
+        # the matcher that forwards to it.
+        positions = {"_home_dir_targets": 0, "_path_in_home_dirs": 1}
+        named: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            callee = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            index = positions.get(callee)
+            if index is None or len(node.args) <= index:
+                continue
+            # A call that forwards its own parameter resolves to nothing here; the
+            # list it received is pinned at whichever call site supplied it.
+            listed = resolve(node.args[index])
+            if listed is None:
+                continue
+            tier = gate._home_targets_tier(listed)
+            assert not tier.startswith(
+                "unnamed"
+            ), f"a gate hands the builder an unnamed list: {ast.unparse(node.args[index])}"
+            named.append(tier)
+
+        assert set(named) == {
+            "read",
+            "write",
+            "keystone-artifact",
+        }, f"the scan must reach every gate, found {sorted(set(named))}"
 
     def test_repointed_home_symlink_is_not_served_from_cache_at_the_longest_expiry(
         self, monkeypatch, tmp_path

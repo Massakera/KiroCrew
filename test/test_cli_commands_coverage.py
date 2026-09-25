@@ -31,6 +31,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -149,9 +150,15 @@ class TestSmallHelpers:
         assert cc._format_schedule("weekly-ish") == "weekly-ish"
 
     def test_format_schedule_at_job_shows_full_date(self) -> None:
+        # A one-shot renders in the CONFIGURED timezone (the zone the instant
+        # was resolved in), with its zone label, not the host's local time.
         sched = CronSchedule(kind="at", at_ts=1700000000.0)
-        out = cc._format_schedule(sched)
-        assert out.startswith("at ") and len(out) == len("at 2023-11-14 14:13")
+        with patch(
+            "kiro_crew.cli_commands.get_local_tz",
+            return_value=("UTC", ZoneInfo("UTC")),
+        ):
+            out = cc._format_schedule(sched)
+        assert out == "at 2023-11-14 22:13 UTC"
 
     def test_format_schedule_delegates_for_every(self) -> None:
         sched = CronSchedule(kind="every", every_secs=300)
@@ -1442,6 +1449,111 @@ class TestAgentCli:
         assert "spare" not in _read_doc(cfg_path)["agents"]
         assert "Deleted agent: spare" in capsys.readouterr().out
 
+    def test_delete_drops_the_crew_from_its_team_best_effort(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Same contract as the dashboard delete: the crew is dropped from its
+        team, and a store that cannot even be locked never refuses the delete
+        (the recreate-inherits harm is closed on the create path instead)."""
+        from kiro_crew import crew_teams
+
+        cfg = _cfg_with(
+            agents={"default": KiroCrewAgentConfig(), "spare": KiroCrewAgentConfig()},
+        )
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        dropped: list[str] = []
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            patch.object(crew_teams, "drop_member", lambda name: dropped.append(name)),
+        ):
+            cc._handle_agent(_ns(agent_action="delete", name="spare"))
+        assert dropped == ["spare"]
+        assert "spare" not in _read_doc(cfg_path)["agents"]
+        assert "Deleted agent: spare" in capsys.readouterr().out
+
+        class _Broken:
+            def __enter__(self):
+                raise OSError("crew-teams: lock file unwritable")
+
+            def __exit__(self, *exc):
+                return False
+
+        cfg = _cfg_with(
+            agents={"default": KiroCrewAgentConfig(), "other": KiroCrewAgentConfig()},
+        )
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            patch.object(crew_teams, "document_lock", lambda: _Broken()),
+        ):
+            cc._handle_agent(_ns(agent_action="delete", name="other"))
+        assert "other" not in _read_doc(cfg_path)["agents"]
+        assert "Deleted agent: other" in capsys.readouterr().out
+
+    def test_create_releases_the_name_from_a_stale_team_first(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A name a deleted crew left on a team is purged BEFORE the new crew
+        is registered, so it never inherits the old membership."""
+        from kiro_crew import crew_teams
+
+        cfg = _cfg_with(agents={})
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        released: list[str] = []
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            patch.object(crew_teams, "release_name", lambda name: released.append(name)),
+        ):
+            cc._handle_agent(
+                _ns(
+                    agent_action="create",
+                    name="new",
+                    kiro_agent="ka",
+                    workspace="ws",
+                    memory_store="",
+                )
+            )
+        assert released == ["new"]
+        assert "new" in _read_doc(cfg_path)["agents"]
+
+    def test_create_is_refused_while_a_stale_membership_cannot_be_purged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Registering the name while its old team entry cannot be removed is
+        exactly what would expose that entry, so the create is refused with
+        the registry untouched."""
+        from kiro_crew import crew_teams
+
+        cfg = _cfg_with(agents={})
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+
+        def _boom(name: str) -> bool:
+            raise OSError("crew-teams: disk full")
+
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            patch.object(crew_teams, "release_name", _boom),
+            pytest.raises(SystemExit) as exc,
+        ):
+            cc._handle_agent(
+                _ns(
+                    agent_action="create",
+                    name="new",
+                    kiro_agent="ka",
+                    workspace="ws",
+                    memory_store="",
+                )
+            )
+        assert exc.value.code == 1
+        assert "new" not in _read_doc(cfg_path)["agents"]
+        out = capsys.readouterr()
+        assert "Created agent" not in out.out
+        assert "cannot create agent 'new'" in out.err
+
     def test_delete_default_is_refused(self, capsys: pytest.CaptureFixture[str]) -> None:
         cfg = _cfg_with(agents={"default": KiroCrewAgentConfig()})
         with (
@@ -1661,6 +1773,152 @@ class TestSecurityCli:
             sel.return_value.recent.return_value = []
             cc._security(_ns(sec_action="events", limit=5))
         assert "No security events recorded." in capsys.readouterr().out
+
+    def test_events_prints_the_resources_a_decision_was_about(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A refusal the owner cannot read the subject of tells them nothing.
+
+        ``resources`` is where a scanner refusal names the file it held back, and
+        this renderer is the read path an owner actually has: the endpoint is
+        owner-only and there is no audit UI. Printing operation and outcome alone
+        says a refusal happened and never says what was refused.
+        """
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            sel.return_value.recent.return_value = [
+                {
+                    "timestamp": "2026-09-24T12:00:00Z",
+                    "event_type": "api_access",
+                    "operation": "file_delivery_consent.refused",
+                    "outcome": "refused",
+                    "source": "file-delivery-consent",
+                    "caller_identity": "gateway",
+                    "resources": "owner_dashboard: download (flagged content): device.conf",
+                }
+            ]
+            cc._security(_ns(sec_action="events", limit=5))
+        out = capsys.readouterr().out
+        assert "device.conf" in out
+        assert "resources:" in out
+
+    def test_events_omits_the_resources_line_when_there_is_none(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The negative: an empty field must print no line, not a bare label."""
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            sel.return_value.recent.return_value = [
+                {
+                    "timestamp": "2026-09-24T12:00:00Z",
+                    "event_type": "api_access",
+                    "operation": "sel.events.read",
+                    "outcome": "allowed",
+                    "source": "dashboard",
+                    "caller_identity": "owner",
+                    "resources": "",
+                }
+            ]
+            cc._security(_ns(sec_action="events", limit=5))
+        assert "resources:" not in capsys.readouterr().out
+
+    def test_events_strips_control_bytes_from_untrusted_audit_fields(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A refused file name is text the AGENT chose, and it lands on a terminal.
+
+        A POSIX name may carry ESC/OSC bytes, and nothing upstream removes them --
+        the consent module's redaction and SEL's write-path pass both police
+        credentials and length, not control sequences. Printed raw here those bytes
+        would execute in the owner's terminal, which is the one place this trail is
+        read, so both untrusted fields go through the shared one-line policy.
+        """
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            sel.return_value.recent.return_value = [
+                {
+                    "timestamp": "2026-09-24T12:00:00Z",
+                    "event_type": "api_access",
+                    "operation": "file_delivery_consent.refused",
+                    "outcome": "refused",
+                    "source": "file-delivery-consent",
+                    "caller_identity": "gateway",
+                    "resources": "owner_dashboard: download: \x1b]0;pwned\x07evil.conf",
+                    "error": "content_redacted: \x1b[2Jwiped.conf",
+                }
+            ]
+            cc._security(_ns(sec_action="events", limit=5))
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "\x07" not in out
+        # The readable part survives -- sanitizing must not blank the subject.
+        assert "evil.conf" in out
+        assert "wiped.conf" in out
+
+    def test_events_strips_control_bytes_from_the_summary_line_too(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``operation`` and ``outcome`` are caller text, like the detail fields.
+
+        SEL's own ``_REDACTED_TEXT_FIELDS`` names ``operation`` beside ``resources``
+        and ``error``, and ``log_api_access`` documents ``outcome`` the same way,
+        because an installed app reaches it through ``ctx.audit``. Sanitizing only
+        the indented detail lines would leave the summary line above them a live
+        path to the same terminal.
+        """
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            sel.return_value.recent.return_value = [
+                {
+                    "timestamp": "2026-09-24T12:00:00Z",
+                    "event_type": "api_\x1b[31maccess",
+                    "operation": "app:evil.\x1b]0;pwned\x07publish",
+                    "outcome": "suc\x1b[2Jcess",
+                    "source": "app\x1b[1m-kit",
+                    "caller_identity": "app:e\x1bvil",
+                }
+            ]
+            cc._security(_ns(sec_action="events", limit=5))
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "\x07" not in out
+        # The readable parts survive on the summary line.
+        assert "publish" in out
+        assert "cess" in out
+
+    def test_events_survives_a_forged_row_whose_fields_are_not_strings(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A non-string field must not abort the owner's only read path.
+
+        ``recent()`` validates that each line is a dict, not that any field is a
+        string, and the log is sandbox read-write, so a forged line can carry an int
+        or a list. Handing that straight to ``re.sub`` would raise ``TypeError`` and
+        take the whole listing down -- one bad row would hide every good one.
+        """
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            sel.return_value.recent.return_value = [
+                {
+                    "timestamp": 1234567890,
+                    "event_type": ["api_access"],
+                    "operation": {"a": 1},
+                    "outcome": None,
+                    "source": 42,
+                    "caller_identity": 7,
+                    "resources": 99,
+                    "error": ["boom"],
+                    "downstream_service": 5,
+                },
+                {
+                    "timestamp": "2026-09-24T12:00:00Z",
+                    "event_type": "api_access",
+                    "operation": "later.row",
+                    "outcome": "success",
+                    "source": "sel",
+                    "caller_identity": "gateway",
+                },
+            ]
+            cc._security(_ns(sec_action="events", limit=5))
+        out = capsys.readouterr().out
+        # The forged row renders instead of raising, and the good row still prints.
+        assert "99" in out
+        assert "later.row" in out
 
     def test_events_passes_the_time_window_through(self) -> None:
         """``-n`` alone cannot express "the last two hours"."""

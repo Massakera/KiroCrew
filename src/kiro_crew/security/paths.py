@@ -355,6 +355,22 @@ _CREW_SECRET_LEAVES: list[str] = [
     # straight off disk, and a corrupted record reads as ABSENT to the store —
     # silent loss the conductor cannot see. No legitimate file-tool reader.
     "work-ledger",
+    # The cross-process work root (``work_root``). Not credentials either: the
+    # hazard is WRITE, and it is specific to this root's deterministic keys. A key
+    # is an issue or pull-request number so a later run can compute it again, so a
+    # name here is GUESSABLE in a way a random-suffixed scratch name is not. An
+    # unmarked directory at a key is refused rather than adopted, but the marker
+    # that lifts that refusal is a NAME IN THE CODE, so a writer inside this root
+    # can plant the tree and the marker together and ``allocate_work`` then rejoins
+    # it. Without this entry an agent's auto-approved file tools are such a writer:
+    # they could furnish a key some job will use, and that job would take the
+    # planted contents as its own prior state. The sandbox mask on the same leaf
+    # stops a spawned subprocess; this entry stops the file tools, and the root
+    # needs both because either alone leaves the other path open. The ``scratch``
+    # root is deliberately NOT here: it is the agent's own sanctioned write area,
+    # named to it by ``$KIROCREW_SCRATCH``. ``work_root`` opens these paths directly
+    # rather than through this gate, so the sweep and every consumer keep working.
+    "work",
     # Every append-only per-unit crew log, crew and session alike (crew_log/store.py).
     # Not credentials, but the design's whole premise is that the crew log is the
     # AUTHORITY and the context window only a cache: a conductor reads a unit's
@@ -506,6 +522,13 @@ _CREW_SECRET_LEAVES: list[str] = [
     # the OS-sandbox counterpart is ``sandbox._CREW_HIDDEN_LEAVES``. Only the
     # gateway opens the path.
     "tag-grants",
+    # Crewmate teams (``crew_teams.py``): the owner's grouping of the roster. Not
+    # a secret, but it decides which team view a crewmate's questions and work
+    # roll up into, and a crewmate must not be able to move itself or a sibling.
+    # Whole directory (``atomic_write`` temp sibling); the OS-sandbox counterpart
+    # is ``sandbox._CREW_HIDDEN_LEAVES``. Opened only by the gateway and by the
+    # operator's own ``kirocrew agent create`` / ``delete``, never by an agent tool.
+    "crew-teams",
     # The operator's OAuth consent-endpoint extension
     # ({additional_authorization_endpoints: [{host, path}]}). Each entry widens
     # the banner-only OAuth entropy carve-out (_OAUTH_AUTHORIZATION_ENDPOINTS),
@@ -611,9 +634,9 @@ _CREW_SECRET_LEAVES: list[str] = [
     # unintended-account outcome the gate exists to prevent. Reading it is
     # fenced too: the file names the account id and caller ARN that a profile
     # resolves to, which is reconnaissance an agent should not get for free from
-    # the shared gate. The authenticated dashboard ``/api/aws/consent`` handler
-    # and the ``kirocrew aws-consent`` CLI are the only writers and open the
-    # path directly, not through this gate, so both keep working.
+    # the shared gate. The authenticated dashboard ``/api/aws/consent`` handler is
+    # the only writer and opens the path directly, not through this gate, so it
+    # keeps working.
     "aws_service_consent.json",
     # Recorded consent to send conversation state to the external decision
     # provider (Jev). Same class of control as ``aws_service_consent.json``
@@ -1968,13 +1991,60 @@ class _BuiltTargets(set[str]):
 
     A plain ``set`` wherever it is consumed -- membership, iteration, equality
     and the casefold contract are all unchanged -- carrying one extra fact that
-    only the CACHE needs and no matcher does: did any target's canonical form
-    differ from its lexical one.
+    only the CACHE needs and no matcher does: did any path this build actually
+    RESOLVED come back spelled differently from the path it was asked about.
+
+    WHICH paths those are is the entire scope of the flag, so they are named here
+    rather than left to be read as "every target". The build resolves five classes
+    of path and no others: ``$HOME``, ``KIROCREW_OS_HOME``, each entry of the
+    CALLER'S ``home_dirs`` list that carries a crew prefix, re-anchored under
+    ``KIROCREW_HOME``, the agents dir under ``KIRO_HOME``, and each harness
+    credential leaf re-anchored under its own home override. Every
+    other member of the set comes from ``_anchor`` or
+    ``_anchor_both_separators``, neither of which touches the filesystem, so the
+    bulk of the set cannot report a traversal at all.
+
+    An ordinary symlinked dotfile under ``$HOME`` can set this flag, and a
+    dotfile-managed home is therefore a case to look for. The trigger is the union
+    this build already resolves: a crew-prefixed entry of the caller's
+    ``home_dirs`` under ``KIROCREW_HOME``, the agents dir under ``KIRO_HOME``, or a
+    DECLARED credential leaf under whichever harness variable relocates it. So a
+    symlinked ``sessions`` or ``models`` leaf under a ``KIROCREW_HOME`` that sits
+    below ``$HOME`` pins the write tier, and a symlinked ``goose`` directory under
+    whatever ``XDG_CONFIG_HOME`` resolves to pins the tier handed that leaf. Read
+    that second one literally: the leaf resolved is
+    ``$XDG_CONFIG_HOME/goose/secrets.yaml``, so it is the exported root that has to
+    contain the symlink. A host whose ``XDG_CONFIG_HOME`` points somewhere other
+    than ``~/.config`` can symlink ``~/.config/goose`` all it likes and no build
+    will resolve it. What CANNOT set it is a dotfile in none of those classes,
+    because the bulk targets are never resolved. The roots themselves cannot
+    either: ``_resolve_root_anchors`` canonicalises every root first, so the
+    symlink has to sit BELOW the resolved root -- which is why relocating the
+    exported config root alone does not trip it while a symlinked ``goose``
+    directory under it does.
+
+    The LEAF-BEARING override roots are ``KIROCREW_HOME``, ``KIRO_HOME``, and every
+    variable in ``host_auth.home_override_env_vars()``. That table is the
+    enumeration; naming the variables or their count here would be a second place
+    to forget the next harness, which is the documentation defect this docstring
+    exists to remove. ``_OVERRIDE_ROOT_ENVS`` carries one more root,
+    ``KIROCREW_OS_HOME``, which is resolved as a root but bears no leaf class of
+    its own -- its entries are joined lexically by ``_anchor_both_separators``.
+
+    The crew-prefix class is the caller's list, not a fixed set of leaves. The
+    crew-prefix arm loops over the ``home_dirs`` it was handed and resolves every
+    entry carrying a prefix, and the three callers hand it three different lists:
+    the read gate passes ``_SENSITIVE_HOME_DIRS``, ``is_sensitive_write_path``
+    passes ``_SENSITIVE_HOME_DIRS + _WRITE_PROTECTED_HOME_PATHS``, and
+    ``_is_keystone_publish_artifact`` passes ``_KEYSTONE_ARTIFACT_PARENTS``. So no
+    one class of leaf describes the resolved population: on the write tier a
+    symlinked write-protected crew leaf that holds no secret sets the flag too,
+    and the three builds can disagree about it on one host.
 
     That fact is what bounds the deeper-leaf staleness the target cache always
-    carried. A target whose resolution differs came through a symlink at or
-    below a resolved root, and THAT is the entry a repoint can move out from
-    under a cached set. When no target resolved differently there is no
+    carried. A resolved path that comes back different came through a symlink at
+    or below a resolved root, and THAT is the entry a repoint can move out from
+    under a cached set. When nothing resolved differently there is no
     resolution-derived entry to go stale, so the long adaptive expiry is safe;
     when one did, the expiry is pinned to the floor. See
     :func:`_home_targets_ttl`.
@@ -2173,10 +2243,14 @@ def _home_dir_targets_uncached(
             _full_real = resolve_target(_full)
             if _full_real is not None:
                 sensitive_targets.add(_full_real.casefold())
-    # Did any target come through a symlink? Read off the memo this build already
-    # filled, so the answer costs one pass over a ~75-entry dict and no extra
-    # filesystem work -- the resolutions themselves are the expense and they have
-    # already happened. Normalised on both sides so a separator or case
+    # Did any path this build resolved come through a symlink? Read off the memo
+    # this build already filled -- the five classes named on ``_BuiltTargets``, so
+    # one entry on a host with no home override set and about eighty with every one
+    # set -- which costs one pass over that dict and no extra filesystem work: the
+    # resolutions themselves are the expense and they have already happened. The
+    # bulk of the set never appears here, because ``_anchor`` and
+    # ``_anchor_both_separators`` build it without resolving anything. Normalised
+    # on both sides so a separator or case
     # difference cannot read as a symlink; a false positive here is merely the
     # short expiry, a false negative would be the stale window this bounds.
     differed = any(
@@ -2382,12 +2456,13 @@ def _home_targets_ttl(rebuild_secs: float, *, resolution_differed: bool = True) 
     subtract.
 
     *resolution_differed* is what keeps the long expiry off the one class of
-    install it could hurt.  True means some target's canonical form differed from
-    its lexical one, i.e. the build came through a symlink at or below a resolved
-    root -- and that resolution-derived entry is exactly what a repoint can move
-    out from under a cached set, the deeper-leaf residual.  There the expiry is
+    install it could hurt.  True means one of the paths the build RESOLVED came
+    back spelled differently -- in practice a symlinked leaf under a home-override
+    root, which is the whole population :class:`_BuiltTargets` enumerates -- and
+    that resolution-derived entry is exactly what a repoint can move out from
+    under a cached set, the deeper-leaf residual.  There the expiry is
     pinned to the floor, so that window stays at 0.1s and does not grow.  False
-    means no target resolved differently, so the set holds nothing a repoint can
+    means nothing resolved differently, so the set holds nothing a repoint can
     stale WITHOUT first creating a symlink inside the crew home, which is a write
     the write gate refuses; the adaptive expiry applies.  It defaults to True so
     every caller that cannot prove otherwise gets the short expiry.
@@ -2404,36 +2479,108 @@ def _home_targets_ttl(rebuild_secs: float, *, resolution_differed: bool = True) 
     return min(max(scaled, _HOME_TARGETS_TTL_SECS), _HOME_TARGETS_TTL_MAX_SECS)
 
 
-#: Last state :func:`_report_expiry_pin` reported, so the line is emitted once per
-#: TRANSITION rather than once per rebuild. A dict rather than a module global
-#: because it is written from inside a function.
-_home_targets_pin_state: dict[str, bool] = {}
+def _home_targets_tier(home_dirs: list[str]) -> str:
+    """Name the gate whose ``home_dirs`` list this is, for the expiry-pin line.
+
+    A label for a reader, never a decision: :func:`_report_expiry_pin` keys its
+    state on the list itself, so an unrecognised list still gets its own slot and
+    the right dedup while being named generically here. That is what keeps this
+    from being a second place a new gate must be registered for correctness --
+    ``test_every_gate_list_handed_to_the_builder_has_a_tier_name`` scans the call
+    sites and fails when one arrives without a name, so the generic answer is a
+    floor rather than somewhere to stop.
+
+    Compared against the live lists rather than a table frozen at import, because
+    the lists are assembled by ``+=`` across this module and a test may extend one.
+    """
+    if home_dirs == _SENSITIVE_HOME_DIRS:
+        return "read"
+    if home_dirs == _SENSITIVE_HOME_DIRS + _WRITE_PROTECTED_HOME_PATHS:
+        return "write"
+    if home_dirs == _KEYSTONE_ARTIFACT_PARENTS:
+        return "keystone-artifact"
+    return f"unnamed {len(home_dirs)}-entry"
 
 
-def _report_expiry_pin(pinned: bool) -> None:
-    """Say once, on each transition, which expiry the cache is actually selecting.
+#: Last state :func:`_report_expiry_pin` reported FOR EACH ``home_dirs`` list, so the
+#: line is emitted once per tier per TRANSITION rather than once per rebuild. Keyed on
+#: the list itself rather than on one shared slot because the gates hand the builder
+#: different lists whose answers can disagree on one host -- see
+#: :func:`_report_expiry_pin`. The roots are deliberately NOT part of this key: they key
+#: the target CACHE, but a tier reporting the same answer under new roots has not
+#: transitioned and must not re-log. Bounded by the number of gate lists, a handful of
+#: module constants, so it needs no eviction. A dict rather than a module global because
+#: it is written from inside a function.
+_home_targets_pin_state: dict[tuple[str, ...], bool] = {}
+
+
+def _report_expiry_pin(home_dirs: list[str], pinned: bool) -> None:
+    """Say once per tier, on each transition, which expiry that build selects.
 
     Without this the availability half self-disables in silence. On an install
-    whose sensitive dotfiles are symlinks -- a stow or chezmoi home is the ordinary
-    case, not an exotic one -- every build reports a traversal, every expiry is
-    therefore the floor, and both knobs read as no-ops to whoever tunes them. The
-    refusals then come back with nothing in the log to say why the fix did not
-    apply to this host. Deduplicated on the state, so a steady host says it once
-    rather than once per rebuild, and a host that flips says it again.
+    whose RESOLVED leaf under a home-override root is a symlink -- a crew-prefixed
+    entry of the caller's ``home_dirs`` under ``KIROCREW_HOME``, the agent-spec dir
+    under ``KIRO_HOME``, or a declared harness credential leaf under any variable in
+    ``host_auth.home_override_env_vars()`` --
+    the build that was handed that leaf reports a traversal, ITS expiry is
+    therefore the floor, and both knobs read as no-ops for that tier to whoever
+    tunes them. The refusals then come back with nothing in the log to say why the
+    fix did not apply to this host.
+
+    A dotfile-managed home IS a case to look for. The trigger is narrower than
+    "any symlinked dotfile" but not exotic: the symlinked path has to fall in one
+    of the three classes above -- a crew-prefixed entry of the caller's
+    ``home_dirs`` under ``KIROCREW_HOME``, the agent-spec dir under ``KIRO_HOME``,
+    or a declared harness credential leaf -- and it has to sit BELOW the resolved
+    root, since ``_resolve_root_anchors`` canonicalises each root first. A
+    symlinked ``sessions`` leaf under a ``KIROCREW_HOME`` below ``$HOME`` is that
+    shape, and so is a ``goose`` directory symlinked into a store underneath
+    whatever ``XDG_CONFIG_HOME`` resolves to -- the leaf resolved is
+    ``$XDG_CONFIG_HOME/goose/secrets.yaml``, so the symlink has to be under the
+    exported root and not under ``~/.config`` unless that is the same directory. A
+    dotfile in none of those classes cannot report
+    a traversal, because the bulk targets are never resolved.
+
+    The dedup is per ``home_dirs`` list, because that list is what decides the
+    answer. The gates hand the builder three different ones -- the read gate passes
+    ``_SENSITIVE_HOME_DIRS``, :func:`is_sensitive_write_path` passes that plus
+    ``_WRITE_PROTECTED_HOME_PATHS``, and :func:`_is_keystone_publish_artifact`
+    passes ``_KEYSTONE_ARTIFACT_PARENTS`` -- while a symlinked write-protected crew
+    leaf that holds no secret (``models``, ``sessions``, ``app-sources``) sits in
+    the write gate's list alone. So one host can have the write build resolve that
+    leaf and pin the floor while the keystone-artifact build reports no traversal
+    and selects the cost-tracking expiry. Under one shared slot each of those builds
+    flips the key the other just set, so the line alternates between two opposite
+    messages for as long as the disagreement lasts and neither survives long enough
+    to read as a state. A per-list slot lets each build transition its OWN state: a
+    steady host says it once per tier rather than once per rebuild, and a tier that
+    flips says it again.
+
+    Both messages name the tier for the same reason. A reader diagnosing a refusal
+    needs to know WHICH gate is pinned, and on a host whose builds disagree a line
+    naming none of them cannot answer that -- the "cost-tracking expiry in force"
+    half would read as the state of the whole gate while another tier is pinned to
+    the floor, which is the opposite of the truth for whoever is tuning the knobs.
     """
-    if _home_targets_pin_state.get("pinned") is pinned:
+    key = tuple(home_dirs)
+    if _home_targets_pin_state.get(key) is pinned:
         return
-    _home_targets_pin_state["pinned"] = pinned
+    _home_targets_pin_state[key] = pinned
+    tier = _home_targets_tier(home_dirs)
     if pinned:
         logger.info(
-            "sensitive-path anchor cache: expiry pinned to the %.1fs floor because a "
-            "target resolved through a symlink, so the cost-tracking expiry and both "
-            "of its knobs do not apply while that holds",
+            "sensitive-path anchor cache (%s tier): expiry pinned to the %.1fs floor "
+            "because a path under a home-override root resolved through a symlink, so "
+            "the cost-tracking expiry and both of its knobs do not apply to this tier "
+            "while that holds",
+            tier,
             _HOME_TARGETS_TTL_SECS,
         )
     else:
         logger.info(
-            "sensitive-path anchor cache: cost-tracking expiry in force " "(ratio %s, cap %.1fs)",
+            "sensitive-path anchor cache (%s tier): cost-tracking expiry in force "
+            "(ratio %s, cap %.1fs)",
+            tier,
             _HOME_TARGETS_TTL_COST_RATIO,
             _HOME_TARGETS_TTL_MAX_SECS,
         )
@@ -2729,7 +2876,7 @@ def _cached_home_dir_targets(
     # double or any future builder that returns a plain ``set`` carries no
     # attribute and gets the floor rather than the long expiry.
     differed = bool(getattr(targets, "resolution_differed", True))
-    _report_expiry_pin(differed)
+    _report_expiry_pin(home_dirs, differed)
     ttl = _home_targets_ttl(max(0.0, built_at - now), resolution_differed=differed)
     # Bound the dict: the key space is tiny (two constant home_dirs lists ×
     # roots), but a test or embedder that churns KIROCREW_HOME must not grow it

@@ -10,8 +10,8 @@ in a spec table describing it, and two statements of one fact drift.
 below is read off the site that produces it (:mod:`kiro_crew.crew_log.emit`
 for the ordinary entries, ``store._closer_entries`` for the crash-repair closers).
 A type earns a declaration by having a writer, so the types declared here are
-exactly the session types something writes today, whether or not the writer marks
-the entry ignorable. An ignorable write is not exempt: a folding reader SKIPS an
+exactly the types something writes today, whether or not the writer marks the
+entry ignorable. An ignorable write is not exempt: a folding reader SKIPS an
 undeclared ignorable entry, a skip is a gap in the sequence the fold receives, and
 the class fold reads a gap as damage. So ``plan/updated`` is declared like the
 rest, and its write keeps ``ignorable=True`` untouched. A type nothing writes at
@@ -52,10 +52,11 @@ because enforcing them converts "the upstream vocabulary grew" into "the entry i
 refused and counted as a write loss" -- the registry would then destroy records
 instead of catching mistakes.
 
-Types with no declaration pass through untouched. That is what keeps the crew
-crew log, whose own type families have no emitter, and every guest namespace
-(``crew:<name>/…``, ``app:<name>/…``) writable while this covers the session
-families that are written today.
+Types with no declaration pass through untouched. Two kinds are declared here --
+the session families and the crew kind's two dispatch contracts -- and everything
+else is left open on purpose: the crew kind's other six domains, the member
+kind's whole vocabulary (owned by the member event log), and every guest
+namespace (``app:<name>/…``) are writable without a registry entry.
 """
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kiro_crew.crew_log.errors import CODE_BAD_DATA_FIELD, CrewLogError
-from kiro_crew.crew_log.schema import KIND_SESSION
+from kiro_crew.crew_log.schema import KIND_CREW, KIND_SESSION
 
 # The ledger subsystem owns the event vocabulary its own writer clamps to, so the
 # declaration below reads it from there instead of restating it. Importing the
@@ -193,6 +194,51 @@ _EVENT_KIND_VALUES: tuple[str, ...] = tuple(sorted(_LEDGER_EVENT_KINDS))
 #: ``phase`` may hold) is the wrong one. The app re-exports these under its own
 #: names so its callers and the fold in ``projection`` read one set of values.
 RADAR_ENTRY_TYPE = "radar/recorded"
+
+#: The conductor work board's entry type, named beside the radar one and for the same
+#: reason: the fold in ``projection`` declares which entry types can move it, and a
+#: set that is narrower than the truth drops a real change with nothing raised -- so
+#: the type the fold matches on and the type the registry declares are one value.
+WORK_ENTRY_TYPE = "work/recorded"
+
+#: The crew webview's entry type, named here for the reason the two above are: the
+#: fold in ``projection`` matches on this type, and a type the fold does not match
+#: drops a real publish with nothing raised -- so the matched value and the declared
+#: one are one constant. The panel store imports it rather than restating it.
+PANEL_ENTRY_TYPE = "panel/published"
+
+#: Ceilings the panel fold RE-APPLIES to the bytes it reads. The writer clamps too,
+#: but these come off a file a reader does not control, so a planted or damaged line
+#: is exactly the input that ignores the writer's rule. Equal to the store's own caps
+#: by construction -- ``test_agent_panel_crew_log`` pins them against
+#: ``agent_panel`` -- because a lower ceiling here would truncate an ordinary
+#: accepted panel on every read, which is silent corruption rather than a bound.
+PANEL_TITLE_LIMIT = 200
+PANEL_TEMPLATE_LIMIT = 64
+#: A SHA-256 hexdigest, which is what ``agent_panel.crew_key`` produces and the read
+#: route compares on. Clamped like every other field the fold reads, so a planted
+#: line cannot carry an unbounded string into a state a reader retains; the clamp is
+#: the digest's own exact width, so no real key is ever shortened by it.
+PANEL_CREW_KEY_LIMIT = 64
+#: Past publishes the fold keeps, newest last. A HISTORY, not the value: each row is
+#: the title and template of a superseded panel, so an operator can see that a crew
+#: is publishing and what it called each cycle without the fold retaining every
+#: payload it ever held -- which is what the byte ceiling per entry bounds, and what
+#: retaining N payloads would multiply.
+PANEL_HISTORY_LIMIT = 50
+#: Distinct OWNERS one slot's panel fold retains a record for, newest publish wins
+#: within each. More than one is possible because a slot is keyed by the member slug
+#: and two crews can resolve to one slug (memory provisioning suffixes a persisted
+#: ``member_id``, so a name-derived slug can be held by a crew of another name). Each
+#: crew then reads the record its OWN ownership digest keys, instead of a newer
+#: crew's publish hiding an older one's panel from its own drawer.
+#:
+#: Small because the number is not a scale: one slug is one member, and a collision
+#: is a degraded roster rather than a mode of use. The cap is what keeps the retained
+#: state bounded -- each record holds a capped payload, so this multiplies it -- and
+#: the oldest publish is evicted when a further owner appears.
+PANEL_OWNER_LIMIT = 4
+PANEL_FOLD_NAME = "panel"
 
 #: Work-item phases. Two classifications hang off this enum and do not coincide:
 #: the TTL-active phases age toward the claim TTL, and the editing phases are the
@@ -358,6 +404,37 @@ _SESSION_CLASS_FIELDS: tuple[Field, ...] = (
             "workspaces, which no single workspace's session may read. Absent on a "
             "log opened before this field existed, and a reader that needs it must "
             "refuse rather than assume."
+        ),
+    ),
+)
+
+#: The members of a parent citation on the two entries that MOVE a session in the
+#: tree. One tuple rather than two identical ones, for the reason
+#: :data:`_SESSION_CLASS_FIELDS` is one: an adoption and the release that undoes it
+#: cite a parent the same way, and a member declared on one and not the other would
+#: be readable from one half of a takeover and silently missing from the other.
+#:
+#: ``session/opened.parent`` deliberately keeps its own copy. It carries the same two
+#: keys, but its notes describe what ``session_create`` attributed at birth, which is
+#: not what these two record -- and the reference tables are read per entry type.
+_PARENT_EDGE_FIELDS: tuple[Field, ...] = (
+    Field(
+        "slot",
+        JSON_STRING,
+        required=True,
+        note=(
+            "The parent session's slot key. The tree's own key, so this is the "
+            "member a fold reads."
+        ),
+    ),
+    Field(
+        "sid",
+        JSON_STRING,
+        note=(
+            "The parent's ACP session id at the moment of the call -- a citation of "
+            "that session's log for a reader, never a tree key, since a slot outlives "
+            "its ACP session. Absent when the gateway had no live handle for it, and "
+            "when the id exceeded MAX_ACP_SESSION_ID_LEN."
         ),
     ),
 )
@@ -529,6 +606,70 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
                     "reasons than any site passes here today."
                 ),
             ),
+        ),
+    ),
+    EntryType(
+        "session/adopted",
+        "Another session took this one over, so it now hangs under that session.",
+        (
+            Field(
+                "parent",
+                JSON_OBJECT,
+                required=True,
+                fields=_PARENT_EDGE_FIELDS,
+                note=(
+                    "The session that took this one over, resolved by the gateway from "
+                    "the calling connection rather than named by the caller. Required: "
+                    "an adoption with no adopter records nothing, and the entry that "
+                    "means 'this session has no parent' is session/released."
+                ),
+            ),
+            Field(
+                "previous_parent",
+                JSON_OBJECT,
+                fields=_PARENT_EDGE_FIELDS,
+                note=(
+                    "The parent this adoption replaced, for a reader of the log. "
+                    "Absent when the session was a root. No fold reads it: the tree "
+                    "takes the parent from ``parent`` alone, so a reader reconstructing "
+                    "who held the session and when has this and the tree still has one "
+                    "statement of the current edge."
+                ),
+            ),
+        ),
+        note=(
+            "Recorded on the session that was taken over, which is where "
+            "``session/opened.parent`` already puts a creating edge -- one axis, one "
+            "place to read it, and a takeover that moves a whole subtree writes one "
+            "entry rather than one per descendant, because descendants hang on this "
+            "session's slot and not on a path.\n\n"
+            "The creating edge is not rewritten and cannot be: the log is append-only "
+            "and that entry states who OPENED the session, which stays true. This "
+            "entry states who holds it now, and the fold prefers the newest of the two "
+            "rather than merging them."
+        ),
+    ),
+    EntryType(
+        "session/released",
+        "This session's parent let it go, so it stands on its own again.",
+        (
+            Field(
+                "previous_parent",
+                JSON_OBJECT,
+                fields=_PARENT_EDGE_FIELDS,
+                note=(
+                    "The parent that let this session go. Absent when the gateway could "
+                    "not name it, which is why it is not required: the entry's meaning "
+                    "is that there is no parent NOW, and that does not depend on being "
+                    "able to name the one there was."
+                ),
+            ),
+        ),
+        note=(
+            "The counterpart of session/adopted, and the only entry that takes a parent "
+            "edge away. A session/opened carrying no parent does not: it means the "
+            "entry did not repeat a creator, which a reader must not read as a "
+            "retraction, so the retraction needs a record of its own."
         ),
     ),
     EntryType(
@@ -1409,7 +1550,7 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
     ),
     # -- work --------------------------------------------------------------- #
     EntryType(
-        "work/recorded",
+        WORK_ENTRY_TYPE,
         "One work-board mutation: who acted, on which item, and the fields it set.",
         (
             Field(
@@ -1580,15 +1721,187 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
             "emitter off the tools refuse rather than keeping a document of their own."
         ),
     ),
+    # -- panel -------------------------------------------------------------- #
+    EntryType(
+        PANEL_ENTRY_TYPE,
+        "One publish of a crew's own webview: the data, and the template that renders it.",
+        (
+            Field(
+                "template",
+                JSON_STRING,
+                required=True,
+                note=(
+                    "Id of the human-authored template the data is rendered with. Required "
+                    "because the pair is what renders: a payload naming no template has no "
+                    "layout to fill, and the store resolves the id at publish so an "
+                    "unknown one is refused before it reaches a line."
+                ),
+            ),
+            Field(
+                "data",
+                JSON_OBJECT,
+                required=True,
+                note=(
+                    "The state the crew published, already scrubbed and depth-checked. The "
+                    "MEMBERS are the crew's own field names -- a panel is deliberately "
+                    "generic, so nothing here knows what they mean -- which is why they are "
+                    "undeclared and bounded by byte and depth ceilings instead."
+                ),
+            ),
+            Field(
+                "title",
+                JSON_STRING,
+                note="Short name for this panel, shown in the page's picker.",
+            ),
+            Field(
+                "crew",
+                JSON_STRING,
+                note=(
+                    "The publishing crew's name as DISPLAY text -- redacted, so it is not "
+                    "an identity. Carried so a reader of one entry can say whose panel it "
+                    "is without resolving the slot."
+                ),
+            ),
+            Field(
+                "crew_key",
+                JSON_STRING,
+                note=(
+                    "Digest of the crew's EXACT name, which is what ownership is decided "
+                    "on. Separate from crew because redaction is many-to-one: a "
+                    "credential-shaped name redacts to a string that matches no exact name, "
+                    "so display text cannot serve as an identity."
+                ),
+            ),
+        ),
+        note=(
+            "One entry per publish, appended to the publishing member's own DM session log "
+            "-- the only session the panel tool is ever mounted on -- so the slot a panel "
+            "folds under is the member's. Two crew names can resolve to one slot, so the "
+            "fold keys a record per crew_key and answers each crew with its own. Each "
+            "publish REPLACES the panel, so the fold takes the newest entry whole and keeps "
+            "the earlier ones only as a short history; a partial update has no meaning here, "
+            "unlike the ledger's. This log is NOT the panel's only home: the publish writes "
+            "crew-panels/<slug>.json first and that file is the durable record, so this "
+            "append is best-effort history and a publish with the emitter off still succeeds."
+        ),
+    ),
 )
 
 #: The session types that have a writer. Keyed by ``type`` for the append path.
 SESSION_ENTRY_TYPES: dict[str, EntryType] = {item.type: item for item in _SESSION_TYPES}
 
+#: Which sort of party a dispatch went to. Closed: the writer builds the object,
+#: so no caller can produce a third kind.
+CREW_TARGET_KINDS: tuple[str, ...] = ("session", "crew")
+
+#: The statuses the crew kind's own spec names for a report.
+_SPEC_REPORT_STATUSES: tuple[str, ...] = ("done", "blocked", "failed", "progress")
+
+#: What a ``crew/report`` may say about an item: the spec's four, plus every
+#: status the work ledger's worker half can commit. Derived from that writer's
+#: own vocabulary rather than restated, because it is the one producer of this
+#: type: a closed enum narrower than its writer turns "the ledger gained a
+#: status" into a refused entry counted as a write loss, which is the posture
+#: this module's docstring rejects. ``question`` reaches the log under its own
+#: name rather than folded into ``blocked``: the two differ by WHICH party must
+#: act, and a conductor reading the fold acts on that difference.
+CREW_REPORT_STATUSES: tuple[str, ...] = _SPEC_REPORT_STATUSES + tuple(
+    value for value in WORK_WORKER_STATUSES if value not in _SPEC_REPORT_STATUSES
+)
+
+#: The crew kind's declared types: the dispatch contract and the report contract.
+#: Only these two, because only these two have a writer -- the same rule the
+#: session table follows. The other six crew domains
+#: (``member``, ``activity``, ``slot``, ``patrol``, ``message``, ``memory``) and
+#: the remaining ``crew``/``item`` actions stay undeclared and pass through, so a
+#: guest app and a future family are writable without a registry change.
+_CREW_TYPES: tuple[EntryType, ...] = (
+    EntryType(
+        type="crew/dispatch",
+        summary="A crew handed one work item to a target.",
+        fields=(
+            Field("item", JSON_STRING, required=True, note="The work item's id."),
+            Field(
+                "target",
+                JSON_OBJECT,
+                required=True,
+                fields=(
+                    Field(
+                        "kind",
+                        JSON_STRING,
+                        required=True,
+                        enum=CREW_TARGET_KINDS,
+                        enum_closed=True,
+                        note="Which sort of target this item went to.",
+                    ),
+                    Field(
+                        "slot",
+                        JSON_STRING,
+                        note="The slot key, carried when the target is a session.",
+                    ),
+                    Field(
+                        "name",
+                        JSON_STRING,
+                        note="The crew name, carried when the target is a crew.",
+                    ),
+                ),
+                note="Who the item went to. A dispatch with no target names nobody.",
+            ),
+            Field("brief", JSON_STRING, note="The brief handed over."),
+        ),
+        note=(
+            "The opener of the dispatch family: one or more reports thread onto its "
+            "seq. Two invariants the declaration cannot state are the writer's and "
+            "are enforced where the entry is built -- ``target.kind`` decides which "
+            "of ``slot`` or ``name`` is carried, and the two forms are exclusive, so "
+            "a target names a session slot or a crew and never both. A conditional "
+            "requirement has no spelling here, and a field marked required that one "
+            "legitimate form omits would refuse a valid dispatch."
+        ),
+    ),
+    EntryType(
+        type="crew/report",
+        summary="A dispatched party reported back on one work item.",
+        fields=(
+            Field(
+                "item",
+                JSON_STRING,
+                required=True,
+                note="The work item's id, matching the dispatch.",
+            ),
+            Field(
+                "status",
+                JSON_STRING,
+                required=True,
+                enum=CREW_REPORT_STATUSES,
+                enum_closed=True,
+                note="Where the item stands.",
+            ),
+            Field("credits", JSON_FLOAT, note="What the work cost. Absent is not zero."),
+            Field("summary", JSON_STRING, note="What was done."),
+        ),
+        note=(
+            "The one type that constrains the ENVELOPE as well as ``data``: ``ref`` "
+            "is required, citing the span of the reporting session's log that holds "
+            "the work, and ``thread`` is the answered dispatch's seq. Neither is a "
+            "``data`` key, so neither is declarable here -- the writer carries both, "
+            "and a report built without a ``ref`` is refused where it is built. A "
+            "``progress`` status may appear several times for one dispatch; a "
+            "terminal status appears once."
+        ),
+    ),
+)
+
+#: The crew types that have a writer. Keyed by ``type`` for the append path.
+CREW_ENTRY_TYPES: dict[str, EntryType] = {item.type: item for item in _CREW_TYPES}
+
 #: Per kind, because the question "what does this type carry" is asked of a unit.
-#: A crew registry drops in beside this one when a crew emitter lands; until then
-#: a crew's log's types are simply undeclared and pass through.
-ENTRY_TYPES: dict[str, dict[str, EntryType]] = {KIND_SESSION: SESSION_ENTRY_TYPES}
+#: The member kind declares nothing here: its vocabulary, writers and projections
+#: are owned by the member event log, and an undeclared type passes through.
+ENTRY_TYPES: dict[str, dict[str, EntryType]] = {
+    KIND_SESSION: SESSION_ENTRY_TYPES,
+    KIND_CREW: CREW_ENTRY_TYPES,
+}
 
 
 def declaration_for(kind: str, entry_type: str) -> EntryType | None:
@@ -1663,8 +1976,14 @@ def validate_data(kind: str, entry_type: str, data: Any) -> None:
 
     Raises ``bad_data_field`` naming the offending path when a required field is
     absent, a value is of the wrong JSON type, a key is not declared, or a value
-    falls outside a CLOSED enum. Returns silently for a type with no declaration,
-    which is every crew type and every guest namespace.
+    falls outside a CLOSED enum. Returns silently for a type with no declaration
+    -- the member kind, a crew domain outside the two dispatch contracts, and
+    every guest namespace.
+
+    The declaration is selected by KIND as well as by type, so it cannot answer
+    for the wrong unit: a ``crew/report`` reaching a session's log finds no
+    session declaration and is refused one layer up, by ``check_ownership``, with
+    ``event_type_not_owned``.
 
     A refusal is a :class:`~kiro_crew.crew_log.errors.CrewLogError`, so the
     write-behind emitter already treats it the way it treats an oversize entry: a

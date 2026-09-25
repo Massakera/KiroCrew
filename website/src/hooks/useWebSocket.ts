@@ -9,6 +9,7 @@ import { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, sseTodoUpd
 import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, clearAllNotifications, fetchNotifications, markBootNotificationsFetched } from '../store/notificationsSlice'
 import { dispatchMcNotification, dispatchLiveNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone } from './notificationEvent'
 import { shouldNotifyOnChatComplete } from './chatCompleteNotify'
+import { postNativeNotification } from '../lib/nativeNotify'
 import { isChatPath } from './notificationBanner'
 import { emitThemeSound } from './themeSound'
 import { streamingFlushHoldMs } from '../lib/streamHold'
@@ -20,7 +21,7 @@ import { reportVoiceFailure } from '../lib/voiceFailure'
 import {
   fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setAutomations, sseAutomation, removeAutomation, sseSideQueue, reconcileWorkflowRuns,
 } from '../store/chatSlice'
-import { selectSidebarSubagentCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys } from '../store/chatSlice'
+import { selectSidebarSubagentCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys, queueEntryAttachments } from '../store/chatSlice'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
 import { TAB_ID } from '../api/tabId'
@@ -30,6 +31,8 @@ import { forgetUnobservedMemberThreads } from '../api/membersQuery'
 import { observedPaneSlots } from '../api/slotMessagesQuery'
 import { MEMBERS_ROSTER_QUERY_KEY } from '../api/membersQuery'
 import { memberProjectionStore } from '../state/memberProjectionStore'
+import { threadLiveStore, type ThreadReplyFrame } from '../state/threadLiveStore'
+import { threadQueryKey, threadsQueryKey } from '../api/threads'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { deriveToolCallTitle } from '../utils/toolCallTitle'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
@@ -123,6 +126,13 @@ function invalidateRefreshQueries(qc: QueryClient): void {
   qc.invalidateQueries({ queryKey: ['default-agent'] })
   qc.invalidateQueries({ queryKey: ['workspaces'] })
   qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+  // These answers derive from the config AND, for an `auto` default, the
+  // installed agent spec rebuilt by the server's config applier. A refresh
+  // frame is emitted only after that applier completes, so invalidate the
+  // infinite-stale caches here rather than relying solely on a changed config
+  // value to mint a new key. This also covers external/CLI config writes.
+  qc.invalidateQueries({ queryKey: ['resolved-model'] })
+  qc.invalidateQueries({ queryKey: ['agent-resolved-model'] })
   // Prefix match on purpose: covers the filtered library list
   // (['artifacts', {tag, kind}]) and the tag-options read
   // (['artifacts', 'all-tags']) in one shot. The `artifact_update` frame
@@ -1251,6 +1261,15 @@ export function useWebSocket() {
         // comes back with its folders missing.
         queryClient.invalidateQueries({ queryKey: ['artifacts'] })
         queryClient.invalidateQueries({ queryKey: ['artifact-folders'] })
+        // Same one-shot problem for a reply thread on a crewmate chat message:
+        // the terminal `chat.thread_reply` frame of a reply that finished while
+        // the socket was down was never delivered, so the live store would show
+        // a partial reply forever and the stored row would never be refetched.
+        // Drop every live row (streamed text only; the stored replies are the
+        // truth) and refetch every observed thread and footer count.
+        threadLiveStore.reset()
+        queryClient.invalidateQueries({ queryKey: ['chat-thread'] })
+        queryClient.invalidateQueries({ queryKey: ['chat-threads'] })
         // A dropped socket is the one client-visible sign the gateway may have
         // restarted — and a restart drops an unmessaged member slot while its
         // binding survives. The Crew Members page mounts a cached thread key
@@ -1941,7 +1960,10 @@ export function useWebSocket() {
             syncPendingQuestions()
             break
           case 'queue_edit':
-            dispatch(editQueuedMessage(data))
+            // The frame's `meta` is the entry's post-edit attachment lists;
+            // `attachments` (present even when empty) tells the reducer this
+            // is the server's word on them, not an optimistic local edit.
+            dispatch(editQueuedMessage({ ...data, attachments: queueEntryAttachments((data as { meta?: unknown }).meta) }))
             break
           case 'queue_reorder':
             dispatch(reorderQueuedMessages(data))
@@ -2277,6 +2299,20 @@ export function useWebSocket() {
           case 'chat.side_result':
             dispatch(sseSideResult(data as { slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; final?: boolean; is_error?: boolean; steer?: boolean }))
             break
+          case 'chat.thread_reply': {
+            // A reply landing in a thread on a crewmate chat message. Streamed
+            // deltas go to the live store the thread panel reads; a stored row
+            // (the user's reply, or the crewmate's terminal frame) refreshes the
+            // thread and the per-slot footer counts through React Query.
+            const frame = data as ThreadReplyFrame
+            if (typeof frame.slot !== 'string' || typeof frame.mid !== 'string') break
+            threadLiveStore.apply(frame)
+            if (frame.role === 'user' || frame.final) {
+              queryClient.invalidateQueries({ queryKey: threadQueryKey(frame.slot, frame.mid) })
+              queryClient.invalidateQueries({ queryKey: threadsQueryKey(frame.slot) })
+            }
+            break
+          }
           case 'chat.side_queue': {
             // `raw` marks content the LOCAL client typed; broadcast payloads are scrubbed by
             // definition. Stripped rather than merely left out of the cast, so a future
@@ -2415,14 +2451,10 @@ export function useWebSocket() {
               const doneBody = completionNeedsInput
                 ? i18nT('hooks.useWebSocket.waiting_for_input')
                 : i18nT('hooks.useWebSocket.response_ready')
-              // Android Chrome throws "Illegal constructor" for page-context
-              // Notification; an uncaught throw here kills the whole message
-              // handler, so the native toast is best-effort (same as approval).
-              try {
-                new Notification(doneTitle, { body: doneBody, tag: `kirocrew-chat-done:${doneSlot}`, silent: questionPending })
-              } catch {
-                /* unsupported platform */
-              }
+              // Best-effort (same as approval): the helper swallows Android
+              // Chrome's "Illegal constructor" and relays to the parent frame
+              // when this dashboard is an embedded instance pane.
+              postNativeNotification(doneTitle, { body: doneBody, tag: `kirocrew-chat-done:${doneSlot}`, silent: questionPending })
             }
             if (data.slot && !isSlotOnScreen(data.slot) && !reconnectingRef.current) {
               dispatch(markSlotUnread({ slot: data.slot, ts: (data as { ts?: string }).ts || undefined }))

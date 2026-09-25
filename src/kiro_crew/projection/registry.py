@@ -187,7 +187,13 @@ class ProjectionRegistry:
             self._fold_one(store, event, emit=False)
         return floor
 
-    def savepoints(self, store: str, identity: Mapping[str, Any]) -> list[Savepoint]:
+    def savepoints(
+        self,
+        store: str,
+        identity: Mapping[str, Any],
+        *,
+        witness: Mapping[str, Any] | None = None,
+    ) -> list[Savepoint]:
         """A savepoint per registered unit for *store*, ready to hand to a store.
 
         Reads the cells and builds the payloads; it does NOT write. When to spend a
@@ -196,7 +202,21 @@ class ProjectionRegistry:
         every drive would make that client write a file per entry -- the exact cost
         its savepoints exist to remove. A unit that has folded nothing is skipped,
         since a savepoint at the empty watermark saves no replay.
+
+        *witness* is the client's evidence about the log the state was folded from,
+        stamped VERBATIM onto every savepoint built here and interpreted no more than
+        the identity is. It is a parameter rather than something the kernel derives
+        because only the client can read its own log, and only the client can read it
+        at the one moment the evidence is worth anything -- before its fold consumed
+        the bytes. Omitted leaves the witness empty, which is a savepoint that carries
+        no evidence, and what that is worth is the reading client's call.
+
+        Each savepoint carries its own ``watermark``, so a client whose witness
+        certifies ONE boundary has to compare the two itself and skip a unit standing
+        somewhere else: the kernel cannot do it, since it cannot read what a boundary
+        means inside a mapping it does not interpret.
         """
+        stamped = dict(witness) if witness else {}
         with self._lock:
             out: list[Savepoint] = []
             for key, defn in self._defns.items():
@@ -210,6 +230,7 @@ class ProjectionRegistry:
                         watermark=cell.observed_seq,
                         state=cell.state,
                         identity=dict(identity),
+                        witness=dict(stamped),
                     )
                 )
             return out

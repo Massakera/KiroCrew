@@ -60,6 +60,10 @@ def _req(
     is a different thing from ``app`` (the aiohttp application): ``""`` means the
     dashboard user, a name means an app token, and ``None`` reproduces a path
     where no auth middleware ran and the claim is absent.
+
+    The claims are exposed through ``in`` and ``[]`` as well as ``get``, because
+    an owner-gated handler distinguishes an ABSENT app claim from an empty one
+    and reads it with ``"app" in request``.
     """
     req = MagicMock(spec=web.Request)
     req.remote = remote
@@ -69,6 +73,8 @@ def _req(
     req.match_info = match_info or {}
     claims: dict = {"user": user, "app": app_token}
     req.get = lambda key, default=None: claims.get(key, default)
+    req.__contains__.side_effect = lambda key: key in claims and claims[key] is not None
+    req.__getitem__.side_effect = lambda key: claims[key]
     return req
 
 
@@ -1650,24 +1656,136 @@ class TestSttTranscribe:
 
 
 class TestSelEndpoints:
+    #: The audit trail is owner-only, so every read below is made AS the owner.
+    _OWNER_APP = {"state": SimpleNamespace(owner_id="dashboard")}
+
+    def _owner_req(self, **kwargs):
+        return _req(app=self._OWNER_APP, user="dashboard", **kwargs)
+
     @pytest.mark.asyncio
     async def test_events_uses_default_limit(self, fake_sel) -> None:
         fake_sel.recent.return_value = [{"event": "a"}]
-        resp = await core_mod.api_sel_events(_req())
+        resp = await core_mod.api_sel_events(self._owner_req())
         assert json.loads(resp.body) == {"events": [{"event": "a"}], "count": 1}
         assert fake_sel.recent.call_args.kwargs["limit"] == 100
 
     @pytest.mark.asyncio
     async def test_events_caps_limit_at_1000(self, fake_sel) -> None:
         fake_sel.recent.return_value = []
-        await core_mod.api_sel_events(_req(query={"limit": "99999"}))
+        await core_mod.api_sel_events(self._owner_req(query={"limit": "99999"}))
         assert fake_sel.recent.call_args.kwargs["limit"] == 1000
 
     @pytest.mark.asyncio
     async def test_events_falls_back_on_unparsable_limit(self, fake_sel) -> None:
         fake_sel.recent.return_value = []
-        await core_mod.api_sel_events(_req(query={"limit": "many"}))
+        await core_mod.api_sel_events(self._owner_req(query={"limit": "many"}))
         assert fake_sel.recent.call_args.kwargs["limit"] == 100
+
+    @pytest.mark.asyncio
+    async def test_a_successful_owner_read_is_audited_after_it_is_served(self, fake_sel) -> None:
+        """A trail of refusals alone never says the log was read.
+
+        The denial branch records who was turned away; without a matching row for
+        the read that succeeded, an operator reviewing the trail cannot tell an
+        untouched log from one the owner has been reading. The write lands AFTER the
+        rows are captured, because ``recent()`` flushes the write queue before it
+        walks the log: enqueued first, this row would reach disk in time to be
+        served back as the newest event, and a ``limit=1`` read would return nothing
+        but its own audit.
+        """
+        calls: list[str] = []
+        fake_sel.log_api_access.side_effect = lambda **kw: calls.append(f"audit:{kw['outcome']}")
+        fake_sel.recent.side_effect = lambda **kw: calls.append("read") or [{"event": "a"}]
+
+        resp = await core_mod.api_sel_events(self._owner_req())
+
+        assert resp.status == 200
+        assert calls == ["read", "audit:allowed"]
+        assert json.loads(resp.body) == {"events": [{"event": "a"}], "count": 1}
+        kwargs = fake_sel.log_api_access.call_args.kwargs
+        assert kwargs["operation"] == "sel.events.read"
+        assert kwargs["outcome"] == "allowed"
+        assert kwargs["caller"] == "dashboard"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_read_writes_no_allow_row(self, fake_sel) -> None:
+        """The negative: the allow row must mean authorized, not merely attempted.
+
+        A refused caller never reaches this handler's own audit, so it writes
+        nothing at all here -- the denial row belongs to the shared owner gate and
+        is covered where that gate lives. What this pins is that the allow row
+        cannot be produced by an attempt.
+        """
+        resp = await core_mod.api_sel_events(_req(app=self._OWNER_APP, user="someone-else"))
+
+        assert resp.status == 403
+        fake_sel.log_api_access.assert_not_called()
+        fake_sel.recent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"user": "someone-else"},
+            {"user": None},
+            {"app_token": "an-app"},
+            {"app_token": None},
+        ],
+        ids=["other-user", "no-user", "app-token", "absent-app-claim"],
+    )
+    async def test_events_refuses_every_non_owner_caller(self, fake_sel, kwargs) -> None:
+        """The rows name the resources a security decision was about.
+
+        A dashboard session is not by itself the owner: the messaging bridges
+        mint a presigned token whose subject is the allowed user's own id, so
+        serving these rows to any authenticated session hands one principal the
+        other's audit trail. Each parameter is a caller class that must fail
+        closed, and the read must not happen AT ALL -- a 403 whose body still
+        carried the rows would pass a status-only assertion.
+        """
+        resp = await core_mod.api_sel_events(_req(app=self._OWNER_APP, **kwargs))
+        assert resp.status == 403
+        assert json.loads(resp.body) == {
+            "error": "owner authorization required",
+            "code": "owner_only",
+        }
+        fake_sel.recent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("subject", ["local-app", "local-startup"])
+    async def test_events_tells_a_pre_owner_session_to_sign_in_again(
+        self, fake_sel, subject
+    ) -> None:
+        """A bootstrap subject under a configured owner IS the owner, refused.
+
+        Configuring an owner after the dashboard session was signed leaves that
+        session's subject at the bootstrap name, and a token refresh preserves the
+        subject, so the real owner keeps failing the gate until they sign in again.
+        A generic 403 gives the one caller class that can act on the refusal no way
+        to know that, which is why the denial goes through the shared tail: the
+        status is 401 and the code names re-authentication. The read must still not
+        happen -- the relabel changes the response, not the decision.
+        """
+        resp = await core_mod.api_sel_events(_req(app=self._OWNER_APP, user=subject, app_token=""))
+        assert resp.status == 401
+        assert json.loads(resp.body)["code"] == "stale_session_reauth"
+        fake_sel.recent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_events_keeps_a_generic_403_when_no_owner_is_configured(self, fake_sel) -> None:
+        """No owner configured means a bootstrap subject is not stale.
+
+        ``is_owner_dashboard_request`` admits the implicit local owner in that
+        configuration, so this asserts the gate does not hand out the 401 to a
+        caller whose credential is current: reaching the relabel requires a
+        CONFIGURED owner, and the subject here is simply not that owner.
+        """
+        resp = await core_mod.api_sel_events(
+            _req(app={"state": SimpleNamespace(owner_id="")}, user="someone-else")
+        )
+        assert resp.status == 403
+        assert json.loads(resp.body)["code"] == "owner_only"
+        fake_sel.recent.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_verify_reports_intact_chain(self, fake_sel) -> None:
@@ -1775,6 +1893,57 @@ class TestAgentSettingsPut:
             assert resp.status == 500
             assert (await resp.json())["error"] == "config.json is corrupt"
         assert seeded_config.read_text(encoding="utf-8") == "<<not json>>"
+
+    @pytest.mark.asyncio
+    async def test_a_stale_plaintext_on_disk_does_not_brick_an_unrelated_put(
+        self, seeded_config, fake_sel
+    ) -> None:
+        """A plaintext ``agent.deepseek_env`` value an older build landed is not this
+        write's doing: the publish floor lets a write that leaves the mapping as it
+        found it through (naming the stale key on the log), so a settings change
+        that never touched that field is a 200, not a 500 with a traceback."""
+        stale = {"DEEPSEEK_API_KEY": "sk-live-not-a-reference"}
+        seeded_config.write_text(
+            json.dumps({"agent": {"approval_mode": "auto", "deepseek_env": stale}}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        async with TestClient(TestServer(_agent_cfg_app())) as client:
+            resp = await _put_agent(client, {"subagent_max_turns": 5})
+            assert resp.status == 200
+        written = json.loads(seeded_config.read_text(encoding="utf-8"))
+        assert written["agent"]["subagent_max_turns"] == 5
+        assert written["agent"]["deepseek_env"] == stale, "the write left the mapping as it was"
+
+    @pytest.mark.asyncio
+    async def test_a_write_the_publish_floor_refuses_is_a_clean_coded_400(
+        self, seeded_config, fake_sel, monkeypatch
+    ) -> None:
+        """When the floor does refuse a document, the PUT arm answers the operator's
+        one-line instruction with a machine-readable code -- never an escaped
+        ``ValueError``. The field is not editable through this surface today, so the
+        refusal is raised the way the floor raises it rather than provoked through
+        the body."""
+        from kiro_crew.config import loader as loader_mod
+        from kiro_crew.config.loader import ConfigWriteRefused
+
+        message = (
+            "agent.deepseek_env entry 'DEEPSEEK_API_KEY' holds a literal value, so the "
+            "config write was refused: this mapping takes a 'secret://<vault name>' "
+            "reference only."
+        )
+
+        def refuse(*_args, **_kwargs):
+            raise ConfigWriteRefused(message)
+
+        monkeypatch.setattr(loader_mod, "update_config_locked", refuse)
+        async with TestClient(TestServer(_agent_cfg_app())) as client:
+            resp = await _put_agent(client, {"subagent_max_turns": 5})
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["code"] == "config_write_refused"
+            assert body["error"] == message
+        assert fake_sel.log_api_access.call_args.kwargs["outcome"] == "denied"
 
     @pytest.mark.asyncio
     async def test_out_of_range_turns_is_denied(self, seeded_config, fake_sel) -> None:
@@ -2298,6 +2467,74 @@ class TestLocalToken:
         assert json.loads(resp.body)["code"] == "member_owner_token_refused"
         assert fake_sel.log_api_access.call_args.kwargs["resources"] == "unverified-owner-process"
         minted.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_every_refusal_carries_a_code_matching_its_audit_record(
+        self, monkeypatch, fake_sel
+    ) -> None:
+        """All three gates are machine-distinguishable to the caller, not just one.
+
+        The SEL record already tells the three apart. A caller that can read only
+        one of them has to guess between the other two, and their remedies differ:
+        one is a worktree update, one regenerates the secret, and the third is about
+        which process called and is fixed by neither. Each ``code`` therefore pairs
+        with the ``resources`` value written for the same refusal, so the pairing
+        cannot drift apart silently.
+        """
+        from kiro_crew import member_memory_auth as auth
+
+        seen: dict[str, str] = {}
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: False)
+        resp = await core_mod.api_token_local(_req(remote="203.0.113.9"))
+        assert resp.status == 403
+        seen[json.loads(resp.body)["code"]] = fake_sel.log_api_access.call_args.kwargs["resources"]
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        resp = await core_mod.api_token_local(
+            _req(app={"local_secret": "right"}, headers={"X-Local-Secret": "wrong"})
+        )
+        assert resp.status == 403
+        seen[json.loads(resp.body)["code"]] = fake_sel.log_api_access.call_args.kwargs["resources"]
+
+        monkeypatch.setattr(auth, "_request_peer_pid", lambda _request: None)
+        resp = await core_mod.api_token_local(
+            _req(app={"local_secret": "right"}, headers={"X-Local-Secret": "right"})
+        )
+        assert resp.status == 403
+        seen[json.loads(resp.body)["code"]] = fake_sel.log_api_access.call_args.kwargs["resources"]
+
+        assert seen == {
+            "loopback_only": "non-loopback",
+            "invalid_secret": "invalid-secret",
+            "member_owner_token_refused": "unverified-owner-process",
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_codes_do_not_disclose_more_than_the_error_text(
+        self, monkeypatch, fake_sel
+    ) -> None:
+        """A code restates the refusal the body already names in words.
+
+        The endpoint is reachable without a credential, so anything added to its
+        refusal body is readable by whoever could already read the ``error``
+        string. These two codes carry no fact that string does not.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: False)
+        body = json.loads((await core_mod.api_token_local(_req(remote="203.0.113.9"))).body)
+        assert body["error"] == "loopback only"
+        assert body["code"] == "loopback_only"
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        body = json.loads(
+            (
+                await core_mod.api_token_local(
+                    _req(app={"local_secret": "right"}, headers={"X-Local-Secret": "wrong"})
+                )
+            ).body
+        )
+        assert body["error"] == "invalid secret"
+        assert body["code"] == "invalid_secret"
 
     @pytest.mark.asyncio
     async def test_bad_embed_port_is_dropped(

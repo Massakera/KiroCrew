@@ -67,6 +67,7 @@ from kiro_crew.dashboard.handlers._shared import (
     pip_extra_install_command,
     read_bounded_json,
 )
+from kiro_crew.dashboard.handlers.browser_view_relay import ROUTE_PREFIX
 from kiro_crew.dashboard.handlers.core import _hot_apply_after_write
 from kiro_crew.dashboard.origin import is_direct_local_request, is_proxied_request
 from kiro_crew.dashboard.state import (
@@ -84,7 +85,11 @@ from kiro_crew.messaging.renderer import (
     display_safe_for,
     format_overflow,
 )
-from kiro_crew.messaging.transport import delivery_confirmed
+from kiro_crew.messaging.transport import (
+    DM_TARGET_PREFIX,
+    delivery_confirmed,
+    sole_direct_target,
+)
 from kiro_crew.notifications.bus import (
     NotificationPayload,
     NotificationValidationError,
@@ -491,6 +496,22 @@ async def api_spawn(request: web.Request) -> web.Response:
     omitting the flag would make ``spawn_run`` reconcile the member again and
     could close a batch wave early.
     """
+    # Owner identity is a property of a dashboard-user request: ``app == ""`` is
+    # the class ``is_owner_dashboard_request`` can rule on at all. The other two
+    # caller classes keep the control that already governs them -- an
+    # ``X-Internal-Secret`` loopback process is admitted by the constant-time
+    # secret match and reaches here with ``app`` ABSENT, and an app token is
+    # confined to its manifest's declared paths by ``_enforce_app_scope``.
+    if request.get("internal_auth") is not True and request.get("app") == "":
+        # Body-scope import, like the sibling gates in this package
+        # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+        # reaches back into sibling handler modules, so importing the helper at
+        # module scope from here would close a cycle.
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, "spawn.create")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     if not state.subagents:
         return web.json_response({"error": "subagents not available"}, status=503)
@@ -2036,8 +2057,9 @@ _CHANNEL_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 
 #: The ``configured_targets()`` prefix every transport gives a DIRECT
 #: conversation (``user:<identity>``). A ``thread:`` or room target is a
-#: different audience and is never the owner's DM.
-_DM_TARGET_PREFIX = "user:"
+#: different audience and is never the owner's DM. The one spelling lives in
+#: ``messaging.transport``, beside the owner inference that reads it.
+_DM_TARGET_PREFIX = DM_TARGET_PREFIX
 
 #: Request fields that only exist in Slack's protocol. Combined with a channel
 #: ``session`` they are refused rather than dropped: a caller that asked for a
@@ -2072,25 +2094,31 @@ def _owner_dm_target(transport: Any) -> str:
     would deliver a message the agent decided to send once N times. With no single
     answer the caller degrades to the dashboard notification, which reaches the
     operator without guessing who they are.
+
+    The inference itself is :func:`~kiro_crew.messaging.transport.sole_direct_target`,
+    shared with session control's owner-DM audience predicate so the two surfaces
+    name the same human as the owner; this wrapper adds only the enumeration guard
+    and the send-path logging.
     """
     try:
         targets = list(transport.configured_targets())
     except Exception:
         logger.warning("send_message: could not enumerate channel targets", exc_info=True)
         return ""
-    direct = [
-        str(getattr(target, "target_id", "") or "")
-        for target in targets
-        if str(getattr(target, "target_id", "") or "").startswith(_DM_TARGET_PREFIX)
-        and getattr(target, "available", False)
-    ]
-    if len(direct) == 1:
-        return direct[0]
-    if direct:
+    target = sole_direct_target(targets)
+    if target:
+        return target
+    direct_count = sum(
+        1
+        for candidate in targets
+        if str(getattr(candidate, "target_id", "") or "").startswith(_DM_TARGET_PREFIX)
+        and getattr(candidate, "available", False)
+    )
+    if direct_count:
         logger.info(
             "send_message: %d configured DM targets and no owner field, so no single "
             "recipient can be inferred; degrading to the dashboard notification",
-            len(direct),
+            direct_count,
         )
     return ""
 
@@ -4190,6 +4218,40 @@ async def api_browser_engine_install(request: web.Request) -> web.Response:
     return await api_browser_install_get(request)
 
 
+def _browser_view_payload() -> dict[str, Any]:
+    """``browser_cli_view.status()`` plus where the panel should FRAME it.
+
+    ``path`` is the dashboard-origin relay (``/browser-view/<token>/``): same
+    origin as the dashboard, so it is reachable wherever the dashboard is — an
+    SSH forward, a tunnel — with no second port. The embedded per-instance
+    capability token IS the relay's authentication (the panel frames it in an
+    opaque-origin sandbox that sends no cookies), and THIS payload — served
+    only through the cookie-authed, owner-gated view endpoints — is its sole
+    disclosure point, so possession proves the holder passed the owner gate.
+    Null unless the view is running, so the field can never frame a dead
+    relay. The absolute ``url`` stays in the payload for direct loopback use
+    and older frontends — but it is only ever published alongside a target
+    the ownership proof vouched for: when ``relay_target()`` refuses (the
+    child exited between the two lock holds, or the proof was inconclusive),
+    the whole payload degrades to ``stopped`` rather than offering the stale
+    direct ``url`` as a frameable fallback for whatever wins the freed port.
+    The panel polls, so a live view is re-reported on the next cycle.
+    """
+    payload = browser_cli_view.status()
+    if payload.get("status") != "running":
+        payload["path"] = None
+        return payload
+    target = browser_cli_view.relay_target()
+    if target is None:
+        payload["status"] = "stopped"
+        payload["url"] = None
+        payload["port"] = None
+        payload["path"] = None
+        return payload
+    payload["path"] = f"{ROUTE_PREFIX}/{target[1]}/"
+    return payload
+
+
 async def api_browser_view_get(request: web.Request) -> web.Response:
     """GET /api/browser/view -- where the Playwright CLI dashboard is served.
 
@@ -4199,12 +4261,15 @@ async def api_browser_view_get(request: web.Request) -> web.Response:
     App-token denied like the install and token routes: the reply carries the
     dashboard URL, and that URL is served WITHOUT authentication, so handing it
     to an app is handing over control of a logged-in browser. Read-only on this
-    gateway is not read-only on the browser.
+    gateway is not read-only on the browser. (The ``path`` field embeds the
+    relay's capability token — this owner-gated endpoint is that token's only
+    disclosure point, so it stays denied to apps for the same reason as the
+    raw URL.)
     """
     denied = _deny_non_owner_browser_request(request, "browser_view_status")
     if denied is not None:
         return denied
-    return web.json_response(await asyncio.to_thread(browser_cli_view.status))
+    return web.json_response(await asyncio.to_thread(_browser_view_payload))
 
 
 async def api_browser_view_start(request: web.Request) -> web.Response:
@@ -4231,7 +4296,7 @@ async def api_browser_view_start(request: web.Request) -> web.Response:
         browser_cli_view.ensure_running(pinned or None)
 
     await asyncio.to_thread(_start_view)
-    return web.json_response(await asyncio.to_thread(browser_cli_view.status))
+    return web.json_response(await asyncio.to_thread(_browser_view_payload))
 
 
 async def api_browser_open(request: web.Request) -> web.Response:
@@ -4309,7 +4374,7 @@ async def api_browser_open(request: web.Request) -> web.Response:
         browser_cli_view.ensure_running(pinned or None)
         result = browser_cli_launcher.open_url(url, session_key.strip())
         payload = result.as_dict()
-        payload["view"] = browser_cli_view.status()
+        payload["view"] = _browser_view_payload()
         return payload
 
     return web.json_response(await asyncio.to_thread(_launch))
@@ -5865,7 +5930,23 @@ async def api_teams_activity(request: web.Request) -> web.Response:
     # no-dashboard-imports property. ``on_activity`` reads the parsed dict from
     # the request mapping, so the body is parsed exactly once and never past the
     # cap.
-    body, cap_error = await read_bounded_json(request, max_bytes=TEAMS_MAX_ACTIVITY_BYTES)
+    #
+    # ``require_json_content_type=False`` is what KEEPS that true here, and is not
+    # a relaxation of this route's perimeter. The shared helper's 415 returns
+    # before a single byte is read; the ``status == 413`` filter below then drops
+    # it, because a verdict derived from body CONTENT must not precede the JWT
+    # check. The body would therefore reach ``on_activity`` unstashed and be
+    # re-parsed by its bare ``request.json()`` fallback on a stream nobody has
+    # read -- bounded only by the app-wide ``client_max_size``, not by
+    # ``TEAMS_MAX_ACTIVITY_BYTES``. Opting out means the capped read runs, so an
+    # over-cap activity is still refused 413 whatever media type it declared.
+    # Whether to REFUSE a non-JSON media type from the Connector is a separate
+    # decision about an external contract; see ``read_bounded_json``.
+    body, cap_error = await read_bounded_json(
+        request,
+        max_bytes=TEAMS_MAX_ACTIVITY_BYTES,
+        require_json_content_type=False,
+    )
     if cap_error is not None and cap_error.status == 413:
         return cap_error
     if body is not None:

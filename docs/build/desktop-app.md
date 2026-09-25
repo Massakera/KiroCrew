@@ -328,13 +328,20 @@ same way). Key details:
 - **Interpreter** is a python-build-standalone CPython 3.12 with `@executable_path`-
   relative dylib references (genuinely portable, no system Python dependency).
 - **Entry point** is `bin/kirocrew` — a shell script that execs
-  `bin/python3.12 -s -m kiro_crew "$@"`.
+  `bin/python3.12 -s -P -m kiro_crew "$@"`. `-s` drops the user site; `-P`
+  keeps the caller's working directory off `sys.path`, so a stdlib-named
+  directory there (`~/concurrent/`, `~/json/`) cannot shadow the bundled
+  standard library. The Windows `bin\kirocrew.cmd` shim, the Electron
+  supervisor's direct `python.exe` spawn, and the CI replicas of both
+  (`.github/workflows/build.yml`'s shim, the installer test's gateway spawn)
+  pass the same two flags; `test/test_stdlib_shadow.py` pins every spelling.
 - **Stdlib probes verified** — `stdlib_probe_gate` fails the build if any package
   the launcher's readiness check probes is missing from the pruned tree, so a
   drifted probe list breaks the build instead of every user's launch (see
   [How the app finds and launches the backend](#how-the-app-finds-and-launches-the-backend)).
 - **Self-containment verified** — the build script runs
-  `PYTHONNOUSERSITE=1 bin/python3.12 -m kiro_crew --version` followed by
+  `PYTHONNOUSERSITE=1 bin/python3.12 -s -P -m kiro_crew --version` (the
+  launcher's exact argv) followed by
   `PYTHONNOUSERSITE=1 bin/python3.12 -c 'import kiro_crew.cli'` to catch any
   missing dependency before packaging. Bare `--version` is a pre-dispatch
   fast-path (see `docs/system-specs/modules/cli.md`), so the import probe is
@@ -524,9 +531,58 @@ The command-palette trigger is positioned from the window midpoint rather than
 the remaining flex space, so asymmetric menu and status controls do not shift it.
 Linux retains the window manager's native frame and menu bar.
 
+#### The frameless window-drag band
+
+On every frameless platform (`IS_MAC || IS_WIN || LINUX_FRAMELESS`),
+[`window-lifecycle.js`](../../website/electron/window-lifecycle.js) injects a
+42px `-webkit-app-region: drag` band, `#electron-drag-bar`, as the FIRST child
+of `<body>`, plus a document-wide exemption list marking
+`a, button, input, select, textarea, [role="button"], [tabindex], iframe` as
+`no-drag`. The band spans the full width on macOS and stops short of the caption
+controls elsewhere: 138px from the right on Windows, 108px on frameless Linux.
+That inset is load-bearing rather than cosmetic, because a drag rectangle over
+Close moves the window instead of closing it. `body.mc-focus-mode` collapses the
+band to `0` and `body.mc-focus-mode.mc-focus-chrome` restores it, so the band
+exists exactly when a header does.
+
+Two properties of it are easy to break by accident.
+
+**The band is prepended, and a later rectangle overrides an earlier one.**
+Electron accumulates the window's draggable region from element rectangles,
+unioning the `drag` ones and subtracting the `no-drag` ones in the order the
+renderer reports them, so the last rectangle over a pixel decides. The band goes
+at the front of the body so the app's own exemptions come after it and subtract
+from it; at the end it would re-add the whole strip on top of all of them. Two
+in-tree notes record that ordering from real windows: `.host-drag-strip`
+elements rendered after a remote pane's iframe re-add drag where the iframe's
+blanket `no-drag` took it away (`InstancesViewport`), and a full-width `drag`
+block following a `no-drag` button swallowed that button's lower half in the
+companion panel (`PanelCard`). Chromium contracts none of this, which is why the
+check below is manual.
+
+**The exemption list is document-wide on purpose.** `app-region` is resolved
+geometrically rather than by DOM containment, so a control anywhere in the page
+that merely overlaps the band needs `no-drag` to stay clickable. A list scoped
+to the bar's own subtree could not express that.
+
+Plain text is not exempt, so text under the band is unselectable and shows an
+arrow cursor. That is the deliberate half of the trade, and the failure on the
+other side is a window that cannot be moved. No conversation text is under the
+band in practice: docked, the band covers the top bar;
+in focus mode without chrome it is `0`; with the chrome peeked the transcript
+scroller carries `tabIndex={-1}`
+([`TranscriptScrollShell.tsx`](../../website/src/pages/chat/TranscriptScrollShell.tsx)),
+matches the exemption list, and subtracts its own column from the band. So
+widening the exemption to text, or narrowing the band's reach, would spend
+draggability on text the band does not cover.
+[`shell-contract.test.js`](../../website/electron/test/shell-contract.test.js)
+pins the five parts a change could silently drop: the 42px height, the
+per-platform right inset, the focus-mode collapse, the prepend, and `[tabindex]`
+together with the scroller attribute it keys on.
+
 #### Focus mode: verify these seams after an Electron or Radix bump
 
-Focus mode (hide the shell chrome behind hover) rests on three mechanisms that
+Focus mode (hide the shell chrome behind hover) rests on four mechanisms that
 key on behavior no API contract guarantees, and each fails **silently** — the
 unit tests mock these seams, so a broken one still passes CI and only manual
 macOS testing catches it. Run this short checklist whenever you bump Electron or
@@ -556,6 +612,16 @@ Radix (`website/electron/package.json`, `@radix-ui/*` in `website/package.json`)
    the ARIA a trigger emits (`aria-haspopup` absent, or `aria-expanded="true"`
    emitted by default with nothing open), the header either slides away under the
    open menu or pins permanently from first paint.
+4. **Peek the header, then try to select conversation text in the top 42px, and
+   try to drag the window from that same strip.** Exercises the drag band
+   described above: peeked, it is 42px again, and the transcript scroller's
+   `tabIndex={-1}` is what subtracts it over the conversation. Text there should
+   select with an I-beam cursor, and the peeked header's own empty regions should
+   still move the window. If a bump changes the order in which Chromium reports
+   app-region rectangles, one of those two stops working: either the top strip of
+   the conversation goes dead and shows an arrow cursor, or the header no longer
+   drags. A headless display cannot answer this one, because the region set is
+   resolved by the window rather than by the page.
 
 ### `find-bin.js` — locating the binary
 

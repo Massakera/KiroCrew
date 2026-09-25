@@ -374,6 +374,28 @@ def _deny_foreign_app(request: web.Request, slot: _ChatSlot, operation: str) -> 
     return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
 
 
+async def threads_enabled() -> bool:
+    """Whether ``dashboard.crewmate_threads`` is on, read live.
+
+    The watcher's snapshot when it has one (a plain attribute read), else a disk
+    load off the loop. The flag is off by default; nothing about a thread is
+    served, stored or sent while it is off.
+    """
+    from kiro_crew.config import live
+
+    cfg = live.snapshot()
+    if cfg is None:
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    return bool(cfg.dashboard.crewmate_threads)
+
+
+def _feature_off() -> web.Response:
+    # The same shape the app-isolation refusal answers with, so a caller cannot
+    # tell "threads are off" from "no such slot": the feature's presence is not
+    # enumerable.
+    return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+
 def _resolve_slot(
     request: web.Request, state: DashboardState, slot_key: str, operation: str
 ) -> tuple[_ChatSlot | None, web.Response | None]:
@@ -431,6 +453,8 @@ async def api_chat_threads_summary(request: web.Request) -> web.Response:
     read path stays unchanged, and the footer data is small enough to fetch
     beside it.
     """
+    if not await threads_enabled():
+        return _feature_off()
     state: DashboardState = request.app["state"]
     slot, refused = _resolve_slot(
         request, state, request.query.get("slot", ""), "chat.threads_summary"
@@ -447,6 +471,8 @@ async def api_chat_threads_summary(request: web.Request) -> web.Response:
 
 async def api_chat_thread_detail(request: web.Request) -> web.Response:
     """GET /api/chat/threads/{mid}?slot=<key> -- one thread: parent + replies."""
+    if not await threads_enabled():
+        return _feature_off()
     state: DashboardState = request.app["state"]
     mid = request.match_info["mid"]
     if not _valid_mid(mid):
@@ -487,6 +513,8 @@ async def api_chat_thread_reply(request: web.Request) -> web.Response:
     wire -- re-sends the same id and gets the stored reply back, never a second
     row and a second turn.
     """
+    if not await threads_enabled():
+        return _feature_off()
     state: DashboardState = request.app["state"]
     mid = request.match_info["mid"]
     if not _valid_mid(mid):

@@ -75,7 +75,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -90,24 +90,31 @@ from kiro_crew.agent import (
 from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
 from kiro_crew.agent_sdk.mcp_refs import parse_tools_refs
 from kiro_crew.env import sanitize_spec_env
-from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS, mcp_entry_is_muted
+from kiro_crew.mcp_cleanup import (
+    CONTROL_PLANE_SERVERS,
+    KIROCREW_BIN_MCP_SERVERS,
+    mcp_entry_is_muted,
+)
 
 logger = logging.getLogger(__name__)
 
-# Crew's own control plane. Re-derived from the managed source of truth on every
-# spawn so a stale hand-edited command in the spec cannot cost a claude session
-# the tools it needs to report back to its channel at all. Both are always-on
-# (no gate, not opt_in), so ``managed_mcp_spec_entry`` returns them unless the
-# install is broken. Re-derived, not read from the spec, is also what keeps them
-# out of the registry filter below: they are the host's own process, not a
-# third-party server the admin's catalog governs.
+# Crew's own control plane, defined in the ``mcp_cleanup`` leaf and re-exported
+# here. Re-derived from the managed source of truth on every spawn so a stale
+# hand-edited command in the spec cannot cost a claude session the tools it needs
+# to report back to its channel at all. Both are always-on (no gate, not
+# opt_in), so ``managed_mcp_spec_entry`` returns them unless the install is
+# broken. Re-derived, not read from the spec, is also what keeps them out of the
+# registry filter below: they are the host's own process, not a third-party
+# server the admin's catalog governs.
 #
-# PUBLIC because the codex projection carries this session's identity onto these
-# two entries and onto NOTHING else. Naming the same tuple twice is how the two
-# decisions drift apart, and the safety of that carriage rests on this being the
-# set the loop below REPLACES from the managed source: the element's command, args
-# and env are Crew's own by construction, not the spec's.
-CONTROL_PLANE_SERVERS = ("kirocrew-core", "kirocrew-cron")
+# PUBLIC on this module because the codex projection carries this session's
+# identity onto these two entries and onto NOTHING else, and the safety of that
+# carriage rests on this being the set the loop below REPLACES from the managed
+# source: the element's command, args and env are Crew's own by construction, not
+# the spec's. The definition sits in the leaf so a consumer the agent-SDK import
+# boundary keeps off ``kiro_crew.acp`` -- the broker-stub ceiling in
+# ``mcp_gateway.session_servers`` -- reads the same tuple rather than a second
+# copy of it.
 
 # Every managed Crew server that must be handed the session's IDENTITY when it
 # is mounted -- a wider set than the control plane above, and a different
@@ -335,7 +342,9 @@ def _project_spec_path_for(agent: str, work_dir: str | Path | None) -> Path | No
     if not work_dir:
         return None
     try:
-        for spec in project_agent_files(work_dir):
+        for spec in project_agent_files(
+            work_dir, operation="session_mcp_project_agent", source="unknown"
+        ):
             if project_agent_name(spec) == agent:
                 return spec
     except OSError:
@@ -931,6 +940,19 @@ def _managed_element_env(declared: Any) -> dict[str, str]:
     return env
 
 
+def _declared_launch(source: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """``(command, args)`` as a spec or settings entry declares them, for comparison.
+
+    A non-sequence ``args`` (``8080``, ``"--flag"``) reads as no args rather than
+    being iterated: it cannot equal the managed launch either way, and raising
+    here would abort ``session/new`` over a typo the module's own rules say must
+    not raise (see :func:`acp_server_element`).
+    """
+    raw_args = source.get("args")
+    args = [str(a) for a in raw_args] if isinstance(raw_args, (list, tuple)) else []
+    return str(source.get("command", "") or ""), args
+
+
 def kiro_control_plane_servers(
     agent: str | None,
     *,
@@ -992,12 +1014,45 @@ def kiro_control_plane_servers(
             or source.get("type", "stdio") != "stdio"
             or mcp_entry_is_muted(source)
             or source.get("disabledTools", []) != []
-            or ("command" in source and source["command"] != managed.get("command"))
-            or ("args" in source and source["args"] != managed.get("args", []))
             for source in sources
         ):
             continue
-        owned = {**entry, "env": _managed_element_env(entry.get("env"))}
+        # The launch is the managed source's, never the spec's. A hand-authored
+        # command for a reserved name cannot be right across users or upgrades
+        # (the managed path carries the home and the installed version; the one
+        # writable spelling, bare ``kirocrew``, resolves to the Toolbox
+        # dispatcher), and skipping such an entry cost the session every
+        # control-plane tool while the server looked mounted. The
+        # module docstring already states the rule -- "re-derived from the
+        # managed source of truth on every spawn so a stale hand-edited command
+        # in the spec cannot cost a claude session the tools it needs" -- and the
+        # codex/opencode projections REPLACE the same way; this applies it here.
+        # Restrictions (mute, ``disabledTools``, non-stdio) still withhold above:
+        # they narrow the grant, which stays the spec's; only the invocation is
+        # ours. Only a sequence is iterated, as in ``acp_server_element``: the
+        # spec is hand-editable JSON, so ``"args": 8080`` is an easy thing to
+        # write, and it must read as "not the managed launch", not abort
+        # ``session/new`` with a TypeError from inside a comprehension.
+        declared = [
+            _declared_launch(source)
+            for source in sources
+            if isinstance(source, dict) and ("command" in source or "args" in source)
+        ]
+        managed_launch = _declared_launch(managed)
+        if any(launch != managed_launch for launch in declared):
+            logger.warning(
+                "session MCP: agent %r declares reserved server %r with a command that is"
+                " not the managed invocation; mounting the managed one so the gateway can"
+                " attest it",
+                agent,
+                name,
+            )
+        owned = {
+            **entry,
+            "command": managed_launch[0],
+            "args": list(managed_launch[1]),
+            "env": _managed_element_env(entry.get("env")),
+        }
         element = acp_server_element(name, owned)
         if element is not None:
             out.append(element)

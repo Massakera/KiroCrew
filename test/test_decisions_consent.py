@@ -24,6 +24,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -258,6 +259,7 @@ class TestWrite:
             "tool_args": False,
             "compaction": False,
             "memory_text": False,
+            "nudge_evidence": False,
         }
         assert consent.permits(CUSTOM) is True
         assert consent.permits(DEFAULT_ENDPOINT) is False
@@ -276,6 +278,7 @@ class TestWrite:
             "tool_args": False,
             "compaction": False,
             "memory_text": False,
+            "nudge_evidence": False,
         }
         assert consent.permits(CUSTOM) is False
 
@@ -290,6 +293,7 @@ class TestWrite:
             "tool_args": False,
             "compaction": False,
             "memory_text": False,
+            "nudge_evidence": False,
         }
 
     def test_records_the_history_ceiling_it_was_given(self, keystone):
@@ -524,6 +528,7 @@ class TestHandler:
             "tool_args": False,
             "compaction": False,
             "memory_text": False,
+            "nudge_evidence": False,
             # One row per point this build ships, projected from the seam's own
             # registry so the card lists what the gate will answer for. Nothing is
             # sent on this keystone, so every status is the effective ``off``.
@@ -765,6 +770,7 @@ class TestHandler:
             tool_args=False,
             compaction=False,
             memory_text=False,
+            nudge_evidence=False,
         ):
             seen.append(history_budget_chars)
             return real(
@@ -774,6 +780,7 @@ class TestHandler:
                 tool_args=tool_args,
                 compaction=compaction,
                 memory_text=memory_text,
+                nudge_evidence=nudge_evidence,
             )
 
         monkeypatch.setattr(consent, "save_enabled", _spy)
@@ -1320,6 +1327,7 @@ class TestPointProjection:
             consent.STATE_KEY_TOOL_ARGS,
             consent.STATE_KEY_COMPACTION,
             consent.STATE_KEY_MEMORY_TEXT,
+            consent.STATE_KEY_NUDGE_EVIDENCE,
         }
 
     @pytest.mark.asyncio
@@ -1428,7 +1436,7 @@ class TestPointProjection:
 
     @pytest.mark.asyncio
     async def test_status_is_the_effective_answer_and_a_missing_scope_says_so(
-        self, keystone, audit, configured
+        self, keystone, audit, configured, monkeypatch
     ):
         """Three statuses, and the middle one is the reason it is not a boolean.
 
@@ -1437,6 +1445,18 @@ class TestPointProjection:
         word that sends a reader back to the main switch they already turned on.
         """
         from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_get
+
+        # The judge is the one point with TWO lanes, and only its Jev lane answers to a
+        # scope. Left on the default ``auto`` it lands on the small model when Jev is
+        # unarmed, so a keystone recording no scope leaves the row reporting something
+        # other than ``needs_scope`` and the sweep below would have to subtract it out.
+        # Subtracting is how a universal assertion stops being universal: the next
+        # point somebody scopes inherits the exemption silently. Pinning the lane that
+        # the scope governs makes the judge answer the same question every other row
+        # answers, and its small-model lane is asserted in ``test_decisions_judge_llm``.
+        monkeypatch.setattr(
+            _gate_module(), "_judge_config", lambda config=None: SimpleNamespace(provider="jev")
+        )
 
         async def _get():
             return await api_decisions_consent_get(_request())

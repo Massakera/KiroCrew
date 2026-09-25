@@ -68,9 +68,13 @@ overlay markers and preserves unrelated settings and a native key that the
 operator changed or removed. Older overlays use their recorded local/global
 source and boolean preference for restoration. Stop projected sessions before
 rollback so another active Crew process cannot reassert the shared overlay.
-Inactive aliases owned by the same Crew data home are pruned only when the
-recorded work directory or authored source proves that the pair cannot be
-regenerated. Aliases published by builds that predate this lifecycle carry NO
+Inactive aliases owned by the same Crew data home are pruned when no projection
+in this process holds them and no held lease in any process names them. The
+recorded work directory is provenance, not a liveness proof: a per-run work
+directory (`workspace_root()/subagent_<id>`, `cron_<id>`) outlives its run, so a
+reclaim keyed on its existence keeps one alias per agent for every run ever
+spawned. Each run caps reclaims at `_PRUNE_MAX_RECLAIMS_PER_RUN` plus the number
+of aliases it publishes. Aliases published by builds that predate this lifecycle carry NO
 record of either kind, so an ownership-keyed reclaim alone would leave the entire
 accumulated backlog on disk and bound only post-upgrade growth -- which is the
 per-turn tool-spec cost this exists to remove. Those are reclaimed on a separate
@@ -103,21 +107,34 @@ this agents directory sees the same eviction-then-republish rather than the
 home-scoped skip a recorded alias gets. Every other gate still applies to it:
 this run's own set, live in-process projections and held leases are all checked
 first, and removal is identity-checked against the bytes and inode just read.
-Reclaims are capped PER RUN rather than per candidate examined: the first prune
-after an upgrade faces the whole accumulated backlog, and it runs while the
-publication lock is held, whose own acquisition ceiling is 2s — draining
-thousands of files in one sweep would make a concurrent spawn fail to acquire and
-fall back to authored agents. The backlog is bounded and shrinking, so spreading
-it over successive spawns reclaims it just as completely. Projected agent JSON contains only fields accepted by Kiro's strict
+The prune runs while the publication lock is held, which is what keeps a deletion
+from landing on an alias a publisher that takes the same lock is writing. That
+lock's acquisition ceiling is fixed, so one call's classification work carries a
+time budget. It is a BETWEEN-candidate budget, not a bound on the section: it is
+read before each candidate, so it limits how many are walked and not how long any
+single one takes, and the directory enumeration that precedes the walk is outside
+it. Reclaims are capped per run as well, but that cap is a ceiling and never a
+floor, and it bounds no part of the section — a candidate that is kept, active or
+leased costs a full classification and never increments it, so a backlog of
+entirely unreclaimable entries was walked in full while the lock was held.
+Per-candidate cost is not flat either, since the lease probe rescans the lease
+directory for every candidate. Each call starts at a rotating offset into the
+candidate list: a budgeted walk from a fixed start examines the same prefix every
+time, so entries that are kept, active or leased at the front of the directory's
+own order would hide the whole reclaimable remainder behind them permanently. The
+offset is drawn per call rather than remembered, since the workload this bounds
+spawns a fresh process per run and a process-local cursor would restart at zero
+every time. Drawing it makes reach across successive spawns probabilistic rather
+than scheduled: the backlog is bounded and shrinking, and every entry is reached
+in expectation, but no single spawn is promised any particular entry. Projected agent JSON contains only fields accepted by Kiro's strict
 schema; lifecycle ownership lives in the non-spec
 `.kirocrew-skill-projection-metadata` directory. Each sidecar records the alias's
 exact byte digest, so a stale or replaced sidecar cannot authorize deletion of a
 different spec. No released build ever wrote lifecycle fields INTO a spec --
 kiro-cli denies unknown fields, so the projection never could -- and an alias
-without a sidecar is judged by the unrecorded path above instead. On Windows, untrusted metadata paths must resolve to a classified
-local volume with no linked ancestor or linked leaf before any existence probe;
-remote, unclassifiable, or linked paths retain the alias without triggering a
-network lookup. Each live projection publishes one bounded lease in the non-spec
+without a sidecar is judged by the unrecorded path above instead. The recorded
+work directory and source paths are never probed, so untrusted metadata cannot
+trigger a filesystem or network lookup. Each live projection publishes one bounded lease in the non-spec
 `.kirocrew-skill-projection-leases` directory as TWO files: a `.json` record
 naming its aliases, which is never locked, and a `.hold` sidecar that carries the
 lock for the projection object's lifetime and is never read. The split is
@@ -138,17 +155,52 @@ Alias publication and pruning share one cross-process lock sidecar in the native
 agents directory, with a two-second acquisition ceiling instead of the platform
 lock's general five-minute ceiling. A sidecar that is a symlink or junction,
 changes identity while opened or acquired, or is otherwise unverifiable is
-treated as lock failure. Removal revalidates the candidate's identity, bytes,
-digest-bound ownership sidecar, and source staleness under that lock immediately before
+treated as lock failure. Removal revalidates the candidate's identity, bytes and
+digest-bound ownership sidecar under that lock immediately before
 unlinking it. POSIX uses descriptor-relative identity-checked deletion; Windows
 uses the same global publisher lock plus a final no-link identity check before
 its by-name unlink. An unknown platform without either contract retains the
-stale alias. A changed, unreadable, oversized, or otherwise uncertain candidate
+unused alias. A changed, unreadable, oversized, or otherwise uncertain candidate
 remains on disk. If the lock cannot be opened or acquired, preparation retains
 every alias and the current settings file byte-for-byte, then falls back to the
 authored native agent rather than risking a stale-snapshot overwrite or blocking
 startup. Active, foreign-home, unmarked, malformed, unreadable, oversized or
 otherwise uncertain alias files remain on disk.
+
+`kirocrew doctor`'s Agents Directory section reports the census read-only,
+through `census_projected_aliases` in this module, reached over the
+`agent_sdk.drivers.acp` seam like the doctor's other backend reads, so the
+record shapes stay here; the lease record itself is parsed by the one
+`_read_lease_record` the liveness probe also uses, and the data-home identity
+the `foreign_home` split is judged against is resolved inside the census with
+the publisher's own spelling, so no caller can hand it a differently normalised
+id. It counts how many `kirocrew-skill-view-*.json` aliases the directory
+holds, how many a lease record names, how many -- among the named and the
+unnamed separately -- an ownership sidecar attributes to another Kiro Crew data
+home (two homes share this directory whenever they share `~/.kiro`), and how
+many lease records are unreadable; a record nested past the interpreter limit
+reads as unreadable rather than aborting, for the probe and the census alike.
+What the census retains is bounded (`_CENSUS_MAX_ALIASES`,
+`_CENSUS_MAX_LEASES`, the diagnostic's own memory and I/O budget) and a hit
+bound is reported as `truncated`: the measured counts are then floors, the
+derived ones (not-named, this home's share) are not printed, and because an
+unscanned record could be the unreadable one that stops the reclaim, the report
+says reclaimability is unknown rather than promising a drain. A backlog left by a build that predates the reclaim is
+thereby visible without `ls`, and its drain can be watched across spawns. Above
+`_SKILL_VIEW_BACKLOG_WARN` (2,000; a healthy host carries live sessions x
+authored agents, a few hundred) it warns and says exactly which share the
+reclaim covers: this home's unreferenced aliases, a bounded number per spawn;
+this home's lease-named aliases are described as kept while their lease is
+held (the census probes no lock, so a crash-stale record is indistinguishable
+from a held one and is reclaimed on the next spawn's probe); aliases another
+data home owns, leased or not, never drain here; and while a lease record is
+unreadable nothing is reclaimed, which the report states instead of promising a
+drain. The manual fallback -- moving the aliases and their metadata directory
+out with the gateway stopped, or with every gateway that uses the directory
+stopped once another home's aliases are present -- is named without being
+performed and without suggesting a delete: the doctor
+cannot prove who authored a file that merely carries the prefix, and a move is
+undoable.
 
 Windows runtime teardown records the reaped return code after the owned-handle
 drain, before dropping the process reference, just as POSIX teardown does. The
@@ -276,7 +328,7 @@ cancelled caller still lets the worker settle).
   "params": { "sessionId": "...", "options": [PermissionOption], "toolCall": ToolCallUpdate } }
 ```
 
-**Unknown server→client requests are answered, never dropped.** `session/request_permission` is the only inbound *request* Kiro Crew implements. Any other server→client request (method **and** id — e.g. `fs/read_text_file`, `terminal/create`) is classified by `_process_message` as `"server_request_unknown"`. Every prompt dispatch site (`send_message_stream`, `_dispatch_events`, `_read_prompt_response`) handles that action by calling `_reject_unknown_server_request`, which replies with a JSON-RPC `-32601` (`JSONRPC_METHOD_NOT_FOUND`, "Method not found") error via `_send_error`. Without this, JSON-RPC semantics leave the agent blocked forever on an unanswered request — the turn hangs. Notifications (method, no id) are unaffected and still classified `"skip"`.
+**Unknown server→client requests are answered, never dropped.** `session/request_permission` is the only inbound *request* `AcpClient` implements. `AcpSessionHandle` serves three more, all KAS-specific: `_kiro/hooks/list`, `_kiro/hooks/sessionStart` and `_kiro/hooks/executeHook`, answered from `acp/kas_wire.py` (see agent-host-contract.md, which states the four gates `executeHook` passes before anything spawns). They are matched in that handle's own dispatch loop, ahead of the shared classifier, precisely so the classifier keeps reporting them as unknown on the `AcpClient` path — which serves no hooks surface, and where naming an action no branch handles would leave the request unanswered instead of refused. Any other server→client request (method **and** id — e.g. `fs/read_text_file`, `terminal/create`) is classified by `_process_message` as `"server_request_unknown"`. Every prompt dispatch site (`send_message_stream`, `_dispatch_events`, `_read_prompt_response`) handles that action by calling `_reject_unknown_server_request`, which replies with a JSON-RPC `-32601` (`JSONRPC_METHOD_NOT_FOUND`, "Method not found") error via `_send_error`. Without this, JSON-RPC semantics leave the agent blocked forever on an unanswered request — the turn hangs. Notifications (method, no id) are unaffected and still classified `"skip"`.
 
 `PermissionOption` field names differ between backends — kiro-cli uses `id`/`label`, claude-agent-acp uses `optionId`/`name` (per the public ACP spec). `_build_permission_event` reads both and remembers the optionIds keyed by `kind` (`allow_once`/`allow_always`/`reject_once`/`reject_always`) on the request id — recording an entry when **either** an allow option (for `approve_tool`) **or** a reject option (for a clean `reject_tool`) was advertised. `approve_tool(request_id, *, always=False)` echoes the matching allow id back, so the host doesn't need to know whether it's talking to kiro (`"allow_once"`/`"allow_always"`) or claude-agent-acp (`"allow"`/`"allow_always"`). `reject_tool` prefers a **clean reject**: if a reject optionId was advertised it sends `outcome: "selected"` with that id. Both backends advertise one — claude-agent-acp as `{kind:"reject_once", optionId:"reject"}` (→ `behavior:"deny"`), kiro-cli as `{kind:"reject_once", optionId:"reject_once"}` — and the fallback to `outcome: "cancelled"` therefore only applies to a backend that advertises no reject option at all. The distinction is load-bearing, not cosmetic: a clean reject resolves the tool call to `status:"failed"` with kiro-cli's fixed content `"User denied tool execution"` and the turn continues to the next model-inference boundary (`stopReason: "end_turn"`), whereas `cancelled` ends the turn immediately with `stopReason: "refusal"` and no text — and drops any queued `_session/steer` as `AgentExecutionUserMessageCleared`. That is why the host's in-band deny notice (`_steer_policy_notice`) can only be folded in on the clean-reject path, and why `stopReason: "refusal"` is NOT by itself evidence of a model-side content refusal.
 
@@ -547,6 +599,36 @@ The resume ID is consumed on attempt (no retry loop). After successful load,
 
 Step 3 (`set_mode`) is **conditional**: sent for all kiro-cli backend agents.
 Skipped for claude-agent-acp backend (which does not support set_mode).
+Two of the guards in front of it, on `session/new` and `session/load` alike,
+end the session rather than let it run as a different agent. Guard (A): when
+the response advertises a `modes` list, the requested agent must be in it
+(`AcpRuntime._mode_available`); an absent id is refused naming the spec file
+and `kirocrew setup --agent-only`, never silently left on the host's default
+mode. Guard (C): the shared runtime asks its harness
+`activation_refusal(agent, resp)` (harness-parity H13: a seam, not a backend
+test); the spawn-time hosts answer `None`, and the KAS harness reads the
+advertised entry's `_meta.kiro.resource.source.origin`
+(`_dispatch.advertised_mode_origin`). The value `bundled` -- the one stamp
+MEASURED on kiro-cli 2.23.0 for the engine's own agents -- means the engine kept
+its OWN built-in under that id and discarded the `customAgents` definition; a
+`set_mode` would succeed and run the built-in under the crewmate's name, so the
+harness answers the refusal text -- the id is reserved for a built-in agent,
+plus the crewmate-side remedy in the dashboard's own labels (the Agent Template
+tab; on the crewmate's own copy 'Save as new template…' under another name or
+'Reset my changes'; on a shared template -- one created under a reserved id
+before the refusal existed, where neither control renders -- the template
+picker at the top of the tab), in plain words with no wire vocabulary or
+session id, the id in curly quotes as the dialogs render it. Only that measured stamp refuses: an absent stamp (kiro-cli,
+the offline fake, an older engine) is not evidence and never refuses, and a
+positive stamp this code has never measured (an engine that renames `client`)
+is logged at WARNING and let through, because kiro-cli is the operator's own
+install, not pinned by Crew, and an unmeasured value must not become a
+session-start denial of every crewmate with a rename remedy that cannot help.
+The ids measured to trip (C) on kiro-cli 2.23.0 are refused before the wire by
+the projection (`agent_files.KAS_RESERVED_AGENT_IDS`); (C) is the read of the
+wire itself, so a built-in a later engine adds under a new id fails loudly
+instead of resurrecting the silent substitution. (Guard (B) is the spawn-flag check for a markdown-only spec on a
+JSON-only host, `_spawn_agent_not_loaded_reason`.)
 
 Step 4 (`set_model`) is **conditional**: only sent when `model` is explicitly
 set (i.e., for the default kirocrew agent).  Custom agents skip this so
@@ -1267,7 +1349,13 @@ The coordinator is keyed by event loop so embedded/test loops never share an
 `asyncio.Semaphore`; cancellation while queued or starting returns the permit,
 and the existing spawn guard still kills a subprocess when initialization is
 cancelled or fails. It uses only asyncio/threading primitives and has no POSIX-only
-behavior.
+behavior. A spawn-level `OSError` gets exactly one retry after two seconds while
+holding its permit: this bridges a Kiro CLI self-update that replaces its executable
+in place without exceeding the cold-start cap. The post-exec shim retries its own
+`execv` on `ENOENT`/`ETXTBSY` (six tries over two seconds), so the same replacement
+window does not surface as an exec failure on the shim path, where the parent's
+spawn has already succeeded and only exit 127 would be left to report it.
+Authentication, protocol, and configuration errors are not retried.
 
 Structured `acp_cold_start` logs distinguish queue wait and spawn, and include
 bounded active/queued counts, outcome, duration, backend class, and coarse process
@@ -1397,14 +1485,17 @@ The `audit_source` constructor param of `AcpClient` (default `None`) tags a clie
 `_send_prompt()` auto-detects image file paths in messages (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`) via regex. When a valid image path is found:
 
 1. Reads the file (paths over `MAX_IMAGE_BYTES` = 10 MB stay as text, not inlined)
-2. Downscales so the longest edge is <= `MAX_IMAGE_EDGE_PX` (2000 px), preserving aspect ratio and re-encoding to the same format (an oversized GIF becomes a PNG still frame)
-3. Shrinks further while the base64 payload still exceeds `MAX_IMAGE_B64_BYTES` (5 MiB), stopping at `MIN_IMAGE_EDGE_PX` (256 px)
-4. Base64-encodes the (possibly downscaled) bytes
-5. Appends an image content block: `{"type": "image", "data": "<base64>", "mimeType": "image/png"}`
-6. Replaces the path in the text with `[image: filename.png]`
-7. Sends both text and image blocks in the `prompt` array
+2. Identifies the raster type from its leading bytes; unsupported or truncated content stays as a path
+3. Downscales so the longest edge is <= `MAX_IMAGE_EDGE_PX` (2000 px), preserving aspect ratio and re-encoding according to the decoded format (an oversized GIF becomes a PNG still frame)
+4. Shrinks further while the base64 payload still exceeds `MAX_IMAGE_B64_BYTES` (5 MiB), stopping at `MIN_IMAGE_EDGE_PX` (256 px)
+5. Base64-encodes the (possibly downscaled) bytes
+6. Appends an image content block with the content-derived `mimeType`
+7. Replaces the path in the text with `[image: filename.png]`
+8. Sends both text and image blocks in the `prompt` array
 
 This leverages kiro-cli's `promptCapabilities.image: true` capability. The LLM receives the image inline — no tool call needed.
+
+The suffix selects only which paths are candidates. `messaging.raster.sniff_raster_mime` derives the wire media type from the file content, and Pillow verifies the complete container when available. A real image with a misleading name is still inlined with truthful metadata; non-raster, unsupported, or truncated content fails closed and remains a path that a tool-capable agent can inspect.
 
 **Dimension backstop** (`build_prompt_blocks` in `acp/prompt_blocks.py`). This shared builder is the single funnel every channel's images cross before reaching kiro-cli, so the `MAX_IMAGE_EDGE_PX` (2000 px) downscale runs for all of them — dashboard upload/paste/screenshot, Slack, Discord. Anthropic rejects the ENTIRE request when a many-image conversation (>20 images) carries any image over 2000 px on a side; because kiro-cli replays the full message history every turn, one oversized image would otherwise sit at a fixed history index and wedge the session permanently (a follow-up resize cannot evict the original). The browser's client-side resize (1568 px, `website/src/utils/resizeImage.ts`) is a token-cost optimization on top; this server-side cap is the correctness guarantee that still holds when that resize is skipped or bypassed (e.g. the native `/api/screenshot` capture, or non-dashboard channels).
 

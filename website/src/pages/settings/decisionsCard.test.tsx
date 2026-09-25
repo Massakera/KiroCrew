@@ -55,14 +55,22 @@ const pointsOf = (
   compaction = false,
   memoryText = false,
   judgeProvider = 'auto',
+  nudgeEvidence = false,
 ) => {
   const granted: Record<string, boolean> = {
     tool_args: toolArgs,
     compaction,
     memory_text: memoryText,
+    nudge_evidence: nudgeEvidence,
   }
   const status = (scope: string | null) =>
     !enabled ? 'off' : scope && !granted[scope] ? 'needs_scope' : 'active'
+  // The gate's own resolution, not a second reading of the switch: `auto` picks Jev
+  // when Jev is ARMED -- consent plus this point's scope -- and the small model
+  // otherwise, so a pinned lane is honoured and `auto` follows the grant.
+  const jevArmed = enabled && nudgeEvidence
+  const judgeLane =
+    judgeProvider === 'jev' ? 'jev' : judgeProvider === 'llm' ? 'llm' : jevArmed ? 'jev' : 'llm'
   return [
     { id: 'skills.select', needs_scope: null, status: status(null) },
     { id: 'tool.risk', needs_scope: 'tool_args', status: status('tool_args') },
@@ -70,16 +78,19 @@ const pointsOf = (
     { id: 'model.route', needs_scope: null, status: status(null) },
     { id: 'compaction.keep', needs_scope: 'compaction', status: status('compaction') },
     { id: 'memory.recall', needs_scope: 'memory_text', status: status('memory_text') },
-    // The judge, whose row the gateway resolves from the LANE as well as the keystone:
-    // its small-model lane needs neither the endpoint consent nor a scope, so that lane
-    // reports active with the switch off. `auto` reaches it too while this build
-    // registers no scope for the point -- the gate resolves `auto` against Jev being
-    // ARMED, and an unregistered scope is not armed.
+    // The judge, whose row the gateway resolves from the LANE as well as the keystone.
+    // Its small-model lane needs neither the endpoint consent nor a scope, so that lane
+    // reports active with the switch off. The Jev lane sends this point's own evidence,
+    // so it runs only on the `nudge_evidence` scope, and `auto` resolves the same way
+    // the gate's own resolver does -- against whether Jev is ARMED, which is consent
+    // plus that grant. Present here because this fixture stands in for the gateway's
+    // `DECISION_POINT_NAMES` projection, and a fixture that omits a shipped point lets
+    // its row and its switch go untested -- which is how the missing switch reached QA.
     {
       id: 'nudge.wake',
-      needs_scope: null,
-      lane: judgeProvider === 'jev' ? 'jev' : 'llm',
-      status: judgeProvider === 'jev' ? (enabled ? 'needs_scope' : 'off') : 'active',
+      needs_scope: 'nudge_evidence',
+      lane: judgeLane,
+      status: judgeLane === 'jev' ? status('nudge_evidence') : 'active',
     },
   ]
 }
@@ -100,11 +111,14 @@ const consentOf = (enabled: boolean, overrides: Partial<DecisionsConsentData> = 
   compaction: false,
   // And the recalled-memory scope, false on the same terms.
   memory_text: false,
+  // The wake judge's evidence scope, false on the same terms.
+  nudge_evidence: false,
   points: pointsOf(
     enabled,
     overrides.tool_args === true,
     overrides.compaction === true,
     overrides.memory_text === true,
+    overrides.nudge_evidence === true,
   ),
   ...overrides,
 })
@@ -123,6 +137,7 @@ const SCOPE_POINT: Record<string, string> = {
   tool_args: 'Risky tool-call notes',
   compaction: 'Which tool calls a compaction would keep (measured only)',
   memory_text: 'Which recalled memories reach the prompt',
+  nudge_evidence: 'Quiet check-ins: wake or skip',
 }
 
 /** The accessible name of each scope's consent switch, as the card labels it. */
@@ -131,7 +146,10 @@ const SCOPE_SWITCH: Record<string, string> = {
   compaction: 'Also send the conversation and tool-call inputs so Jev can score compaction',
   memory_text:
     'Also send snippets of recalled memories so Jev can drop the ones that do not help',
+  nudge_evidence: 'Also send what a watching loop has found so Jev can skip a turn',
 }
+
+type ScopeName = 'tool_args' | 'compaction' | 'memory_text' | 'nudge_evidence'
 
 /**
  * Open the panel that owns a scope and hand back its switch.
@@ -141,7 +159,7 @@ const SCOPE_SWITCH: Record<string, string> = {
  * That is the shape itself, not an accident of it: the switch is the OK for THAT
  * point, and drawing it beside the main switch is what made it ambiguous.
  */
-async function openScope(scope: 'tool_args' | 'compaction' | 'memory_text') {
+async function openScope(scope: ScopeName) {
   await waitFor(() => {
     expect(pointRow(SCOPE_POINT[scope])).toBeInTheDocument()
   })
@@ -158,7 +176,7 @@ async function openScope(scope: 'tool_args' | 'compaction' | 'memory_text') {
  * one. A test asserting absence without opening the panel passes on a card that
  * offers the switch with consent withheld.
  */
-async function scopeSwitchOnPanel(scope: 'tool_args' | 'compaction' | 'memory_text') {
+async function scopeSwitchOnPanel(scope: ScopeName) {
   await waitFor(() => {
     expect(pointRow(SCOPE_POINT[scope])).toBeInTheDocument()
   })
@@ -1791,6 +1809,7 @@ describe('a refused scope write says so', () => {
     expect(note).toContain('the name and arguments of your tool calls')
     expect(note).toContain('the conversation and tool-call inputs')
     expect(note).toContain('short snippets of the memories recalled')
+    expect(note).toContain('the recent messages of the sessions a watching loop reads')
   })
 
   it('says WHICH switch could not be saved', async () => {
@@ -1840,5 +1859,50 @@ describe('a refused scope write says so', () => {
     // One notice, and it names the scope that failed and not the one beside it.
     expect(screen.getByTestId('decisions-save-error').textContent).toContain('Also send snippets of recalled memories')
     expect(screen.getByTestId('decisions-save-error').textContent).not.toContain('Also send tool-call arguments')
+  })
+})
+
+
+describe("the wake judge's point on the card", () => {
+  /* QA armed a loop against a gateway reporting `needs_scope=nudge_evidence
+   * status=off` and saw a panel with no switch at all, so the scope could not be
+   * granted from the dashboard and the feature was unreachable end to end. The
+   * switch is drawn generically from the row's own `needs_scope`, so what these
+   * assert is that every piece that lookup needs is registered: the scope's label,
+   * its description, its granted position, and the point's plain-words name.
+   */
+
+  it('draws the nudge_evidence switch on the nudge.wake panel', async () => {
+    stubGateway(consentOf(true))
+    renderSection()
+    const toggle = await openScope('nudge_evidence')
+    expect(toggle).toBeInTheDocument()
+    // Consent is on but this scope is withheld, which is the state an install that
+    // consented before the scope existed is in.
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('shows the switch already on when the scope is granted', async () => {
+    stubGateway(consentOf(true, { nudge_evidence: true }))
+    renderSection()
+    const toggle = await openScope('nudge_evidence')
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+  })
+
+  it('names the point in plain words rather than as a raw id', async () => {
+    stubGateway(consentOf(true))
+    renderSection()
+    await waitFor(() => {
+      expect(pointRow(SCOPE_POINT.nudge_evidence)).toBeInTheDocument()
+    })
+    // The fallback is `POINT_NAME[id] ?? id`, so an unregistered point renders its
+    // internal identifier to every visitor, every visit.
+    expect(screen.queryByRole('tab', { name: /^nudge\.wake$/ })).not.toBeInTheDocument()
+  })
+
+  it('withholds the switch entirely while Decisions consent is off', async () => {
+    stubGateway(consentOf(false))
+    renderSection()
+    expect(await scopeSwitchOnPanel('nudge_evidence')).toBeNull()
   })
 })

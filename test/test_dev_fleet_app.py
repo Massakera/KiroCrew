@@ -6068,7 +6068,7 @@ def test_find_cli_is_module_invocation_only(nonbundled_python_without_user_site)
     entry (its __main__), never ``kiro_crew.cli`` (no __main__ guard -> #220)."""
     import sys as _sys
 
-    assert mod._find_cli() == [_sys.executable, "-s", "-m", "kiro_crew"]
+    assert mod._find_cli() == [_sys.executable, "-s", "-P", "-m", "kiro_crew"]
 
     import subprocess as _sp
 
@@ -6997,7 +6997,7 @@ def test_find_cli_targets_kiro_crew_package(nonbundled_python_without_user_site)
     ``kiro_crew.cli`` — the latter has no __main__ guard and no-ops silently."""
     import sys
 
-    assert mod._find_cli() == [sys.executable, "-s", "-m", "kiro_crew"]
+    assert mod._find_cli() == [sys.executable, "-s", "-P", "-m", "kiro_crew"]
 
 
 def test_kiro_crew_module_entry_actually_runs():

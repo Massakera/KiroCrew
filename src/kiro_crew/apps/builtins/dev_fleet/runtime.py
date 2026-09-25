@@ -121,7 +121,7 @@ def _find_cli() -> list[str]:
     ``__main__`` also performs the SSL-cert / UTF-8-console setup that must run
     before ``kiro_crew.cli`` is imported, so it is the only correct ``-m`` entry.
     """
-    return platform_compat.isolated_python_argv("-m", "kiro_crew")
+    return platform_compat.isolated_python_argv("-P", "-m", "kiro_crew")
 
 
 # Git hardening injected as ENVIRONMENT (same precedence as `git -c`, which

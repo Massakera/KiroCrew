@@ -171,12 +171,69 @@ Auto-sizing and the runtime gate are independent guards; readings fail open
 only when neither host memory nor a finite cgroup limit is available.
 
 When enabled, the per-spawn guard adds `_startup_memory_reserve_gb` to that
-floor: the next start, unregistered claims, and the gap between estimated cost
-and observed RSS of live dedicated workers. The estimate uses the greatest of
-zero, `subagent_cost_gb` and live dedicated peak RSS. Yielded parents retain their
-reservation; queued/terminal rows and confirmed shared sessions contribute none.
-This guards rapid admissions during delayed RSS growth without counting observed
-memory twice. The claim re-entry uses the reservation taken before its await.
+floor. Two prices apply. A WARMING start -- the next one, a claim awaiting
+registration, a dedicated worker fewer than `_RSS_SAMPLES_TO_SETTLE` (2) sweeps
+have measured -- is priced at `_effective_next_start_gb`: the larger of
+`subagent_cost_gb`, the learned p90 for the run's cost bucket (`_cost_bucket`: the
+explicit agent, else the template the run inherits -- the same key `_record_cost`
+writes its samples under; `learned_cost_for` answers only that bucket's own
+dedicated p90, never another bucket's, since on a sharing-default backend a
+share-eligible agent's own bucket never forms and a heaviest-known fallback
+would price its every spawn at an unrelated figure) and any live dedicated peak,
+less the RSS it already holds. One reading can land mid-growth, so a single
+sample does not yet settle a worker. A SETTLED dedicated worker owes only the gap
+between the larger of `subagent_cost_gb` and its own peak and its observed RSS,
+so its reservation retires as RSS is observed and a learned p90 above what that
+worker needed never becomes a phantom reserve beyond the sweeps before it
+settles.
+Yielded parents retain their reservation; queued/terminal rows and confirmed
+shared sessions contribute none. This guards rapid admissions during delayed RSS
+growth without counting observed memory twice. The claim re-entry uses the
+reservation taken before its await.
+
+The learned figures reach the gate as `SubagentManager._learned_costs_gb`, one
+p90 per cost bucket, published by the reaper sweep's off-loop `_refresh_learned_cost` (once at reaper
+start, then every `_REAPER_INTERVAL`); the gate itself does arithmetic only and
+never opens the cost log on the event loop. The read is `dedicated_only`: a
+session-shared run's sample (written with `shared: true`) is a per-session share
+of one runtime, not what a start that may run as its own process will cost, and
+`compact_cost_log` keeps one FIFO window per `(agent, shared)` so shared runs can
+never evict an agent's dedicated history. Records written before the field
+existed read as dedicated -- on a backend where sharing is the default, diluted
+shares can keep a bucket's p90 low until the 50-sample window turns over; that
+window is never worse than the fallback the fix replaces and self-corrects with
+every new sample. The reserve's read leaves out samples older than
+`_SAMPLE_MAX_AGE_SECS` (30 days), so a price learned under a workload that is
+gone expires without an operator reset while a host idle for less than that
+keeps its figure; the cap's reader (`read_learned_cost`, `_host_mem_term`)
+applies no horizon and is unchanged. The log is streamed, never held whole
+(`_iter_samples`): each bucket keeps at most `window` values in a bounded deque,
+at most `_PARSE_BUCKET_CEILING` buckets are held while parsing (a memory
+ceiling, with one WARNING naming an overflow), keys longer than `_BUCKET_KEY_CAP`
+are dropped, and what is returned and held is the heaviest `_MAX_BUCKETS`
+(`cap_buckets`); compaction streams the same way. The identity is read on both
+sides of the parse and a mismatch keeps the prior state. The held map is cleared
+when the log is ABSENT (first boot, or the operator's reset), and a COMPLETE read
+of an inspectable log is authoritative -- it replaces the map, so a bucket it
+does not yield (expired past the horizon, or below `min_samples`) retires on the
+running gateway without a restart; the same fresh read serves a REPLACED log
+(`cost_log_identity`: a new inode, or a shrunk size -- the reset re-created by the
+next sample within one sweep, or a compaction rewrite). An INCOMPLETE read
+(`read_learned_costs_checked`: a refused record ended the parse early, the
+present log could not be opened, or its identity could not be inspected) is
+MERGED, so an unreached bucket keeps its figure rather than being lowered
+silently. A cancel-recovery respawn resets the run's sample count and last
+reading and bumps `_rss_generation`, which the sweep re-checks after its off-loop
+`/proc` read so a reading of the dead process cannot settle the new one. That sweep interval is also why the
+reserve must read the learned cost at all: it is the only price on a start until
+the first RSS sample, and priced at the 0.5 GB fallback a burst of ~6 GB dedicated
+runtimes each cleared the raw free-memory check and then grew into the same
+headroom together. A low-memory deferral names the per-start price, the learned
+p90 and the configured cost (log line and SEL `startup_cost_gb` /
+`learned_cost_gb`), because a p90 that outlived the roster it was measured on
+can hold the bar above what the host will clear while deferred runs record no
+new samples; the remedies are lowering `agent.spawn_min_memory_gb` or deleting
+`subagents/cost_samples.jsonl` under the data home.
 
 The adaptive growth bound is the user's ceiling itself (`user_max_concurrent`),
 with no static host prediction under it: the controller climbs on live pressure
@@ -353,10 +410,23 @@ surface is attached. Telegram implements the hook over its existing
 Approve/Deny/Trust inline keyboard (`TelegramDispatcher.deliver_spawn_approval`):
 the press resolves through the same `on_callback` `a:` path as a tool approval, so
 **Trust** grants parent-session trust via `add_trusted_session` and a later spawn
-from that session is auto-approved by the parent-trusted rung. The seam is
-in-memory only (dies with the process); the hook is registered on Telegram startup
-and unregistered on client shutdown. The per-agent `auto_approve_spawn` rung
-(issue #2381 item 2) is deferred to #4751/#4693 and is NOT added here.
+from that session is auto-approved by the parent-trusted rung. Discord implements it
+too (`DiscordDispatcher.deliver_spawn_approval`), over its existing Approve/Deny
+buttons on the same `on_interaction` `a:` path, with three differences: no Trust rung
+(standing spawn trust is granted from the dashboard), a `unified` dm_scope key is
+unaddressable and falls through, and a refused send is reported by an absent message
+id rather than an exception and is read the same way. Consulting the channels
+governance ceiling (`channel_inbound_permitted`) before anything is armed is not a
+Discord peculiarity but a requirement of the seam: every channel's press path drops a
+non-reject press under a governance deny, so a prompt posted into a denied channel
+can never be answered and its wait hands the gate a deny-by-default nobody pressed.
+The seam reads it once for every hook, before invoking one. Discord adds a single
+re-read of its own on the direct route, after the peer's DM channel is opened: that
+open is a full round trip inside the hook, so the seam's answer can go stale across a
+gap the seam cannot see. The seam is in-memory
+only (dies with the process); each hook is registered on its channel's startup and
+unregistered on client shutdown. The per-agent `auto_approve_spawn` rung (issue #2381
+item 2) is deferred to #4751/#4693 and is NOT added here.
 
 **Delivery order.** A spawn-approval prompt that reaches `_spawn_with_approval`
 is offered to surfaces in this fixed order, and the search stops at the first one
@@ -499,8 +569,14 @@ each rule in the table on its own, so a classification nothing reads cannot go u
 ### `cancel_for_teardown(agent_ids) -> stopped`
 The CANCELLATION half. Takes ids rather than a parent key, because a key would be
 re-resolved here and that is the defect the snapshot exists to avoid. Each run is
-marked `_teardown_cancelled` and then stopped through the ordinary `cancel`
-machinery; no second reap path exists and one would drift. A queued run's store phase
+marked `_teardown_cancelled`, has its stop cause and origin written on it
+(`_reap_reason = "parent_end"`, `_stop_origin = "parent conversation ended (<verb>)"`,
+which `cancel` carries into the reap and the tombstone — see the Terminal-State Contract)
+and is then stopped through the ordinary `cancel` machinery; no second reap path
+exists and one would drift. The one `parent-end teardown: verb=… key=… snapshot_ids=…`
+audit line is logged at **WARNING when the snapshot names work to discard** (INFO for a
+childless parent end): the gateway log's default level is WARNING, and at INFO the only
+record of an action that discards live work was invisible in every field report of it. A queued run's store phase
 goes through `taskq_cancel_queued_async`, which is `taskq_cancel_queued` handed whole to
 `store.run` rather than a second copy of its transaction — one hop onto the writer
 thread, and the race-safety argument (the state test and the cancel sharing one
@@ -689,7 +765,7 @@ Two delivery modes for `spawn_steer` (REST `POST /api/spawn/{id}/steer`, body `m
 ```python
 @dataclass
 class SubagentInfo:
-    id: str               # 8-char hex UUID
+    id: str               # 16-char hex run id (see _RUN_ID_HEX_CHARS)
     task: str             # original task text
     started: float        # time.time() at spawn
     done: bool            # True when finished (success or error)
@@ -732,8 +808,9 @@ A record's terminal outcome is three-way, with a **single canonical source**: th
 | `completed` | neither | success |
 
 - A user stop is neutral **in the record itself**: `cancel()` sets `user_stopped=True` and neither it nor `_force_reap` ever synthesizes an `error` for it.
+- **A reap's echo is recorded as the reap, never as a runtime death.** `_force_reap` tears a dedicated run's session down (`sessions.reset` → `provider.shutdown()` → `runtime.kill(reason="provider shutdown")`) BEFORE it cancels the run task, so the in-flight `client.stream` observes the kill first and raises `AcpProcessDied` — `Runtime process died during prompt — killed (provider shutdown) [returncode=<not reaped>]` — inside `_run`'s `except Exception` arm, ahead of the reaper's own record. That arm reads `_reap_started` together with `agent_sdk.drivers.acp_vocab.is_runtime_death(exc)` (the `AcpProcessDied` test, offered from the driver vocabulary so application code never names the ACP class): both true, the exception is the ECHO of our own teardown; any other exception under a reap is the run's own fault and keeps the existing failure path and traceback and the record names the stop — `_stop_origin` ("stopped by user", "parent conversation ended (<verb>)", "reaped after Ns (<reason>)", written by `cancel()` / `cancel_for_teardown` / `_force_reap` next to the `_reap_started` marker) and the reap's own tombstone cause `_reap_reason` (`user_stop` / `parent_end` / `stage_cancel` / `reaped` / `startup_timeout`; the parent-end teardown and the stage-boundary cancel write it before calling `cancel`, a bare `cancel` is the user's Stop, and `_force_reap` fills in its own reason only when none is set — nothing is inferred from the origin text, and every writer assigns only when the field is still empty, so the FIRST stopper keeps the attribution when a user Stop, a parent end and a stage cancel race). `tombstone_terminal_state` maps `parent_end` / `stage_cancel` to the task queue's CANCELLED like `user_stop`, so boot reconciliation settles such a row instead of recovering a deliberately ended run. Neutrality is decided by the FIRST stopper, `SubagentInfo.stop_is_neutral` (`_reap_reason in _NEUTRAL_REAP_REASONS` = `user_stop` / `parent_end` / `stage_cancel`), never by `user_stopped` alone: a Stop that lands while a deadline reap is already tearing the run down sets `user_stopped` too, and both the echo arm and `_force_reap`'s own record put the flag back so the late Stop cannot convert a claimed deadline failure into a neutral stop. A user stop, a parent end and a stage cancel stay neutral (`error` unset, `outcome == "stopped"`, partial output preserved); a deadline reap is a failure whose `error` names the deadline. The gateway log gets ONE line — INFO for a user's own stop, WARNING for a parent end or a deadline reap — never `Subagent X failed` at ERROR with a traceback. Recording the death text as the run's error, tombstoned `cause="error"`, sends every reader of a run "dying at random" (a user Stop-all, an identity-sweep parent end) to the provider, the OOM killer and the leak reaper in turn. `_reap_started` (not `reaped`) is the gate because the reaper sets `reaped` late, after the awaits; the record is still first-arrival (`if not info.done`) so the reaper's own synthesis is never duplicated. Pinned by `test_subagent_reap_attribution.py`.
 - Every emission carries the flag explicitly: live `subagent_done` events, the `_run` finally emit, `_force_reap`'s emit, WS **reconnect replay** (managed and native), `native_subagent_snapshots`, and the `/api/spawn` listing all include `stopped`. Cancelling a native card persists `stopped` on the slot tracker record so replay reconstructs it as stopped.
-- The gateway completion consumer (`_subagent_done`) classifies three-way: a stopped agent is announced as "stopped by user ⏹" with partial output flagged, and in orchestrator mode records **neither** `record_success` nor `record_failure`.
+- The gateway completion consumer (`_subagent_done`) classifies three-way: a stopped agent is announced ⏹ with the record's own `_stop_origin` as its status ("stopped by user" when a user pressed Stop; a parent-end verb or a stage cancel otherwise, so the announce never credits the user with a stop they did not press), partial output flagged, and in orchestrator mode records **neither** `record_success` nor `record_failure`.
 - **Intentional-cancel rule**: every code path that cancels a subagent task on purpose MUST set a terminal marker first — `cancel()` → `user_stopped`, `cancel_all()` → `_shutting_down`, `_force_reap` → `reaped`. An unmarked cancel is treated as unexpected and recovered once (below). Enforced MECHANICALLY, not by convention: all in-module intentional cancels route through the `_cancel_task_intentionally(task, info, reason=...)` chokepoint, which verifies a marker is visible before cancelling (a missing marker logs an error and consumes the recovery budget defensively so a mis-marked cancel can never zombie-respawn), and a source-scan test asserts no raw `.cancel()` on a managed run task exists outside the chokepoint.
 
 ## Stop reason → state (`classify_stop_reason`)
@@ -995,6 +1072,76 @@ and `mcp_core.py` reads it via `os.environ.get()`. If the env var is missing
 `~/.kiro/crew/session_pid_{getppid()}.txt` for backward compatibility. The
 session key flows through the `/api/spawn` endpoint as `parent_session`.
 
+## Run state file (`state.json`) write model
+
+**Decision: `state.json` stays a WHOLE-FILE rewrite.** No revision counter, no
+compare-and-swap retry loop, no per-field or append-merge format. This is a
+recorded choice, not a deferral.
+
+**Why.** `state.json` is a run's artifact and evidence record. Scheduling's
+source of truth is `tasks.db` (next section), which already carries generation
+fencing. Building a second coordination protocol one layer below it would order
+writes this file does not need, and would cost a format that `read_state`, the
+tombstone pruner, the keep scan, orphan recovery and the legacy-record migration
+must all agree on — an irreversible on-disk migration for a class with no
+reachable defect today.
+
+**The invariant that keeps the rewrite safe.**
+
+> Every whole-file `state.json` write happens at a KNOWN site, and each site
+> reachable from the event loop carries its own fence.
+
+`update_state` and `update_execution_context` both read, merge, then land a
+blocking fsync-and-rename. Two writers on one `agent_id` therefore interleave,
+and the later one restores a snapshot predating the other's write — rolling back
+fields *neither* writer touched, which is the damaging half. Off-loop callers are
+serialized by the per-agent lock (`_STATE_LOCKS`). An on-loop caller must not wait
+on that lock, because parking the gateway's only event loop behind a pool
+thread's fsync is the `no-blocking-call-on-event-loop` class, so each on-loop
+site carries its own fence instead -- with exactly one named exception, the
+spawn-path acquire in the third row:
+
+| Site | Fence |
+|---|---|
+| `release_conversation_impl` → `update_state` | refuses while the run is in flight, so no concurrent writer exists |
+| `promote_retention` → injected writer | probes the state lock non-blocking, returns `RETRYABLE` on contention |
+| `create_agent_folder` → `update_execution_context` | the ONE on-loop acquire that can wait; bounded by sitting on the spawn and admission path, never a per-turn one |
+| `create_agent_folder` → `_atomic_write` | creation path; writes the initial file before any writer for the agent exists |
+| every writer inside a run | goes off-loop through `_write_state_off_loop`, inheriting the lock, and is drained on cancellation |
+
+`update_execution_context`'s other three callers are absent from that table
+deliberately. `bind_session_execution`, `tighten_run_memory_mode` and
+`write_run_agent` each reach it from a pool thread at every call site
+(`asyncio.to_thread` or `drained_to_thread`), so the callee's unconditional lock
+serializes them exactly like an off-loop `update_state` and needs no fence of its
+own. An unconditional blocking acquire is a fence only off the loop; the single
+on-loop exception is the row above, and `_STATE_LOCKS` records the same bound at
+the lock itself.
+
+**How the asymmetry closes.** By moving the remaining on-loop sites OFF the loop,
+where each inherits the per-agent lock and needs no fence of its own — never by
+changing the on-disk format. The site census is therefore expected to shrink and
+never grow.
+
+**Enforcement.** `test_subagent_state_write_model` is a static AST gate over
+`kiro_crew` source. It pins the write-site census with a per-site call count, so
+a new write anywhere fails and its author must state the fence; it separately
+refuses any write sitting directly in an `async def` body, of which there are
+none. Every current site lives in a *synchronous* function that a coroutine
+calls, which is why the gate pins sites rather than trying to decide statically
+whether a given call runs on the loop.
+
+**What the gate does not check.** The fence column above is prose, derived by
+reading each call site's callers; no test re-derives it. A site that moves on or
+off the loop keeps the same `(module, function, call)` key, so the stale-entry
+test cannot see a fence go out of date — only a site that moves or disappears
+entirely. A commit that changes a site's loop status therefore updates that row
+in the same commit, and a commit that takes the last on-loop site off the loop
+deletes its row, which is how the census shrinks. The gates' own assertions are
+pinned by meta-tests that drive each gate against a census or a site list that
+must fail it, so dropping an assertion reddens the suite instead of quietly
+disabling the gate.
+
 ## Durable task queue (`kiro_crew.taskq`)
 
 Specified in [taskq.md](taskq.md); this section is the manager's side of it.
@@ -1070,6 +1217,23 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   drains a row that still holds the grant and asserts the approval callback ran).
   The value stays recorded in `scope_ref`, which the schema defines as references
   rather than grants and which no start path reads.
+- **A run id is 16 hex characters, minted at one site**
+  (`SubagentManager._mint_agent_id`, `_RUN_ID_HEX_CHARS`; the gate, the
+  continuation coordinator and the wave digest all call it and none of them
+  draws). The width IS the uniqueness argument: 16 hex characters are 64 bits, so
+  2000 spawns on one host collide with probability about 1 in 10**13. At the 8
+  characters this replaces it was 32 bits and about 1 in 2,100, and the collision
+  did not read as one -- identity is assigned before registration, so the caller
+  was handed the id and the accept then failed on the duplicate primary key,
+  reaching the user as `task store write failed`, naming a subsystem that was
+  working correctly. A narrow id plus a uniqueness check is the alternative, and
+  it is more mechanism for less: the check would have to know which ids are
+  taken, a durable task row outlives the process that wrote it, and the spawn
+  path cannot ask the store because taking a task-store connection on the event
+  loop is refused (`kiro_crew.on_loop_db`). Nothing pins the width -- every
+  consumer prints the id or passes it through -- so ids written before this are
+  8 characters and stay valid; `spawn_status`, `spawn_continue` and the dashboard
+  wave roster read both.
 - **Wakes.** Only `resume_grant` writes `running` (`wake_wait(to=running)`,
   slot reserved, runtime resident) — and the landed wake is the PRECONDITION
   for the publish: the pump reserves the lane slot on the loop
@@ -1382,7 +1546,7 @@ Three optional fields are passed to `ScriptHookStore.fire()` and the
 
 | Field | Source | Description |
 |-------|--------|-------------|
-| `subagent_id` | `SubagentInfo.id` | 8-char hex ID of the firing subagent (None for parent) |
+| `subagent_id` | `SubagentInfo.id` | 16-char hex id of the firing subagent (None for parent) |
 | `parent_session_key` | `SubagentInfo.parent_session_key` | Session key of the parent that spawned this subagent |
 | `agent_role` | `SubagentInfo.agent` | Agent role name configured for the subagent |
 
@@ -1597,12 +1761,29 @@ reconciliation classifies the file on that flag alone — `result_available` wit
 it, `partial_result` without — and the `partial_result` notice tells the parent
 the text is an unfinished fragment rather than pointing it at a result to read.
 
+No result is not no work. A run the restart caught before its first token has no
+`result.txt`, but its CONVERSATION — every turn and tool call kiro-cli persisted
+under `~/.kiro/sessions/cli/{sid}.json` (+ `.jsonl`) — is a file reconciliation
+deliberately keeps (retain-by-default), and `spawn_continue` re-seeds the session
+map from the run's `state.json` to resume it after a restart. The `lost to gateway
+restart` notice therefore carries the run's progress (`turns`, `last_tool`) and the
+resume handle (`spawn_continue(conversation="<owner>", task=...)`, where the owner is
+the `conversation_key`'s subagent id when the run was itself minted by `spawn_continue`,
+else the run's own id — one session-map key per sid) — `orphan_resume_hint` — but ONLY when the conversation is resumable by the one rule
+`SessionMap.get` applies before it hands a sid out, `session_map.session_files_resumable`
+(for kiro-cli the `.json` present and the `.jsonl` holding at least
+`_RESUMABLE_JSONL_MIN_BYTES`; for any other backend `session/load` decides, so the
+handle is offered and `spawn_continue` refuses typed if the session is gone). A pruned,
+released or never-started kiro-cli conversation is therefore never advertised. Without
+the hint the parent re-spawns from scratch and pays for the same tool calls twice.
+
 **Orphan delivery is wired** (not a stub): the gateway registers `on_orphan_notify` (session injection — rides the parent slot's batched pending-failures drain) and `on_orphan_dm` (fallback). The DM fallback collects every undelivered orphan across the reconciliation scan and sends ONE digest message (`"N subagent(s)…"`) — never N pings; a lone orphan keeps the plain per-agent message.
 
 ### Tombstone Lifecycle
 
-- Created on: process death without result, delivery failure, timeout (`cause` =
-  `error` / `timeout` / `cancelled` / `reaped` / `gateway_restart`), **and on
+- Created on: process death without result, delivery failure, timeout, a stop (`cause` =
+  `error` / `timeout` / `cancelled` / `reaped` / `startup_timeout` / `user_stop` /
+  `parent_end` / `stage_cancel` / `gateway_restart`), **and on
   successful delivery** (`cause="delivered"`, via `mark_delivered`) so `result.txt`
   is retained for the grace window instead of deleted immediately. The generic
   writer snapshots any non-empty session ID, provider, and CWD from readable

@@ -305,7 +305,7 @@ The model-facing half is the `pod_up` / `pod_down` / `pod_status` / `pod_ls` too
 `kirocrew-core` (`mcp_tools/apps.py`). The pod token is returned to the agent
 verbatim — redacting it would hand back an unusable handle — which is safe because it
 is a 2h credential scoped to that pod's own gateway, minted server-side from the
-pod's `.local_secret` so the agent never touches the secret itself.
+pod's own internal-API credential so the agent never touches the secret itself.
 
 ## Authorization
 
@@ -441,8 +441,11 @@ worktree removal never blocks the gateway event loop.
 - `runtime.mint_token(cfg, name, ttl)` — credential minting (blocking, offloaded).
   Requires POSITIVE ownership proof and refuses when ownership is merely
   unprovable, unlike `health`, which keeps its reading: this call sends the pod's
-  own `.local_secret`, so failing open would hand a credential to whatever
-  answered
+  own internal-API credential, so failing open would hand a credential to whatever
+  answered. That credential resolves per listener first, from the pod home's
+  `run/gateway-<port>.secret`, and falls back to the shared `.local_secret` only
+  for a gateway predating the per-listener file — the shared slot is one per data
+  home, so a live second gateway leaves it naming the other generation
 - `runtime.recent_journal(cfg, name, n)` — journalctl tail (blocking, offloaded)
 - `provision.has_venv(path)` / `provision.has_dist(path)` — filesystem checks (offloaded)
 
@@ -1281,8 +1284,10 @@ choose the gateway's next image. Instead:
   `GET /api/apps/dev-fleet/live-target` (30 s display cache; `fresh=1` for the
   removal guards). The broker aims at `KIROCREW_BOUND_PORT`, which
   `apps/backend.py` hands to this one backend at spawn from the gateway's own
-  environment — so `dashboard.server.start_dashboard` spawns it in a second wave,
-  AFTER `_export_bound_port` has recorded the port the site actually bound
+  environment — the port is exported the moment it is reserved
+  (`dashboard.server._reserve_dashboard_port`, before any backend spawns;
+  `_export_bound_port` republishes it once the site serves), and
+  `dashboard.server.start_dashboard` spawns this backend in a second wave
   (`apps.backend.DEV_FLEET_APP_NAME`; the main wave still runs before
   `runner.setup()` so every other app's startup hooks find their backend up). A
   backend spawned before the bind would have no port for its whole lifetime;

@@ -2097,15 +2097,22 @@ class TestUxScopeGateSurvivesAWideDiff:
 UX_BLIND_STEP = "Blind read of the screenshots (Fable 5)"
 UX_REVIEW_STEP = "UX review (Fable 5)"
 UX_EVIDENCE_STEP = "Collect blind-read evidence"
-FORK_ATTACHMENT_STEP = "Fetch attachment evidence from the PR description"
+FORK_ATTACHMENT_STEP = "Collect review evidence (description attachments and committed media)"
 UX_CAPTURE_STEP = "Capture the blind-read report"
-# The step each lane fetches PR-description attachments in. The same-repo copy
-# also reads committed images off its checkout; the fork copy has no checkout.
-# The executed tests run both, so the two copies cannot drift apart unnoticed.
+# The step each lane fetches PR-description attachments in. The same-repo UX
+# copy also reads committed images off its checkout; the fork copies have no
+# checkout. The executed tests run every one of them, so the copies cannot
+# drift apart unnoticed -- and both design lanes, which source the shared
+# committed-evidence script and must behave identically with or without a
+# checkout.
+DESIGN_EVIDENCE_STEP = "Collect rendered evidence"
 EVIDENCE_STEP = {
     "ux-review.yml": UX_EVIDENCE_STEP,
     "fork-ux-review.yml": FORK_ATTACHMENT_STEP,
+    "design-review.yml": DESIGN_EVIDENCE_STEP,
+    "fork-design-review.yml": DESIGN_EVIDENCE_STEP,
 }
+DESIGN_EVIDENCE_LANES = ("design-review.yml", "fork-design-review.yml")
 # The one fetch loop both steps source. The fork lane runs it from its
 # trusted base checkout, so a fork cannot alter what fetches its evidence.
 ATTACHMENT_SCRIPT = ".github/scripts/pr-attachment-evidence.sh"
@@ -2474,9 +2481,21 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
             env["CURL_STUB_MAP"] = (tmp_path / "curl-map.tsv").as_posix()
         script = _step_script(_workflow(lane), EVIDENCE_STEP[lane])
         blind_dir = tmp_path / "ux-blind"
-        # The same-repo step copies into BLIND_DIR next to its committed
-        # images; the fork step, which has no checkout, copies into ATTACH_DIR.
-        dir_var = "BLIND_DIR" if lane == "ux-review.yml" else "ATTACH_DIR"
+        # The same-repo UX step copies into BLIND_DIR next to its committed
+        # images; the fork UX step, which has no checkout, copies into
+        # ATTACH_DIR; both design lanes take DEST_DIR straight from their step
+        # env, with the copy-name stem and the evidence file beside it.
+        dir_var = {"ux-review.yml": "BLIND_DIR", "fork-ux-review.yml": "ATTACH_DIR"}.get(
+            lane, "DEST_DIR"
+        )
+        design_env: dict[str, str] = {}
+        if lane in DESIGN_EVIDENCE_LANES:
+            step_env = _step_env(lane, EVIDENCE_STEP[lane])
+            self._evidence_file = tmp_path / "design-evidence.txt"
+            design_env = {
+                "NAME_STEM": step_env["NAME_STEM"],
+                "EVIDENCE": self._evidence_file.as_posix(),
+            }
         shots = tmp_path / "shots.txt"
         shot_map = tmp_path / "shot-map.txt"
         clips = tmp_path / "clips.txt"
@@ -2495,6 +2514,10 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
             env={
                 **env,
                 "BASE_SHA": base,
+                # The fork lanes and both design lanes read the media the PR
+                # commits out of the object store at this revision; the
+                # same-repo UX step, which has the files checked out, ignores it.
+                "HEAD_SHA": "HEAD",
                 "REPO": "example/repo",
                 "PR": "7",
                 dir_var: blind_dir.as_posix(),
@@ -2506,6 +2529,7 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
                 "MAX_CLIPS": max_clips,
                 "GITHUB_OUTPUT": str(github_output),
                 "GITHUB_WORKSPACE": str(ROOT),
+                **design_env,
             },
         )
         if expect_failure:
@@ -3479,8 +3503,799 @@ class TestUxReviewReadsTheScreenshotsBlindFirst:
             fork_prompt
         )
         assert "The workflow downloads each one for you" in fork_prompt
-        assert "A committed image still counts" in fork_prompt
+        assert "A committed image counts the same" in fork_prompt
         assert "at least one screenshot the PR supplies" in fork_prompt
+
+    # --- Evidence a contributor with no write access COMMITS -----------------
+    # `gh pr create|edit --attach` uploads through an endpoint that answers READ
+    # and TRIAGE permission with a 404 (cli/cli#14302), so a fork contributor
+    # has no CLI path to a description attachment at all. The committed
+    # convention is theirs, and the fork lane -- which never checks the fork
+    # head out -- has to read those blobs out of the object store for the
+    # reviewer, or their UI change is reviewed with no evidence.
+
+    COMMITTED_SCRIPT = ".github/scripts/pr-committed-evidence.sh"
+    COMMITTED_SOURCE_LINE = '. "$GITHUB_WORKSPACE/.github/scripts/pr-committed-evidence.sh"'
+
+    def _repo_committing_evidence(self, tmp_path: Path) -> tuple[Path, str]:
+        """A repository whose head changes a UI file and commits its evidence
+        under both committed-screenshot conventions, plus the things that must
+        NOT reach the reviewer: a text file, and a tracked SYMLINK pointing out
+        of the tree (mode 120000), which is how a PR would otherwise aim the
+        reviewer at an arbitrary file on the runner."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / "README").write_text("base\n")
+        self._git(repo, "add", "README")
+        self._git(repo, "commit", "-qm", "base")
+        base = self._git(repo, "rev-parse", "HEAD")
+        (repo / "website").mkdir()
+        (repo / "website" / "App.tsx").write_text("x")
+        shots = repo / "temp-screenshots" / "topic"
+        shots.mkdir(parents=True)
+        # An author-named file: the copy handed to the reviewer must not carry
+        # this name, which would prime it with the author's own vocabulary.
+        (shots / "pinned-turn-chip.png").write_bytes(self.PNG)
+        (shots / "walkthrough.webm").write_bytes(self.WEBM)
+        (shots / "notes.txt").write_bytes(self.TEXT)
+        legacy = repo / ".github" / "screenshots" / "legacy"
+        legacy.mkdir(parents=True)
+        (legacy / "old.png").write_bytes(self.PNG)
+        # `git add -f`: both directories are gitignored in this repository, and
+        # that is exactly the command the fallback documents.
+        self._git(repo, "add", "-fA")
+        # A symlink entry written through the index, so the fixture does not
+        # depend on the platform's symlink support.
+        target = tmp_path / "symlink-target"
+        target.write_text("../../../../etc/passwd")
+        oid = self._git(repo, "hash-object", "-w", "--", str(target))
+        self._git(
+            repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "120000",
+            oid,
+            "temp-screenshots/topic/secrets.png",
+        )
+        self._git(repo, "commit", "-qm", "head")
+        return repo, base
+
+    def test_the_fork_lane_reads_the_media_a_no_write_access_contributor_commits(
+        self, tmp_path: Path
+    ) -> None:
+        """Execute the ACTUAL fork evidence step against a PR that commits its
+        screenshots. Each image reaches the reviewer as an index-named copy
+        (never the author's filename), the recording is listed, the map records
+        the repository path as the origin, and the text file is skipped by its
+        bytes. Without this the fork lane reviewed a UI change with nothing to
+        look at whenever the author could not attach -- which is every
+        contributor whose permission is READ."""
+        repo, base = self._repo_committing_evidence(tmp_path)
+        shot_list, shot_map, clip_list, _output, attach_dir = self._run_evidence_gate(
+            repo,
+            base,
+            tmp_path,
+            body="No attachments here.\n",
+            fixtures={},
+            lane="fork-ux-review.yml",
+        )
+        kept = sorted(p.name for p in attach_dir.iterdir())
+        assert kept == ["attachment-01.png", "attachment-02.png"], kept
+        assert [Path(line).name for line in shot_list.splitlines()] == kept
+        # The origin is the repository path; the copy's name carries only the
+        # order and the format.
+        origins = dict(line.split("\t") for line in shot_map.splitlines())
+        assert set(origins) == set(kept)
+        assert sorted(origins.values()) == [
+            ".github/screenshots/legacy/old.png",
+            "temp-screenshots/topic/pinned-turn-chip.png",
+        ]
+        assert "pinned-turn-chip" not in shot_list
+        assert clip_list.splitlines() == ["temp-screenshots/topic/walkthrough.webm"]
+        assert "notes.txt" not in shot_list and "notes.txt" not in clip_list
+        assert "Committed evidence:" in self._evidence_stdout
+        assert "2 image(s) kept" in self._evidence_stdout
+
+    def test_a_committed_symlink_is_refused_by_its_mode_before_its_bytes_are_read(
+        self, tmp_path: Path
+    ) -> None:
+        """A tracked symlink under temp-screenshots/ is how a fork PR would aim
+        the reviewer at an arbitrary path. The tree entry's MODE refuses it, so
+        the decision never depends on what the link resolves to -- and because
+        the bytes come from `git cat-file`, the link is never created on disk in
+        the first place."""
+        repo, base = self._repo_committing_evidence(tmp_path)
+        shot_list, shot_map, _clips, _output, _attach_dir = self._run_evidence_gate(
+            repo, base, tmp_path, body="", fixtures={}, lane="fork-ux-review.yml"
+        )
+        assert "secrets.png" not in shot_list and "secrets.png" not in shot_map
+        assert "etc/passwd" not in shot_list and "etc/passwd" not in shot_map
+        assert (
+            "::warning::SKIPPED (not a regular file at HEAD, mode 120000): "
+            "temp-screenshots/topic/secrets.png" in self._evidence_stdout
+        ), self._evidence_stdout
+        # Nothing was materialized from the fork's tree: the step wrote only
+        # its own index-named copies.
+        assert not (repo / "temp-screenshots" / "topic" / "secrets.png").is_symlink()
+
+    def test_rejected_committed_media_still_consumes_the_blob_read_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """Rejected bytes cannot make fork-controlled object reads unbounded."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / "README").write_text("base\n")
+        self._git(repo, "add", "README")
+        self._git(repo, "commit", "-qm", "base")
+        base = self._git(repo, "rev-parse", "HEAD")
+        evidence = repo / "temp-screenshots"
+        evidence.mkdir()
+        for name in ("a.png", "b.png", "c.png"):
+            (evidence / name).write_text("not an image\n")
+        self._git(repo, "add", "-fA")
+        self._git(repo, "commit", "-qm", "head")
+
+        self._run_evidence_gate(
+            repo,
+            base,
+            tmp_path,
+            body="",
+            fixtures={},
+            max_shots="1",
+            max_clips="1",
+            lane="fork-ux-review.yml",
+        )
+
+        assert self._evidence_stdout.count("SKIPPED (mime text/plain)") == 2
+        assert (
+            "TRUNCATED: more than 2 pieces of evidence; not read: " "temp-screenshots/c.png"
+        ) in self._evidence_stdout
+        assert (
+            "Committed evidence: 3 media path(s) added or changed under "
+            "temp-screenshots/ or .github/screenshots/, 0 image(s) kept, 2 skipped."
+        ) in self._evidence_stdout
+
+    def test_a_description_attachment_is_never_displaced_by_a_committed_file(
+        self, tmp_path: Path
+    ) -> None:
+        """Attachments are the normal home for evidence, so they are read FIRST
+        and numbered first: the two sources share one MAX_SHOTS cap, and a
+        committed file must never push a downloaded attachment out of it."""
+        repo, base = self._repo_committing_evidence(tmp_path)
+        url = "https://github.com/user-attachments/assets/0f3b2c1a-1111-4bcd-9e8f-0123456789ab"
+        shot_list, shot_map, _clips, _output, _attach_dir = self._run_evidence_gate(
+            repo,
+            base,
+            tmp_path,
+            body=f"![after]({url})\n",
+            fixtures={url: self.JPEG},
+            max_shots="1",
+            lane="fork-ux-review.yml",
+        )
+        copies = [
+            Path(line).name for line in shot_list.splitlines() if not line.startswith("TRUNC")
+        ]
+        assert copies == ["attachment-01.jpg"]
+        origins = dict(line.split("\t") for line in shot_map.splitlines())
+        assert origins["attachment-01.jpg"] == url
+        # The committed images did not fit under the cap, and the list says so
+        # rather than dropping them silently.
+        assert "TRUNCATED" in shot_list
+
+    def test_the_committed_script_runs_under_the_bash_3_of_macos(self) -> None:
+        """The macOS shard runs the fork evidence step under /bin/bash 3.2,
+        which has no `${var,,}` and aborts the sourced script on it with `bad
+        substitution` -- taking the whole evidence step down. The extension
+        allowlist lower-cases through `tr`, the way ux-review.yml does."""
+        script = (ROOT / self.COMMITTED_SCRIPT).read_text(encoding="utf-8")
+        code = "\n".join(line for line in script.splitlines() if not line.lstrip().startswith("#"))
+        assert not re.search(
+            r"\$\{[A-Za-z_]+(,,|\^\^)\}", code
+        ), "case-folding parameter expansion is bash 4 only; lower-case with tr"
+        assert "LC_ALL=C tr '[:upper:]' '[:lower:]'" in code
+
+    def test_a_glob_metacharacter_in_a_committed_name_names_that_one_entry(
+        self, tmp_path: Path
+    ) -> None:
+        """`git ls-tree` takes a pathspec while `git cat-file` takes an exact
+        path, so the mode and size gates must be pinned to the same tree entry
+        `cat-file` reads: with `:(literal)` a `*`, a `[`, a `!` or a `)` in a
+        committed name is that name, not a pattern. Four legitimate images
+        under such names all reach the reviewer, none is dropped as `mode
+        unknown`, and each origin is the exact repository path. The entries
+        are written through the index, so the test does not depend on the
+        platform's filesystem permitting these characters."""
+        repo, base = self._repo_committing_evidence(tmp_path)
+        hostile = ["!a.png", "*.png", "chip[1].png", "a)b:c?.png"]
+        blob = tmp_path / "hostile-blob"
+        blob.write_bytes(self.PNG)
+        oid = self._git(repo, "hash-object", "-w", "--", str(blob))
+        for name in hostile:
+            self._git(
+                repo,
+                # These names are invalid WIN32 paths, and git's Windows build
+                # refuses them in the index under `core.protectNTFS`, which is
+                # on by default there. The entry is what this test needs, not a
+                # file: a fork on Linux can commit such a name, so CI must be
+                # able to build the tree that proves the reader handles it.
+                "-c",
+                "core.protectNTFS=false",
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                oid,
+                f"temp-screenshots/topic/{name}",
+            )
+        self._git(repo, "commit", "-qm", "hostile names")
+        script = (ROOT / self.COMMITTED_SCRIPT).read_text(encoding="utf-8")
+        assert 'git ls-tree -l "$HEAD_SHA" -- ":(literal)$path"' in script
+
+        shot_list, shot_map, _clips, _output, attach_dir = self._run_evidence_gate(
+            repo, base, tmp_path, body="", fixtures={}, lane="fork-ux-review.yml"
+        )
+        origins = dict(line.split("\t") for line in shot_map.splitlines())
+        for name in hostile:
+            assert f"temp-screenshots/topic/{name}" in origins.values(), (
+                name,
+                self._evidence_stdout,
+            )
+        assert "mode unknown" not in self._evidence_stdout, self._evidence_stdout
+        assert len(shot_list.splitlines()) == 2 + len(hostile)
+        assert len(list(attach_dir.iterdir())) == 2 + len(hostile)
+
+    def test_a_committed_name_with_a_control_character_reaches_no_sink(
+        self, tmp_path: Path
+    ) -> None:
+        """Git permits a newline, a tab or a carriage return in a tracked
+        filename, and the fork controls the names it commits. The map and the
+        clip list are presented to the reviewer as files the workflow wrote, so
+        a newline inside a recorded path forges extra records in them, and the
+        same byte in a `::warning::` line forges a workflow command. Such a name
+        is refused before the first line that interpolates it: neither data
+        file gains a record, the log shows it only `%q`-quoted, and the valid
+        media beside it are still read."""
+        repo, base = self._repo_committing_evidence(tmp_path)
+        forged = [
+            ("temp-screenshots/topic/a\nforged.gif", self.GIF),
+            ("temp-screenshots/topic/c\tforged.png", self.PNG),
+            ("temp-screenshots/topic/e\rforged.png", self.PNG),
+        ]
+        for path, payload in forged:
+            blob = tmp_path / f"blob-{len(path)}"
+            blob.write_bytes(payload)
+            oid = self._git(repo, "hash-object", "-w", "--", str(blob))
+            # `core.protectNTFS` (default on in git for Windows) refuses a
+            # control character in an index entry; a fork on Linux can commit
+            # one, which is the whole point of the guard under test.
+            self._git(
+                repo,
+                "-c",
+                "core.protectNTFS=false",
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                oid,
+                path,
+            )
+        self._git(repo, "commit", "-qm", "forged names")
+
+        shot_list, shot_map, clip_list, _output, _attach_dir = self._run_evidence_gate(
+            repo, base, tmp_path, body="", fixtures={}, lane="fork-ux-review.yml"
+        )
+        # The clip list holds exactly the one legitimate recording: no line
+        # from the GIF's name, split or whole.
+        assert clip_list.splitlines() == ["temp-screenshots/topic/walkthrough.webm"], clip_list
+        # Every map record is one name, one tab, one origin; the tab-bearing
+        # name would have made a third column and the newline a fifth row.
+        rows = shot_map.splitlines()
+        assert len(rows) == 2 and all(row.count("\t") == 1 for row in rows), shot_map
+        assert "forged" not in shot_map and "forged" not in shot_list
+        # No raw control character from a path reached the log, and the
+        # refusal names each file quoted.
+        stdout = self._evidence_stdout
+        assert "\nforged" not in stdout and "\tforged" not in stdout
+        assert "\rforged" not in stdout
+        assert (
+            "::warning::SKIPPED (path contains a control character): "
+            "$'temp-screenshots/topic/a\\nforged.gif'"
+        ) in stdout, stdout
+        assert "$'temp-screenshots/topic/c\\tforged.png'" in stdout
+        assert "$'temp-screenshots/topic/e\\rforged.png'" in stdout
+        assert "7 media path(s) added" in stdout and "2 image(s) kept, 4 skipped." in stdout, stdout
+
+    def test_a_committed_format_the_reviewer_cannot_read_is_named_not_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        """A committed file the script declines has to reach its author.
+
+        An author who commits `after.svg` has followed the instruction to commit
+        evidence, and the reviewer cannot read SVG. Declining it in silence
+        leaves them with a summary saying nothing was found and a lane blocking
+        them for supplying nothing, which is the worst of both. So a name in an
+        unreadable MEDIA format is counted and named with its reason, while a
+        sidecar that was never evidence (a provenance JSON, a README, a
+        dotfile) stays silent -- otherwise every run warns about files nobody
+        offered as a screenshot. A refused name must also cost no object read:
+        it is declined before the blob is materialized, so it cannot consume the
+        read budget.
+        """
+        repo, base = self._repo_committing_evidence(tmp_path)
+        extra = {
+            "temp-screenshots/topic/after.svg": b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+            "temp-screenshots/topic/After.BMP": b"BM\x00\x00\x00\x00",
+            "temp-screenshots/topic/provenance.json": b'{"ok": true}\n',
+            "temp-screenshots/topic/README": b"why these files exist\n",
+            # A hidden PARENT directory must not hide real media: the sort is on
+            # the basename, not the path.
+            "temp-screenshots/.hidden/shot.png": self.PNG,
+        }
+        for path, payload in extra.items():
+            blob = tmp_path / f"extra-{len(path)}-{path.rsplit('/', 1)[-1]}"
+            blob.write_bytes(payload)
+            oid = self._git(repo, "hash-object", "-w", "--", str(blob))
+            self._git(repo, "update-index", "--add", "--cacheinfo", "100644", oid, path)
+        self._git(repo, "commit", "-qm", "unreadable formats beside sidecars")
+
+        shot_list, shot_map, _clips, _output, _attach_dir = self._run_evidence_gate(
+            repo, base, tmp_path, body="", fixtures={}, lane="fork-ux-review.yml"
+        )
+        stdout = self._evidence_stdout
+        # Named, with the reason the author needs to act on.
+        assert (
+            "::warning::SKIPPED (SVG is opened as markup, not pixels; export the "
+            "image as PNG): temp-screenshots/topic/after.svg" in stdout
+        ), stdout
+        assert (
+            "::warning::SKIPPED (not a format the reviewer reads; commit PNG, JPEG, "
+            "WebP, GIF, MP4, MOV or WebM): temp-screenshots/topic/After.BMP" in stdout
+        ), stdout
+        # Sidecars were never offered as screenshots, so they stay silent.
+        for quiet in ("provenance.json", "README", "notes.txt"):
+            assert quiet not in stdout, quiet
+        # The hidden parent directory did not hide its media.
+        assert "temp-screenshots/.hidden/shot.png" in shot_map
+
+    def test_a_refused_committed_format_consumes_no_read_budget(self, tmp_path: Path) -> None:
+        """The refusal happens before the blob is materialized, so an unreadable
+        name cannot push a real image out of the shared cap. Under a cap of one
+        image the PNG is still kept, and the `.svg` is never reported as
+        TRUNCATED -- it was declined, not crowded out."""
+        repo, base = self._repo_committing_evidence(tmp_path)
+        blob = tmp_path / "svg-blob"
+        blob.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+        oid = self._git(repo, "hash-object", "-w", "--", str(blob))
+        # Sorts before `pinned-turn-chip.png`, so it is listed first and would
+        # take the slot if it were read.
+        self._git(
+            repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            oid,
+            "temp-screenshots/topic/aaa.svg",
+        )
+        self._git(repo, "commit", "-qm", "an svg ahead of the real media")
+
+        shot_list, _map, _clips, _output, _dir = self._run_evidence_gate(
+            repo,
+            base,
+            tmp_path,
+            body="",
+            fixtures={},
+            max_shots="1",
+            max_clips="1",
+            lane="fork-ux-review.yml",
+        )
+        assert "aaa.svg" not in shot_list
+        assert "not read: temp-screenshots/topic/aaa.svg" not in self._evidence_stdout
+        kept = [ln for ln in shot_list.splitlines() if not ln.startswith("TRUNC")]
+        assert len(kept) == 1, shot_list
+
+    def test_a_screenshot_that_was_only_moved_is_named_as_the_base_not_admitted(
+        self, tmp_path: Path
+    ) -> None:
+        """A `git mv` of a screenshot the base already holds is a rename to
+        git, and rename detection is on by default, so a listing filtered to
+        additions and modifications never sees the destination: the moved file
+        is neither counted nor warned about, and the author is told nothing was
+        found. The listing here admits every status a path at HEAD can carry and
+        decides the rename by its status: bytes already on the base show the
+        base's rendering, not this revision's, so an unchanged move is refused
+        by name with both paths and counted, while a move whose bytes changed is
+        a modified file under a new name and is read like any other. The
+        summary counts the moved file and says what it was."""
+        repo = tmp_path / "repo"
+        shots = repo / "temp-screenshots" / "topic"
+        shots.mkdir(parents=True)
+        self._git(repo, "init", "-q")
+        # Two screenshots on the BASE: one the head moves untouched, one it
+        # moves and re-captures. The second is long enough that a change to
+        # its tail leaves git a high similarity score: a rename, not A + D.
+        (shots / "same.png").write_bytes(self.PNG)
+        (shots / "before.png").write_bytes(self.PNG + bytes(range(256)) * 16)
+        self._git(repo, "add", "-fA")
+        self._git(repo, "commit", "-qm", "base")
+        base = self._git(repo, "rev-parse", "HEAD")
+        (repo / "website").mkdir()
+        (repo / "website" / "App.tsx").write_text("x")
+        panel = repo / "temp-screenshots" / "panel"
+        panel.mkdir()
+        self._git(repo, "mv", "temp-screenshots/topic/same.png", "temp-screenshots/panel/same.png")
+        self._git(
+            repo, "mv", "temp-screenshots/topic/before.png", "temp-screenshots/panel/after.png"
+        )
+        (panel / "after.png").write_bytes(self.PNG + bytes(range(256)) * 15 + b"Z" * 256)
+        (panel / "fresh.png").write_bytes(self.JPEG)
+        self._git(repo, "add", "-fA")
+        self._git(repo, "commit", "-qm", "head")
+        listing = self._git(
+            repo, "diff", "-M", "--name-status", "--diff-filter=d", f"{base}...HEAD"
+        )
+        assert "R100\ttemp-screenshots/topic/same.png\ttemp-screenshots/panel/same.png" in listing
+        assert "\ttemp-screenshots/topic/before.png\ttemp-screenshots/panel/after.png" in listing
+        assert "R100\ttemp-screenshots/topic/before.png" not in listing, listing
+
+        shot_list, shot_map, _clips, _output, _dir = self._run_evidence_gate(
+            repo, base, tmp_path, body="", fixtures={}, lane="fork-ux-review.yml"
+        )
+        stdout = self._evidence_stdout
+        origins = dict(line.split("\t") for line in shot_map.splitlines())
+        # The re-captured file and the new file reach the reviewer; the moved
+        # file does not, under either of its names.
+        assert sorted(origins.values()) == [
+            "temp-screenshots/panel/after.png",
+            "temp-screenshots/panel/fresh.png",
+        ], shot_map
+        assert "same.png" not in shot_list and "same.png" not in shot_map
+        assert (
+            "::warning::SKIPPED (moved from temp-screenshots/topic/same.png with no change "
+            "in its bytes, so it shows the base, not this revision; capture the screenshot "
+            "again): temp-screenshots/panel/same.png"
+        ) in stdout, stdout
+        assert "not read: temp-screenshots/panel/same.png" not in stdout
+        assert (
+            "Committed evidence: 3 media path(s) added or changed under temp-screenshots/ "
+            "or .github/screenshots/, 2 image(s) kept, 1 skipped. 1 of the skipped were moved "
+            "from the base without a change in bytes and show the base, not this revision."
+        ) in stdout, stdout
+        # The listing itself is the contract: every status but a deletion
+        # supplies a candidate, rename detection is asked for rather than
+        # inherited from the runner's config, and the status letter reaches
+        # the loop so the rename is decided there.
+        script = (ROOT / self.COMMITTED_SCRIPT).read_text(encoding="utf-8")
+        assert "git diff -z -M --name-status --diff-filter=d" in script
+        assert "--diff-filter=AM" not in script
+        assert "R100|C100)" in script
+
+    def test_a_failed_enumeration_fails_the_step_instead_of_reading_as_no_media(
+        self, tmp_path: Path
+    ) -> None:
+        """`git diff` failing is not "this PR commits no media": an empty
+        listing would make the design lane report evidence missing that the
+        author supplied. The step fails with an error annotation naming the
+        re-run, the same contract the attachment script applies to a
+        description it could not read, and the summary line that means "the
+        enumeration ran" is not printed."""
+        repo, _base = self._repo_committing_evidence(tmp_path)
+        missing = "0123456789abcdef0123456789abcdef01234567"
+        _shots, _map, _clips, output, _dir = self._run_evidence_gate(
+            repo,
+            missing,
+            tmp_path,
+            body="",
+            fixtures={},
+            lane="fork-ux-review.yml",
+            expect_failure=True,
+        )
+        stdout = self._evidence_stdout
+        assert (
+            f"::error::Could not enumerate the media committed between {missing} and HEAD "
+            "(git diff failed, see above), so the committed evidence cannot be collected; "
+            "re-run the workflow."
+        ) in stdout, stdout
+        assert "Committed evidence:" not in stdout, stdout
+        # `exit 1` from a SOURCED script skips the rest of the caller's step,
+        # so the output the fork lanes turn into a FAILED check-run has to be
+        # written before leaving. Without it the step is red while the
+        # check-run resolves NEUTRAL, which PR readiness scores as a pass.
+        assert "unfetched=true" in output, output
+
+    def test_both_fork_lanes_read_the_committed_media_from_the_object_store(self) -> None:
+        """Static contract for the fallback. Both fork lanes source the shared
+        committed-evidence script AFTER the attachment script, pass it the
+        pinned head, and read blobs with `git cat-file` -- never by checking the
+        fork head out. The UX prompt tells the reviewer a committed image counts
+        the same as an attached one, because this script puts it in front of
+        the reviewer."""
+        script = (ROOT / self.COMMITTED_SCRIPT).read_text(encoding="utf-8")
+        assert 'git cat-file blob "$HEAD_SHA:$path"' in script
+        assert 'mime="$(file --mime-type -b -- "$tmp")"' in script
+        # Mode-gated before any read, with the permanent-history blob cap.
+        assert "100644|100755) ;;" in script
+        assert 'if [ "${size:-0}" -gt 10485760 ]; then' in script
+        assert "over the 10 MB ceiling" in script
+        assert "checkout" in script, "the script says why it reads objects, not files"
+        for lane, step in (
+            ("fork-ux-review.yml", FORK_ATTACHMENT_STEP),
+            ("fork-design-review.yml", "Collect rendered evidence"),
+        ):
+            step_script = _step_script(_workflow(lane), step)
+            assert ATTACHMENT_SOURCE_LINE in step_script
+            assert self.COMMITTED_SOURCE_LINE in step_script
+            assert step_script.index(ATTACHMENT_SOURCE_LINE) < step_script.index(
+                self.COMMITTED_SOURCE_LINE
+            ), "attachments are read first, so the shared cap cannot drop one"
+            env = _step_env(lane, step)
+            assert env["HEAD_SHA"] == "${{ steps.pr.outputs.head_sha }}"
+            assert env["BASE_SHA"] == "${{ steps.pr.outputs.base_sha }}"
+        fork_prompt = _flat(_step("fork-ux-review.yml", UX_REVIEW_STEP)["with"]["prompt"])
+        assert "A committed image counts the same" in fork_prompt
+        assert "not materialized here" not in fork_prompt
+        assert "a committed-only image cannot close it" not in fork_prompt
+        design = _flat(_workflow("fork-design-review.yml"))
+        assert "committed images this revision adds or changes: not checked" not in design
+
+    def test_the_same_repo_design_lane_sources_the_shared_script_and_keeps_no_loop_of_its_own(
+        self,
+    ) -> None:
+        """The same-repo design lane once re-spelled the committed-media
+        collection inline: its own symlink gate, its own mime table, no size
+        cap, no control-character guard, no skip counting -- and a listing by
+        `--diff-filter=AM` that lost a renamed screenshot, beside a shipped
+        script whose header says that is the shape that loses one. The rule
+        this pins is structural: there is ONE admission contract, the shared
+        script, and the same-repo lane sources it AFTER the attachment script
+        like the fork lanes do. Nothing of the inline copy may return -- not
+        the AM listing, not a `file` call on a working-tree path, not a
+        `-L` test, not a mime table -- and the mime table exists in exactly
+        two files under .github/: the two evidence scripts. The two design
+        lanes' evidence-writing blocks are pinned byte-identical, the way
+        their calibration blocks are, so the report cannot drift by lane."""
+        raw = _workflow("design-review.yml")
+        script = _step_script(raw, DESIGN_EVIDENCE_STEP)
+        assert ATTACHMENT_SOURCE_LINE in script
+        assert self.COMMITTED_SOURCE_LINE in script
+        assert script.index(ATTACHMENT_SOURCE_LINE) < script.index(self.COMMITTED_SOURCE_LINE)
+        # The inline copy, gone in every one of its parts.
+        assert "--diff-filter=AM" not in raw
+        assert "--diff-filter" not in script
+        assert 'file --mime-type -b -- "$path"' not in script
+        assert '[ -L "$path" ]' not in script and "[ ! -f " not in script
+        assert 'committed=""' not in script
+        assert "image/webp" not in raw and "video/quicktime" not in raw
+        # The one mime table lives in the two scripts and nowhere else.
+        tables = sorted(
+            str(p.relative_to(ROOT)).replace(os.sep, "/")
+            for p in (ROOT / ".github").rglob("*")
+            if p.is_file() and "image/webp" in p.read_text(encoding="utf-8", errors="ignore")
+        )
+        assert tables == [ATTACHMENT_SCRIPT, self.COMMITTED_SCRIPT], tables
+        # The blobs are read at the pull request's head, listed against its
+        # base -- the same inputs the fork lanes hand the script.
+        env = _step_env("design-review.yml", DESIGN_EVIDENCE_STEP)
+        assert env["HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
+        assert env["BASE_SHA"] == "${{ github.event.pull_request.base.sha }}"
+        assert env["NAME_STEM"] == "attachment"
+        # The report the prompt reads still says the committed media was
+        # typed by its bytes, and it is the same report in both design lanes.
+        blocks = {}
+        for lane in DESIGN_EVIDENCE_LANES:
+            lane_script = _step_script(_workflow(lane), DESIGN_EVIDENCE_STEP)
+            start = lane_script.index('attached_images="$n"')
+            end = lane_script.index('echo "Rendered evidence:')
+            blocks[lane] = lane_script[start:end]
+            assert "read from the object store and typed by their bytes: $committed_kept" in (
+                blocks[lane]
+            ), lane
+            assert "typed by their bytes: $((clips - attached_clips))" in blocks[lane], lane
+        assert (
+            blocks["design-review.yml"] == blocks["fork-design-review.yml"]
+        ), "the two design lanes' evidence blocks drifted apart"
+
+    def _repo_renaming_its_evidence(self, tmp_path: Path) -> tuple[Path, str]:
+        """The rename case the inline `--diff-filter=AM` listing lost, beside
+        the things the fenced fix refuses. The base tracks two screenshots; the
+        head `git mv`s one untouched and re-captures the other under a new
+        name (a rename to git, with a high similarity score), adds a fresh
+        image whose NAME says PNG but whose BYTES are JPEG, commits a text file
+        under an image name, a recording, and a tracked SYMLINK written through
+        the index (mode 120000) pointing out of the tree."""
+        repo = tmp_path / "repo"
+        shots = repo / "temp-screenshots" / "topic"
+        shots.mkdir(parents=True)
+        self._git(repo, "init", "-q")
+        (shots / "same.png").write_bytes(self.PNG)
+        (shots / "before.png").write_bytes(self.PNG + bytes(range(256)) * 16)
+        self._git(repo, "add", "-fA")
+        self._git(repo, "commit", "-qm", "base")
+        base = self._git(repo, "rev-parse", "HEAD")
+        (repo / "website").mkdir()
+        (repo / "website" / "App.tsx").write_text("x")
+        panel = repo / "temp-screenshots" / "panel"
+        panel.mkdir()
+        self._git(repo, "mv", "temp-screenshots/topic/same.png", "temp-screenshots/panel/same.png")
+        self._git(
+            repo, "mv", "temp-screenshots/topic/before.png", "temp-screenshots/panel/after.png"
+        )
+        (panel / "after.png").write_bytes(self.PNG + bytes(range(256)) * 15 + b"Z" * 256)
+        (panel / "fresh.png").write_bytes(self.JPEG)
+        (panel / "notes.png").write_bytes(self.TEXT)
+        (panel / "walkthrough.webm").write_bytes(self.WEBM)
+        self._git(repo, "add", "-fA")
+        target = tmp_path / "symlink-target"
+        target.write_text("../../../../etc/passwd")
+        oid = self._git(repo, "hash-object", "-w", "--", str(target))
+        self._git(
+            repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "120000",
+            oid,
+            "temp-screenshots/panel/secrets.png",
+        )
+        self._git(repo, "commit", "-qm", "head")
+        return repo, base
+
+    @pytest.mark.parametrize("lane", DESIGN_EVIDENCE_LANES)
+    def test_both_design_lanes_admit_a_renamed_screenshot_and_refuse_by_mode_and_bytes(
+        self, tmp_path: Path, lane: str
+    ) -> None:
+        """Execute the ACTUAL "Collect rendered evidence" step of each design
+        lane against a PR that renames its screenshots. First the fixture is
+        shown to be the losing case: `git diff --name-only --diff-filter=AM`
+        does not list the re-captured file's destination. Then the step
+        proves it reaches the reviewer anyway -- the evidence file counts it,
+        the map names its repository path -- while the unchanged move is
+        refused by name as the base's rendering, the symlink is refused by its
+        MODE before any bytes are read, the text file under an image name is
+        refused by its BYTES, the JPEG under a `.png` name is kept under the
+        extension its bytes earn, and the recording is listed. Every count in
+        the file matches what the lists hold. That is the fenced guarantee --
+        no path is called rendered evidence without being established as a
+        regular, byte-typed media file -- now held by execution rather than by
+        the text of an inline loop, and held identically by both lanes."""
+        repo, base = self._repo_renaming_its_evidence(tmp_path)
+        lost = self._git(repo, "diff", "--name-only", "--diff-filter=AM", f"{base}...HEAD")
+        assert "temp-screenshots/panel/after.png" not in lost.splitlines(), lost
+        assert "temp-screenshots/panel/fresh.png" in lost.splitlines(), lost
+
+        shot_list, shot_map, clip_list, _output, dest_dir = self._run_evidence_gate(
+            repo, base, tmp_path, body="No attachments.\n", fixtures={}, lane=lane
+        )
+        stdout = self._evidence_stdout
+        evidence = self._evidence_file.read_text(encoding="utf-8")
+        origins = dict(line.split("\t") for line in shot_map.splitlines())
+        assert sorted(origins.values()) == [
+            "temp-screenshots/panel/after.png",
+            "temp-screenshots/panel/fresh.png",
+        ], shot_map
+        # Index-named copies, extension from the bytes: the `.png` holding
+        # JPEG is a .jpg to the reviewer.
+        assert sorted(origins) == ["attachment-01.png", "attachment-02.jpg"], shot_map
+        assert sorted(p.name for p in dest_dir.iterdir()) == sorted(origins)
+        assert clip_list.splitlines() == ["temp-screenshots/panel/walkthrough.webm"]
+        # The refusals, each by the gate that decides it.
+        assert (
+            "::warning::SKIPPED (moved from temp-screenshots/topic/same.png with no change "
+            "in its bytes, so it shows the base, not this revision; capture the screenshot "
+            "again): temp-screenshots/panel/same.png"
+        ) in stdout, stdout
+        assert (
+            "::warning::SKIPPED (not a regular file at HEAD, mode 120000): "
+            "temp-screenshots/panel/secrets.png"
+        ) in stdout, stdout
+        assert "::warning::SKIPPED (mime text/plain): temp-screenshots/panel/notes.png" in stdout
+        assert not (repo / "temp-screenshots" / "panel" / "secrets.png").is_symlink()
+        # The file the prompt calls the predicate: counts that match the
+        # lists, the admitted copies, the recording, and none of the refused.
+        assert "attachments downloaded and typed as images: 0" in evidence
+        assert "attachments downloaded and typed as recordings: 0" in evidence
+        assert (
+            "committed images this revision adds or changes, read from the object store "
+            "and typed by their bytes: 2"
+        ) in evidence, evidence
+        assert (
+            "committed recordings this revision adds or changes, read from the object store "
+            "and typed by their bytes: 1"
+        ) in evidence, evidence
+        assert "(presence unconfirmed, not absent): 0" in evidence
+        for copy in shot_list.splitlines():
+            assert copy in evidence, (copy, evidence)
+        assert "temp-screenshots/panel/walkthrough.webm" in evidence
+        for refused in ("same.png", "secrets.png", "etc/passwd", "notes.png", "before.png"):
+            assert refused not in evidence, (refused, evidence)
+        assert "(none)" not in evidence
+        assert (
+            "Committed evidence: 6 media path(s) added or changed under temp-screenshots/ or "
+            ".github/screenshots/, 2 image(s) kept, 3 skipped. 1 of the skipped were moved from "
+            "the base without a change in bytes and show the base, not this revision."
+        ) in stdout, stdout
+        assert "Rendered evidence: 2 image(s) (2 committed), 1 recording(s) (1 committed)" in (
+            stdout
+        ), stdout
+
+    @pytest.mark.parametrize("lane", DESIGN_EVIDENCE_LANES)
+    def test_a_design_lane_attachment_is_counted_apart_from_the_committed_media(
+        self, tmp_path: Path, lane: str
+    ) -> None:
+        """One attachment downloads and two images are committed: the file
+        reports one attached image and two committed ones, the attachment is
+        numbered first (the cap must never drop it for a committed file), and
+        the summary line's totals are the sums."""
+        repo, base = self._repo_committing_evidence(tmp_path)
+        url = "https://github.com/user-attachments/assets/0f3b2c1a-1111-4bcd-9e8f-0123456789ab"
+        shot_list, shot_map, _clips, _output, _dir = self._run_evidence_gate(
+            repo, base, tmp_path, body=f"![after]({url})\n", fixtures={url: self.JPEG}, lane=lane
+        )
+        evidence = self._evidence_file.read_text(encoding="utf-8")
+        origins = dict(line.split("\t") for line in shot_map.splitlines())
+        assert origins["attachment-01.jpg"] == url
+        assert sorted(origins) == ["attachment-01.jpg", "attachment-02.png", "attachment-03.png"]
+        assert "attachments downloaded and typed as images: 1" in evidence
+        assert "attachments downloaded and typed as recordings: 0" in evidence
+        assert (
+            "committed images this revision adds or changes, read from the object store "
+            "and typed by their bytes: 2"
+        ) in evidence, evidence
+        assert (
+            "committed recordings this revision adds or changes, read from the object store "
+            "and typed by their bytes: 1"
+        ) in evidence, evidence
+        assert len(shot_list.splitlines()) == 3
+        assert "Rendered evidence: 3 image(s) (2 committed), 1 recording(s) (1 committed)" in (
+            self._evidence_stdout
+        ), self._evidence_stdout
+
+    def test_neither_fork_lane_tells_its_reviewer_to_discount_a_committed_image(self) -> None:
+        """The evidence steps hand the reviewer committed media as bytes out of
+        the object store, so the trigger that decides "cannot evaluate" has to
+        count that media as evidence. A trigger that still says a committed
+        image is not evidence on a fork pull request, or that a gap is a
+        control no ATTACHED screenshot shows, instructs the reviewer to block
+        an author for the very evidence the workflow just gave it. The negative
+        assertions name the stale shapes; the positive ones name the rule the
+        trigger states instead. The design trigger is checked in BOTH design
+        lanes because their calibration blocks are pinned identical, so its
+        wording has to be true of a same-repo and a fork pull request alike --
+        which it is only as the one read the shared script performs: bytes out
+        of the object store at the head SHA, never off a working tree. A
+        per-lane split ("in a same-repo checkout as the file at HEAD") names a
+        read the script does not perform. The CANNOT-EVALUATE contract itself is
+        untouched: the point is which evidence counts, not when the lane may
+        refuse."""
+        for lane in DESIGN_LANES:
+            design_prompt = _flat(_step(lane, "Design review (Fable 5)")["with"]["prompt"])
+            assert "THIS checkout can render" not in design_prompt, lane
+            assert "a committed image is not evidence here" not in design_prompt, lane
+            assert "in a same-repo checkout as the file at HEAD" not in design_prompt, lane
+            assert "no committed image or recording it names" in design_prompt, lane
+            assert "counts the same as an attachment" in design_prompt, lane
+            assert (
+                "read as bytes out of the object store at the head SHA, never off a "
+                "working tree, on a same-repo and a fork pull request alike" in design_prompt
+            ), lane
+            assert "a committed path the list does not name was not admitted" in design_prompt, lane
+            # The lane still refuses when the list names nothing, and still
+            # says a URL the workflow could not download is not evidence.
+            assert "CANNOT EVALUATE -- REQUIRED EVIDENCE MISSING" in design_prompt, lane
+            assert "a URL that did not download is not evidence" in design_prompt, lane
+        ux_prompt = _flat(_step("fork-ux-review.yml", UX_REVIEW_STEP)["with"]["prompt"])
+        assert "attached screenshot" not in ux_prompt
+        assert "a control the attachments show" not in ux_prompt
+        assert "a control no supplied screenshot (attached or committed) shows is" in ux_prompt
+        assert "a control or state no supplied screenshot shows" in ux_prompt
+        assert "user-visible control in no supplied screenshot" in ux_prompt
+        # The same-repo lane's own wording is the model: it never had a
+        # checkout problem, and it says "supplied" for the same reason.
+        same_repo = _flat(_step("ux-review.yml", UX_REVIEW_STEP)["with"]["prompt"])
+        assert "a control or state no supplied screenshot" in same_repo
 
 
 # The lanes whose missing head marker degrades to a NON-BLOCKING UNKNOWN.
@@ -3783,6 +4598,20 @@ class TestOpusTwoStageArchitecture:
 
     LANES = ("claude-review.yml", "fork-opus-review.yml")
 
+    #: One turn budget, both stages, both lanes. Discovery explores the repo, so
+    #: it is the stage that runs out: a 31-file diff exhausted 120 turns in 25
+    #: minutes and published no verdict at all, because a run stopped at the cap
+    #: emits no stamp and the lane refuses to call that a review.
+    TURN_BUDGET = 180
+    #: The job wall, which stays a HANG backstop rather than a second budget. Both
+    #: stages share one job, so the wall bounds their sum. Sized off the one run
+    #: that exhausted the budget -- fork-opus-review run 35948052812, job
+    #: 107470355540, 121 turns in 25m14s, so ~12.5 s per turn -- which makes two
+    #: exhausted stages about 76 minutes. Re-measure from a fresh exhausted run
+    #: before trusting the margin: one observation is what this number rests on,
+    #: and a slower turn moves the wall back into being the real budget.
+    WALL_MINUTES = 120
+
     # Clauses that must live ONLY in validation. Each of these was shown, by
     # single-clause ablation with n=3 on a known-real defect, to silence a
     # finding the same model reports 3/3 times without it.
@@ -3804,6 +4633,22 @@ class TestOpusTwoStageArchitecture:
             # it, an unfiltered candidate list would be posted and gated on.
             assert "\n        id: review\n" in workflow[validate_at:], lane
             assert "\n        id: discover\n" in workflow[discover_at:validate_at], lane
+
+    def test_both_stages_of_both_lanes_carry_the_same_turn_budget(self) -> None:
+        """A cap that differs per stage or per lane makes one of them the wall."""
+        for lane in self.LANES:
+            # Line-anchored: the surrounding prose names the number too, and a
+            # comment is not a budget.
+            budgets = re.findall(r"(?m)^ *--max-turns (\d+) *$", _workflow(lane))
+            assert budgets == [str(self.TURN_BUDGET)] * 2, (lane, budgets)
+
+    def test_the_job_wall_leaves_room_for_two_exhausted_stages(self) -> None:
+        """Both stages share one job, so the wall bounds their SUM."""
+        for lane in self.LANES:
+            spec = yaml.safe_load(_workflow(lane))
+            walls = [job.get("timeout-minutes") for job in spec["jobs"].values()]
+            assert walls == [self.WALL_MINUTES], (lane, walls)
+            assert self.WALL_MINUTES * 60 > self.TURN_BUDGET * 2 * 12.5, lane
 
     def test_candidates_cross_the_stage_boundary_as_a_file(self) -> None:
         """Model output must never be spliced into YAML or a shell argument."""
@@ -6989,6 +7834,12 @@ class TestGptVerdictVisibility:
             "# changed author guard) fails these tests instead of hiding.\n"
             'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
             '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  # Every attempt at the comment WRITE fails, so the retry is\n"
+            "  # visible in the recorded call count. Records no body: a write\n"
+            "  # that failed left nothing on the comment, and asserting on a\n"
+            "  # body the API never accepted is how a lost write reads as a\n"
+            "  # published one.\n"
+            '  if [ -n "${STUB_PATCH_FAIL:-}" ]; then exit 6; fi\n'
             '  for a in "$@"; do\n'
             '    case "$a" in body=*) printf \'%s\' "${a#body=}" > "$STUB_CALLS/patched-body.md";; esac\n'
             "  done\n"
@@ -7005,7 +7856,21 @@ class TestGptVerdictVisibility:
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            '  printf \'%s\\n\' "$3" >> "$STUB_CALLS/create-calls.txt"\n'
             "  shift 3\n"
+            '  if [ -n "${STUB_CREATE_FAIL:-}" ]; then\n'
+            "    # STUB_CREATE_LANDS emulates the lost-ack partial failure that\n"
+            "    # makes a create unsafe to repeat: GitHub ACCEPTS the POST, so\n"
+            "    # the comment now exists, but the CLI still reports failure.\n"
+            "    # The body is written into the finder fixture, so the step's own\n"
+            "    # confirmation query sees it through real jq.\n"
+            '    if [ -n "${STUB_CREATE_LANDS:-}" ] && [ "$1" = "--body-file" ]; then\n'
+            '      jq -n --arg b "$(cat "$2")" \\\n'
+            "        '[{id:777,user:{login:\"github-actions[bot]\"},body:$b}]' \\\n"
+            '        > "$FINDER_COMMENTS_FILE"\n'
+            "    fi\n"
+            "    exit 7\n"
+            "  fi\n"
             '  if [ "$1" = "--body-file" ]; then cp "$2" "$STUB_CALLS/created-body.md"; fi\n'
             "  exit 0\n"
             "fi\n"
@@ -7013,6 +7878,20 @@ class TestGptVerdictVisibility:
             encoding="utf-8",
         )
         gh_stub.chmod(0o755)
+
+        # `sleep` is an external command, so a shim earlier on PATH intercepts
+        # the retry backoff without a test-only knob in the workflow: the lanes
+        # keep their real production budget and these tests do not wait it out.
+        # Records each interval, so the SCHEDULE is assertable rather than just
+        # the attempt count.
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf \'%s\\n\' "$1" >> "$STUB_CALLS/sleeps.txt"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        sleep_stub.chmod(0o755)
 
         script = _step_script(_workflow("codex-review.yml"), "Post/update review comment")
         script_file = tmp_path / "step.sh"
@@ -7474,6 +8353,27 @@ _GUARDED_LANES = [
 
 _GUARDED_LANE_PARAMS = [pytest.param(lane, id=lane["id"]) for lane in _GUARDED_LANES]
 
+# Every lane that publishes a review VERDICT into a marker comment, including
+# the two same-repo lanes that do not route through guarded_comment_upsert
+# (claude-review.yml and codex-review.yml). Spelled out rather than globbed for
+# the primitive's name: a lane that DROPS the write primitive must fail this
+# list, and a glob keyed on the primitive would silently stop measuring exactly
+# that lane.
+_VERDICT_PUBLISHING_LANES = (
+    ("claude-review.yml", "Post Opus 5 review summary"),
+    ("codex-review.yml", "Post/update review comment"),
+    ("design-review.yml", "Post design review summary"),
+    ("first-principles-review.yml", "Post first-principles review summary"),
+    ("fork-design-review.yml", "Post/update design review comment"),
+    ("fork-first-principles-review.yml", "Post/update first-principles review comment"),
+    ("fork-gpt-review.yml", "Post/update summary comment"),
+    ("fork-opus-review.yml", "Post/update summary comment"),
+    ("fork-security-scope-review.yml", "Post/update the scope review comment"),
+    ("fork-ux-review.yml", "Post UX review summary"),
+    ("security-scope-review.yml", "Post the scope verdict"),
+    ("ux-review.yml", "Post UX review summary"),
+)
+
 
 class TestReviewLaneVerdictVisibility:
     """No review lane may bury a posted verdict under an incomplete body.
@@ -7586,6 +8486,12 @@ class TestReviewLaneVerdictVisibility:
             "# changed author guard) fails these tests instead of hiding.\n"
             'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
             '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  # Every attempt at the comment WRITE fails, so the retry is\n"
+            "  # visible in the recorded call count. Records no body: a write\n"
+            "  # that failed left nothing on the comment, and asserting on a\n"
+            "  # body the API never accepted is how a lost write reads as a\n"
+            "  # published one.\n"
+            '  if [ -n "${STUB_PATCH_FAIL:-}" ]; then exit 6; fi\n'
             '  for a in "$@"; do\n'
             '    case "$a" in body=*) printf \'%s\' "${a#body=}" > "$STUB_CALLS/patched-body.md";; esac\n'
             "  done\n"
@@ -7602,6 +8508,20 @@ class TestReviewLaneVerdictVisibility:
             "      ;;\n"
             "  esac\n"
             "fi\n"
+            'if [ "$1" = "api" ] && [ -n "${STUB_COMMENT_FAIL_FIRST:-}" ]; then\n'
+            "  # Only the FIRST N comment lookups fail, then they succeed. This is\n"
+            "  # the interleaving that makes a stale comment dangerous: the id\n"
+            "  # lookup errors so the step takes the create path, and a later\n"
+            "  # confirmation query then succeeds and can see the stale comment.\n"
+            '  case "$2" in\n'
+            "    */comments)\n"
+            '      printf \'%s\\n\' "$2" >> "$STUB_CALLS/comment-reads.txt"\n'
+            '      if [ "$(wc -l < "$STUB_CALLS/comment-reads.txt")" -le "$STUB_COMMENT_FAIL_FIRST" ]; then\n'
+            "        exit 4\n"
+            "      fi\n"
+            "      ;;\n"
+            "  esac\n"
+            "fi\n"
             'if [ "$1" = "api" ]; then\n'
             "  # The PR object, from which the step reads the CURRENT head sha.\n"
             "  # STUB_PR_HEAD unset means the PR still points at this run;\n"
@@ -7611,7 +8531,34 @@ class TestReviewLaneVerdictVisibility:
             "    */pulls/*)\n"
             '      printf \'%s\\n\' "$2" >> "$STUB_CALLS/pr-head-reads.txt"\n'
             '      if [ -z "${STUB_PR_HEAD-unset}" ]; then exit 5; fi\n'
+            "      # STUB_PR_HEAD_AFTER=<n>:<sha> moves the head MID-RUN: the\n"
+            "      # first n reads answer as usual and later ones answer <sha>,\n"
+            "      # or fail when it is empty. That is the only way to reach the\n"
+            "      # retry's own head re-confirmation, because the caller's\n"
+            "      # check reads first and a head that has already moved there\n"
+            "      # never gets as far as a write.\n"
+            '      if [ -n "${STUB_PR_HEAD_AFTER:-}" ] \\\n'
+            '        && [ "$(wc -l < "$STUB_CALLS/pr-head-reads.txt")" -gt "${STUB_PR_HEAD_AFTER%%:*}" ]; then\n'
+            '        if [ -z "${STUB_PR_HEAD_AFTER#*:}" ]; then exit 5; fi\n'
+            "        printf '%s\\n' \"${STUB_PR_HEAD_AFTER#*:}\"\n"
+            "        exit 0\n"
+            "      fi\n"
             "      printf '%s\\n' \"${STUB_PR_HEAD:-$HEAD}\"\n"
+            "      exit 0\n"
+            "      ;;\n"
+            "  esac\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  # One comment read by id: what a repeat uses to spot a human\n"
+            "  # override before writing over it. STUB_TARGET_BODY set-but-empty\n"
+            "  # makes the read FAIL, which is a different case from a body that\n"
+            "  # simply is not an override. The PATCH branch above matches first,\n"
+            "  # so a write to the same path never lands here.\n"
+            '  case "$2" in\n'
+            "    */issues/comments/[0-9]*)\n"
+            '      printf \'%s\\n\' "$2" >> "$STUB_CALLS/target-reads.txt"\n'
+            '      if [ -z "${STUB_TARGET_BODY-x}" ]; then exit 5; fi\n'
+            "      printf '%s\\n' \"${STUB_TARGET_BODY:-## Lane Review -- verdict body}\"\n"
             "      exit 0\n"
             "      ;;\n"
             "  esac\n"
@@ -7627,7 +8574,21 @@ class TestReviewLaneVerdictVisibility:
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            '  printf \'%s\\n\' "$3" >> "$STUB_CALLS/create-calls.txt"\n'
             "  shift 3\n"
+            '  if [ -n "${STUB_CREATE_FAIL:-}" ]; then\n'
+            "    # STUB_CREATE_LANDS emulates the lost-ack partial failure that\n"
+            "    # makes a create unsafe to repeat: GitHub ACCEPTS the POST, so\n"
+            "    # the comment now exists, but the CLI still reports failure.\n"
+            "    # The body is written into the finder fixture, so the step's own\n"
+            "    # confirmation query sees it through real jq.\n"
+            '    if [ -n "${STUB_CREATE_LANDS:-}" ] && [ "$1" = "--body-file" ]; then\n'
+            '      jq -n --arg b "$(cat "$2")" \\\n'
+            "        '[{id:777,user:{login:\"github-actions[bot]\"},body:$b}]' \\\n"
+            '        > "$FINDER_COMMENTS_FILE"\n'
+            "    fi\n"
+            "    exit 7\n"
+            "  fi\n"
             '  if [ "$1" = "--body-file" ]; then cp "$2" "$STUB_CALLS/created-body.md"; fi\n'
             "  exit 0\n"
             "fi\n"
@@ -7635,6 +8596,20 @@ class TestReviewLaneVerdictVisibility:
             encoding="utf-8",
         )
         gh_stub.chmod(0o755)
+
+        # `sleep` is an external command, so a shim earlier on PATH intercepts
+        # the retry backoff without a test-only knob in the workflow: the lanes
+        # keep their real production budget and these tests do not wait it out.
+        # Records each interval, so the SCHEDULE is assertable rather than just
+        # the attempt count.
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf \'%s\\n\' "$1" >> "$STUB_CALLS/sleeps.txt"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        sleep_stub.chmod(0o755)
 
         script = _step_script(_workflow(lane["workflow"]), lane["step"])
         script_file = tmp_path / "step.sh"
@@ -7708,9 +8683,12 @@ class TestReviewLaneVerdictVisibility:
         assert not (calls / "patched-body.md").exists()
         assert not (calls / "created-body.md").exists()
         # Whether a comment exists is a gating input, so the read retries
-        # before the step concludes it could not be determined.
+        # before the step concludes it could not be determined -- on a budget
+        # that outlasts the failure it exists for. App-wide API exhaustion
+        # lasts minutes, so a few seconds of tolerance withholds a verdict the
+        # lane has already earned.
         reads = (calls / "comment-reads.txt").read_text(encoding="utf-8").splitlines()
-        assert len(reads) == 3, reads
+        assert len(reads) == 6, reads
         assert "comment lookup also failed" in result.stdout.decode()
 
     @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
@@ -7756,10 +8734,17 @@ class TestReviewLaneVerdictVisibility:
 
         assert result.returncode == 0, result.stderr.decode()
         reads = (calls / "pr-head-reads.txt").read_text(encoding="utf-8").splitlines()
-        assert len(reads) == 3, reads
+        assert len(reads) == 6, reads
         assert not (calls / "patched-body.md").exists()
         assert not (calls / "created-body.md").exists()
-        assert "unreadable after 3 attempts" in result.stdout.decode()
+        stdout = result.stdout.decode()
+        assert "unreadable after 6 attempts" in stdout
+        # A withheld verdict is reported as an ANNOTATION, not as one line in a
+        # job log nobody opens. Withholding is the right call on an unreadable
+        # head, but a lane that withholds still concludes `success`, so the
+        # annotation is the only thing that tells a withheld verdict apart from
+        # a published one.
+        assert "::warning::Withholding" in stdout
 
     @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
     def test_completed_verdict_still_replaces_the_comment(self, lane: dict, tmp_path: Path) -> None:
@@ -7781,19 +8766,27 @@ class TestReviewLaneVerdictVisibility:
         assert "/comments/999" not in patch_calls
 
     @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
-    def test_completed_verdict_creates_when_the_lookup_fails(
+    def test_completed_verdict_creates_once_a_duplicate_is_ruled_out(
         self, lane: dict, tmp_path: Path
     ) -> None:
-        # The asymmetry that makes the guard safe in both directions: a
-        # duplicate comment is recoverable, an unposted verdict is not, so a
-        # completed verdict publishes even when the lookup could not confirm
-        # whether a comment already exists.
+        # A completed verdict must not be dropped merely because the caller's own
+        # id lookup failed. That lookup is not the last word: the write re-reads,
+        # and a clean re-read finding the slot empty has PROVED there is nothing
+        # to duplicate, so the verdict publishes exactly as it would have.
+        #
+        # An UNKNOWN and an OCCUPIED slot are different answers from an empty
+        # one, and only emptiness licenses the write. The sibling contract above
+        # refuses to create when the lookup errored, because a marker planted is
+        # not undone by a later run; the same unknown cannot mean "must not
+        # create" for a notice and "must create" for a verdict.
+        # `test_an_unreadable_duplicate_check_refuses_the_write` and
+        # `test_a_stale_head_comment_also_occupies_the_slot` cover the other two.
         calls, result = self._run_step(
             lane,
             tmp_path,
-            existing_body=self._verdict_body(lane, self.OLD),
+            existing_body=None,
             kind="completed",
-            extra_env={"FINDER_FAIL": "1"},
+            extra_env={"STUB_COMMENT_FAIL_FIRST": "6"},
         )
 
         assert result.returncode == 0, result.stderr.decode()
@@ -8025,14 +9018,17 @@ class TestReviewLaneVerdictVisibility:
         # Exactly two conditions withhold the write, and each names itself.
         assert 'if ! grep -Fq "$stamp $HEAD" "$out_file"; then' in canonical
         assert 'withhold="run for $HEAD produced no completed verdict"' in canonical
-        # BOTH gating reads retry a transient failure before deciding.
-        assert canonical.count("for attempt in 1 2 3; do") == 2
-        assert canonical.count('if [ "$attempt" -lt 3 ]; then') == 2
+        # BOTH gating reads retry a transient failure before deciding, on a
+        # budget that outlasts the failure they exist for: API exhaustion
+        # windows last minutes. Linear 5s backoff, ~75s per read.
+        assert canonical.count("for attempt in 1 2 3 4 5 6; do") == 2
+        assert canonical.count('if [ "$attempt" -lt 6 ]; then') == 2
+        assert canonical.count('sleep "$(( attempt * 5 ))"') == 2
         assert 'pr_head="$(gh api "repos/$REPO/pulls/$PR" --jq \'.head.sha\')"' in canonical
         # An unreadable head is NOT confirmed current: the destructive write
         # must not proceed on an unknown, so this arm withholds like the others.
         assert 'if [ -z "$pr_head" ]; then' in canonical
-        assert "unreadable after 3 attempts" in canonical
+        assert "unreadable after 6 attempts" in canonical
         assert 'elif [ "$pr_head" != "$HEAD" ]; then' in canonical
         assert 'withhold="$HEAD is no longer this PR\'s head ($pr_head)"' in canonical
         # A withheld write returns before reaching any PATCH: both no-touch
@@ -8046,6 +9042,829 @@ class TestReviewLaneVerdictVisibility:
         # A failed lookup on a COMPLETED verdict for the current head still
         # falls through to CREATE, never to silence.
         assert 'gh pr comment "$PR" --body-file "$out_file"' in canonical
+        # Every write inside the guard goes through the retrying primitive, and
+        # none of them is followed by an unconditional success line: `|| true`
+        # plus a hardcoded "Updated existing ..." echo reports a lost PATCH as
+        # a published verdict. Backslash continuations are joined first, because
+        # a call site that wraps puts the command on a later physical line and a
+        # per-line test would skip it while still passing.
+        joined = canonical.replace("\\\n", " ")
+        writes = [
+            line
+            for line in joined.splitlines()
+            if not line.lstrip().startswith("#")
+            if "gh api --method PATCH" in line or "gh pr comment " in line
+        ]
+        assert len(writes) == 3, writes
+        for line in writes:
+            assert "retry_comment_write" in line, line
+            assert "|| true" not in line, line
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_a_lost_patch_is_retried_and_never_claimed_as_published(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # The lane HAS a completed verdict for the current head and is cleared
+        # to claim the slot, but the write itself fails. One attempt under
+        # `|| true` with an unconditional "Updated existing ..." echo leaves the
+        # marker pinned to a superseded head while the job log claims the
+        # opposite, and prepare-pr then refuses a PR whose every check passes.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="completed",
+            extra_env={"STUB_PATCH_FAIL": "1"},
+        )
+
+        # An unpublishable verdict is an infrastructure failure, not a BLOCK
+        # verdict, so it still must not fail an advisory lane's gate.
+        assert result.returncode == 0, result.stderr.decode()
+        # The write is retried on the gating reads' budget, not attempted once.
+        attempts = (calls / "patch-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(attempts) == 6, attempts
+        # The backoff SCHEDULE, not just the count: five waits between six
+        # attempts, linear 5s, ~75s in total -- sized against exhaustion
+        # windows that last minutes rather than seconds.
+        waits = (calls / "sleeps.txt").read_text(encoding="utf-8").splitlines()
+        assert waits == ["5", "10", "15", "20", "25"], waits
+        # Each repeat re-confirms this run's head first, so six write attempts
+        # carry five re-confirmations on top of the caller's own check. The
+        # head is what gives this write the standing to replace the comment, so
+        # a repeat that never re-checks it can restore a superseded body over a
+        # newer head's verdict.
+        heads = (calls / "pr-head-reads.txt").read_text(encoding="utf-8").splitlines()
+        assert len(heads) == 6, heads
+        # And each repeat re-reads the comment it is about to write, which is
+        # what keeps an accepted override from being restored away. Five reads
+        # for five repeats; the first write has nothing to guard against.
+        targets = (calls / "target-reads.txt").read_text(encoding="utf-8").splitlines()
+        assert len(targets) == 5, targets
+        # Nothing landed, so the stub recorded no accepted body.
+        assert not (calls / "patched-body.md").exists()
+        stdout = result.stdout.decode()
+        # The step does NOT claim to have updated the comment ...
+        assert "Updated existing" not in stdout
+        # ... and the loss is an annotation naming the head whose verdict is
+        # unpublished, so it is visible without opening the job log.
+        assert "::error::" in stdout
+        assert self.HEAD in stdout
+
+    def test_only_the_fail_closed_lanes_exit_on_a_verdict_that_missed_the_slot(
+        self,
+    ) -> None:
+        # Two lane classes, two correct answers, and the difference is in
+        # pr-readiness.yml rather than in taste. `Design Review`, `UX Review`
+        # and `First Principles Review` have any non-success conclusion
+        # attributed as "(BLOCK)", a judged-wrong design, so failing them for a
+        # write that never landed manufactures a verdict nobody reached -- those
+        # lanes report the loss as an annotation and stay green, and the PR
+        # carrying no verdict for its head surfaces through the readiness
+        # staleness read. The two same-repo reviewer lanes are FAIL-CLOSED and
+        # attributed plainly: their own gate reads the captured review text, not
+        # the PR, so a verdict that missed the slot would pass the check while
+        # the PR presents an older head's verdict, and a repository writer
+        # clears a wrong failure with a head-scoped override.
+        #
+        # Status 3 divides the two classes as sharply as the write failures do.
+        # An advisory lane loses nothing it can act on when an earlier run for
+        # this same head already filled the slot. A fail-closed lane loses the
+        # fresh sample the re-run was asked for, and the earlier verdict keeps
+        # whatever it said -- so a stale blocking line goes on gating the PR
+        # while the lane reports green, which is the silence this change removes.
+        for workflow, step in (
+            ("claude-review.yml", "Post Opus 5 review summary"),
+            ("codex-review.yml", "Post/update review comment"),
+        ):
+            code = _step_script(_workflow(workflow), step).splitlines()
+            missed = [
+                n
+                for n, line in enumerate(code)
+                if "::error::" in line
+                and (
+                    "could not publish" in line
+                    or "slot is already taken" in line
+                    or "was not published" in line
+                )
+            ]
+            # Four arms per lane: the replace that did not land, the create that
+            # did not land, the create that found the slot taken, and the create
+            # that found an earlier run's verdict for this same head. The last is
+            # the one a re-run exists to replace, so discarding it silently is
+            # the same loss as never publishing at all.
+            assert len(missed) == 4, (workflow, missed)
+            for n in missed:
+                assert code[n + 1].strip() == "exit 1", (workflow, code[n])
+            # The outcomes where the PR is not missing this run's verdict by
+            # accident do NOT exit: it moved to a newer head whose own run
+            # publishes, or a human override occupies the comment and decided
+            # what it says.
+            for n, line in enumerate(code):
+                if "moved to a newer head" in line or "accepted human override" in line:
+                    assert code[n + 1].strip() != "exit 1", (workflow, line)
+        # The shared function carries no exit at all, in any arm: ten lanes use
+        # it, three of them the ones readiness reads as a judged BLOCK.
+        for workflow, step in _VERDICT_PUBLISHING_LANES:
+            if workflow in ("claude-review.yml", "codex-review.yml"):
+                continue
+            guard = _shell_function(
+                _step_script(_workflow(workflow), step), "guarded_comment_upsert"
+            )
+            assert "exit 1" not in guard, workflow
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_a_repeat_never_writes_over_an_accepted_override(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # The head check cannot see a SAME-head writer, and one same-head body
+        # must never be written over: an accepted human override replaces this
+        # slot's comment, so restoring a verdict on top of it puts back the
+        # block the override cleared, and no later run undoes that. A repeat
+        # therefore re-reads the comment it is about to write.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="completed",
+            extra_env={
+                "STUB_PATCH_FAIL": "1",
+                "STUB_TARGET_BODY": "## Lane Review -- human override accepted by a writer",
+            },
+        )
+
+        # Green: a human decided what this slot says, so this run publishing
+        # nothing is the correct outcome rather than a loss.
+        assert result.returncode == 0, result.stderr.decode()
+        # ONE attempt. The repeat stops at the guard, which is what leaves the
+        # override in place.
+        attempts = (calls / "patch-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(attempts) == 1, attempts
+        assert not (calls / "patched-body.md").exists()
+        stdout = result.stdout.decode()
+        assert "accepted human override" in stdout
+        assert "Updated existing" not in stdout
+        assert "::error::" not in stdout
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_an_unreadable_target_stops_the_repeat(self, lane: dict, tmp_path: Path) -> None:
+        # Same rule as the unreadable head: repeating is the destructive half,
+        # so it does not proceed on an unknown. A re-run publishes the verdict.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="completed",
+            extra_env={"STUB_PATCH_FAIL": "1", "STUB_TARGET_BODY": ""},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        attempts = (calls / "patch-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(attempts) == 1, attempts
+        assert not (calls / "patched-body.md").exists()
+        stdout = result.stdout.decode()
+        assert "could not be read" in stdout
+        assert "::error::" in stdout
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_a_moved_head_stops_the_patch_retry(self, lane: dict, tmp_path: Path) -> None:
+        # A replace has no slot re-read to protect it: the caller names the
+        # comment id and the primitive never reads that comment's body, so the
+        # repeat is blind. When the PR moves to a newer head between two
+        # attempts, the run for that head owns the comment, and repeating this
+        # write puts a superseded verdict back over a current one.
+        newer = "cccc567890abcdef1234567890abcdef1234cccc"
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="completed",
+            extra_env={"STUB_PATCH_FAIL": "1", "STUB_PR_HEAD_AFTER": f"1:{newer}"},
+        )
+
+        # Green: an unpublished verdict is an infrastructure outcome, and a
+        # superseded run publishing nothing is the correct outcome besides.
+        assert result.returncode == 0, result.stderr.decode()
+        # ONE write attempt, not six. The head re-confirmation ends the loop
+        # before the second, which is what keeps the newer verdict in place.
+        attempts = (calls / "patch-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(attempts) == 1, attempts
+        assert not (calls / "patched-body.md").exists()
+        stdout = result.stdout.decode()
+        assert "Updated existing" not in stdout
+        assert newer in stdout
+        assert "this PR has moved to a newer head" in stdout
+        # Nothing is missing from the PR, so this is not an error annotation:
+        # the run for the current head publishes the verdict that counts.
+        assert "::error::" not in stdout
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_an_unreadable_head_stops_the_patch_retry_too(self, lane: dict, tmp_path: Path) -> None:
+        # Repeating is the destructive half, so an unknown stops it on the same
+        # terms as a moved head. The budget belongs to the write, not to this
+        # read: one unreadable answer ends the loop, and a re-run publishes the
+        # verdict. The opposite trade cannot be made safely -- a blind repeat
+        # can restore a superseded body over a verdict that is current.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="completed",
+            extra_env={"STUB_PATCH_FAIL": "1", "STUB_PR_HEAD_AFTER": "1:"},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        attempts = (calls / "patch-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(attempts) == 1, attempts
+        assert not (calls / "patched-body.md").exists()
+        stdout = result.stdout.decode()
+        assert "Updated existing" not in stdout
+        assert "is unreadable, so this write was not repeated" in stdout
+        # This one IS a loss: the verdict is not on the PR and nobody else is
+        # publishing it, so it gets the annotation.
+        assert "::error::" in stdout
+        assert self.HEAD in stdout
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_a_landed_write_is_reported_landed_even_once_the_head_moves(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # Order inside the retry: the landing check runs BEFORE the head
+        # re-confirmation. A write whose ack was lost is ON the PR, so the head
+        # moving afterwards does not un-publish it, and calling it a superseded
+        # no-write would be the same false claim as calling an unlanded write
+        # published, only in the other direction.
+        newer = "dddd567890abcdef1234567890abcdef1234dddd"
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=None,
+            kind="completed",
+            extra_env={
+                "STUB_CREATE_FAIL": "1",
+                "STUB_CREATE_LANDS": "1",
+                "STUB_PR_HEAD_AFTER": f"1:{newer}",
+            },
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # One create, and no second one: the confirmation saw the landed write.
+        attempts = (calls / "create-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(attempts) == 1, attempts
+        stdout = result.stdout.decode()
+        assert "the previous attempt landed" in stdout
+        assert "moved to a newer head" not in stdout
+        assert "::error::" not in stdout
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_a_lost_create_is_retried_and_never_claimed_as_published(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # The same defect on the other write: with no existing comment the
+        # guard CREATES, and that call carries the identical risk of a lost
+        # write announced as a published one.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=None,
+            kind="completed",
+            extra_env={"STUB_CREATE_FAIL": "1"},
+        )
+
+        # Green, with an error annotation, for the same reason: the lane must
+        # not manufacture a blocking verdict out of a failed write.
+        assert result.returncode == 0, result.stderr.decode()
+        attempts = (calls / "create-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(attempts) == 6, attempts
+        assert not (calls / "created-body.md").exists()
+        stdout = result.stdout.decode()
+        assert "Published" not in stdout
+        assert "::error::" in stdout
+        assert self.HEAD in stdout
+
+    @pytest.mark.parametrize(("workflow", "step"), _VERDICT_PUBLISHING_LANES)
+    def test_the_lookup_that_gates_a_verdict_write_is_retried(
+        self, workflow: str, step: str
+    ) -> None:
+        # The caller's own comment lookup decides whether it has the standing to
+        # UPDATE the lane's comment: only a caller whose read succeeded knows the
+        # comment it found is the one to replace. A single attempt that swallows
+        # its error answers "no comment" for an ordinary flake, and the step then
+        # takes the create path, where the slot pre-read finds that same comment
+        # and refuses -- publishing nothing for a head the PR afterwards reads as
+        # unreviewed. That is a stranded verdict reached by another door, and it
+        # is worse than the duplicate it replaces, because a duplicate at least
+        # leaves a verdict for this head on the PR.
+        #
+        # Three marker-filtered reads gate a verdict write: the caller's lookup,
+        # the slot pre-read, and the landing confirmation. Each is budgeted. The
+        # count is a floor, not an equality, because a lane's OTHER comment reads
+        # answer other questions -- an override lookup, a skip notice that
+        # updates a comment if one happens to exist -- and an empty answer there
+        # writes nothing and strands nothing.
+        code = _step_script(_workflow(workflow), step).splitlines()
+        budgeted = 0
+        for n, line in enumerate(code):
+            if "issues/$PR/comments" not in line:
+                continue
+            read = "\n".join(code[n : n + 3])
+            if not any(f'startswith(\\"${var}' in read for var in ("MARKER", "marker", "slot")):
+                continue
+            if "for attempt in 1 2 3 4 5 6; do" in "\n".join(code[max(0, n - 12) : n + 1]):
+                # A budgeted read reports its own failure instead of hiding it,
+                # which is what lets the caller tell a flake from an empty slot.
+                assert "|| true" not in read, (workflow, line)
+                budgeted += 1
+        assert budgeted >= 3, (workflow, budgeted)
+        assert any('sleep "$(( attempt * 5 ))"' in line for line in code)
+
+    def test_write_primitive_is_byte_identical_across_every_publishing_lane(self) -> None:
+        # Same invariant as guarded_comment_upsert's, extended to the two
+        # same-repo lanes that do not route through it: the retry budget and
+        # the refusal to claim an unlanded write must not drift lane by lane.
+        bodies = set()
+        for workflow, step in _VERDICT_PUBLISHING_LANES:
+            script = _step_script(_workflow(workflow), step)
+            bodies.add(_shell_function(script, "retry_comment_write"))
+        assert len(bodies) == 1, (
+            "retry_comment_write must stay byte-identical across every lane "
+            "that publishes a verdict; edit all copies together"
+        )
+        canonical = bodies.pop()
+        code = [line for line in canonical.splitlines() if not line.lstrip().startswith("#")]
+        # Bounded: a permanently failing API must not hold an if:always() step
+        # open. Six attempts, 5s linear backoff, ~75s.
+        assert any("for attempt in 1 2 3 4 5 6; do" in line for line in code)
+        assert any('sleep "$(( attempt * 5 ))"' in line for line in code)
+        # The OUTCOME is returned, never swallowed: no `|| true` anywhere, and
+        # the caller decides what to print because only it knows which body it
+        # was publishing.
+        assert not any("|| true" in line for line in code)
+        assert any(line.strip() == "return 0" for line in code)
+        assert any(line.strip() == "return 1" for line in code)
+        # A repeat is gated on a confirmation read, and only from the second
+        # attempt: the first write has nothing to confirm against.
+        assert any('[ "$attempt" -gt 1 ] && [ -n "$needle" ]' in line for line in code)
+        # Two needles, two matchers, and neither substitutes for the other. The
+        # SLOT is matched with `startswith` on the lane marker, because that is
+        # what each lane's own id lookup selects and what an older head's comment
+        # still occupies. LANDING is matched with `contains` on the current
+        # head's stamp, which only a run for this head writes.
+        # Both reads are slot-scoped and both classify their occupant, so they
+        # are told apart by ORDER: the first runs before the write, the second
+        # during the backoff. Neither branches the write -- an occupant refuses
+        # it -- so what the classification decides is the caller's status.
+        land_reads = [line for line in code if "contains(" in line]
+        assert len(land_reads) == 2, land_reads
+        slot_reads = land_reads[:1]
+        assert "$slot" in slot_reads[0], slot_reads[0]
+        for line in land_reads:
+            assert "$needle" in line, line
+        # A body with no current-head stamp gets one attempt and no repeat.
+        assert "This body carries no current-head stamp" in canonical
+        # An unreadable confirmation STOPS rather than repeating a POST, which
+        # is the same rule the head-confirmation read follows: the destructive
+        # half must not proceed on an unknown.
+        assert "Cannot confirm whether the previous attempt landed" in canonical
+        # The duplicate check runs BEFORE the first write, not only before the
+        # repeats, because the caller reaches a create precisely when its own
+        # lookup could not confirm a comment. It gets the same widened budget as
+        # every other read, and it is the destructive half: an existing
+        # current-head comment refuses the write, and a check that could not be
+        # read refuses it too rather than guessing the slot is empty.
+        assert "to find this lane's slot failed on attempt" in canonical
+        assert "holds this lane's slot" in canonical
+        assert "is unreadable after 6 attempts, so nothing was posted" in canonical
+        # An occupied slot is NEVER written, whatever head the occupant names
+        # and whatever this body is. One comment answers for this lane, so
+        # every alternative loses something no run can get back: a second
+        # comment beside it is the one a later human override cannot reach, and
+        # overwriting it can discard a verdict for a head this run has no
+        # standing to judge -- a concurrent run's for the same head, or the
+        # CURRENT head's when this run's own head is already superseded.
+        assert "already holds this lane's slot" in canonical
+        assert "--method PATCH" not in canonical, "an occupied slot is not overwritten"
+        # Status 2 is that case and only that case, so no caller can read a
+        # write-free path as a write. A success there is the same false claim as
+        # a silently lost write.
+        assert any(line.strip() == "return 2" for line in code)
+        # Two budgeted read loops and one write loop: the slot read, the write,
+        # and nothing else. A third loop would be a write into an occupied slot.
+        assert sum("for attempt in 1 2 3 4 5 6; do" in line for line in code) == 2
+        # A repeat is gated on the HEAD as well, and on the attempt number
+        # ALONE: the landing read cannot see a replace's rival, because the
+        # caller names the comment id there and this function never reads that
+        # comment's body. So the re-confirmation covers the replace too, which
+        # is the write that has no other protection.
+        assert any(line.strip() == 'if [ "$attempt" -gt 1 ]; then' for line in code)
+        assert "pulls/$PR" in canonical
+        assert canonical.index('"$attempt" -gt 1') < canonical.index("pulls/$PR")
+        # It runs AFTER the landing read, so a write whose ack was lost is still
+        # reported as landed rather than as a superseded no-write, and BEFORE
+        # the write it gates.
+        assert canonical.index(
+            "took this lane's slot while this run was retrying"
+        ) < canonical.index("pulls/$PR")
+        assert canonical.index("pulls/$PR") < canonical.index(
+            "Writing this lane's marker comment failed"
+        )
+        # A moved head and an unreadable head are different answers. A moved one
+        # means another run owns the slot and the PR is missing nothing, which is
+        # status 4 and not an error. An unreadable one means nothing is known, so
+        # the write is not repeated either -- repeating is the destructive half.
+        assert any(line.strip() == "return 4" for line in code)
+        assert "is unreadable, so this write was not repeated" in canonical
+        assert "not $HEAD, so this write was not repeated" in canonical
+        # The head check cannot see a SAME-head writer, and exactly one same-head
+        # body must never be written over: an accepted human override. A repeat
+        # re-reads the comment it is about to write and stops on that one body,
+        # which is why the read is gated on the target id and why it recognises
+        # nothing else. One bounded read, not a compare-and-set: no body
+        # pre-image is kept, so an ordinary same-head rival is still overwritten.
+        assert any(line.strip() == 'if [ -n "$target" ]; then' for line in code)
+        assert "issues/comments/$target" in canonical
+        assert "human override accepted" in canonical
+        assert any(line.strip() == "return 5" for line in code)
+        assert canonical.index('"$attempt" -gt 1') < canonical.index("issues/comments/$target")
+        assert canonical.index("pulls/$PR") < canonical.index("issues/comments/$target")
+        assert canonical.index("issues/comments/$target") < canonical.index(
+            "Writing this lane's marker comment failed"
+        )
+        # The target is a positional the CALLER names, so a create passes none
+        # and cannot reach this read at all.
+        assert 'target="$4"' in canonical
+        assert any(line.strip() == "shift 4" for line in code)
+        # The residual this cannot close is written down rather than implied:
+        # two runs on the SAME head are alike to a head check, so a same-head
+        # rival's body can still be overwritten by a repeat.
+        assert "RESIDUAL" in canonical
+        # The PRE-write slot read classifies its occupant, but NOT to decide
+        # the write -- an occupant refuses it either way. It decides the STATUS,
+        # because the caller acts on two different facts: a slot already
+        # carrying a verdict for this head means the PR reads fresh and the lane
+        # is green, and anything else means this verdict is not on the PR and
+        # the lane must go red rather than hide it behind a passing check.
+        # One read shape, issued at two times: the classification is the same
+        # question either side of the write, so it cannot drift between them.
+        assert land_reads[0] == land_reads[1], land_reads
+        assert "mine" in slot_reads[0] and "other" in slot_reads[0], slot_reads[0]
+        # Both classifications are read back the same way, and status 3 is the
+        # answer that says the PR holds a verdict this run did not write.
+        assert sum('$2 == "mine"' in line for line in code) == 2
+        assert any(line.strip() == "return 3" for line in code)
+        # The POST-write read asks a different question at a different time. The
+        # slot was confirmed empty before the first write, so an occupant found
+        # during the backoff is either this run's own lost-ack write or a run for
+        # ANOTHER head that published while this one waited, and those two have
+        # opposite answers. Reading only this run's needle made the second
+        # invisible, so a retry could post beside that verdict.
+        assert '$2 == "mine"' in canonical
+        assert "took this lane's slot while this run was retrying" in canonical
+        # And that branch answers 2 as well: a rival comment in the slot is the
+        # same refusal as finding one before the first write, reached later.
+        rival = canonical.split("took this lane's slot while this run was retrying", 1)[1]
+        assert rival.split("\n")[1].strip() == "return 2", rival[:160]
+        # Two classified reads, asking the same question at different times:
+        # before the first write, and again during the backoff. Both are scoped
+        # to the slot as well as the needle.
+        classified = [line for line in code if "contains(" in line and "mine" in line]
+        assert len(classified) == 2, classified
+        for line in classified:
+            assert "startswith(" in line, line
+        # The landing read is scoped to the SLOT as well as the needle. That is
+        # what lets a lane whose authoritative body carries no lane-specific
+        # stamp -- a human override -- name the head alone and stay lane-scoped.
+        for line in code:
+            if "contains(" in line:
+                assert "startswith(" in line, line
+        # The slot question comes FIRST, before the no-stamp branch. A withhold
+        # or incomplete notice carries no stamp, and asking it afterwards let
+        # that body post blind into a slot another comment already held.
+        assert canonical.index("$slot") < canonical.index("carries no current-head stamp")
+        # Reaching the write loop means the slot was CONFIRMED empty, so an id
+        # carrying the stamp afterwards is this run's own landed write.
+        assert "before_flat" not in canonical
+        assert "the slot was confirmed empty before this run wrote" in canonical
+        # The confirmation selects the first id off a CAPTURED value, never via
+        # a `head -n1` inside the pipeline, which SIGPIPEs the api call under
+        # pipefail and misreads a good lookup as a failure.
+        assert not any("head -n1" in line for line in code)
+        assert any("| awk 'NR == 1" in line for line in code)
+
+    @pytest.mark.parametrize(
+        ("workflow", "step"),
+        _VERDICT_PUBLISHING_LANES,
+        ids=[w for w, _ in _VERDICT_PUBLISHING_LANES],
+    )
+    def test_no_verdict_write_announces_a_success_it_did_not_get(
+        self, workflow: str, step: str
+    ) -> None:
+        # Diff-scoped by construction: only the VERDICT writes are covered.
+        # The early-exit notice writes in some of these steps (human-override
+        # notes, skip and no-contract notices) still carry the one-attempt
+        # `|| true` shape, and they sit BEFORE their step's `exit 0`, above the
+        # primitive's definition -- a separate defect with the same symptom,
+        # deliberately left to its own change rather than folded in here.
+        script = _step_script(_workflow(workflow), step)
+        body_writes = [
+            line
+            for line in script.splitlines()
+            if "--body-file" in line or "--field body=" in line
+            if not line.lstrip().startswith("#")
+            if "claude-summary.md" in line
+            or "codex-comment.md" in line
+            or "codex-merged-comment.md" in line
+            or '"$out_file"' in line
+        ]
+        assert body_writes, workflow
+        for line in body_writes:
+            assert "|| true" not in line, (workflow, line)
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_a_create_whose_ack_was_lost_is_not_posted_again(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # A PATCH is idempotent, so repeating it is safe. A create is a POST and
+        # is not: GitHub can ACCEPT it and lose the ack, so a blind second
+        # attempt plants a SECOND marker comment. Every id lookup in these lanes
+        # selects one comment, so a later human override patches only that one
+        # while the duplicate keeps its own [BLOCK-MERGE] line, and pr_status.py
+        # stays blocked until somebody deletes the extra comment by hand. That is
+        # the same gate-stranding this change exists to remove, reached from the
+        # other side, so the retry confirms before it repeats.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=None,
+            kind="completed",
+            extra_env={"STUB_CREATE_FAIL": "1", "STUB_CREATE_LANDS": "1"},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        creates = (calls / "create-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(creates) == 1, creates
+        stdout = result.stdout.decode()
+        # The occupancy check read cleanly and found the slot empty, so an id
+        # carrying the stamp afterwards is this run's own landed POST.
+        assert "the slot was confirmed empty before this run wrote" in stdout
+        assert "Published" in stdout
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_an_existing_current_head_comment_is_never_duplicated(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # The case that makes the FIRST write the dangerous one. A comment for
+        # the current head is already on the PR, from a re-run of this lane or a
+        # cancelled run whose if:always() step still executed. The caller's own
+        # id lookup then errors on all six attempts, so it cannot see that
+        # comment and takes the create path. Nothing here fails the write: the
+        # POST would succeed and put a SECOND comment for this head in a slot
+        # that holds one.
+        #
+        # That is unrecoverable without a person. Every id lookup in these lanes
+        # selects one comment, so a later `/ai-review override` patches whichever
+        # it picks while the other keeps its own [BLOCK-MERGE] line, and no run
+        # undoes it. So the write re-reads first and declines.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.HEAD),
+            kind="completed",
+            extra_env={"STUB_COMMENT_FAIL_FIRST": "6"},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        stdout = result.stdout.decode()
+        # NOTHING was written: no create, not one attempt, and no PATCH either.
+        # One comment answers for this lane, so every alternative loses something
+        # no run can get back -- a second comment beside it is the one a later
+        # human override cannot reach, and overwriting it can discard a verdict
+        # for a head this run has no standing to judge.
+        assert not (calls / "create-calls.txt").exists(), stdout
+        assert not (calls / "patch-calls.txt").exists(), stdout
+        assert not (calls / "patched-body.md").exists(), stdout
+        # And the report is not a publication. A write-free path that answers
+        # success is the same false claim as a silently lost write.
+        # An earlier run for this same head filled the slot, which an advisory
+        # lane loses nothing it can act on by. Stopping there is a success in
+        # THIS lane class -- but it is named as that earlier run's write, never
+        # as this run's.
+        assert "already carries a verdict for this head" in stdout
+        assert "written by an earlier run" in stdout
+        assert "#123" in stdout
+        assert "Published" not in stdout, stdout
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_a_superseded_head_comment_is_refused_too(self, lane: dict, tmp_path: Path) -> None:
+        # The needle the occupancy check must NOT use is the current head's
+        # stamp. The steady state after any earlier review is a comment for an
+        # OLDER head -- that comment is the slot, because every lane's id lookup
+        # selects on the lane marker and finds it. Matching the current head's
+        # stamp would miss it, and the POST would then sit a second comment
+        # beside it: a later override patches whichever id the lookup picks,
+        # while the other keeps its own [BLOCK-MERGE] line and no run undoes it.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.OLD),
+            kind="completed",
+            extra_env={"STUB_COMMENT_FAIL_FIRST": "6"},
+        )
+
+        # Green, with an error annotation. These lanes are advisory and
+        # pr-readiness maps a FAILED lane to a blocking verdict on the required
+        # check, so failing here would invent a BLOCK nobody judged from an
+        # infrastructure fault. The annotation is what reports the loss, and
+        # prepare-pr's marker evaluation is what refuses a PR whose head has no
+        # verdict; the required status itself reads only conclusions.
+        assert result.returncode == 0, result.stderr.decode()
+        stdout = result.stdout.decode()
+        # NOTHING was written: no create, not one attempt, and no PATCH either.
+        # The occupant names a SUPERSEDED head, the slot's steady state
+        # after any earlier review, and it is refused on the same terms.
+        # One comment answers for this lane, so every alternative loses something
+        # no run can get back -- a second comment beside it is the one a later
+        # human override cannot reach, and overwriting it can discard a verdict
+        # for a head this run has no standing to judge.
+        assert not (calls / "create-calls.txt").exists(), stdout
+        assert not (calls / "patch-calls.txt").exists(), stdout
+        assert not (calls / "patched-body.md").exists(), stdout
+        # And the report is not a publication. A write-free path that answers
+        # success is the same false claim as a silently lost write.
+        assert "already holds this lane's slot" in stdout
+        assert "#123" in stdout
+        assert "Published" not in stdout, stdout
+        assert "::error::" in stdout, stdout
+        # The annotation carries the remedy, because nothing in CI catches this
+        # for an advisory lane: the required readiness status reads check-run
+        # conclusions and has no stamp-freshness read, so the reader that sees a
+        # head with no verdict is prepare-pr's own marker evaluation.
+        assert "re-run this lane" in stdout, stdout
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_a_concurrent_runs_comment_is_not_reported_as_this_runs_write(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # Same interleaving with the write also failing. The outcome is the same
+        # refusal, and the point of the test is the REPORT: the comment in the
+        # slot is another run's, so announcing it as this run's publication is
+        # the same false "published" claim as the lost update, reached from the
+        # other side.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.HEAD),
+            kind="completed",
+            extra_env={"STUB_COMMENT_FAIL_FIRST": "6", "STUB_CREATE_FAIL": "1"},
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        stdout = result.stdout.decode()
+        assert not (calls / "create-calls.txt").exists(), stdout
+        assert not (calls / "patched-body.md").exists(), stdout
+        assert "did land" not in stdout
+        # The comment in the slot is another run's. Announcing it as this run's
+        # publication is the same false claim as a silently lost write, and
+        # overwriting it discards that run's verdict, so neither happens.
+        # An earlier run for this same head filled the slot, which an advisory
+        # lane loses nothing it can act on by. Stopping there is a success in
+        # THIS lane class -- but it is named as that earlier run's write, never
+        # as this run's.
+        assert "already carries a verdict for this head" in stdout
+        assert "written by an earlier run" in stdout
+        assert "Published" not in stdout, stdout
+        assert "#123" in stdout
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_an_unreadable_duplicate_check_refuses_the_write(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # The duplicate check is itself an API read on the same exhausted window,
+        # so it can fail outright. It then knows neither that the slot is empty
+        # nor that it is taken, and both readings are destructive to act on:
+        # posting risks the duplicate no run undoes, and claiming publication
+        # hides a lost verdict. So it posts nothing and says which cost that
+        # buys -- a re-run republishes a verdict, a duplicate needs a person.
+        #
+        # Six outer lookups plus six duplicate checks, so every read fails.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=self._verdict_body(lane, self.HEAD),
+            kind="completed",
+            extra_env={"STUB_COMMENT_FAIL_FIRST": "12"},
+        )
+
+        # Green, with an error annotation: an unpublishable verdict is an
+        # infrastructure fault, and an advisory lane that fails on one is turned
+        # into a BLOCK verdict nobody judged.
+        assert result.returncode == 0, result.stderr.decode()
+        stdout = result.stdout.decode()
+        assert not (calls / "create-calls.txt").exists(), stdout
+        assert "did land" not in stdout
+        assert "Published" not in stdout
+        assert "is unreadable after 6 attempts, so nothing was posted" in stdout
+        # The check spent its whole budget before refusing.
+        reads = (calls / "comment-reads.txt").read_text(encoding="utf-8").splitlines()
+        assert len(reads) == 12, len(reads)
+
+    @pytest.mark.parametrize("lane", _GUARDED_LANE_PARAMS)
+    def test_a_first_write_still_happens_when_the_slot_is_provably_empty(
+        self, lane: dict, tmp_path: Path
+    ) -> None:
+        # The guard must not cost the ordinary case. A duplicate check that reads
+        # cleanly and finds no comment for this head has PROVED the slot empty,
+        # so the verdict is posted on the first attempt with no confirmation read
+        # in between. Without this, "refuse when unsure" could quietly become
+        # "refuse", and a verdict nobody publishes is the original defect.
+        calls, result = self._run_step(
+            lane,
+            tmp_path,
+            existing_body=None,
+            kind="completed",
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        creates = (calls / "create-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(creates) == 1, creates
+        body = (calls / "created-body.md").read_text(encoding="utf-8")
+        assert f"{lane['stamp']} {self.HEAD}" in body
+        assert "Published" in result.stdout.decode()
+
+    def test_only_the_idempotent_write_may_repeat_without_confirming(self) -> None:
+        # The contract that keeps the two write kinds apart. Read off the call
+        # sites, not the primitive: the primitive cannot tell which kind it was
+        # handed, so the arguments at each call site ARE the decision.
+        #
+        # Backslash continuations are joined first. A wrapped call site puts the
+        # command on a later physical line, so a per-line test would find no
+        # `retry_comment_write` on it, skip it, and pass while measuring nothing.
+        seen = 0
+        for workflow, step in _VERDICT_PUBLISHING_LANES:
+            script = _step_script(_workflow(workflow), step).replace("\\\n", " ")
+            for line in script.splitlines():
+                stripped = " ".join(line.split())
+                if stripped.startswith("#") or "retry_comment_write" not in stripped:
+                    continue
+                if stripped.startswith("retry_comment_write() {"):
+                    continue
+                seen += 1
+                if "gh pr comment" in stripped:
+                    # A create names TWO needles and the order is the contract:
+                    # the lane's SLOT marker first, for occupancy, then the
+                    # CURRENT HEAD's stamp, for landing. Neither can stand in for
+                    # the other -- an older head's comment occupies the slot, and
+                    # every body carries the lane marker whatever head it is for.
+                    # Head-scoped, either named inline or carried in the
+                    # lane's own head_needle. The two lanes that use the
+                    # variable do so because their body's authoritative marker
+                    # depends on how the body was produced: a review carries
+                    # [<LANE>-REVIEWED], a human override carries
+                    # [<LANE>-OVERRIDE], and the needle has to name whichever
+                    # one this run is actually writing.
+                    assert "$HEAD" in stripped or "$head_needle" in stripped, (
+                        workflow,
+                        stripped,
+                    )
+                    assert (
+                        'retry_comment_write "$marker"' in stripped
+                        or 'retry_comment_write "$MARKER"' in stripped
+                    ), (workflow, stripped)
+                elif "--method PATCH" in stripped:
+                    # A PATCH names a known id and is idempotent, so it needs
+                    # neither an occupancy check nor a landing check.
+                    assert 'retry_comment_write "" "" ""' in stripped, (workflow, stripped)
+                else:
+                    raise AssertionError(f"unclassified write: {workflow} {stripped}")
+        # Ten guarded lanes with three sites each, claude with two, codex with
+        # three. A drop in this number means a site stopped being measured.
+        assert seen == 35, seen
+        # Where the needle is a variable, its definition is the contract: the
+        # lane's stamp by default, the head alone for an accepted override.
+        for workflow, stamp in (
+            ("claude-review.yml", "[OPUS-REVIEWED] $HEAD"),
+            ("codex-review.yml", "[GPT-REVIEWED] $HEAD"),
+        ):
+            body = _workflow(workflow)
+            assert f'head_needle="{stamp}"' in body, workflow
+            assert 'if [ "$kind" = "override" ]; then' in body, workflow
+            # NOT the bare head. Every body in this slot names the head, so a
+            # standing blocking verdict for this same head matched a bare-head
+            # needle, and the slot reads then read that verdict as this run's own
+            # write -- reporting the override as already published while the
+            # block it was posted to clear stayed in the slot.
+            override_marker = stamp.replace("-REVIEWED]", "-OVERRIDE]")
+            assert f'head_needle="{override_marker}"' in body, workflow
+            # And the override body CARRIES that marker, or the needle names
+            # something the slot reads can never find.
+            assert f'echo "{override_marker}"' in body, workflow
+            # ORDER, not just presence. `kind` is a shell variable this step
+            # assigns, not an env var, so a head_needle computed above the
+            # classification tests an EMPTY kind: the override branch never
+            # runs, the needle stays the stamp no override body carries, and the
+            # one body that must replace a standing block is classified a
+            # notice and silently left out -- while the caller says Published.
+            # Presence alone is satisfied by exactly that arrangement.
+            assert body.index('kind="override"') < body.index("head_needle="), workflow
 
     def test_every_lane_calls_the_guard_and_fork_fp_covers_both_sites(self) -> None:
         for lane in _GUARDED_LANES:
@@ -9493,7 +11312,21 @@ class TestForkLaneSurfacesAnUnstampedReviewBody:
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            '  printf \'%s\\n\' "$3" >> "$STUB_CALLS/create-calls.txt"\n'
             "  shift 3\n"
+            '  if [ -n "${STUB_CREATE_FAIL:-}" ]; then\n'
+            "    # STUB_CREATE_LANDS emulates the lost-ack partial failure that\n"
+            "    # makes a create unsafe to repeat: GitHub ACCEPTS the POST, so\n"
+            "    # the comment now exists, but the CLI still reports failure.\n"
+            "    # The body is written into the finder fixture, so the step's own\n"
+            "    # confirmation query sees it through real jq.\n"
+            '    if [ -n "${STUB_CREATE_LANDS:-}" ] && [ "$1" = "--body-file" ]; then\n'
+            '      jq -n --arg b "$(cat "$2")" \\\n'
+            "        '[{id:777,user:{login:\"github-actions[bot]\"},body:$b}]' \\\n"
+            '        > "$FINDER_COMMENTS_FILE"\n'
+            "    fi\n"
+            "    exit 7\n"
+            "  fi\n"
             '  if [ "$1" = "--body-file" ]; then cp "$2" "$STUB_CALLS/created-body.md"; fi\n'
             "  exit 0\n"
             "fi\n"
@@ -9501,6 +11334,20 @@ class TestForkLaneSurfacesAnUnstampedReviewBody:
             encoding="utf-8",
         )
         gh_stub.chmod(0o755)
+
+        # `sleep` is an external command, so a shim earlier on PATH intercepts
+        # the retry backoff without a test-only knob in the workflow: the lanes
+        # keep their real production budget and these tests do not wait it out.
+        # Records each interval, so the SCHEDULE is assertable rather than just
+        # the attempt count.
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf \'%s\\n\' "$1" >> "$STUB_CALLS/sleeps.txt"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        sleep_stub.chmod(0o755)
 
         script_file = tmp_path / "step.sh"
         script = _step_script(_workflow(workflow), step)

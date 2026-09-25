@@ -54,6 +54,10 @@ class _Req:
         self.query: dict[str, str] = {}
         self.can_read_body = True
         self.charset = None
+        # ``read_bounded_json`` refuses a body that does not DECLARE JSON with a
+        # 415 before the shape guard runs, so a double that models a real client
+        # has to carry the header one sends.
+        self.content_type = "application/json"
         self.app = {"state": None}
 
     async def json(self):

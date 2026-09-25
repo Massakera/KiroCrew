@@ -48,7 +48,7 @@ organized for someone browsing the repository.
 | [secrets-vault.md](secrets-vault.md) | Storing credentials encrypted where the agent cannot read them. |
 | [monitor-loops.md](monitor-loops.md) | Keeping one session checking something on an interval until an exit condition fires. |
 | [session-ledger.md](session-ledger.md) | The durable per-session work record that survives context compaction. |
-| [session-control.md](session-control.md) | Opening, seeding, watching, stopping and closing another session, and the sidebar folders and tags that file them. |
+| [session-control.md](session-control.md) | Opening, forking, seeding, watching, stopping and closing another session, and the sidebar folders and tags that file them. |
 | [work-ledger.md](work-ledger.md) | The conductor/worker record: work items, acceptance conditions, and how a dispatched worker reports. |
 | [artifacts.md](artifacts.md) | Saving, versioning, and reverting generated UI and documents. |
 | [computer-use.md](computer-use.md) | Reading and driving native desktop applications; opt-in and off by default. |

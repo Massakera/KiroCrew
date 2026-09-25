@@ -19,7 +19,15 @@ from pathlib import Path
 
 from kiro_crew import __version__ as _mc_version
 from kiro_crew import agent as _agent
-from kiro_crew import agent_state, dep_sync, diagnostics, platform_compat, sandbox, stt
+from kiro_crew import (
+    agent_state,
+    dep_sync,
+    diagnostics,
+    platform_compat,
+    sandbox,
+    stdlib_shadow,
+    stt,
+)
 from kiro_crew._bootstrap import _source_checkout_root
 from kiro_crew.acp.client import KIRO_CLI_BIN
 from kiro_crew.acp.kas_transport import (
@@ -35,7 +43,7 @@ from kiro_crew.agent_discovery import (
     project_agent_name,
 )
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
-from kiro_crew.agent_spec_format import is_agent_spec_name
+from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX, is_agent_spec_name
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cli_perf import _read_gateway_pid
@@ -134,6 +142,18 @@ logger = logging.getLogger(__name__)
 # attribute directly (``patch("kiro_crew.cli_doctor.KIRO_AGENTS_DIR", tmp)``),
 # so the name is kept and read through ``_agents_dir()``.
 KIRO_AGENTS_DIR: Path | None = None
+
+# Alias count above which the skill-view census warns. Every spawn projects one
+# ``kirocrew-skill-view-*.json`` per authored agent into the shared agents
+# directory, and kiro-cli reads EVERY file there on startup, so the count is a
+# startup cost for every session on the host. A healthy host carries live
+# sessions x authored agents (a few hundred); the measured trouble starts past a
+# couple of thousand -- about 8s of prune walk per spawn at 2,360 files, and
+# ``EMFILE: too many open files`` from kiro-cli at 15k. The reclaim drains a
+# backlog by a bounded number per spawn, so a count above this is either a
+# pre-reclaim backlog still draining or one this gateway cannot drain (another
+# data home's aliases, an unreadable lease record); the warning tells which.
+_SKILL_VIEW_BACKLOG_WARN = 2000
 
 
 def _agents_dir() -> Path:
@@ -399,7 +419,11 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
         # still found. Matching on `<bound>.json` alone would miss exactly that
         # and under-report the shadow.
         proj_spec = next(
-            (p for p in project_agent_files(project_dir) if project_agent_name(p) == bound),
+            (
+                p
+                for p in project_agent_files(project_dir, operation="doctor", source="cli")
+                if project_agent_name(p) == bound
+            ),
             None,
         )
         if proj_spec is not None:
@@ -1155,6 +1179,122 @@ def _doctor_cron_script_sources(issues: list[str]) -> None:
             "               Reconcile using the owning skill's own copy recipe. "
             "A diverged copy may be a stale deploy OR an intentional local edit "
             "-- doctor cannot tell which, so it does not overwrite either one."
+        )
+
+
+def _doctor_skill_currency(issues: list[str]) -> None:
+    """Report installed skills that do not match the package this build ships.
+
+    An installed skill can run for days against a package that has already fixed
+    the script it carries, and nothing else anywhere says so. The sync's update
+    gate compares mtimes, so an installed copy whose mtime is newer than
+    anything the package ships is judged up to date and simply skipped; the
+    operator keeps running superseded code and reads its output as current.
+
+    A shipped file cannot answer this about itself. It has no import-time
+    version to read and no subprocess to ask git with, and a hardcoded version
+    constant goes stale silently the moment someone edits the file without
+    bumping it -- the exact failure it would claim to prevent. Currency is a
+    relation between the install and the package, and only one side of that
+    relation is visible from inside the script. Doctor sees both sides.
+
+    Scope is deliberately narrow. "Behind" means the install does not match the
+    source tree the sync selects for it, not that it trails a remote revision:
+    doctor makes no network call, and an operator running an older build must not
+    be told their skill is stale against a revision they never installed. A
+    skill no source root ships is absent from the result, not reported, because
+    there is no source tree for it to be out of step with.
+
+    POSIX only for now. On Windows the comparison would have to read each
+    install by name, where losing the race against a substituted junction costs
+    an outbound authenticated connection rather than a wrong answer, so this
+    prints the boundary instead of a verdict there.
+    """
+    from kiro_crew.skills import (
+        SKILL_INSTALL_BEHIND,
+        SKILL_INSTALL_EDITED,
+        SKILL_INSTALL_IN_SYNC,
+        installed_skill_currency,
+    )
+
+    if os.name == "nt":
+        # Said out loud rather than printed as silence. The check reports nothing
+        # on Windows, and an absent section is indistinguishable from a gateway
+        # whose installs are all current -- which is the false reassurance this
+        # whole instrument exists to remove.
+        print("\nInstalled Skill Currency")
+        print(
+            "  not checked on this platform yet: the comparison reads each "
+            "installed directory by name, and the pinned read that makes that "
+            "safe here does not exist yet, so no verdict is printed rather than "
+            "one taken unsafely"
+        )
+        return
+
+    states = installed_skill_currency()
+    if not states:
+        return
+
+    behind = [state for state in states if state.state == SKILL_INSTALL_BEHIND]
+    edited = [state for state in states if state.state == SKILL_INSTALL_EDITED]
+    unverifiable = [
+        state
+        for state in states
+        if state.state not in (SKILL_INSTALL_IN_SYNC, SKILL_INSTALL_BEHIND, SKILL_INSTALL_EDITED)
+    ]
+
+    print("\nInstalled Skill Currency")
+    print(
+        f"  {len(states) - len(behind) - len(edited) - len(unverifiable)} in step with this build"
+    )
+    # Skill names and source paths come off disk, out of a packaged tree or a
+    # KIROCREW_PROJECT_DIR tree, so a name is untrusted text: printed raw, an
+    # OSC/ANSI sequence or an embedded newline in a directory name would drive
+    # the terminal or forge a verdict line. The source path is displayed for the
+    # same reason the cron section displays its own: it names which tree the
+    # verdict was reached against, which is what makes a project skill
+    # shadowing a builtin legible rather than surprising.
+    for state in behind:
+        print(
+            f"  {_safe_display(state.name)}:  ❌ does not match "
+            f"{_safe_display(str(state.source))}"
+        )
+    for state in edited:
+        print(
+            f"  {_safe_display(state.name)}:  ⚠ edited since install, so it is not "
+            f"compared against {_safe_display(str(state.source))}"
+        )
+    for state in unverifiable:
+        print(
+            f"  {_safe_display(state.name)}:  ⏹ could not be compared against "
+            f"{_safe_display(str(state.source))}"
+        )
+
+    if behind:
+        # Named as the source tree rather than as the package: the comparison
+        # picks the root the sync itself would pick, so a project skill is
+        # judged against the project tree that shadows the builtin. Each line
+        # above prints which tree that was.
+        issues.append("installed skill does not match the source tree the sync selects for it")
+        print(
+            "               Restart the gateway to re-run the skill sync. A name "
+            "that persists after a restart carries an mtime NO OLDER than "
+            "anything that source tree holds, so the sync reads it as up to date "
+            "and skips it: "
+            "move that installed directory OUT of the skills directory (a "
+            "rename in place keeps a readable SKILL.md, which discovery "
+            "publishes as a second copy of the same skill) and restart again, "
+            "and the sync reinstalls it from that source. A behind copy still "
+            "matches the marker the sync wrote, so it holds no local edits to "
+            "lose."
+        )
+    if edited:
+        print(
+            "               An edited copy is not overwritten in place. While no "
+            "update is due it stays on its current code; when an update IS due "
+            "the sync moves the edited tree aside to a dot-prefixed backup "
+            "beside it and installs the packaged version, so the edit stops "
+            "taking effect until it is reconciled."
         )
 
 
@@ -1931,14 +2071,16 @@ def _doctor_name_grant_platform_scope() -> None:
 #: MCP servers that host strict-identity tools — the reflexive verbs
 #: (``monitor_start``, ``session_ledger_*``, ``set_project``, ``ask_question``)
 #: and the authorization-subject ones (session control, ``chat_folder_*``).
-#: Mirrors ``mcp_core._STRICT_IDENTITY_SERVERS``; ``kirocrew-dashboard`` is
-#: opt-in per agent, so it is reported only when an agent actually references it.
+#: Mirrors ``mcp_core._STRICT_IDENTITY_SERVERS``; ``kirocrew-dashboard`` and
+#: ``kirocrew-panel`` are opt-in per agent, so each is reported only when an
+#: agent actually references it.
 _STRICT_IDENTITY_SERVERS = (
     "kirocrew-core",
     "kirocrew-dashboard",
     "kirocrew-work",
     "kirocrew-crew-log",
     "kirocrew-debug",
+    "kirocrew-panel",
 )
 
 
@@ -3943,6 +4085,107 @@ def _doctor_agents_janitor(issues: list[str], sweep_backups: bool) -> None:
             print(f"{_INDENT}- {name!r}")
     else:
         print("  janitor:     ✅ no stale temp/backup files to reclaim")
+    _doctor_skill_view_census(agents_dir)
+
+
+def _doctor_skill_view_census(agents_dir: Path) -> None:
+    """Report how many projected skill-view aliases the agents directory holds.
+
+    Advisory and read-only, like the janitor line above it. The count matters
+    because kiro-cli enumerates every file in this directory on every startup
+    and the projection writes one alias per authored agent per spawn: a backlog
+    from a build that predates the lease-based reclaim reached 28k files on one
+    host and made every session start crawl. The gateway's reclaim drains its
+    own home's unreferenced aliases a bounded number per spawn; the report says
+    exactly which share that covers -- not aliases another data home owns, not
+    lease-named ones while their lease is held -- and refuses to promise any
+    drain while a lease record is unreadable, since the reclaim then keeps
+    everything. Once the census hit a retention bound its counts are floors and
+    the derived ones are not printed at all. The manual fallback is named,
+    never performed, and is a move rather than a delete: the doctor cannot
+    prove who authored a file that merely carries the prefix, and a move is
+    undoable.
+    """
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    counts = acp_driver.skill_view_alias_census(agents_dir)
+    total = counts.get("total", 0)
+    leased = counts.get("leased", 0)
+    foreign_unreferenced = counts.get("foreign_home", 0)
+    foreign_leased = counts.get("foreign_leased", 0)
+    foreign = foreign_unreferenced + foreign_leased
+    unreadable = counts.get("unreadable_leases", 0)
+    truncated = bool(counts.get("truncated", 0))
+    metadata_dir, lease_dir = acp_driver.skill_view_sidecar_dirs()
+    alias_glob = f"{NATIVE_SKILL_ALIAS_PREFIX}*.json"
+    # Two Kiro Crew data homes share this directory whenever they share
+    # ``~/.kiro``; the remedy must then stop every gateway that uses it, not
+    # only the one this doctor speaks for.
+    stopped = (
+        "with every gateway that uses this agents directory stopped"
+        if foreign
+        else "with the gateway stopped"
+    )
+
+    floor = "+" if truncated else ""
+    detail = f"{total}{floor} {alias_glob} alias(es)"
+    if total:
+        detail += f" ({leased}{floor} named by a lease record"
+        # Once a bound was hit "not named" is total minus a floor, which is
+        # neither a floor nor a ceiling, so only the measured counts are shown.
+        if not truncated:
+            detail += f", {total - leased} not"
+        if foreign:
+            detail += f", {foreign}{floor} owned by another Kiro Crew home"
+        detail += ")"
+    warn = bool(unreadable) or total > _SKILL_VIEW_BACKLOG_WARN
+    print(f"  skill views: {'⚠️ ' if warn else '✅'} {detail}")
+    if truncated:
+        print(f"{_INDENT}(floors: the census stopped at its retention bound)")
+    if unreadable:
+        print(
+            f"{_INDENT}{unreadable} lease record(s) in {lease_dir}/ cannot be read, and"
+            f" the reclaim keeps every alias while one exists. {stopped[0].upper()}"
+            f"{stopped[1:]}, move that directory out of the agents directory; every"
+            f" live projection republishes its own lease."
+        )
+    if total <= _SKILL_VIEW_BACKLOG_WARN:
+        return
+    if unreadable:
+        drain = " Nothing is reclaimed until the unreadable lease record(s) above are gone."
+    elif truncated:
+        # Past the lease bound the census did not read every record, and one
+        # unreadable record it did not reach would stop the reclaim entirely.
+        drain = (
+            " Unscanned lease records leave reclaimability unknown: the gateway"
+            " reclaims this home's unreferenced aliases a bounded number per spawn"
+            " only while every lease record is readable."
+        )
+    else:
+        drain = (
+            f" On every spawn the gateway reclaims a bounded number of the"
+            f" {total - leased - foreign_unreferenced} this home owns and no lease names."
+        )
+    if leased - foreign_leased > 0:
+        drain += (
+            " This home's lease-named aliases are kept while their lease is held; a"
+            " crash-stale lease is reclaimed on the next spawn."
+        )
+    if foreign:
+        drain += (
+            f" The {foreign}{floor} another Kiro Crew home owns never drain here;"
+            f" only that home's gateway reclaims them."
+        )
+    print(
+        f"{_INDENT}kiro-cli reads every file here on startup, so this many slows every"
+        f" session start.{drain}"
+    )
+    print(
+        f"{_INDENT}To clear it at once: {stopped}, move the {alias_glob} files and the"
+        f" {metadata_dir}/ directory out of the agents directory (a move is undoable;"
+        f" the doctor never deletes). Every spawn republishes the aliases it needs;"
+        f" authored agents keep their own names and are not touched."
+    )
 
 
 def _discord_intent_grants(token: str) -> intent_probe.IntentGrants:
@@ -4223,6 +4466,47 @@ def _venv_deps_ok(venv_py: Path) -> bool:
     except Exception:
         return False
     return proc.returncode == 0
+
+
+def _doctor_import_path(issues: list[str]) -> None:
+    """Report where the standard library resolves from, and whether the launch
+    directory can shadow it.
+
+    The process entries refuse to start on a shadowed stdlib, so by the time
+    doctor runs the answer is normally clean; this row exists for the other
+    half of the diagnosis -- an install that still LETS the launch directory
+    onto ``sys.path`` (no ``-P``), so the same ``~/concurrent/`` that is harmless
+    from one directory breaks the gateway from another. A shadow reported here
+    is an issue; a launch entry on ``sys.path`` is a note, because a console
+    script's own ``bin/`` is the ordinary case for a pip install.
+    """
+    shadows = stdlib_shadow.find_shadowed_stdlib()
+    if shadows:
+        for s in shadows:
+            entry = s.path_entry or os.getcwd()
+            # ascii(): the path is caller-chosen bytes; escape control characters
+            # rather than write them to the terminal.
+            print(f"  import path: ❌ {s.name} shadowed by {ascii(s.resolved)}")
+            print(f"               sys.path entry {ascii(entry)} ({s.entry_kind})")
+        remedy = stdlib_shadow.remedy_command(shadows[0])
+        if remedy is None:
+            print(
+                "               Fix: move or rename the shadowed path above, or run from another directory"
+            )
+        else:
+            print(f"               Fix: {remedy}, or run from another directory")
+        issues.append("stdlib shadowed")
+        return
+    launch = None
+    if not getattr(sys.flags, "safe_path", False) and sys.path:
+        launch = sys.path[0]
+    if launch is None:
+        print("  import path: ✅ stdlib intact (launch directory kept off sys.path: -P)")
+    else:
+        print(
+            f"  import path: ✅ stdlib intact; launch entry on sys.path: {launch or os.getcwd()!r}"
+        )
+        print("               A stdlib-named directory placed there would shadow the stdlib")
 
 
 def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False) -> None:
@@ -4511,6 +4795,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Data Home (+ leftover legacy home) ──
     _doctor_data_home()
     _doctor_cron_script_sources(issues)
+    _doctor_skill_currency(issues)
     _doctor_deprecated_agent_specs(cfg, issues)
     _doctor_path_launcher()
     _doctor_trust_root()
@@ -4631,6 +4916,8 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             if pip_install_channel_available():
                 print(f"               Fix: {pip_install_command_for('-e', '.')}")
             issues.append("python deps")
+
+    _doctor_import_path(issues)
 
     # SQLite FTS5 — required by memory + knowledge full-text search. On macOS
     # and Linux aarch64 we rely on the host sqlite3 build (pysqlite3-binary is

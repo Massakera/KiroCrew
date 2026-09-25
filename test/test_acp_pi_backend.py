@@ -428,8 +428,13 @@ class TestGateArtifactsRefuseAnUnsafeDirectory:
         assert list(elsewhere.iterdir()) == []
 
     def test_both_writers_go_through_the_strict_resolver(self):
-        assert "_seal_pi_extension(" in inspect.getsource(_seal_pi_gate_extension)
-        for function in (acp_client._seal_pi_extension, _ensure_pi_gate_launcher):
+        for function in (acp_client._seal_pi_gate_extension, acp_client._seal_pi_bridge_extension):
+            assert "_seal_gate_extension(" in inspect.getsource(function)
+        for function in (
+            acp_client._seal_pi_gate_extension,
+            acp_client._seal_pi_bridge_extension,
+            _ensure_pi_gate_launcher,
+        ):
             source = inspect.getsource(function)
             assert "_pi_gate_artifact_dir()" in source
             assert "_ensure_run_dir" not in source
@@ -594,6 +599,70 @@ class TestGateTripwire:
         assert "call_ok" not in client._pi_gate_denied_ids
         asyncio.run(client._tripwire_pi_gate(self._update("call_ok")))
         assert killed == []
+
+    def test_a_re_asked_call_is_judged_on_its_fresh_verdict(self, tmp_path, monkeypatch):
+        """A DENY is scoped to the ask it answered, not to the id for the session's life.
+
+        Nothing makes a tool-call id unique for a whole session, so the same id can be
+        denied once and then legitimately asked about again. Were the denial to survive
+        the second ask, the approved call's own ``completed`` frame would trip
+        ``ran_despite_deny`` and kill a harness that behaved correctly throughout.
+        """
+        client, killed = self._client(tmp_path, monkeypatch)
+
+        async def _send(request_id, payload):
+            pass
+
+        monkeypatch.setattr(client, "_send_response", _send)
+        first = _permission_frame(_envelope(toolCallId="call_reask"))
+        client._build_permission_event(first)
+        asyncio.run(client.reject_tool(first.id))
+        assert "call_reask" in client._pi_gate_denied_ids
+
+        second = _permission_frame(_envelope(toolCallId="call_reask"))
+        client._build_permission_event(second)
+        assert "call_reask" not in client._pi_gate_denied_ids
+        asyncio.run(client.approve_tool(second.id))
+
+        asyncio.run(client._tripwire_pi_gate(self._update("call_reask")))
+        assert killed == []
+
+    def test_a_completed_call_consumes_its_ask_so_a_reused_id_is_asked_again(
+        self, tmp_path, monkeypatch
+    ):
+        """The mirror of the stale-deny case: an approval must not outlive its call.
+
+        Ids recur within a session, so an ask left behind by a completed call would
+        vouch for the next call wearing the same id -- one the gate never saw. The
+        terminal frame consumes the id's state; a reuse is unasked until a fresh
+        dialog names it, and a fresh dialog earns it a fresh, trusted verdict.
+        """
+        client, killed = self._client(tmp_path, monkeypatch)
+
+        async def _send(request_id, payload):
+            pass
+
+        monkeypatch.setattr(client, "_send_response", _send)
+        first = _permission_frame(_envelope(toolCallId="call_reuse"))
+        client._build_permission_event(first)
+        asyncio.run(client.approve_tool(first.id))
+        asyncio.run(client._tripwire_pi_gate(self._update("call_reuse")))
+        assert killed == []
+        assert "call_reuse" not in client._pi_gate_asked_ids
+
+        with pytest.raises(AcpToolGateUnroutable) as excinfo:
+            asyncio.run(client._tripwire_pi_gate(self._update("call_reuse")))
+        assert "without asking" in str(excinfo.value)
+        assert killed == [True]
+
+        fresh, fresh_killed = self._client(tmp_path, monkeypatch)
+        monkeypatch.setattr(fresh, "_send_response", _send)
+        for _ in range(2):
+            frame = _permission_frame(_envelope(toolCallId="call_reuse"))
+            fresh._build_permission_event(frame)
+            asyncio.run(fresh.approve_tool(frame.id))
+            asyncio.run(fresh._tripwire_pi_gate(self._update("call_reuse")))
+        assert fresh_killed == []
 
     def test_a_failed_call_does_not_trip(self, tmp_path, monkeypatch):
         """Schema rejections and gate denials both fail before the gate could ask."""
@@ -1590,10 +1659,16 @@ class TestTheGateArtifactsStayReachableInsideTheSandbox:
         monkeypatch.setattr(acp_client, "_pi_gate_artifact_dir", lambda: str(artifact_dir))
         monkeypatch.setattr(acp_client, "_pi_gate_launcher_cache", {})
         sealed = _seal_pi_gate_extension()
+        bridge = acp_client._seal_pi_bridge_extension()
         launcher = _ensure_pi_gate_launcher("/usr/bin/pi", sealed)
         assert Path(sealed).parent == artifact_dir
+        assert Path(bridge).parent == artifact_dir
         assert Path(launcher).parent == artifact_dir
-        for function in (acp_client._seal_pi_extension, _ensure_pi_gate_launcher):
+        for function in (
+            acp_client._seal_pi_gate_extension,
+            acp_client._seal_pi_bridge_extension,
+            _ensure_pi_gate_launcher,
+        ):
             source = inspect.getsource(function)
             assert "_pi_gate_artifact_dir()" in source
             assert "_ensure_run_dir" not in source

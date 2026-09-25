@@ -15,7 +15,9 @@ compatibility seams through :class:`BackgroundRuntimeDeps`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator, Callable, MutableMapping, Set
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +25,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from kiro_crew.agent_scratch import SharedScratchJoinError
 from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
+from kiro_crew.kiro_prerequisite import (
+    identity_park_grace_remaining,
+    pre_spawn_identity,
+    spawn_pid,
+    stamp_spawn_identity,
+)
 from kiro_crew.metrics.sessions import (
     END_REASON_RECYCLED,
     discard_session_start,
@@ -80,10 +88,16 @@ class _BackgroundOwner(Protocol):
     _lock: asyncio.Lock
     _closing: bool
     _start_sem: asyncio.Semaphore
+    #: The facade's start-to-registration PID guard (see ``spawn_pid``):
+    #: freshly-started background providers/runtimes are shielded here while
+    #: the spawn-identity stamp read suspends before registration.
+    _starting_pids: set[int]
 
     async def _ensure_background(self) -> None: ...
 
     def _advance_session_generation(self, key: str) -> int: ...
+
+    def _dispatch_hard_kill(self, provider: LLMProvider) -> None: ...
 
     def _configured_bg_backend_raw(self) -> str | None: ...
 
@@ -250,39 +264,80 @@ class BackgroundSessionRuntime:
         # Create outside lock
         if not self._owner._provider_factory:
             return
+        # The permit is retained through stamping AND registration, not just
+        # the process start: the identity sweep drains every cold-start permit
+        # as its quiescence barrier, so releasing the permit while this
+        # provider is started-but-unregistered would let a concurrent sweep
+        # reconcile the store change this spawn straddled while the (possibly
+        # wrong-account) provider is invisible to it -- it would then register,
+        # unstamped by the sweep's epoch handling, after the sweep completed.
+        # Holding the permit keeps this spawn inside the barrier until the
+        # registry can see the result. Explicit acquire/release rather than
+        # ``async with`` so the start-failure return keeps its original
+        # exception semantics while the registration section (whose failures
+        # must PROPAGATE, per the rollback handler below) also stays under the
+        # permit. Lock order matches the sweep's own (permit -> owner._lock).
+        await self._owner._start_sem.acquire()
         try:
-            provider = self._owner._provider_factory(background_key, agent=background_agent)
-            async with self._owner._start_sem:
-                await provider.start()
-        except Exception:
-            logger.warning("Failed to create background session", exc_info=True)
-            return
-        async with self._owner._lock:
-            # _closing is rechecked because the start above spans the window
-            # in which close_all takes its session snapshot: registering now
-            # would leak this provider past graceful shutdown.
-            if not self._owner._closing and background_key not in self._owner._sessions:
-                sess = self._deps.session_factory(
-                    provider=provider,
-                    first_turn=self._deps.first_turn_nothing_armed,
-                    agent=background_agent,
+            try:
+                provider = self._owner._provider_factory(background_key, agent=background_agent)
+                pre_spawn = await pre_spawn_identity(
+                    getattr(self._owner, "spawn_identity_reader", None)
                 )
-                self._owner._sessions[background_key] = sess
-                self._owner._advance_session_generation(background_key)
-                try:
-                    await record_session_started(background_key)
-                except BaseException:
-                    # Cancelled between registering and recording: roll the entry
-                    # back so no claimant sees a session the caller is tearing
-                    # down, and consume the crumb so it cannot become a false
-                    # crash at the next boot.
-                    if self._owner._sessions.get(background_key) is sess:
-                        del self._owner._sessions[background_key]
-                        self._owner._advance_session_generation(background_key)
-                    await discard_session_start(background_key)
-                    raise
-                logger.info("Background session created")
+                await provider.start()
+            except Exception:
+                logger.warning("Failed to create background session", exc_info=True)
                 return
+            # Best-effort spawn-account record; see flag_identity_stamp_mismatches.
+            # A cancellation landing in this read would leak the started
+            # provider before registration below, so kill it on the way out
+            # (the permit's finally releases the barrier either way). The read
+            # also suspends before the session map can see this provider, so
+            # shield its PID from the orphan sweep for the span.
+            starting_pid = spawn_pid(provider)
+            if starting_pid is not None:
+                self._owner._starting_pids.add(starting_pid)
+            try:
+                try:
+                    await stamp_spawn_identity(
+                        getattr(self._owner, "spawn_identity_reader", None),
+                        provider,
+                        pre_spawn=pre_spawn,
+                    )
+                except BaseException:
+                    self._owner._dispatch_hard_kill(provider)
+                    raise
+                async with self._owner._lock:
+                    # _closing is rechecked because the start above spans the window
+                    # in which close_all takes its session snapshot: registering now
+                    # would leak this provider past graceful shutdown.
+                    if not self._owner._closing and background_key not in self._owner._sessions:
+                        sess = self._deps.session_factory(
+                            provider=provider,
+                            first_turn=self._deps.first_turn_nothing_armed,
+                            agent=background_agent,
+                        )
+                        self._owner._sessions[background_key] = sess
+                        self._owner._advance_session_generation(background_key)
+                        try:
+                            await record_session_started(background_key)
+                        except BaseException:
+                            # Cancelled between registering and recording: roll the entry
+                            # back so no claimant sees a session the caller is tearing
+                            # down, and consume the crumb so it cannot become a false
+                            # crash at the next boot.
+                            if self._owner._sessions.get(background_key) is sess:
+                                del self._owner._sessions[background_key]
+                                self._owner._advance_session_generation(background_key)
+                            await discard_session_start(background_key)
+                            raise
+                        logger.info("Background session created")
+                        return
+            finally:
+                if starting_pid is not None:
+                    self._owner._starting_pids.discard(starting_pid)
+        finally:
+            self._owner._start_sem.release()
         # Racing registration lost, or shutdown began while we were starting:
         # tear the fresh provider down instead of registering it.
         await provider.shutdown()
@@ -315,11 +370,18 @@ class BackgroundSessionRuntime:
         Caller MUST hold ``_bg_runtime_lock``. A runtime that is still busy
         stays parked for the next pass; a failed kill also stays parked so the
         process is retried rather than orphaned. ``kill()`` is called even on an
-        already-dead runtime so it can release PID bookkeeping.
+        already-dead runtime so it can release PID bookkeeping. A runtime the
+        spawn-identity gate parked additionally keeps a kill grace on top of
+        the busy probe (see ``identity_park_grace_remaining``); backend-switch
+        parks carry no mark and keep their original timing.
         """
         logger = self._deps.logger
+        now = time.monotonic()
         remaining: list[_BackgroundRuntime] = []
         for runtime in self._draining_bg_runtimes:
+            if identity_park_grace_remaining(runtime, now) > 0.0:
+                remaining.append(runtime)
+                continue
             try:
                 busy = runtime.is_alive() and runtime.has_active_or_initializing_sessions()
             except Exception:
@@ -639,6 +701,15 @@ class BackgroundSessionRuntime:
                         )
 
                     replacement = build_runtime(self.state.inherited_scratch)
+                    # Bracket the spawn with identity reads so the runtime
+                    # carries a spawn stamp: sessions demuxed onto it inherit
+                    # its credential, and the registry pass in
+                    # ``flag_identity_stamp_mismatches`` can only compare a
+                    # stamp that was recorded. Unstamped would be fail-safe but
+                    # silently blind for this runtime's whole lifetime.
+                    pre_spawn = await pre_spawn_identity(
+                        getattr(self._owner, "spawn_identity_reader", None)
+                    )
                     try:
                         await replacement.spawn()
                     except SharedScratchJoinError:
@@ -670,8 +741,41 @@ class BackgroundSessionRuntime:
                             exc_info=True,
                         )
                         replacement = build_runtime(None)
+                        # A fresh spawn needs its own bracket: the first
+                        # pre-read bounded the FAILED spawn, not this one.
+                        pre_spawn = await pre_spawn_identity(
+                            getattr(self._owner, "spawn_identity_reader", None)
+                        )
                         await replacement.spawn()
-                    self._bg_runtime = replacement
+                    # Best-effort spawn-account record on the runtime object
+                    # itself (the registry gate reads ``runtime.spawn_identity``
+                    # directly); see flag_identity_stamp_mismatches. A
+                    # cancellation landing in this read would leak the spawned
+                    # replacement before it becomes ``_bg_runtime``, so tear
+                    # it down on the way out. The read also suspends before
+                    # the ``_bg`` slot (the orphan sweep's companion-PID
+                    # union) can see it, so shield its PID for the span.
+                    starting_pid = spawn_pid(replacement)
+                    if starting_pid is not None:
+                        self._owner._starting_pids.add(starting_pid)
+                    try:
+                        try:
+                            await stamp_spawn_identity(
+                                getattr(self._owner, "spawn_identity_reader", None),
+                                replacement,
+                                pre_spawn=pre_spawn,
+                            )
+                        except BaseException:
+                            with contextlib.suppress(Exception):
+                                await replacement.kill(
+                                    expected=True,
+                                    reason="spawn-stamp interrupted before registration",
+                                )
+                            raise
+                        self._bg_runtime = replacement
+                    finally:
+                        if starting_pid is not None:
+                            self._owner._starting_pids.discard(starting_pid)
                     # Recorded NOW, off the live runtime, not at the next
                     # acquisition: a backend switch retires the runtime through
                     # _retire_stale_backend_bg_runtime without another call
@@ -754,28 +858,59 @@ class BackgroundSessionRuntime:
             if not self._owner._provider_factory:
                 return
             # Spawn the replacement BEFORE tearing the old one down: a failed
-            # spawn leaves the working session in place.
+            # spawn leaves the working session in place. As in
+            # ``_ensure_background``, the permit is retained through stamping
+            # and adoption so the identity sweep's permit barrier covers the
+            # whole started-but-not-yet-adopted window (permit -> owner._lock,
+            # the sweep's own lock order).
+            await self._owner._start_sem.acquire()
             try:
-                replacement = self._owner._provider_factory(
-                    background_key,
-                    agent=background_agent,
-                )
-                async with self._owner._start_sem:
+                try:
+                    replacement = self._owner._provider_factory(
+                        background_key,
+                        agent=background_agent,
+                    )
+                    pre_spawn = await pre_spawn_identity(
+                        getattr(self._owner, "spawn_identity_reader", None)
+                    )
                     await replacement.start()
-            except Exception:
-                logger.warning(
-                    "Background session recycle kept the old provider — "
-                    "replacement failed to start",
-                    exc_info=True,
-                )
-                return
+                except Exception:
+                    logger.warning(
+                        "Background session recycle kept the old provider — "
+                        "replacement failed to start",
+                        exc_info=True,
+                    )
+                    return
+                # Best-effort spawn-account record; see flag_identity_stamp_mismatches.
+                # A cancellation landing in this read would leak the started
+                # replacement before adoption below, so kill it on the way out.
+                # The read also suspends before adoption makes the PID visible
+                # through the session map, so shield it for the span.
+                starting_pid = spawn_pid(replacement)
+                if starting_pid is not None:
+                    self._owner._starting_pids.add(starting_pid)
+                try:
+                    try:
+                        await stamp_spawn_identity(
+                            getattr(self._owner, "spawn_identity_reader", None),
+                            replacement,
+                            pre_spawn=pre_spawn,
+                        )
+                    except BaseException:
+                        self._owner._dispatch_hard_kill(replacement)
+                        raise
 
-            async with self._owner._lock:
-                # Lifecycle methods do not take the turn semaphore, so the entry
-                # can still have moved while the replacement was starting.
-                adopted = self._owner._sessions.get(background_key) is session
-                if adopted:
-                    session.adopt_provider(replacement)
+                    async with self._owner._lock:
+                        # Lifecycle methods do not take the turn semaphore, so the entry
+                        # can still have moved while the replacement was starting.
+                        adopted = self._owner._sessions.get(background_key) is session
+                        if adopted:
+                            session.adopt_provider(replacement)
+                finally:
+                    if starting_pid is not None:
+                        self._owner._starting_pids.discard(starting_pid)
+            finally:
+                self._owner._start_sem.release()
 
             doomed = provider if adopted else replacement
             try:

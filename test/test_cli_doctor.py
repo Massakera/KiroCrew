@@ -2763,11 +2763,11 @@ class TestEffectiveModelSection:
         hostile = Path("/tmp/proj/.kiro/agents/kirocrew\x1b[2J.json")
         self._install_spec(None)
         real_reader = cli_doctor._read_agent_spec
-        monkeypatch.setattr(cli_doctor, "project_agent_files", lambda d: [hostile])
+        monkeypatch.setattr(cli_doctor, "project_agent_files", lambda d, **kw: [hostile])
         monkeypatch.setattr(cli_doctor, "project_agent_name", lambda p: "kirocrew")
         # Only the injected path is faked; the user-level spec still goes through
         # the real reader so the report's own self-check is not disturbed. The
-        # stub forwards **kw because the reader takes keyword-only SEL
+        # scan and reader stubs forward **kw because both take keyword-only SEL
         # attribution labels that this test does not care about.
         monkeypatch.setattr(
             cli_doctor,
@@ -3890,3 +3890,255 @@ class TestNameGrantPlatformScopeRow:
 
         params = inspect.signature(cli_doctor._doctor_name_grant_platform_scope).parameters
         assert not params
+
+
+class TestDoctorSkillViewCensus:
+    """The Agents Directory section counts the ``kirocrew-skill-view-*`` aliases.
+
+    Every spawn projects one alias per authored agent into the shared kiro
+    agents directory, and kiro-cli reads every file there on startup. Before
+    the lease-based reclaim the directory grew without bound (28k files / 580 MB
+    on one host; ``EMFILE`` on another), and the only way to see it was ``ls``.
+    Doctor reports the census read-only: how many aliases exist, how many a
+    lease record names, which share this gateway's reclaim covers, and a
+    warning once the count is past the point where startup cost is measurable.
+    """
+
+    PREFIX = "kirocrew-skill-view-"
+
+    @staticmethod
+    def _home(tmp_path: Path) -> Path:
+        # Spelled through ``.absolute().as_posix()`` like the publisher does, so
+        # the test does not depend on how the platform absolutises a bare "/x".
+        return tmp_path / "crew-home"
+
+    @classmethod
+    def _alias(cls, directory: Path, index: int, *, home: str | None) -> str:
+        stem = f"{cls.PREFIX}{index:024x}"
+        (directory / f"{stem}.json").write_text('{"name": "%s"}' % stem)
+        if home is not None:
+            metadata_dir = directory / ".kirocrew-skill-projection-metadata"
+            metadata_dir.mkdir(exist_ok=True)
+            (metadata_dir / f"{stem}.json").write_text(
+                json.dumps({"x-kirocrew-managed": "skill-view", "x-kirocrew-home": home})
+            )
+        return stem
+
+    def _own(self, tmp_path: Path, index: int) -> str:
+        return self._alias(tmp_path, index, home=self._home(tmp_path).absolute().as_posix())
+
+    @staticmethod
+    def _lease(directory: Path, stems: list[str], name: str = "1-abc") -> None:
+        lease_dir = directory / ".kirocrew-skill-projection-leases"
+        lease_dir.mkdir(exist_ok=True)
+        (lease_dir / f"{name}.json").write_text(json.dumps({"aliases": stems}))
+        (lease_dir / f"{name}.hold").write_text("")
+
+    def _run(self, tmp_path: Path, monkeypatch, capsys) -> str:
+        from kiro_crew.acp import skill_projection
+
+        monkeypatch.setattr(cli_doctor, "KIRO_AGENTS_DIR", tmp_path)
+        # The census resolves the data home itself, spelled as the publisher
+        # spells it, so the doctor cannot hand it a differently normalised id.
+        monkeypatch.setattr(skill_projection, "data_home", lambda: self._home(tmp_path))
+        cli_doctor._doctor_agents_janitor([], sweep_backups=False)
+        return capsys.readouterr().out
+
+    @staticmethod
+    def _line(out: str) -> str:
+        return out.split("skill views:", 1)[1]
+
+    def test_an_empty_directory_reports_zero_aliases(self, tmp_path, monkeypatch, capsys):
+        out = self._run(tmp_path, monkeypatch, capsys)
+        assert "skill views: ✅ 0 kirocrew-skill-view-*.json alias(es)" in out
+
+    def test_live_and_unreferenced_aliases_are_counted_separately(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        live = [self._own(tmp_path, i) for i in range(3)]
+        for i in range(3, 8):
+            self._own(tmp_path, i)
+        self._lease(tmp_path, live)
+        out = self._run(tmp_path, monkeypatch, capsys)
+        assert "skill views: ✅ 8 kirocrew-skill-view-*.json alias(es)" in out
+        assert "(3 named by a lease record, 5 not)" in out
+        assert "⚠️" not in self._line(out)
+
+    def test_the_threshold_is_the_real_one_and_exclusive(self, tmp_path, monkeypatch, capsys):
+        # Exactly the production threshold is still green; one more warns. No
+        # monkeypatched constant, so the 2,000 the docs claim is what is measured.
+        limit = cli_doctor._SKILL_VIEW_BACKLOG_WARN
+        assert limit == 2000
+        for i in range(limit):
+            self._alias(tmp_path, i, home=None)
+        assert "skill views: ✅" in self._run(tmp_path, monkeypatch, capsys)
+        self._alias(tmp_path, limit, home=None)
+        out = self._run(tmp_path, monkeypatch, capsys)
+        assert "skill views: ⚠️" in out
+        assert f"{limit + 1} kirocrew-skill-view-*.json alias(es)" in out
+
+    def test_a_backlog_this_home_owns_names_its_share_and_the_remedy_is_a_move(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 5)
+        for i in range(6):
+            self._own(tmp_path, i)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "⚠️" in line
+        assert "reclaims a bounded number of the 6 this home owns" in line
+        assert "gateway stopped" in line
+        assert "move" in line
+        # Advice the doctor prints is text an operator acts on: it must never
+        # suggest deleting a file whose author the doctor cannot prove.
+        assert "delete them" not in line
+        assert "removed" not in line
+        # No lease, no foreign home: neither caveat is printed.
+        assert "Lease-named" not in line
+        assert "another Kiro Crew home" not in line
+
+    def test_a_backlog_another_home_owns_is_named_as_not_draining_here(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 3)
+        for i in range(4):
+            self._alias(tmp_path, i, home="/some/other/home")
+        self._own(tmp_path, 4)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "(0 named by a lease record, 5 not, 4 owned by another Kiro Crew home)" in line
+        assert "reclaims a bounded number of the 1 this home owns" in line
+        assert "The 4 another Kiro Crew home owns never drain here" in line
+        # A second home shares this directory, so the remedy must stop BOTH
+        # gateways, not only the one this doctor speaks for.
+        assert "with every gateway that uses this agents directory stopped" in line
+        assert "with the gateway stopped" not in line
+
+    def test_another_homes_leased_aliases_are_not_called_held_or_crash_stale(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # The other home's live sessions hold leases in this shared directory.
+        # This gateway's reclaim refuses those aliases unconditionally, so they
+        # are neither "kept while held" nor "reclaimed on the next spawn" here.
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 2)
+        theirs = [self._alias(tmp_path, i, home="/some/other/home") for i in range(3)]
+        self._lease(tmp_path, theirs)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "(3 named by a lease record, 0 not, 3 owned by another Kiro Crew home)" in line
+        assert "crash-stale" not in line
+        assert "The 3 another Kiro Crew home owns never drain here" in line
+
+    def test_lease_named_aliases_are_described_as_held_not_as_never_draining(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # A crash-stale but readable lease names aliases the next spawn will
+        # reclaim; the census cannot tell it from a held one without probing
+        # the lock, so the text says "while held", never "will not drain".
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 2)
+        stems = [self._own(tmp_path, i) for i in range(3)]
+        self._lease(tmp_path, stems)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "(3 named by a lease record, 0 not)" in line
+        assert "This home's lease-named aliases are kept while their lease is held" in line
+        assert "a crash-stale lease is reclaimed on the next spawn" in line
+        assert "will not drain" not in line
+
+    def test_an_unreadable_lease_record_withdraws_the_drain_promise(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # The reclaim reads a malformed record as uncertainty and keeps EVERY
+        # alias while it exists, so the census must say so even below the
+        # backlog threshold -- and, below it, say nothing about startup cost.
+        self._own(tmp_path, 1)
+        self._own(tmp_path, 2)
+        lease_dir = tmp_path / ".kirocrew-skill-projection-leases"
+        lease_dir.mkdir()
+        (lease_dir / "1-bad.json").write_text("{not json")
+        (lease_dir / "1-big.json").write_text(json.dumps({"aliases": ["x" * 70000]}))
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "⚠️  2 kirocrew-skill-view-*.json alias(es)" in line
+        assert "(0 named by a lease record, 2 not)" in line
+        assert "2 lease record(s)" in line and "cannot be read" in line
+        assert "slows every session start" not in line
+        assert "reclaims a bounded number" not in line
+
+    def test_an_unreadable_lease_above_the_threshold_denies_the_drain(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 1)
+        for i in range(3):
+            self._own(tmp_path, i)
+        lease_dir = tmp_path / ".kirocrew-skill-projection-leases"
+        lease_dir.mkdir()
+        (lease_dir / "1-bad.json").write_text("?")
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "Nothing is reclaimed until the unreadable lease record(s) above are gone." in line
+        assert "reclaims a bounded number" not in line
+        assert "gateway stopped" in line
+
+    def test_a_truncated_census_is_reported_as_floors_without_derived_counts(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from kiro_crew.acp import skill_projection
+
+        monkeypatch.setattr(skill_projection, "_CENSUS_MAX_ALIASES", 3)
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 2)
+        for i in range(5):
+            self._own(tmp_path, i)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "3+ kirocrew-skill-view-*.json alias(es) (0+ named by a lease record)" in line
+        assert "floors: the census stopped at its retention bound" in line
+        # `total - leased` is neither a floor nor a ceiling once a bound was hit,
+        # so no derived number is printed or promised.
+        assert " not" not in line.split(")", 1)[0]
+        assert "Unscanned lease records leave reclaimability unknown" in line
+        assert "of the 3" not in line
+        assert "On every spawn the gateway reclaims" not in line
+
+    def test_a_pathologically_nested_sidecar_or_lease_does_not_abort_the_doctor(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # json.loads raises RecursionError (a RuntimeError) on nesting past the
+        # interpreter limit; a hand-authored file in Kiro Crew's own hidden
+        # directories must read as unreadable, never take the diagnostic down.
+        deep = "[" * 100000 + "]" * 100000
+        self._own(tmp_path, 1)
+        stem = self._own(tmp_path, 2)
+        (tmp_path / ".kirocrew-skill-projection-metadata" / f"{stem}.json").write_text(deep)
+        lease_dir = tmp_path / ".kirocrew-skill-projection-leases"
+        lease_dir.mkdir()
+        (lease_dir / "1-deep.json").write_text(deep)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "2 kirocrew-skill-view-*.json alias(es)" in line
+        assert "1 lease record(s)" in line and "cannot be read" in line
+
+    def test_authored_specs_and_foreign_files_are_not_counted(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        (tmp_path / "kirocrew.json").write_text('{"name": "kirocrew"}')
+        (tmp_path / "kirocrew-skill-view-notes.txt").write_text("x")
+        (tmp_path / "kirocrew-skill-view-dir.json").mkdir()
+        self._own(tmp_path, 1)
+        out = self._run(tmp_path, monkeypatch, capsys)
+        assert "skill views: ✅ 1 kirocrew-skill-view-*.json alias(es)" in out
+
+    def test_the_census_never_deletes_anything(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 1)
+        stems = [self._own(tmp_path, i) for i in range(4)]
+        self._lease(tmp_path, stems[:1])
+        (tmp_path / ".kirocrew-skill-projection-leases" / "2-bad.json").write_text("?")
+        before = sorted(p.name for p in tmp_path.rglob("*"))
+        self._run(tmp_path, monkeypatch, capsys)
+        assert sorted(p.name for p in tmp_path.rglob("*")) == before
+
+    def test_the_remedy_names_the_projection_directories_it_means(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from kiro_crew.acp import skill_projection
+
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 1)
+        for i in range(2):
+            self._own(tmp_path, i)
+        (tmp_path / ".kirocrew-skill-projection-leases").mkdir()
+        (tmp_path / ".kirocrew-skill-projection-leases" / "1-bad.json").write_text("?")
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert f"{skill_projection._PROJECTION_METADATA_DIR_NAME}/ directory" in line
+        assert f"in {skill_projection._PROJECTION_LEASE_DIR_NAME}/ cannot be read" in line

@@ -7,9 +7,12 @@ import { useQuery, useMutation } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
 import ChatMessageList from '../app-sdk/ChatMessageList'
 import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
+import type { ThreadHooks } from '../app-sdk/messageRenderers'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
+import { filterCrewmateChat } from './chat/crewmateBubbles'
+import type { CrewmateIdentity } from '../pages/chat/CrewmateMessage'
 import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
 import ChatDropOverlay, { useChatFileDrop } from './ChatDropOverlay'
@@ -52,6 +55,7 @@ import { useAppSelector, useAppDispatch, store } from '../store'
 import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
+import { appendFollowUpOption, removeFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
 import { scaleContentWidth } from '../pages/chat/contentWidth'
 import { tryQuickSend } from '../lib/quickSend'
@@ -105,6 +109,9 @@ export default function ChatPane({
   openSideChat,
   leading,
   busyMode = 'split',
+  crewmate,
+  onOpenCrewWorkLog,
+  threads,
 }: {
   slotKey: string
   focused?: boolean
@@ -160,6 +167,23 @@ export default function ChatPane({
    *  turn. Decided by the host, never inferred here, so no pane changes
    *  behaviour by accident. */
   busyMode?: ComposerBusyMode
+  /** This pane is a CREWMATE's chat (a member-mode slot on the Members page):
+   *  the transcript shows only what the crewmate says to the user — the
+   *  auto-nudge turns, cron and sub-agent envelopes, tool rows and say-nothing
+   *  rows stay in the slot's history for the Work log but are not drawn — and
+   *  the assistant rows draw as a run of bubbles under the crewmate's avatar
+   *  (components/chat/crewmateBubbles). Undefined = an ordinary transcript;
+   *  decided by the host, never inferred from the slot. */
+  crewmate?: CrewmateIdentity
+  /** Focus the crewmate's Work log tab (the side-panel tab that holds what
+   *  the filter hid). When given, the quiet hint's "where the work went" line
+   *  is a link that opens it, so the words that read as a destination are one;
+   *  without it the line is plain text. Only meaningful with `crewmate`. */
+  onOpenCrewWorkLog?: () => void
+  /** Reply threads on this pane's messages. Only a host presenting a
+   *  crewmate's chat (the Members page) passes it; absent, the rows draw no
+   *  thread footer and no "Reply in thread" action. */
+  threads?: ThreadHooks
 }) {
   // One instance covers both dropdown filter inputs (never open at once).
   const dispatch = useAppDispatch()
@@ -390,10 +414,24 @@ export default function ChatPane({
   // hand `messages` a fresh array identity per character, defeating the memo()
   // on ChatMessageList and re-running its O(N) turn grouping while the user
   // types.
-  const { messages, queuedMessages, systemDeliveryCount } = useMemo(
+  const { messages: paneMessages, queuedMessages, systemDeliveryCount } = useMemo(
     () => splitPaneMessages(allMessages),
     [allMessages],
   )
+  // A crewmate's chat draws only what the crewmate says (see the `crewmate`
+  // prop). Filtered HERE, above the list, so the run positions the assistant
+  // rows compute from their neighbours see the drawn list, and so the pinned
+  // prompt, the earlier-messages anchor and the empty hint all agree with what
+  // is on screen. Same array identity back when nothing is dropped.
+  const messages = useMemo(
+    () => (crewmate ? filterCrewmateChat(paneMessages) : paneMessages),
+    [crewmate, paneMessages],
+  )
+  // The unfiltered rows, handed to the row set for the one read that must see
+  // what the filter dropped (the steer-chip decision reads the policy-block
+  // inject row). `undefined` for an ordinary chat, so its renderer set does not
+  // rebuild on every appended message.
+  const crewmateTranscript = crewmate ? paneMessages : undefined
   // EVERY queued row, cards and hidden system deliveries alike. A reorder
   // submits the full sequence — see useQueuedMessageActions — so the
   // non-interactive rows `splitPaneMessages` strips out are still needed here.
@@ -427,6 +465,24 @@ export default function ChatPane({
   // Read by the option handler instead of the state: two clicks landing before
   // a re-render would both see the same set and both take the append branch.
   const followUpPickedRef = useRef(followUpPicked); followUpPickedRef.current = followUpPicked
+  // Ownership of the appended suffix, not content-matching (#7616). See
+  // lib/followUpToggle: the chips own a recorded (base, options) span of the
+  // draft, options kept as an ARRAY so a comma-bearing label is one element.
+  // Advanced SYNCHRONOUSLY in the click handler (never in a render-time state
+  // updater), so React StrictMode's double-invocation cannot rebase it on stale
+  // state (the #7616 F2 defect).
+  const followUpInsertedRef = useRef<OwnedSuffix | null>(null)
+  // Any DIRECT user edit of the composer invalidates chip ownership (#7616):
+  // the recorded span describes a draft the chips produced, and once the user
+  // types the span no longer maps to the live text. Clearing here — the single
+  // path a user keystroke takes into `input` — means the un-toggle path can
+  // never act on a stale span, even one the user edited and then restored
+  // byte-for-byte. Chip append/remove set the ref themselves and go through
+  // setInput directly, not this handler, so they are unaffected.
+  const handleUserInput = useCallback((next: string | ((prev: string) => string)) => {
+    followUpInsertedRef.current = null
+    setInput(next)
+  }, [])
   // Orchestrator plan dispatch (#5893) — same mutation ChatPage uses,
   // targeting THIS pane's slot. The hook owns the latch acknowledgement,
   // keyed on the derived options-row identity passed here; the ref lets the
@@ -443,7 +499,7 @@ export default function ChatPane({
     return true
   }
   const followUpOptionsKey = followUpOptions.join('\x00')
-  useEffect(() => { setFollowUpPicked(new Set()) }, [followUpOptionsKey, slotKey])
+  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
   // with the page and no extra request is made for a pane.
   const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
@@ -597,6 +653,17 @@ export default function ChatPane({
   const limitRef = useRef<number | undefined>(PANE_HYDRATE_LIMIT)
   const limitLatched = useRef(false)
   if (!limitLatched.current && (running || paneSlot?.running)) {
+    limitRef.current = undefined
+    limitLatched.current = true
+  }
+  // A crewmate's chat that filters a BOUNDED window down to no speech has
+  // proved nothing: the last thing it said may sit just behind the window,
+  // under fifty newer patrol rows. The never-spoken hint is a claim about the
+  // whole history, so that read is upgraded to the whole transcript first
+  // (same latch as the streaming upgrade) and the hint waits for it. An
+  // unbounded read that is still empty is the real never-spoken case.
+  const crewmateQuietUnproven = !!crewmate && warmHasMore === true && paneMessages.length > 0 && messages.length === 0
+  if (!limitLatched.current && crewmateQuietUnproven) {
     limitRef.current = undefined
     limitLatched.current = true
   }
@@ -1286,8 +1353,10 @@ export default function ChatPane({
       // A steer-only surface has no steer/queue concept to explain, so a
       // confirmed steer draws as an ordinary message: no badge, no tint.
       hideSteerBadge: busyMode === 'steer-only',
+      crewmate,
+      crewmateTranscript,
     }),
-    [slotKey, toolDisclosure, setToolDisclosureFor, busyMode],
+    [slotKey, toolDisclosure, setToolDisclosureFor, busyMode, crewmate, crewmateTranscript],
   )
 
   // Quote / Ask on selected assistant text — the same chat-core seam the main
@@ -1451,6 +1520,7 @@ export default function ChatPane({
           hiddenRow={pinHiddenRow}
           onQuote={onQuote}
           onAsk={onAsk}
+          threads={threads}
           transcript={{
             sessionId: `pane:${slotKey}`,
             scrollerRef,
@@ -1471,8 +1541,39 @@ export default function ChatPane({
                     <Btn onClick={() => { void refetchSlotDetail() }}>{i18nT('components.chatPane.retry')}</Btn>
                   </div>
                 )}
-                {messages.length === 0 && !running && !slotDetailFailed && !hideEmptyHint && (
-                  <div className="text-center text-muted text-[13px] px-4 py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
+                {/* A crewmate whose whole history is machinery (a patroller that
+                    has not spoken yet) filters to an empty chat. That is not a
+                    fresh thread, so it must not read as one: say who has not
+                    spoken and where the work went, instead of "type a message
+                    to start" beside a summary that counts its wakes. Said only
+                    once the read is the WHOLE history (`crewmateQuietUnproven`
+                    above): a bounded window with no speech in it is not proof. */}
+                {messages.length === 0 && !running && !slotDetailFailed && !hideEmptyHint && !crewmateQuietUnproven && (
+                  <div className="text-center text-muted text-[13px] px-4 py-8" data-testid={crewmate && paneMessages.length > 0 ? 'crewmate-quiet-hint' : undefined}>
+                    {crewmate && paneMessages.length > 0 ? (
+                      <>
+                        <div>{i18nT('components.chatPane.crewmate_quiet', { name: crewmate.label || crewmate.name })}</div>
+                        {/* Where the work went: named after the panel tab
+                            (pages.membersPage.work_log_tab). A link when the
+                            host can focus that tab — the words read as a
+                            destination, so they must be one. */}
+                        {onOpenCrewWorkLog ? (
+                          <button
+                            type="button"
+                            onClick={onOpenCrewWorkLog}
+                            data-testid="crewmate-quiet-where"
+                            className="mt-1 text-accent underline bg-transparent border-none cursor-pointer hover:text-accent-hover transition-colors"
+                          >
+                            {i18nT('components.chatPane.crewmate_quiet_where')}
+                          </button>
+                        ) : (
+                          <div className="mt-1" data-testid="crewmate-quiet-where">{i18nT('components.chatPane.crewmate_quiet_where')}</div>
+                        )}
+                      </>
+                    ) : (
+                      i18nT('components.chatPane.session_ready_type_a_message_to_start')
+                    )}
+                  </div>
                 )}
                 {/* Suppressed on the active slot: that pane renders the store's full
                     history, so the bound does not apply and the row would be false. */}
@@ -1695,12 +1796,12 @@ export default function ChatPane({
           ref={composerRef}
           slotKey={slotKey}
           value={input}
-          onChange={setInput}
+          onChange={handleUserInput}
           voice={composerVoiceOptions}
         >
         <ChatInput
           value={input}
-          onChange={setInput}
+          onChange={handleUserInput}
           pasteBlocks={pasteBlocks}
           onPasteBlocksChange={setPasteBlocks}
           onSend={doSend}
@@ -1744,6 +1845,9 @@ export default function ChatPane({
           followUpLayout={chatConfig.followUpLayout}
           quickSend={dashCfg?.quick_send}
           followUpSourceKey={followUpSourceKey}
+          followUpPendingOptions={planActionMutation.latchedActions}
+          followUpRefusedOptions={new Set(followUpOptions.filter(planActionMutation.isRefused))}
+          followUpError={planActionMutation.failure}
           onFollowUpSelect={(o: string, e: React.MouseEvent, sourceKeyAtClick?: string | null) => {
             // Mirrors ChatPage's wiring, plan branch included (#5893). Plan
             // options (Go / Go All / Cancel — the only labels the plan
@@ -1766,27 +1870,26 @@ export default function ChatPane({
             if (followUpPickedRef.current.has(o)) {
               const next = new Set(followUpPickedRef.current); next.delete(o)
               followUpPickedRef.current = next
-              setInput(prev => {
-                // Order matters: try leading ", o" first so "opt, opt" + remove
-                // last "opt" doesn't match "opt, " and splice the wrong one.
-                // lastIndexOf, not indexOf: the handler appends options at the
-                // END, so the last occurrence is the one it created — a draft
-                // merely containing ", o" as a substring (draft "Please, Google"
-                // + option "Go") must not be spliced mid-word.
-                const leading = ', ' + o
-                let idx = prev.lastIndexOf(leading)
-                if (idx >= 0) return prev.slice(0, idx) + prev.slice(idx + leading.length)
-                const trailing = o + ', '
-                idx = prev.indexOf(trailing)
-                if (idx >= 0) return prev.slice(0, idx) + prev.slice(idx + trailing.length)
-                if (prev === o) return ''
-                return prev  // user edited — leave text, still unmark below
-              })
+              // Compute the transform SYNCHRONOUSLY in the event handler from
+              // the live draft + ownership refs, then advance both refs and set
+              // the value. No functional state updater is involved, so React
+              // StrictMode's double-invocation cannot rebase ownership on stale
+              // state (the #7616 F2 defect); and because the refs advance before
+              // the next click, two clicks landing in one uncommitted tick still
+              // compose. The refs are the source of truth between renders;
+              // render re-affirms inputRef.current from committed state.
+              const r = removeFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+              followUpInsertedRef.current = r.owned
+              inputRef.current = r.value
+              setInput(r.value)
               setFollowUpPicked(next)
             } else {
               const next = new Set(followUpPickedRef.current); next.add(o)
               followUpPickedRef.current = next
-              setInput(prev => prev.trim() ? prev.trimEnd() + ', ' + o : o)
+              const r = appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+              followUpInsertedRef.current = r.owned
+              inputRef.current = r.value
+              setInput(r.value)
               setFollowUpPicked(next)
             }
           }}
@@ -1798,6 +1901,9 @@ export default function ChatPane({
             doSend(text)
           }}
           project={paneSlot?.project ?? ''}
+          // A crewmate's chat is a DM with one named crewmate, so the composer
+          // addresses it by name rather than the product ("Message Kiro Crew…").
+          placeholder={crewmate ? i18nT('components.chatInput.message_placeholder', { bot: crewmate.label || crewmate.name }) : undefined}
           onUploadFiles={uploadFiles}
           onCancelUpload={cancelUpload}
           pendingFiles={pendingFiles}

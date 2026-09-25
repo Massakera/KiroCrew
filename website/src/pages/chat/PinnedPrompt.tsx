@@ -113,7 +113,8 @@ const THUMB_FRAME = 'bg-muted forced-colors:border'
  * the session title.
  *
  * The card is a pixel-for-pixel copy of the user bubble's own box — same
- * `px-4 mx-auto` content column, right-aligned, `max-w-[550px]`, `px-4 py-2
+ * `px-4 mx-auto` content column, right-aligned, the bubble's own `max-w-full`
+ * cap (so both follow Settings → Chat → Content Width, #8398), `px-4 py-2
  * rounded-xl bg-card text-sm` with an inner `my-1 leading-6` paragraph —
  * because the transcript row it represents is hidden while it is pinned (see
  * ChatPage's row `visibility`). For a one-line prompt the two are the same size
@@ -564,7 +565,7 @@ export default function PinnedPrompt({
         // copied or clicked, and its two buttons keep their hover styling while
         // doing nothing. So the gesture is FORWARDED instead (see
         // `scrollTranscriptBy`) and the card keeps its pointer events.
-        className="pointer-events-auto max-w-[550px] min-w-0"
+        className="pointer-events-auto max-w-full min-w-0"
         style={{ transform: `translateY(${-pushUp}px)`, willChange: 'transform' }}
       >
         <div

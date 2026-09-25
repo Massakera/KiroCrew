@@ -315,7 +315,10 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
     # Local import: session_control reaches this module through state, so taking
     # the key at module level would close an import cycle.
     from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY
-    from kiro_crew.dashboard.session_control import QUEUED_CONTAINMENT_META_KEY
+    from kiro_crew.dashboard.session_control import (
+        QUEUED_CONTAINMENT_META_KEY,
+        SEND_ORIGIN_META_KEY,
+    )
 
     entries: list[dict[str, Any]] = []
     budget = MAX_DURABLE_QUEUE_BYTES
@@ -379,10 +382,30 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
             # the drain re-derives what it can from the entry's `kind`, which the
             # writer never emits either. A restored app entry therefore carries no
             # actor at all -- the same fail-closed baseline the flags above get.
+            #
+            # The SENDING SLOT goes with them, and it is the sharpest of the
+            # three because the value is not merely read, it names a WRITE
+            # TARGET: the drain resolves the recipient of its drop notice from
+            # this key alone and appends the entry's own text there
+            # (`session_control.notify_send_origin_dropped`). Carried back off
+            # the line verbatim, an edited stamp turns a file write into a
+            # transcript row in a session the editor does not own, with the
+            # entry's content as its body. Nothing in the entry can attest to
+            # who sent it, so the key is worth exactly what the file is worth
+            # and is dropped. The cost is one notice: a relay that outlives a
+            # restart and is then dropped reports to nobody, while the RELAY
+            # itself still survives -- which is what putting the stamp in
+            # ``meta`` rather than a consumption callback buys, since a
+            # callback-carrying entry is not persisted at all.
             entry["meta"] = {
                 k: v
                 for k, v in meta.items()
-                if k not in (QUEUED_CONTAINMENT_META_KEY, TURN_ACTOR_META_KEY)
+                if k
+                not in (
+                    QUEUED_CONTAINMENT_META_KEY,
+                    TURN_ACTOR_META_KEY,
+                    SEND_ORIGIN_META_KEY,
+                )
             }
         try:
             # Costed against the same key projection the WRITER admits

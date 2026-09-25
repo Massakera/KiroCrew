@@ -30,6 +30,7 @@
         "subagent_backend_fallback": [],
         "subagent_backend_limits": {},
         "default_agent": "",
+        "deepseek_env": {},
         "sweep_agents_backups": false,
         "sandbox": "auto",
         "sandbox_allow_no_isolation": false,
@@ -82,6 +83,7 @@
         "tool_approval_timeout_secs": 600,
         "session_control": true,
         "member_dispatch": true,
+        "crew_panel": true,
         "subagent_cost_gb": 0.5,
         "subagent_cpu_cost_cores": 1.0,
         "subagent_auto_max": 32,
@@ -396,6 +398,34 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "agent.deepseek_env",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "DeepSeek Harness provider keys",
+      "help": "Provider keys handed to the DeepSeek Harness ('deepseek' backend) as environment variables at spawn, mapping an environment-variable NAME to a 'secret://<vault name>' reference. The harness resolves a provider credential from its inherited environment above its own credential files, so this is how it reaches a hosted model without Kiro Crew leaving those files readable inside the sandbox. Store the key under Settings > Secrets, then map it here, e.g. {\"DEEPSEEK_API_KEY\": \"secret://my-dsh-key\"}. Any provider name the harness knows works (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...). A plaintext value is REFUSED at write time -- the config write itself fails, so no credential is ever stored in config.json -- and so, at spawn, is a name the harness would forward to its own shell children, a name Kiro Crew owns, or one Kiro Crew's agent environment scrub strips; the DeepSeek session is refused before it starts with a message naming the offending key. Empty means no key: a model served locally on this machine needs none. Ignored by every other backend.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "agent.deepseek_env.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "agent.sweep_agents_backups",
@@ -1211,6 +1241,20 @@
       "defaultValue": true
     },
     {
+      "path": "agent.crew_panel",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Crew Dashboard",
+      "help": "Let a crew member publish its own webview, shown in that member's drawer on the Crew page. A member sends a JSON object and names a template that renders it, so a long-running crew can say what it is holding, which worker is stuck and what needs a decision, to someone who is not reading its transcript. On by default, because a crew that cannot be watched is the thing this surface exists to fix. The tools come from the kirocrew-panel MCP server, so the grant follows the same rule as every other MCP server: an agent that does not mount it never has them. Turn this off to withdraw the capability from every member at once without editing each spec, and the withdrawal is immediate: the publish route reads this switch on every call, so a member whose session was already running loses the panel too. A member writes only its OWN panel: the server resolves the publishing crew from the calling session and takes no crew or session argument, and a subagent has no panel to write.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
       "path": "agent.subagent_cost_gb",
       "kind": "core",
       "type": "number",
@@ -1950,7 +1994,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Embedding Threads",
-      "help": "CPU threads for an explicit memory query or user-started re-embedding. Defaults to 4, capped one core below the machine's core count -- never below one thread, so a single-core host still embeds -- to leave the event loop a core wherever there is one to spare; 4 means that default, so pinning threads on a 4-core host takes another number. Any other setting is honoured up to the core count. All memory stores share one model and inference worker. V2 message context does not run an embedding search; V1 retains its session-start retrieval.",
+      "help": "CPU threads for an explicit memory query or user-started re-embedding. Defaults to 4, capped one core below the CPUs this process may run on -- never below one thread, so a single-core host still embeds -- to leave the event loop a core wherever there is one to spare; 4 means that default, so pinning threads where the process may use 4 or fewer CPUs takes another number. Any other setting is honoured up to that count, which a CPU-set restriction (--cpuset-cpus, taskset) narrows; a CFS quota (--cpus, cpu.max) sets no mask and is not seen, while a limit a scheduler turns into an exclusive cpuset is. All memory stores share one model and inference worker. V2 message context does not run an embedding search; V1 retains its session-start retrieval.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 4
@@ -1964,7 +2008,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Embedding Threads (bulk)",
-      "help": "CPU threads for BACKGROUND corpus embedding — the re-embed sweep that gives imported memories semantic reach, plus imports and consolidation — as opposed to a query you are waiting on. Defaults to 1: nothing waits on this work (those rows are keyword-searchable meanwhile), so it is tuned to use fewer resources rather than finish early. Both classes share one inference worker; waiting interactive queries take priority. 0 means inherit Embedding Threads. Explicit settings are honoured up to the machine's core count.",
+      "help": "CPU threads for BACKGROUND corpus embedding — the re-embed sweep that gives imported memories semantic reach, plus imports and consolidation — as opposed to a query you are waiting on. Defaults to 1: nothing waits on this work (those rows are keyword-searchable meanwhile), so it is tuned to use fewer resources rather than finish early. Both classes share one inference worker; waiting interactive queries take priority. 0 means inherit Embedding Threads. Explicit settings are honoured up to the CPUs this process may run on.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 1
@@ -3145,12 +3189,13 @@
       "sensitive": false,
       "tags": [],
       "label": "Provider",
-      "help": "Where speech is recognised. `local` runs on this machine and needs no account (it downloads one model the first time you dictate), `apple` uses the on-device recogniser built into macOS 26 and later, and `transcribe` sends your audio to AWS Transcribe, which bills your AWS account.",
+      "help": "Where speech is recognised. `local` runs on this machine and needs no account (it downloads one model the first time you dictate), `apple` uses the on-device recogniser built into macOS 26 and later, and `transcribe` sends your audio to AWS Transcribe, which bills your AWS account. `off` runs no recogniser at all, the same as turning speech input off.",
       "hasChildren": false,
       "enumValues": [
         "local",
         "apple",
-        "transcribe"
+        "transcribe",
+        "off"
       ],
       "defaultValue": "local"
     },
@@ -4186,7 +4231,8 @@
         },
         "nudge_wake": {
           "provider": "auto",
-          "llm_model": ""
+          "llm_model": "",
+          "quiet_streak_floor": 0
         }
       }
     },
@@ -4334,12 +4380,13 @@
       "sensitive": false,
       "tags": [],
       "label": "Wake judge",
-      "help": "Per-point settings for nudge.wake: which judge answers, and the model id for the small-model lane. The Jev lane still needs this point's consent scope on the Decisions card; the small-model lane needs no consent row, because it sends to the model provider your sessions already use, so picking it here is what runs it.",
+      "help": "Per-point settings for nudge.wake: which judge answers, the model id for the small-model lane, and how long a judge may keep a loop quiet before one fires anyway. The Jev lane still needs this point's consent scope on the Decisions card; the small-model lane needs no consent row, because it sends to the model provider your sessions already use, so picking it here is what runs it.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {
         "provider": "auto",
-        "llm_model": ""
+        "llm_model": "",
+        "quiet_streak_floor": 0
       }
     },
     {
@@ -4369,6 +4416,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "decisions.nudge_wake.quiet_streak_floor",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Quiet ticks before firing anyway",
+      "help": "How many QUIET verdicts in a row end the run of skipped turns. The Nth consecutive QUIET tick FIRES regardless of its own verdict, so this many quiet verdicts skip one fewer turn than the number suggests, and a judge that is wrong about a subject costs a late turn rather than silence. 0, the default, means inherit the shipped floor -- the same number the typed probe path uses, spelled once in the loop engine so the two cannot drift. A negative value also reads as inherit. This knob only ever SHORTENS the silence window: the shipped floor is the ceiling, and a larger value is clamped back down to it, because config.json is writable by an auto-approved agent shell and a raised floor would silence a watch with no new code, only a number.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0
     },
     {
       "path": "watchdog",
@@ -6935,6 +6996,7 @@
           "keep_awake": true
         },
         "restore_sessions": false,
+        "crewmate_threads": false,
         "qr_session_until_restart": true,
         "qr_session_persist_across_restart": false,
         "restore_window_minutes": 30,
@@ -6953,7 +7015,6 @@
         "browser_view_port": 0,
         "verbosity": "default",
         "link_previews": false,
-        "usage_text_scrape_enabled": false,
         "tail_fork_enabled": false,
         "auto_open_browser": true,
         "prevent_sleep": false,
@@ -6977,6 +7038,7 @@
         "onboarded": false,
         "import_onboarded": false,
         "privacy_acked": false,
+        "crewmates_onboarded": false,
         "user_role": "",
         "user_role_other": "",
         "user_technical_level": "",
@@ -7148,6 +7210,20 @@
       "enumValues": null,
       "defaultValue": false,
       "requiresRestart": true
+    },
+    {
+      "path": "dashboard.crewmate_threads",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Reply threads on crewmate chat messages",
+      "help": "Let any message in a crewmate's chat carry its own reply thread, opened in the side panel while the main chat stays visible. Off by default: the thread routes answer not-found, no thread frame is sent, and the dashboard draws no Reply in thread control. Takes effect on the next request; no restart.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "dashboard.qr_session_until_restart",
@@ -7413,20 +7489,6 @@
       "tags": [],
       "label": "Link Previews",
       "help": "Render http(s) links in assistant messages as favicon + page title instead of a raw URL. Off by default because it is a network decision, not a display one: this machine fetches every link the model outputs, so each linked site sees a request from your IP address. When false the /api/link-meta endpoint fetches nothing and returns 403.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": false
-    },
-    {
-      "path": "dashboard.usage_text_scrape_enabled",
-      "kind": "core",
-      "type": "boolean",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Spend Credits To Read The Credit Meter",
-      "help": "Let the credit pill fall back to a `kiro-cli /usage` chat turn when the free usage API returns no plan. That fallback is a REAL billed LLM turn on whichever model the lite agent resolves, and it repeats on every refresh interval for as long as any dashboard tab is open, so it is off by default: a meter that reports spending must not itself spend. While it is off the pill shows whatever the free API returned and hides when the API has nothing to show.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
@@ -7827,6 +7889,20 @@
       "tags": [],
       "label": "Privacy Acknowledged",
       "help": "Whether the user has seen the mandatory first-run Privacy chapter, which discloses the anonymous heartbeat and offers the opt-out. Server-backed rather than browser-local because the gateway gates the very FIRST heartbeat on it: until this is true the user has not yet been shown the opt-out, and a ping sent before the offer makes the offer meaningless.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "dashboard.crewmates_onboarded",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Crewmates Onboarded",
+      "help": "Whether the user has finished or dismissed the first-run Meet CrewMates flow (the four-step introduction that creates the first crewmate). Server-backed like the other first-run flags so a second machine does not replay it. Also set when the flow is re-run from the Crewmates page.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
@@ -8473,6 +8549,20 @@
       "tags": [],
       "label": "Reasoning Effort",
       "help": "Default reasoning effort for sessions on this crew. Empty inherits: the global agent.reasoning_effort (or, for a background worker crew, its role effort). A per-session pick still overrides this. Only reasoning-capable models accept a level; on any other model the pin is ignored, exactly as the global default is.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "agents.*.display_name",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Display Name",
+      "help": "Optional label the dashboard shows instead of the agent's name. Purely presentational: the name stays the immutable identity — it keys this record, addresses /api/agents/{name}, and is what dispatch, crons and spawn resolve — so renaming the label never breaks a binding. Empty means the dashboard shows the name itself.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""

@@ -38,7 +38,7 @@ import sys
 import tempfile
 import threading
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -46,6 +46,7 @@ from typing import Any, Iterator, Literal, Mapping, MutableMapping, NamedTuple
 
 from kiro_crew import agent_state, platform_compat
 from kiro_crew.agent_discovery import (
+    AmbiguousAgentSpecError,
     _declared_project_agent_name,
     _read_agent_spec,
     project_agent_files,
@@ -103,7 +104,12 @@ from kiro_crew.env import (
     sanitize_spec_env,
     spec_path_key,
 )
-from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
+from kiro_crew.hooks import (
+    FileTooLargeError,
+    is_unc_shape,
+    safe_read_file_bytes_nolink,
+    unc_probe_allowed,
+)
 from kiro_crew.mcp_cleanup import prune_dangling_tool_refs, purge_deleted_proxy_from_config
 from kiro_crew.mcp_provenance import (
     DERIVED_KEY,
@@ -114,9 +120,16 @@ from kiro_crew.mcp_provenance import (
     without_marker,
 )
 from kiro_crew.mcp_utils import kiro_oauth_wire_entry, mcp_server_alias
-from kiro_crew.platform import current_context
-from kiro_crew.platform import redact_via_context as redact
-from kiro_crew.platform import safe_context_call
+from kiro_crew.platform import (
+    current_context,
+)
+from kiro_crew.platform import redact_log_via_context as redact_log
+from kiro_crew.platform import (  # noqa: F401 - module attribute read by the platform wiring probe
+    redact_via_context as redact,
+)
+from kiro_crew.platform import (
+    safe_context_call,
+)
 from kiro_crew.platform.governance import (
     CU_MCP_SERVER,
     agentcore_posture,
@@ -1884,25 +1897,53 @@ def _validate_hook_command(command: str, event: str) -> str | None:
     Since config.json is LLM-writable, this guards against indirect
     command injection.  Uses an allowlist regex for path characters.
     """
+    # A rejected command is quoted in each warning below, and the value came out
+    # of an LLM-writable config, so it can carry a credential. ``gateway.log``
+    # persists and rotates rather than expires, so every one of them is redacted
+    # first — the same rule the SEL writer applies on its own side.
     if not _SAFE_PATH_RE.match(command):
-        logger.warning("kiro_hooks[%s]: command contains disallowed characters: %r", event, command)
+        logger.warning(
+            "kiro_hooks[%s]: command contains disallowed characters: %s",
+            event,
+            _hook_diagnostic(command),
+        )
         return None
     if not os.path.isabs(command):
-        logger.warning("kiro_hooks[%s]: command must be absolute path, got %r", event, command)
+        logger.warning(
+            "kiro_hooks[%s]: command must be absolute path, got %s",
+            event,
+            _hook_diagnostic(command),
+        )
         return None
-    resolved = str(Path(command).resolve())
+    # ``resolve`` raises on a symlink loop, and on Python 3.12 — this project's
+    # floor — that is a ``RuntimeError`` rather than an ``OSError``. The command
+    # comes from an LLM-writable config and this validator runs inside the
+    # agent-install pass, whose documented fallback re-enters the same call, so an
+    # unguarded raise takes the whole rebuild down. A path that cannot be resolved
+    # is simply not a usable hook command.
+    try:
+        resolved = str(Path(command).resolve())
+    except (OSError, ValueError, RuntimeError):
+        logger.warning(
+            "kiro_hooks[%s]: command cannot be resolved: %s", event, _hook_diagnostic(command)
+        )
+        return None
     if not _SAFE_PATH_RE.match(resolved):
         logger.warning(
-            "kiro_hooks[%s]: resolved path contains disallowed characters: %r", event, resolved
+            "kiro_hooks[%s]: resolved path contains disallowed characters: %s",
+            event,
+            _hook_diagnostic(resolved),
         )
         return None
     if is_sensitive_path(resolved):
         logger.warning(
-            "kiro_hooks[%s]: command points to sensitive path %r, skipping", event, command
+            "kiro_hooks[%s]: command points to sensitive path %s, skipping",
+            event,
+            _hook_diagnostic(command),
         )
         return None
     if not os.path.isfile(resolved):
-        logger.warning("kiro_hooks[%s]: command not found: %s", event, command)
+        logger.warning("kiro_hooks[%s]: command not found: %s", event, _hook_diagnostic(command))
         return None
     return resolved
 
@@ -1920,14 +1961,27 @@ def _sel_hook_rejected(event: str, command: str, reason: str) -> None:
                 source="cli",
                 operation="kiro_hooks_rejected",
                 outcome="rejected",
-                # redact-then-truncate on the interpolated value, through the
-                # same context-aware shim as the outer call: slicing ``command``
-                # raw could cut a credential at the boundary, and slicing after
-                # baseline-only redaction would still cut a companion-only token
-                # before the companion regexes see it. Context redaction runs
-                # over the FULL command first, so no redactor ever sees a
-                # boundary-cut fragment.
-                resources=redact(f"event={event} command={redact(command)[:200]}"),
+                # redact-then-truncate on each value, through the context-aware
+                # shim: slicing ``command`` raw could cut a credential at the
+                # boundary, and slicing after baseline-only redaction would still
+                # cut a companion-only token before the companion regexes see it.
+                # Redaction runs over the FULL value first, so no redactor ever
+                # sees a boundary-cut fragment.
+                #
+                # Per value, not over the interpolated field: ``event`` carries an
+                # author-supplied trigger at several call sites, so it needs the
+                # same pass, and one outer call would put the whole field behind a
+                # single substitution — losing the field's shape along with both
+                # values on a host whose policy cannot be composed.
+                #
+                # The non-raising spelling, because this is the argument to the
+                # audit call itself. The egress form re-raises when a policy cannot
+                # be composed, which would lose the whole rejection record — the
+                # one thing this function exists to write. What the log shim
+                # substitutes there is ``LOG_WITHHELD_PLACEHOLDER``, never the raw
+                # value: each withheld value is named as withheld, and the event
+                # type, operation, outcome and ``error`` reason are still written.
+                resources=(f"event={redact_log(event)} command={redact_log(command)[:200]}"),
                 error=reason,
             )
         )
@@ -1953,6 +2007,29 @@ _VALID_HOOK_EVENTS = frozenset(
     k
     for k in (_load_json(_BUNDLED_CFG_DIR / "defaults.json") or {}).get("hooks", {})
     if k not in _INTERNAL_HOOK_KEYS
+)
+
+# Hook triggers a Kiro Agent session owns, in the camelCase spelling that side
+# uses. They are authorable in Kiro Crew (``hooks.HOOK_EVENTS_KAS_ONLY`` carries
+# the PascalCase twin the hook store persists) and they are deliberately NOT in
+# ``_VALID_HOOK_EVENTS``, because kiro-cli's ``hooks`` map is a CLOSED enum: a
+# spec carrying one of these keys does not load at all. Measured against
+# kiro-cli 2.23.1, ``agent validate`` answers "data did not match any variant of
+# untagged enum Repr" and ``agent list`` refuses the same file, while an unknown
+# TOP-LEVEL key and an unknown hook-entry field are both accepted and ignored.
+# So the closed set is the event map specifically, and one of these names
+# reaching a generated spec would cost the user their whole default agent --
+# which is why ``_merge_kiro_hooks`` names them as a distinct refusal below
+# rather than letting them read as a typo.
+_CREW_ONLY_HOOK_EVENTS = frozenset(
+    {
+        "preTaskExecution",
+        "postTaskExecution",
+        "fileCreated",
+        "fileEdited",
+        "fileDeleted",
+        "userTriggered",
+    }
 )
 
 # Repair is subtractive against the runtime-only key Kiro Crew is known to have
@@ -2009,13 +2086,555 @@ _MAX_TOTAL_USER_HOOKS = 20
 # The agent config stores them in camelCase (preToolUse, ...).  Script headers
 # ("# event: PreToolUse") use kiro-cli's PascalCase convention; this map
 # normalizes both casings back to the canonical camelCase form.
+#
+# It spans the WHOLE authorable vocabulary, kiro-cli's five and the six a Kiro
+# Agent session owns, so a recognised name is never reported as unknown. That is
+# safe because recognising a name is not emitting it: every autoimported entry
+# goes through ``_merge_kiro_hooks``, whose ``_VALID_HOOK_EVENTS`` gate is the one
+# place that decides what reaches the generated spec, and it drops the six there
+# with their own reason.
 _HOOK_EVENT_CANONICAL = {
     "pretooluse": "preToolUse",
     "posttooluse": "postToolUse",
     "userpromptsubmit": "userPromptSubmit",
     "agentspawn": "agentSpawn",
     "stop": "stop",
+    "pretaskexecution": "preTaskExecution",
+    "posttaskexecution": "postTaskExecution",
+    "filecreated": "fileCreated",
+    "fileedited": "fileEdited",
+    "filedeleted": "fileDeleted",
+    "usertriggered": "userTriggered",
 }
+
+
+# A spec's ``hooks`` field accepts two shapes, and each has exactly one reader.
+# Crew's own shape is an object keyed by kiro-cli event name, each value a list of
+# ``{command, matcher?}`` entries; it is read by ``_merge_kiro_hooks``, which owns
+# every rule about a command, a matcher, dedup and the caps. KAS (kiro-agent)
+# writes a list of hook documents: ``{name, description?, trigger, matcher?,
+# action, timeout?, enabled?, confirm?}``; the ARRAY form normalizes to the
+# document list and is then projected onto the object form kiro-cli is handed.
+# ``normalize_spec_hooks`` reads the array only, so routing an object form through
+# it rejects every entry. The standalone hook FILE wrapper
+# ``{"version": "v1", "hooks": [...]}`` is not a spec shape: it is an object, so
+# the merge sees ``version``/``hooks`` as unknown event names and rejects it.
+#
+# Canonical KAS trigger for every spelling a spec may carry, transcribed from
+# kiro-agent's own alias table: ``packages/kiro-agent/src/hooks/trigger-names.ts``
+# at blob ``2d4a3127e32e5e81e68d5c2ea406a6a5728f6d78``, which is the version this
+# table is verified against and the one to re-read when adding a name. It holds
+# twelve canonical triggers with their identity rows, the IDE's legacy camelCase
+# spellings, the CLI aliases, and one Open Plugins legacy alias.
+#
+# One deliberate difference: kiro-agent matches the spelling exactly, while the
+# keys here are lowercased so a spec's casing does not matter — the same leniency
+# ``_HOOK_EVENT_CANONICAL`` applies to a script header. Crew therefore accepts
+# every spelling kiro-agent does, plus casings of them.
+_KAS_TRIGGER_CANONICAL = {
+    # KAS canonical PascalCase, one row per trigger
+    "sessionstart": "SessionStart",
+    "sessionend": "SessionEnd",
+    "stop": "Stop",
+    "pretooluse": "PreToolUse",
+    "posttooluse": "PostToolUse",
+    "pretaskexec": "PreTaskExec",
+    "posttaskexec": "PostTaskExec",
+    "userpromptsubmit": "UserPromptSubmit",
+    "postfilecreate": "PostFileCreate",
+    "postfilesave": "PostFileSave",
+    "postfiledelete": "PostFileDelete",
+    "manual": "Manual",
+    # IDE legacy camelCase, as a .kiro.hook ``when.type`` emits it
+    "agentstop": "Stop",
+    "promptsubmit": "UserPromptSubmit",
+    "pretaskexecution": "PreTaskExec",
+    "posttaskexecution": "PostTaskExec",
+    "fileedited": "PostFileSave",
+    "filecreated": "PostFileCreate",
+    "filedeleted": "PostFileDelete",
+    "usertriggered": "Manual",
+    # CLI aliases, as an inline agent-profile hook spells them
+    "agentspawn": "SessionStart",
+    # Open Plugins legacy alias
+    "afterfileedit": "PostFileSave",
+}
+
+# The KAS triggers a kiro-cli hook event can express. The other seven
+# (``SessionEnd``, ``PreTaskExec``, ``PostTaskExec``, ``PostFileCreate``,
+# ``PostFileSave``, ``PostFileDelete``, ``Manual``) have no kiro-cli event name, so
+# a document carrying one stays in Crew's stored spec and is left out of the
+# kiro-cli emission.
+_KAS_TRIGGER_TO_EVENT = {
+    "PreToolUse": "preToolUse",
+    "PostToolUse": "postToolUse",
+    "UserPromptSubmit": "userPromptSubmit",
+    "SessionStart": "agentSpawn",
+    "Stop": "stop",
+}
+
+# Action types in a KAS hook document. Only ``command`` is expressible as a
+# kiro-cli hook entry; an ``agent`` action (a prompt handed back to the model)
+# has no kiro-cli equivalent and is dropped on the emission path only.
+_KAS_ACTION_TYPES = frozenset({"command", "agent"})
+
+# SEL event tag for a document-level rejection. The spec field is the only
+# surface these helpers read, so the tag is named once here rather than threaded
+# through every helper as an argument with one value.
+_HOOK_SPEC_AUDIT_TAG = "kiro_hooks"
+
+# Bound on the documents taken from one ``hooks`` field. ``_merge_kiro_hooks``
+# caps what reaches kiro-cli; this caps the work done to get there, so a spec
+# carrying a huge list cannot spend the whole install pass on it.
+_MAX_SPEC_HOOK_DOCUMENTS = 200
+
+# A document count alone bounds nothing if each document may carry strings of
+# any size, so every string a document RETAINS carries its own limit. The
+# command still has to resolve to an existing absolute path, and the matcher
+# still has :data:`_MAX_MATCHER_LEN`; these cover the fields those checks do not
+# reach.
+_MAX_HOOK_NAME_LEN = 200
+_MAX_HOOK_DESCRIPTION_LEN = 1000
+_MAX_HOOK_PAYLOAD_LEN = 4096
+
+# Per-document fields whose type is checked before the document is accepted.
+_KAS_DOCUMENT_FIELD_TYPES: tuple[tuple[str, type | tuple[type, ...]], ...] = (
+    ("name", str),
+    ("description", str),
+    ("enabled", bool),
+    ("confirm", bool),
+)
+
+# Per-document string fields and the length each one is held to.
+_KAS_DOCUMENT_FIELD_LIMITS: tuple[tuple[str, int], ...] = (
+    ("name", _MAX_HOOK_NAME_LEN),
+    ("description", _MAX_HOOK_DESCRIPTION_LEN),
+)
+
+
+# Every value quoted in a diagnostic on the hook paths — the spec field, the
+# merge, and the autoimport scan — came out of an LLM-writable config or a
+# directory an author controls, so it can carry a credential and it can carry
+# control characters. Two rules hold for all of THOSE sites, which is the scope
+# this states and no wider: other diagnostics in this file quote their own values
+# and answer for themselves.
+#
+# 1. A logged value goes through :func:`_hook_diagnostic`, which escapes and then
+#    redacts. ``gateway.log`` persists and rotates rather than expires, so an
+#    unredacted value is a credential at rest and an unescaped one is a forged
+#    record.
+# 2. A SEL value is passed WHOLE, because :func:`_sel_hook_rejected` redacts
+#    before it truncates and a caller that pre-slices hands the redactors a value
+#    already cut at an arbitrary boundary.
+def _hook_diagnostic(value: object) -> str:
+    """Escape and redact a config-supplied value for a log line.
+
+    ``repr`` first, because redaction substitutes credential and exfil patterns
+    and leaves control characters alone: a command carrying a newline would close
+    the record and write a second one that reads like a real gateway line.
+    Forgeable evidence is worse than none, so the escape comes before the
+    scrub — the same order ``redact_store_value`` and ``_log_safe_path`` use.
+
+    ``redact_log_via_context`` rather than the egress spelling: these callers are
+    un-wrapped log arguments on the agent-install path, and refusing to compose a
+    policy is safe for a sink that must not send while being merely a lost line
+    here. The egress form re-raises, which would abort the install over a
+    diagnostic.
+    """
+    return redact_log(repr(value))
+
+
+def _hook_matcher_ok(matcher: object) -> bool:
+    """Whether a present ``matcher`` passes the object form's rules.
+
+    Same three rules ``_merge_kiro_hooks`` applies to an object-form entry: a
+    string, within :data:`_MAX_MATCHER_LEN`, and inside
+    :data:`_SAFE_MATCHER_RE`.
+    """
+    return (
+        isinstance(matcher, str)
+        and len(matcher) <= _MAX_MATCHER_LEN
+        and bool(_SAFE_MATCHER_RE.match(matcher))
+    )
+
+
+def _event_for_hook_trigger(trigger: object) -> str | None:
+    """kiro-cli event name a document's trigger can be emitted as, or None."""
+    if not isinstance(trigger, str):
+        return None
+    return _KAS_TRIGGER_TO_EVENT.get(trigger)
+
+
+def _hook_document_action(action: object, *, index: int) -> dict | None:
+    """Validate a document's ``action``, returning the normalized copy or None."""
+    if not isinstance(action, dict):
+        logger.warning("kiro_hooks[%d]: action is not an object, skipping", index)
+        _sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, str(action), "action is not an object")
+        return None
+    action_type = action.get("type")
+    # The membership test runs against a frozenset, so an unhashable value
+    # (a list, a dict) would raise out of a normalizer whose contract is to
+    # warn and skip. Screen the type first.
+    if not isinstance(action_type, str) or action_type not in _KAS_ACTION_TYPES:
+        logger.warning(
+            "kiro_hooks[%d]: unknown action type %s, skipping",
+            index,
+            _hook_diagnostic(action_type),
+        )
+        _sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, str(action_type), "unknown action type")
+        return None
+    payload_key = "command" if action_type == "command" else "prompt"
+    payload = action.get(payload_key)
+    if not isinstance(payload, str) or not payload:
+        logger.warning(
+            "kiro_hooks[%d]: %s action needs a non-empty %s, skipping",
+            index,
+            action_type,
+            payload_key,
+        )
+        _sel_hook_rejected(
+            _HOOK_SPEC_AUDIT_TAG, str(payload), f"{action_type} action without {payload_key}"
+        )
+        return None
+    if len(payload) > _MAX_HOOK_PAYLOAD_LEN:
+        logger.warning(
+            "kiro_hooks[%d]: %s is longer than %d characters, skipping",
+            index,
+            payload_key,
+            _MAX_HOOK_PAYLOAD_LEN,
+        )
+        _sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, payload, f"{payload_key} too long")
+        return None
+    return {"type": action_type, payload_key: payload}
+
+
+def _hook_document_from_document(entry: object, *, index: int) -> dict | None:
+    """Validate one KAS hook document, returning the normalized copy or None."""
+    if not isinstance(entry, dict):
+        logger.warning("kiro_hooks[%d]: hook document is not an object, skipping", index)
+        _sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, str(entry), "hook document is not an object")
+        return None
+    # ``"matcher": null`` is how JSON spells an optional the author left out, so
+    # a null reads as absent. Without this it is a present value of the wrong
+    # type, and the whole document is lost over a field that says nothing.
+    entry = {key: value for key, value in entry.items() if value is not None}
+    trigger_raw = entry.get("trigger")
+    trigger = (
+        _KAS_TRIGGER_CANONICAL.get(trigger_raw.lower()) if isinstance(trigger_raw, str) else None
+    )
+    if trigger is None:
+        logger.warning(
+            "kiro_hooks[%d]: unknown trigger %s, skipping", index, _hook_diagnostic(trigger_raw)
+        )
+        _sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, str(trigger_raw), "unknown trigger")
+        return None
+    action = _hook_document_action(entry.get("action"), index=index)
+    if action is None:
+        return None
+    for field, expected in _KAS_DOCUMENT_FIELD_TYPES:
+        if field in entry and not isinstance(entry[field], expected):
+            logger.warning("kiro_hooks[%d]: %s has the wrong type, skipping", index, field)
+            _sel_hook_rejected(
+                _HOOK_SPEC_AUDIT_TAG, str(entry.get(field)), f"{field} has the wrong type"
+            )
+            return None
+    if "timeout" in entry and (
+        not isinstance(entry["timeout"], int)
+        or isinstance(entry["timeout"], bool)
+        or entry["timeout"] <= 0
+    ):
+        logger.warning("kiro_hooks[%d]: timeout must be a positive integer, skipping", index)
+        _sel_hook_rejected(
+            _HOOK_SPEC_AUDIT_TAG, str(entry.get("timeout")), "timeout not a positive integer"
+        )
+        return None
+    for field, limit in _KAS_DOCUMENT_FIELD_LIMITS:
+        value = entry.get(field)
+        if isinstance(value, str) and len(value) > limit:
+            logger.warning(
+                "kiro_hooks[%d]: %s is longer than %d characters, skipping", index, field, limit
+            )
+            _sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, value, f"{field} too long")
+            return None
+    name = entry.get("name")
+    if name is not None and not name:
+        logger.warning("kiro_hooks[%d]: name is empty, skipping", index)
+        _sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, "", "name is empty")
+        return None
+    if "matcher" in entry and not _hook_matcher_ok(entry["matcher"]):
+        logger.warning(
+            "kiro_hooks[%d]: matcher contains disallowed characters or is too long, skipping", index
+        )
+        _sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, str(entry.get("matcher")), "invalid matcher")
+        return None
+    doc: dict = {
+        "name": name if isinstance(name, str) else f"{trigger}-{index}",
+        "trigger": trigger,
+        "action": action,
+    }
+    if "matcher" in entry:
+        doc["matcher"] = entry["matcher"]
+    for field, _expected in _KAS_DOCUMENT_FIELD_TYPES:
+        if field in entry and field != "name":
+            doc[field] = entry[field]
+    if "timeout" in entry:
+        doc["timeout"] = entry["timeout"]
+    return doc
+
+
+def _hook_documents_from_array_form(hooks: list) -> list[dict]:
+    """Normalize a KAS array of hook documents to the document list."""
+    if len(hooks) > _MAX_SPEC_HOOK_DOCUMENTS:
+        logger.warning(
+            "kiro_hooks: %d documents exceeds the limit of %d, ignoring the remainder",
+            len(hooks),
+            _MAX_SPEC_HOOK_DOCUMENTS,
+        )
+        _sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, str(len(hooks)), "document limit exceeded")
+    docs: list[dict] = []
+    for index, entry in enumerate(hooks[:_MAX_SPEC_HOOK_DOCUMENTS]):
+        doc = _hook_document_from_document(entry, index=index)
+        if doc is not None:
+            docs.append(doc)
+    return docs
+
+
+def normalize_spec_hooks(value: object) -> list[dict]:
+    """Normalize a KAS array of hook documents to the internal document list.
+
+    A rejected element is warned about and SEL-audited rather than raising, which
+    is how a spec's ``hooks`` has always treated bad input.
+
+    Crew's object-of-arrays is NOT read here. It goes to ``_merge_kiro_hooks`` as
+    it was read, because that merge is the object form's own validator and
+    auditor: every rule about a command, a matcher, dedup and the caps lives
+    there, and re-deriving the object form from documents would move its error
+    path and the bytes kiro-cli receives. So anything that is not an array —
+    an object included — is rejected here, and the one caller sends an object
+    straight to that merge instead.
+    """
+    if isinstance(value, list):
+        return _hook_documents_from_array_form(value)
+    logger.warning("kiro_hooks is not an array of hook documents, ignoring")
+    _sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, str(value), "hooks is not an array of hook documents")
+    return []
+
+
+def _hook_command_reaches_a_share(command: str) -> bool:
+    """True when resolving this command would touch a network or device path.
+
+    ``Path.resolve()`` on a UNC path is an outbound SMB authentication on Windows,
+    so an LLM-writable config naming ``\\\\attacker\\share\\x.sh`` would make the
+    install pass hand credentials to a host of someone else's choosing. The shape
+    is judged lexically, before any resolution, and it is judged on the string the
+    author wrote AND on its user-expanded form so a ``~`` cannot smuggle one in.
+
+    The three terms are the spelling every UNC gate in this tree uses, and each
+    one is load-bearing. The probe is a Windows one: on POSIX a leading ``//`` is
+    an ordinary path and ``\\\\host\\share`` is one filename, so refusing either
+    there would reject a legal command for a risk that platform does not have.
+    And ``unc_probe_allowed`` is the user's own consent — a roaming profile whose
+    data home IS a share must be able to run a hook script that lives on it.
+
+    One caller: :func:`_resolved_hook_command`, where the resolve is the first
+    thing that touches the path. ``_validate_hook_command`` deliberately does NOT
+    ask — the object form has always resolved its command there, autoimport hands
+    it a path already resolved and stat-ed, and refusing on shape at that point
+    would silently un-install every hook on a host whose hooks directory lives on
+    a share while preventing no probe at all.
+    """
+    if not platform_compat.IS_WINDOWS:
+        return False
+    for candidate in (command, os.path.expanduser(command)):
+        if is_unc_shape(candidate) and not unc_probe_allowed(candidate):
+            return True
+    return False
+
+
+def _resolved_hook_command(command: object) -> str | None:
+    """Resolve a hook command for the suppression comparison, or None.
+
+    One spelling for both sides: a document's command and an autoimport entry's
+    command must resolve through the same steps or a match is missed. ``resolve``
+    raises on a symlink loop, and a command that cannot be resolved matches
+    nothing.
+
+    ``expanduser`` here is deliberately NOT what ``_validate_hook_command`` does:
+    its allowlist rejects ``~`` outright, so a document spelling its command that
+    way can never itself install a hook. The expansion exists for the other side
+    of the comparison — autoimport reports absolute resolved paths, and a document
+    that switched off ``~/.kiro/hooks/guard.sh`` has to suppress the script that
+    scan finds.
+    """
+    if not isinstance(command, str) or not command:
+        return None
+    if _hook_command_reaches_a_share(command):
+        # Naming the consequence, not just the refusal: this read is what
+        # subtracts a switched-off script from the autoimport scan, so a command
+        # left unresolved here leaves that script installed. On a host whose
+        # hooks directory is itself on a share, that is every such document.
+        logger.warning(
+            "kiro_hooks: command %s is a network or device path, so it is not resolved "
+            "and a scan-discovered script by that name stays installed",
+            _hook_diagnostic(command),
+        )
+        return None
+    try:
+        return str(Path(os.path.expanduser(command)).resolve())
+    except (OSError, ValueError, RuntimeError):
+        logger.debug("kiro_hooks: cannot resolve a hook command", exc_info=True)
+        return None
+
+
+# Why each suppressed command is suppressed, as the audit line reports it. The
+# two causes are not interchangeable in an audit trail: one says the author
+# switched the hook off, the other says the author wanted it to run behind a
+# prompt kiro-cli cannot give.
+_HOOK_SUPPRESSED_DISABLED = "suppressed by a disabled spec document"
+_HOOK_SUPPRESSED_CONFIRM = "suppressed by a confirmation-gated spec document"
+
+
+def hook_documents_suppressed_commands(hooks: object) -> dict[str, str]:
+    """Resolved commands whose author switched execution OFF, and why, read RAW.
+
+    ``enabled: false`` and ``confirm: true`` keep a hook out of the emission, and
+    that has to hold against the OTHER source of hooks: autoimport scans
+    ``~/.kiro/hooks`` for executable scripts, so a document naming a command that
+    lives there would be dropped here and rediscovered as a fresh entry, landing
+    on autoimport's default event — a broader one than the document named. The
+    caller subtracts these commands from what autoimport found, so "off" means off
+    whichever way the script is reachable.
+
+    Read from the RAW array rather than from the normalized documents, and this
+    ordering is the point: a document that says ``enabled: false`` and is then
+    rejected for something else entirely — a kiro-agent matcher like
+    ``@git/status``, a bad ``timeout`` — never becomes a document at all, so a
+    post-validation read would let autoimport arm its script, unscoped, against an
+    author who switched it off. "Off" is legible from two well-typed fields and a
+    command string, so it is taken from those alone.
+
+    Only the fields this decision needs are trusted: the flag must be exactly
+    ``False``/``True`` and the command a non-empty string. Everything else about
+    the entry stays the validator's business, and a normalized document is
+    accepted here too because it carries the same three fields.
+
+    Bypassing the validator means carrying its two bounds here rather than
+    inheriting them. The same ``_MAX_SPEC_HOOK_DOCUMENTS`` slice the normalizer
+    announces, because a document the log calls ignored must not still delete an
+    autoimported script; and ``_MAX_HOOK_PAYLOAD_LEN`` on the command, because
+    this mapping is retained and an unbounded string in it is unbounded memory.
+
+    The cause travels with the command because the caller audits it. ``enabled:
+    false`` outranks ``confirm: true`` on one document and across two documents
+    naming the same command: "the author switched this off" is the stronger
+    statement, and it must not be weakened by the order the array happens to be
+    written in.
+    """
+    if not isinstance(hooks, list):
+        return {}
+    suppressed: dict[str, str] = {}
+    for entry in hooks[:_MAX_SPEC_HOOK_DOCUMENTS]:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("enabled") is False:
+            cause = _HOOK_SUPPRESSED_DISABLED
+        elif entry.get("confirm") is True:
+            cause = _HOOK_SUPPRESSED_CONFIRM
+        else:
+            continue
+        raw_action = entry.get("action")
+        action: dict = raw_action if isinstance(raw_action, dict) else {}
+        command = action.get("command")
+        if not isinstance(command, str) or not command:
+            continue
+        if len(command) > _MAX_HOOK_PAYLOAD_LEN:
+            continue
+        resolved = _resolved_hook_command(command)
+        if resolved is None:
+            continue
+        if suppressed.get(resolved) == _HOOK_SUPPRESSED_DISABLED:
+            continue
+        suppressed[resolved] = cause
+    return suppressed
+
+
+def hook_documents_to_object_form(docs: Sequence[dict]) -> dict[str, list[dict]]:
+    """Derive the kiro-cli object form from normalized hook documents.
+
+    Only a ``command`` action on one of the five triggers kiro-cli names is
+    expressible. An ``agent`` action, one of the seven triggers kiro-cli has no
+    name for, and the per-document ``name``, ``description`` and ``timeout`` have
+    no object-form slot, so they are dropped HERE, on the emission path, and kept
+    in Crew's stored spec.
+
+    ``enabled`` and ``confirm`` are not dropped that way. Each grants LESS
+    execution than the object form can express, so an entry emitted without them
+    would run unconditionally and unprompted: ``enabled: false`` and
+    ``confirm: true`` keep the whole hook out of the emission instead.
+    """
+    result: dict[str, list[dict]] = {}
+    for doc in docs:
+        raw_action = doc.get("action")
+        action: dict = raw_action if isinstance(raw_action, dict) else {}
+        event = _event_for_hook_trigger(doc.get("trigger"))
+        command = action.get("command")
+        # ``enabled`` and ``confirm`` each grant LESS execution than the object
+        # form can express, so neither may be dropped the way a label is: an
+        # entry emitted without them runs unconditionally and unprompted. A hook
+        # the author switched off, or asked to be prompted for, is left out.
+        if doc.get("enabled") is False:
+            # A chosen steady state, re-read on every refresh: INFO, not a
+            # warning an operator learns to scroll past. The SEL line stays,
+            # because what is installed differs from what was authored.
+            logger.info(
+                "kiro_hooks: hook %s is disabled, leaving it out of the kiro-cli spec",
+                _hook_diagnostic(doc.get("name")),
+            )
+            _sel_hook_rejected(str(doc.get("trigger")), str(command), "hook is disabled")
+            continue
+        if doc.get("confirm") is True:
+            # Unlike ``enabled: false``, this author wanted the hook to run —
+            # with a prompt kiro-cli cannot give. The hook not firing is the
+            # surprise, so it warns at the same level as an inexpressible
+            # trigger rather than at the disabled hook's INFO.
+            logger.warning(
+                "kiro_hooks: hook %s asks to be confirmed, which a kiro-cli hook cannot do, "
+                "leaving it out of the kiro-cli spec",
+                _hook_diagnostic(doc.get("name")),
+            )
+            _sel_hook_rejected(str(doc.get("trigger")), str(command), "hook asks to be confirmed")
+            continue
+        if event is None or action.get("type") != "command" or not isinstance(command, str):
+            logger.warning(
+                "kiro_hooks: hook %s has trigger %s and action type %s, which no kiro-cli hook "
+                "event can express, so it does not run there",
+                _hook_diagnostic(doc.get("name")),
+                _hook_diagnostic(doc.get("trigger")),
+                _hook_diagnostic(action.get("type")),
+            )
+            _sel_hook_rejected(
+                str(doc.get("trigger")),
+                str(command),
+                "no kiro-cli hook event can express this hook",
+            )
+            continue
+        if doc.get("timeout") is not None:
+            # A bound the author asked for, which kiro-cli's hook entry cannot
+            # carry: the command still runs, under kiro-cli's own bound rather
+            # than this one. That is a constraint quietly widened, so it warns
+            # like a confirm that cannot prompt rather than sitting at INFO.
+            logger.warning(
+                "kiro_hooks: hook %s asks for a %s second timeout, which a kiro-cli hook "
+                "cannot carry, so the command runs under kiro-cli's own bound",
+                _hook_diagnostic(doc.get("name")),
+                _hook_diagnostic(doc.get("timeout")),
+            )
+        entry: dict[str, str] = {"command": command}
+        if isinstance(doc.get("matcher"), str):
+            entry["matcher"] = doc["matcher"]
+        result.setdefault(event, []).append(entry)
+    return result
+
 
 # Default hooks directory matches kiro-cli's discovery path.
 _DEFAULT_KIRO_HOOKS_DIR = Path.home() / ".kiro" / "hooks"
@@ -2060,7 +2679,11 @@ def _parse_hook_script_headers(path: Path) -> tuple[str | None, str | None]:
                 elif key == "matcher" and matcher_header is None:
                     matcher_header = val
     except OSError:
-        logger.debug("kiro_hooks_autoimport: could not read %s for headers", path, exc_info=True)
+        logger.debug(
+            "kiro_hooks_autoimport: could not read %s for headers",
+            _hook_diagnostic(path),
+            exc_info=True,
+        )
     return event_header, matcher_header
 
 
@@ -2113,16 +2736,27 @@ def _autoimport_kiro_hooks(hooks_dir: Path) -> dict[str, list[dict[str, str]]]:
         # Emit SEL audit so an auditor sees a distinct "hooks_dir
         # unresolvable" signal — same symmetry principle as the
         # per-entry ``cannot resolve entry`` branch below.
-        logger.debug("kiro_hooks_autoimport: cannot resolve %s, skipping", hooks_dir, exc_info=True)
+        logger.debug(
+            "kiro_hooks_autoimport: cannot resolve %s, skipping",
+            _hook_diagnostic(hooks_dir),
+            exc_info=True,
+        )
         _sel_hook_rejected("autoimport", str(hooks_dir), "cannot resolve hooks_dir")
         return result
     try:
         entries = sorted(resolved_hooks_dir.iterdir())
     except FileNotFoundError:
-        logger.debug("kiro_hooks_autoimport: directory %s does not exist, skipping", hooks_dir)
+        logger.debug(
+            "kiro_hooks_autoimport: directory %s does not exist, skipping",
+            _hook_diagnostic(hooks_dir),
+        )
         return result
     except OSError:
-        logger.warning("kiro_hooks_autoimport: cannot read %s, skipping", hooks_dir, exc_info=True)
+        logger.warning(
+            "kiro_hooks_autoimport: cannot read %s, skipping",
+            _hook_diagnostic(hooks_dir),
+            exc_info=True,
+        )
         # Emit SEL audit so an auditor reconstructing agent-install
         # activity sees a distinct "hooks dir unreadable" signal rather
         # than only the merge-summary ``requested_autoimport=0`` (which
@@ -2153,7 +2787,9 @@ def _autoimport_kiro_hooks(hooks_dir: Path) -> dict[str, list[dict[str, str]]]:
             # catch, a maliciously-named file in hooks_dir crashes agent
             # bootstrap.
             logger.warning(
-                "kiro_hooks_autoimport: cannot resolve %s, skipping", entry, exc_info=True
+                "kiro_hooks_autoimport: cannot resolve %s, skipping",
+                _hook_diagnostic(entry),
+                exc_info=True,
             )
             _sel_hook_rejected("autoimport", str(entry), "cannot resolve entry")
             continue
@@ -2163,9 +2799,9 @@ def _autoimport_kiro_hooks(hooks_dir: Path) -> dict[str, list[dict[str, str]]]:
         ):
             logger.warning(
                 "kiro_hooks_autoimport: %s resolves outside %s (to %s), skipping",
-                entry,
-                resolved_hooks_dir,
-                resolved_entry,
+                _hook_diagnostic(entry),
+                _hook_diagnostic(resolved_hooks_dir),
+                _hook_diagnostic(resolved_entry),
             )
             _sel_hook_rejected("autoimport", str(entry), "resolved path escapes hooks dir")
             continue
@@ -2173,7 +2809,9 @@ def _autoimport_kiro_hooks(hooks_dir: Path) -> dict[str, list[dict[str, str]]]:
         try:
             resolved_entry.stat()  # surface a stat error (broken symlink, perms) as a skip
         except OSError:
-            logger.warning("kiro_hooks_autoimport: cannot stat %s, skipping", entry)
+            logger.warning(
+                "kiro_hooks_autoimport: cannot stat %s, skipping", _hook_diagnostic(entry)
+            )
             _sel_hook_rejected("autoimport", str(entry), "cannot stat entry")
             continue
         # Executable check is platform-aware: POSIX requires the execute bit (so
@@ -2182,7 +2820,10 @@ def _autoimport_kiro_hooks(hooks_dir: Path) -> dict[str, list[dict[str, str]]]:
         # — instead a known script extension (.sh/.ps1/.cmd/...) is treated as
         # runnable. See platform_compat.is_executable_file.
         if not platform_compat.is_executable_file(resolved_entry):
-            logger.info("kiro_hooks_autoimport: %s is not executable, skipping", entry)
+            logger.info(
+                "kiro_hooks_autoimport: %s is not executable, skipping",
+                _hook_diagnostic(entry),
+            )
             # Audit parity with the other rejection branches
             # (symlink-escape, cannot-resolve, cannot-stat,
             # failed-validation, unknown-event, invalid-matcher,
@@ -2216,9 +2857,9 @@ def _autoimport_kiro_hooks(hooks_dir: Path) -> dict[str, list[dict[str, str]]]:
         event = _infer_hook_event(entry, event_header)
         if event is None:
             logger.warning(
-                "kiro_hooks_autoimport: %s declares unknown event %r, skipping",
-                entry,
-                event_header,
+                "kiro_hooks_autoimport: %s declares unknown event %s, skipping",
+                _hook_diagnostic(entry),
+                _hook_diagnostic(event_header),
             )
             # Match the other three rejection branches in this function
             # (symlink-escape, failed-validation, invalid-matcher): every
@@ -2237,9 +2878,9 @@ def _autoimport_kiro_hooks(hooks_dir: Path) -> dict[str, list[dict[str, str]]]:
                 # promoting a tool-scoped hook to unscoped (firing on every
                 # tool call) would be a silent privilege expansion.
                 logger.warning(
-                    "kiro_hooks_autoimport: %s matcher %r is invalid, skipping script",
-                    entry,
-                    matcher_header,
+                    "kiro_hooks_autoimport: %s matcher %s is invalid, skipping script",
+                    _hook_diagnostic(entry),
+                    _hook_diagnostic(matcher_header),
                 )
                 _sel_hook_rejected("autoimport", str(entry), "invalid matcher")
                 continue
@@ -2249,9 +2890,15 @@ def _autoimport_kiro_hooks(hooks_dir: Path) -> dict[str, list[dict[str, str]]]:
         loaded += 1
 
     if loaded:
-        logger.info("kiro_hooks_autoimport: loaded %d scripts from %s", loaded, hooks_dir)
+        logger.info(
+            "kiro_hooks_autoimport: loaded %d scripts from %s",
+            loaded,
+            _hook_diagnostic(hooks_dir),
+        )
     else:
-        logger.debug("kiro_hooks_autoimport: no scripts loaded from %s", hooks_dir)
+        logger.debug(
+            "kiro_hooks_autoimport: no scripts loaded from %s", _hook_diagnostic(hooks_dir)
+        )
     return result
 
 
@@ -2271,21 +2918,33 @@ def _merge_kiro_hooks(hooks: dict, user_hooks: dict) -> dict:
     total_added = 0
     for event, entries in user_hooks.items():
         if event not in _VALID_HOOK_EVENTS:
-            logger.warning("kiro_hooks: unknown event type %r, skipping", event)
+            # Two different rejections wearing one message is a support cost: a
+            # Kiro-Agent-only trigger is a name Kiro Crew knows and stores, it
+            # just cannot travel in a kiro-cli spec, and reporting it as
+            # "unknown" sends the reader hunting a typo that is not there.
+            #
+            # Through `_hook_diagnostic`, like every other rejection line here: the
+            # event name is author-supplied, and that helper escapes before it
+            # redacts so a newline inside it cannot forge a second log record.
+            crew_only = event in _CREW_ONLY_HOOK_EVENTS
+            reason = (
+                "Kiro Agent trigger, not emitted to kiro-cli" if crew_only else "unknown event type"
+            )
+            logger.warning("kiro_hooks: %s: %s, skipping", reason, _hook_diagnostic(event))
             # Audit parity with every other rejection branch in this
             # function: per AUTOSDE.yaml security-controls, rejecting an
             # entire event-bucket is a permission decision that must be
             # SEL-audited.  Use the (invalid) event name as the tag so
             # auditors can correlate with the config input.
-            _sel_hook_rejected(str(event), str(entries)[:200], "unknown event type")
+            _sel_hook_rejected(str(event), str(entries), reason)
             continue
         if not isinstance(entries, list):
-            logger.warning("kiro_hooks[%s] is not a list, skipping", event)
+            logger.warning("kiro_hooks[%s] is not a list, skipping", _hook_diagnostic(event))
             # Same audit-parity rationale: dropping a non-list
             # entries-bucket removes all configured hooks for that
             # event.  SEL must record the decision so auditors can
             # distinguish "0 configured" from "N dropped as non-list".
-            _sel_hook_rejected(event, str(entries)[:200], "entries not a list")
+            _sel_hook_rejected(event, str(entries), "entries not a list")
             continue
         existing = list(merged.get(event, []))
         existing_keys = {
@@ -2310,11 +2969,7 @@ def _merge_kiro_hooks(hooks: dict, user_hooks: dict) -> dict:
                 # configured 10 and all loaded".
                 _sel_hook_rejected(
                     event,
-                    (
-                        str(entry.get("command", ""))[:200]
-                        if isinstance(entry, dict)
-                        else str(entry)[:200]
-                    ),
+                    (str(entry.get("command", "")) if isinstance(entry, dict) else str(entry)),
                     "per-event limit exceeded",
                 )
                 break
@@ -2330,11 +2985,7 @@ def _merge_kiro_hooks(hooks: dict, user_hooks: dict) -> dict:
                 # loaded".
                 _sel_hook_rejected(
                     event,
-                    (
-                        str(entry.get("command", ""))[:200]
-                        if isinstance(entry, dict)
-                        else str(entry)[:200]
-                    ),
+                    (str(entry.get("command", "")) if isinstance(entry, dict) else str(entry)),
                     "global limit exceeded",
                 )
                 break
@@ -2344,7 +2995,7 @@ def _merge_kiro_hooks(hooks: dict, user_hooks: dict) -> dict:
                 or not entry["command"]
             ):
                 logger.warning("kiro_hooks[%s]: skipping entry without command", event)
-                _sel_hook_rejected(event, str(entry)[:200], "missing or invalid command")
+                _sel_hook_rejected(event, str(entry), "missing or invalid command")
                 continue
             resolved = _validate_hook_command(entry["command"], event)
             if resolved is None:
@@ -2441,10 +3092,10 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
                 or is_sensitive_path(str(resolved))
             ):
                 logger.warning(
-                    "kiro_hooks_autoimport: kiro_hooks_dir %r rejected "
+                    "kiro_hooks_autoimport: kiro_hooks_dir %s rejected "
                     "(must resolve under %s and not be sensitive), "
                     "falling back to %s",
-                    custom_dir,
+                    _hook_diagnostic(custom_dir),
                     home,
                     _DEFAULT_KIRO_HOOKS_DIR,
                 )
@@ -2460,7 +3111,37 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
                 # check we just performed.
                 hooks_dir = resolved
 
-    explicit_hooks: dict = user_hooks if isinstance(user_hooks, dict) and user_hooks else {}
+    # Both spec shapes are accepted. The object form goes to the merge below
+    # exactly as it is read: that merge is the object form's own validator and
+    # auditor, and routing it through the document form instead would move its
+    # error path and could perturb the bytes kiro-cli receives. The array form is
+    # normalized to hook documents and then projected onto the object form, so
+    # command validation, matcher rules, dedup and the caps hold both shapes to
+    # one bar.
+    explicit_hooks: dict
+    suppressed_commands: dict[str, str] = {}
+    # Documents the author wrote, for the audit summary. Zero on the object-form
+    # path, where the per-event loop below counts entries instead.
+    requested_documents = 0
+    if isinstance(user_hooks, dict):
+        explicit_hooks = user_hooks
+    elif user_hooks is not None:
+        # Every other value, a list included, goes through the normalizer, so a
+        # ``hooks`` that is neither shape is audited rather than dropped in
+        # silence.
+        documents = normalize_spec_hooks(user_hooks)
+        explicit_hooks = hook_documents_to_object_form(documents)
+        # Read from the raw value, BEFORE validation: a document that says
+        # ``enabled: false`` and is rejected for an unrelated field must still
+        # keep its script out of the autoimport scan.
+        suppressed_commands = hook_documents_suppressed_commands(user_hooks)
+        # The audit's "requested" figure counts what the author WROTE — the raw
+        # array — not the documents that survived validation and not the
+        # projection that survived expressibility. Either narrower count reports
+        # a fraction of the config as requested.
+        requested_documents = len(user_hooks) if isinstance(user_hooks, list) else 0
+    else:
+        explicit_hooks = {}
     has_explicit = bool(explicit_hooks)
     if not has_explicit and not autoimport_enabled:
         return
@@ -2483,13 +3164,14 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
     # security-controls, and the caller-side filter must audit it
     # (``_merge_kiro_hooks``'s internal defensive check never fires here
     # because this filter runs first).
-    requested_explicit = 0
+    requested_explicit = requested_documents
     for event, entries in explicit_hooks.items():
         if isinstance(entries, list):
-            requested_explicit += len(entries)
+            if not requested_documents:
+                requested_explicit += len(entries)
         else:
-            logger.warning("kiro_hooks[%s] is not a list, skipping", event)
-            _sel_hook_rejected(str(event), str(entries)[:200], "entries not a list")
+            logger.warning("kiro_hooks[%s] is not a list, skipping", _hook_diagnostic(event))
+            _sel_hook_rejected(str(event), str(entries), "entries not a list")
     requested_autoimport = 0
     discovered: dict[str, list[dict[str, str]]] = {}
     if autoimport_enabled:
@@ -2502,6 +3184,48 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
         if "hooks" not in config:
             config["hooks"] = {}
         return
+
+    if suppressed_commands and discovered:
+        # A script the author switched off is not re-armed by having been found on
+        # disk. Filtered before the merge, so the caps and the dedup below see the
+        # set that is actually installed.
+        kept: dict[str, list[dict[str, str]]] = {}
+        for event, entries in discovered.items():
+            survivors = [
+                entry
+                for entry in entries
+                if _resolved_hook_command(entry.get("command", "")) not in suppressed_commands
+            ]
+            dropped = len(entries) - len(survivors)
+            if dropped:
+                logger.info(
+                    "kiro_hooks_autoimport[%s]: %d script(s) left out, switched off in the spec",
+                    event,
+                    dropped,
+                )
+                # The emission path's own audit cannot stand in for this: an
+                # off-document rejected for an unrelated field never reaches it,
+                # so without this line a discovered, validated hook would stop
+                # being installed with nothing in the audit trail.
+                for entry in entries:
+                    if entry not in survivors:
+                        command = str(entry.get("command", ""))
+                        # The cause is read back from the mapping rather than
+                        # assumed: the same filter drops a hook the author
+                        # disabled and one the author asked to be prompted for,
+                        # and an audit line that names the wrong one is worse
+                        # than a generic one.
+                        _sel_hook_rejected(
+                            str(event),
+                            command,
+                            suppressed_commands.get(
+                                _resolved_hook_command(entry.get("command", "")) or "",
+                                _HOOK_SUPPRESSED_DISABLED,
+                            ),
+                        )
+            if survivors:
+                kept[event] = survivors
+        discovered = kept
 
     combined_user_hooks: dict[str, list[dict[str, str]]] = {}
     for src in (explicit_hooks, discovered):
@@ -2531,7 +3255,11 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
                 source="cli",
                 operation="kiro_hooks_merge",
                 outcome="completed",
-                resources=redact(
+                # Non-raising, for the same reason as the rejection audit: a
+                # host whose redaction policy cannot be composed would otherwise
+                # lose the merge summary too. These three values are counts, so
+                # there is nothing here to redact in the first place.
+                resources=redact_log(
                     f"requested_explicit={requested_explicit} "
                     f"requested_autoimport={requested_autoimport} added={added}"
                 ),
@@ -2714,6 +3442,34 @@ def _enforce_managed_mcp_ownership(
         entry["autoApprove"] = list(spec["autoApprove"])
 
 
+# kiro-cli reads the spec ``prompt`` off disk and KAS inlines it onto the wire,
+# so a real prompt here delivers the persona a second time, raw and unresolved —
+# ``context.py``'s session-start injection already delivers it resolved on every
+# backend. The stub is non-empty because KAS treats an empty prompt as absent and
+# substitutes its lightweight-worker persona, and it points at the injected block
+# so a model that privileges the system role still defers to that contract.
+# The text is FROZEN: forks and template copies carry it verbatim on disk and
+# ``is_managed_prompt`` matches by equality, so a respelled stub would turn every
+# existing fork's prompt into a custom persona (the old stub text) — a new
+# spelling must join a superseded-spellings list there, never replace this one.
+_NATIVE_PROMPT_STUB = (
+    "Your operating instructions are provided at the top of the session context, "
+    "wrapped in [AGENT SYSTEM PROMPT] ... [END AGENT SYSTEM PROMPT]. Treat that "
+    "block as your system prompt and follow it as your authoritative contract."
+)
+
+
+def is_managed_prompt(prompt: str) -> bool:
+    """Whether a spec ``prompt`` is the managed operating contract.
+
+    context.py injects that contract at session start, so the readers that must
+    not deliver it twice recognise it here. It has two spellings: the ``file://``
+    pointer a not-yet-healed fork or an older spec carries, and
+    ``_NATIVE_PROMPT_STUB``.
+    """
+    return prompt == _NATIVE_PROMPT_STUB or prompt == f"file://{_prompt_path()}"
+
+
 def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     """Return the final agent config (shipped defaults + user overrides + dynamic fields).
 
@@ -2758,7 +3514,7 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     _apply_user_kiro_hooks(config, mc_cfg)
 
     # Dynamic fields — always resolved at install time
-    config["prompt"] = f"file://{_prompt_path()}"
+    config["prompt"] = _NATIVE_PROMPT_STUB
     mcp = config.setdefault("mcpServers", {})
     registry_mode = _mcp_registry_mode()
     if gated_off is None:
@@ -2844,7 +3600,8 @@ def _refresh_dynamic_fields(
             human edits stop landing on the shared file, so three writes that
             are correct for ``kirocrew.json`` are wrong here and are skipped:
             the unconditional prompt overwrite (only refreshed while the value
-            is still the machine-shaped ``file://`` pointer), the legacy
+            is still the machine-shaped managed ``file://`` pointer, and then
+            to ``_NATIVE_PROMPT_STUB``), the legacy
             ``deniedCommands`` strip (on a fork that field IS the user's
             guardrails, not an old build's injection), and the global
             ``agent.model`` propagation (a main-agent setting; stamping it on
@@ -2852,21 +3609,24 @@ def _refresh_dynamic_fields(
             managed MCP commands, security hooks, the data-home pin — applies
             identically, which is the whole reason forks are refreshed at all.
     """
-    # Prompt URI — always resolve at install time. On a fork, only while the
-    # value is positively the MANAGED pointer: it equals the current
+    # Prompt field — always refreshed at install time. On the main agent it is
+    # ``_NATIVE_PROMPT_STUB`` (see its definition for why the spec prompt is a
+    # stub). On a fork the heal rewrites the value to that same stub, but only
+    # while the value is positively the MANAGED pointer: it equals the current
     # machine-shaped URI, or it is a stale spelling of a place the managed
     # prompt has actually LIVED — under a crew data home or inside the
     # installed package (a moved data home / upgraded wheel, the repairs this
-    # branch exists for). Identity comes from those locations, never from the
-    # basename alone: the managed file is called ``prompt.md``, the single
-    # most natural name for a CUSTOM prompt too, so name matching would
-    # silently and irrecoverably rewrite real user references.
-    # A custom pointer that goes stale is left alone — not healing preserves
-    # the user's path; healing destroys it.
+    # branch exists for). A fork left on the pointer would deliver the persona
+    # twice — natively from the file and again via injection. Identity comes
+    # from those locations, never from the basename alone: the managed file is
+    # called ``prompt.md``, the single most natural name for a CUSTOM prompt
+    # too, so name matching would silently and irrecoverably rewrite real user
+    # references. A custom pointer that goes stale is left alone — not healing
+    # preserves the user's path; healing destroys it.
     managed_prompt = _prompt_path()
     managed_uri = f"file://{managed_prompt}"
     if not fork:
-        config["prompt"] = managed_uri
+        config["prompt"] = _NATIVE_PROMPT_STUB
     else:
         current = str(config.get("prompt") or "")
         if current.startswith("file://"):
@@ -2884,7 +3644,7 @@ def _refresh_dynamic_fields(
                 norm.rsplit("/", 1)[-1] == managed_prompt.name
                 and any(spelling in norm for spelling in managed_homes)
             ):
-                config["prompt"] = managed_uri
+                config["prompt"] = _NATIVE_PROMPT_STUB
 
     # Managed MCP servers — ensure present and up-to-date.
     # Only refresh command/args; preserve user customizations (e.g. autoApprove).
@@ -3732,7 +4492,8 @@ def agent_spec_path(name: str, *, agents_dir: Path | None = None) -> Path | None
     clears the wrong agent's pin while the requested one stays pinned. The
     filename is accepted only when no spec declares this name -- see below.
 
-    Raises ``ValueError`` when TWO safe specs declare the same name. The runtime
+    Raises :class:`~kiro_crew.agent_discovery.AmbiguousAgentSpecError` (a
+    ``ValueError``) when TWO safe specs declare the same name. The runtime
     iterates the directory unordered, so which of them is live is undefined, and
     a writer cannot pick without risking clearing the pin nothing is reading.
     """
@@ -3770,7 +4531,11 @@ def agent_spec_path(name: str, *, agents_dir: Path | None = None) -> Path | None
     if len(declared_matches) > 1:
         # Paths are repr'd: a filename in this user-writable, tool-shared
         # directory is untrusted input, and this message is printed to a terminal.
-        raise ValueError(
+        # The typed subclass lets a caller that can answer its own question
+        # despite the ambiguity (the spawn gate, see require_fork_governance)
+        # tell it apart from every other ValueError; ``except ValueError``
+        # callers are unaffected.
+        raise AmbiguousAgentSpecError(
             f"{len(declared_matches)} specs declare the name {name!r}: "
             f"{', '.join(repr(str(p)) for p in declared_matches)}. The runtime iterates the "
             f"directory unordered, so which one is live is undefined -- remove or rename "
@@ -3805,7 +4570,9 @@ def markdown_spec_for_agent(agent: str, work_dir: str | Path | None = None) -> P
     project_markdown: Path | None = None
     try:
         if work_dir:
-            for spec in project_agent_files(work_dir):
+            for spec in project_agent_files(
+                work_dir, operation="markdown_spec_lookup", source="unknown"
+            ):
                 if project_agent_name(spec) != agent:
                     continue
                 if not is_markdown_spec(spec):
@@ -6496,6 +7263,79 @@ class ForkGovernanceUnresolved(RuntimeError):
     """A fork-backed agent may not start: fork governance is not projected."""
 
 
+def _lineage_unreadable_refusal(agent: str, exc: BaseException) -> str:
+    """The refusal for a sidecar the gate could not read.
+
+    Names the file and carries the parse error, so the operator repairs the
+    sidecar rather than searching the agents directory. The error text is
+    the reader's own (a JSON position, an OSError), never file contents. The
+    only remedy offered is restoring the file: deleting it would make every
+    recorded private copy read as a shared template and lose its governance,
+    which is the state this gate exists to refuse.
+    """
+    try:
+        where = str(agent_state._state_path())
+    except Exception:
+        where = agent_state._STATE_FILENAME
+    return (
+        f"cannot verify whether agent {agent!r} is a private template copy: "
+        f"the lineage sidecar {where} could not be read "
+        f"({type(exc).__name__}: {exc}); refusing to start a session on "
+        "unverifiable permissions. Restore that file to valid JSON (the gateway "
+        "log carries the same error), then retry."
+    )
+
+
+def _spec_unresolvable_refusal(agent: str, exc: BaseException) -> str:
+    """The refusal for a spec the gate could not resolve or read.
+
+    The other failure class: the sidecar answered, but the agents directory
+    did not. Distinct wording so the two are never confused again.
+    """
+    return (
+        f"cannot verify whether agent {agent!r} is a private template copy: "
+        f"its spec could not be resolved under the agents directory "
+        f"({type(exc).__name__}: {exc}); refusing to start a session on "
+        "unverifiable permissions."
+    )
+
+
+def _stem_claimant_fork(agent: str) -> str | None:
+    """The fork-backed name a direct-filename spec for *agent* declares, else None.
+
+    Consulted only when two or more specs declare *agent*, which is when
+    :func:`agent_spec_path` raises before its stem fallback is ever considered.
+    The backend's own resolver accepts ``path.stem == agent`` as well as the
+    declared name over an unordered directory listing, so ``<agent>.json``
+    declaring a DIFFERENT name can still be the file it runs. When that name is
+    a recorded private copy, the session may execute a fork's grants, and the
+    gate must take the fork path for it rather than admit the ambiguity as a
+    non-fork. A candidate that is unsafe or unreadable propagates: the gate
+    cannot rule it out, so it fails closed like any other resolution error.
+    """
+    agents_dir = kiro_agents_dir_path()
+    for candidate in agent_spec_candidates(agents_dir, agent):
+        if not candidate.exists():
+            continue
+        if not _spec_path_is_safe(candidate, agents_dir):
+            raise ValueError(f"direct spec candidate {str(candidate)!r} is not a safe file")
+        data = _read_spec_capped(candidate)
+        if not isinstance(data, dict):
+            # The capped reader answers None for a spec it refused (not JSON,
+            # too large, not an object). Unread, the file cannot be ruled out
+            # as a fork claimant, so it is reported rather than skipped.
+            raise ValueError(f"direct spec candidate {str(candidate)!r} could not be parsed")
+        declared = data.get("name")
+        if (
+            isinstance(declared, str)
+            and declared
+            and declared != agent
+            and agent_state.get_fork_info(declared, strict=True) is not None
+        ):
+            return declared
+    return None
+
+
 def require_fork_governance(agent: str | None, project_dir: str | Path | None = None) -> None:
     """Fail closed: block a fork-backed session start until fork governance is
     re-projected, and ABORT it when the projection failed or timed out.
@@ -6515,35 +7355,78 @@ def require_fork_governance(agent: str | None, project_dir: str | Path | None = 
     """
     if not agent:
         return
+    # Each failure class gets its own refusal, because each is repaired
+    # differently: a corrupt sidecar is fixed by restoring THAT file, an
+    # unresolvable spec by looking at the agents directory. One message for
+    # both left every operator hunting a duplicate spec that was not there.
     try:
         # strict: an unreadable sidecar must SURFACE here, not degrade to
         # "not a fork" — the lenient default would make the except branch
         # below unreachable and the guard a dead letter.
         is_fork = agent_state.get_fork_info(agent, strict=True) is not None
-        effective = agent
-        if not is_fork:
-            # Lineage is keyed by the DECLARED name, but a binding can carry
-            # the file STEM where the two differ — and the backend resolves
-            # that binding to the same file. Resolve before concluding "not a
-            # fork"; resolution errors and ambiguity land in
-            # the except below and fail CLOSED like an unreadable sidecar.
-            spec_path = agent_spec_path(agent)
-            if spec_path is not None:
-                data = _read_spec_capped(spec_path)
-                declared = data.get("name") if isinstance(data, dict) else None
-                if isinstance(declared, str) and declared and declared != agent:
-                    effective = declared
-                    is_fork = agent_state.get_fork_info(declared, strict=True) is not None
     except Exception as exc:
         # Unreadable lineage fails CLOSED: treating a missing/corrupt sidecar
         # read as "not a fork" would start a session whose grants predate the
         # tightened ceiling. A VERIFIED non-fork is a successful read that
         # returned no lineage — only that may pass without waiting.
-        raise ForkGovernanceUnresolved(
-            f"cannot verify whether agent {agent!r} is a private template "
-            "copy (lineage or spec resolution failed); refusing to start a "
-            "session on unverifiable permissions"
-        ) from exc
+        raise ForkGovernanceUnresolved(_lineage_unreadable_refusal(agent, exc)) from exc
+    effective = agent
+    if not is_fork:
+        # Lineage is keyed by the DECLARED name, but a binding can carry
+        # the file STEM where the two differ — and the backend resolves
+        # that binding to the same file. Resolve before concluding "not a
+        # fork"; a resolution error fails CLOSED like an unreadable sidecar.
+        try:
+            spec_path = agent_spec_path(agent)
+        except AmbiguousAgentSpecError as exc:
+            # Two or more specs declare this name. That is NOT an unverifiable
+            # lineage: every one of them DECLARES `agent` (that is what the
+            # ambiguity is), so the declared name is `agent` itself, whose
+            # lineage was read above and found empty. Whichever of THOSE files
+            # the backend runs, the verdict "not a private copy" is the same,
+            # and a non-fork was never this gate's to govern. Refusing here made
+            # every agent that a package installer vends twice — one upstream
+            # agent reached through two dependency chains — unstartable, with
+            # the duplicate regenerated on the next install. One file is not
+            # among "those": the backend also matches the STEM, so a
+            # `<agent>.json` declaring a fork-backed name (the resolver's stem
+            # fallback, which the ambiguity discarded unread) can be the live
+            # spec; it is checked here and sends the gate down the fork path.
+            # Otherwise still surfaced, so the operator can tidy the directory;
+            # a private copy with a same-named twin takes the fork path below,
+            # where the refresh cannot pick a file to re-filter and records the
+            # failure.
+            spec_path = None
+            try:
+                stem_fork = _stem_claimant_fork(agent)
+            except Exception as stem_exc:
+                raise ForkGovernanceUnresolved(
+                    _spec_unresolvable_refusal(agent, stem_exc)
+                ) from stem_exc
+            if stem_fork is not None:
+                effective = stem_fork
+                is_fork = True
+            else:
+                logger.warning(
+                    "fork governance: %s; every duplicate declares the binding name, "
+                    "so the non-fork verdict for %r holds for all of them",
+                    exc,
+                    agent,
+                )
+        except Exception as exc:
+            raise ForkGovernanceUnresolved(_spec_unresolvable_refusal(agent, exc)) from exc
+        if spec_path is not None:
+            try:
+                data = _read_spec_capped(spec_path)
+            except Exception as exc:
+                raise ForkGovernanceUnresolved(_spec_unresolvable_refusal(agent, exc)) from exc
+            declared = data.get("name") if isinstance(data, dict) else None
+            if isinstance(declared, str) and declared and declared != agent:
+                effective = declared
+                try:
+                    is_fork = agent_state.get_fork_info(declared, strict=True) is not None
+                except Exception as exc:
+                    raise ForkGovernanceUnresolved(_lineage_unreadable_refusal(agent, exc)) from exc
     if not is_fork:
         return
     # Checked before the refresh wait: a shadowed fork is refused no matter
@@ -7243,6 +8126,20 @@ handle immediately.
 #: * ``session_send`` — WITHHELD. Runs text as another session's user-role turn
 #:   under that target's own grants. The server-side gates bound WHICH target is
 #:   reachable; nothing bounds WHAT is sent.
+#: * ``session_adopt`` — WITHHELD, on the invariant rather than on a judgement about
+#:   how bad it would be. It MUTATES workspace state that already exists and is not
+#:   the caller's own: where another session hangs in the tree, which is what the
+#:   sidebar shows the person. A takeover moves that session's whole subtree with it,
+#:   so one auto-approved call on an ingested-content cycle rearranges a part of the
+#:   sidebar nobody asked to have rearranged. The verb exists for a person deciding to
+#:   consolidate conductors, and that decision is exactly what an approval prompt
+#:   records.
+#: * ``session_release`` — WITHHELD, for the same reason and with one honest
+#:   asymmetry: releasing ITSELF is the agent's own state and would pass the
+#:   invariant, while releasing a session it holds is not. The tool is one verb, so
+#:   it is judged on its wider reach; an agent that needs to get out from under a
+#:   stopped conductor gets an approval prompt, which a person is present for by
+#:   definition when they are the one consolidating.
 #: * ``session_stop`` — WITHHELD. Ends another session's in-flight turn and
 #:   DISCARDS its work (``stop_target``: "A stop cancels cooperatively", and the
 #:   cancelled turn's work is gone either way — the retry de-duplication that
@@ -7277,6 +8174,44 @@ _CONDUCTOR_DASHBOARD_GRANTS: tuple[str, ...] = (
 _MEMBER_DASHBOARD_GRANTS: tuple[str, ...] = _CONDUCTOR_DASHBOARD_GRANTS + (
     "@kirocrew-dashboard/session_send",
     "@kirocrew-dashboard/session_stop",
+)
+
+#: The panel verbs a CREW MEMBER's DM session may call without an approval
+#: prompt. BOTH of them, which is the whole surface ``kirocrew-panel`` exposes.
+#:
+#: This does not contradict the rule ``mcp_panel``'s own module doc states for
+#: that server ("No ``autoApprove`` key ... this tool's input is derived from
+#: text the agent read unattended"). The two paths differ in exactly the thing
+#: that rule is about. An ``autoApprove`` key is resolved inside kiro-cli, emits
+#: no permission request, and so skips ``hooks.on_tool_call`` -- the always-on
+#: deny floor, the sensitive-path check and the governance ceiling. A grant named
+#: here travels as ``allowedTools`` and is filtered by
+#: ``kas_agents._ceiling_permitted`` through ``may_skip_gate_now``, which fails
+#: closed, before any rule reaches the wire. So the ceiling the ``autoApprove``
+#: key would have bypassed is the ceiling this grant crosses, and an operator who
+#: governs either verb still governs it.
+#:
+#: ``panel_templates`` is a read and needs no further argument.
+#:
+#: ``panel_publish`` is a write, and it is granted on the invariant the dashboard
+#: tuples above are judged by -- a granted verb may CREATE or READ, never MUTATE
+#: something that already exists and is not the agent's OWN -- taking the same
+#: asymmetry those tuples record for ``session_release``: the panel a call writes
+#: is the CALLING CREW'S own, which is that agent's state. The server cannot be
+#: pointed anywhere else. It takes no crew or session argument at all, resolves
+#: the publishing crew strictly from the calling session, and refuses a subagent
+#: outright rather than walking ``/proc`` ancestors to its parent's panel. The
+#: worst case of an auto-approved call is therefore a member's own drawer showing
+#: something its own unattended cycle put there, which is what the surface is for.
+#:
+#: Withholding ``panel_publish`` instead would cost the capability rather than
+#: bound it: a panel exists to be refreshed once per cycle of long-running work
+#: with nobody at the keyboard, so an approval prompt on the write verb stalls
+#: exactly the unattended loop the drawer is watched during, and the operator's
+#: real switch for that is ``agent.crew_panel``.
+_MEMBER_PANEL_GRANTS: tuple[str, ...] = (
+    "@kirocrew-panel/panel_templates",
+    "@kirocrew-panel/panel_publish",
 )
 
 
@@ -8757,7 +9692,9 @@ def _project_shadow_of(
     if not work_dir:
         return None
     try:
-        for spec in project_agent_files(work_dir):
+        for spec in project_agent_files(
+            work_dir, operation="agent_project_shadow", source="unknown"
+        ):
             if not markdown_specs and is_markdown_spec(spec):
                 continue
             if dispatchable_only:

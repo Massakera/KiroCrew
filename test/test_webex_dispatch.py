@@ -173,7 +173,7 @@ class FakeSessions:
     def dequeue(self, key):
         return self.queued.pop(0) if self.queued else None
 
-    def clear_queue(self, key) -> None:
+    def clear_queue(self, key, owned_by=None) -> None:
         self.cleared.append(key)
         self.queued.clear()
 
@@ -376,7 +376,7 @@ def _entry(
         "webex_room_type": room_type,
         **extra,
     }
-    return (ts, text, tag_entry(kwargs, "webex"))
+    return (ts, text, tag_entry(kwargs, "webex", ""))
 
 
 # ------------------------------------------------------------------
@@ -2950,6 +2950,7 @@ class TestWebexSharesTheQueueWithOtherTransports:
                 "webex_room_type": "direct",
             },
             "webex",
+            "",
         )
 
         with pytest.raises(KeyError) as caught:

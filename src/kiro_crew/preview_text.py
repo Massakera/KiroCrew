@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from typing import Callable
 
 from kiro_crew.constants import OPTIONS_RE_LINE, strip_control_comments
 
@@ -37,9 +38,18 @@ _LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 # can't drift from the dashboard/Slack copies and handles `]` inside a label.
 _OPTIONS_RE = OPTIONS_RE_LINE
 _HEADER_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
-_BLOCKQUOTE_RE = re.compile(r"^\s*>\s?", re.MULTILINE)
-_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+", re.MULTILINE)
-_HR_RE = re.compile(r"^\s*([-*_])\1{2,}\s*$", re.MULTILINE)
+# Line-anchored markers: leading whitespace is HORIZONTAL only (``[^\S\n]``,
+# i.e. ``\s`` minus newline). A MULTILINE ``^\s*`` lets the quantifier run
+# PAST the current line across a whole run of blank lines, so every ``^``
+# anchor in that run rescans the run's remainder — polynomial backtracking
+# (CWE-1333, py/polynomial-redos) that wedged the gateway event loop for
+# 25s+ on whitespace-heavy previews and crash-looped the watchdog. Matching
+# within one line keeps the scan linear and the semantics identical: ``^``
+# already matches at the marker's own line, and the trailing whitespace
+# collapse eats any newlines the old pattern happened to consume.
+_BLOCKQUOTE_RE = re.compile(r"^[^\S\n]*>\s?", re.MULTILINE)
+_BULLET_RE = re.compile(r"^[^\S\n]*(?:[-*+]|\d+\.)\s+", re.MULTILINE)
+_HR_RE = re.compile(r"^[^\S\n]*([-*_])\1{2,}[^\S\n]*$", re.MULTILINE)
 _BOLD_RE = re.compile(r"(\*\*|__)(.+?)\1", re.DOTALL)
 _ITALIC_STAR_RE = re.compile(r"\*([^*\n]+)\*")
 _STRIKE_RE = re.compile(r"~~(.+?)~~", re.DOTALL)
@@ -78,6 +88,42 @@ def drop_format_chars(text: str) -> str:
     if text.isascii():
         return text
     return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+
+
+#: The one length a roster preview is cut to. Both spellings of a member's
+#: ``last_message`` (the cold transcript read and the live ``member/message``
+#: event) go through :func:`speech_preview`, so this is the only place the cap lives.
+PREVIEW_MAX_CHARS = 120
+
+
+def speech_preview(
+    text: str,
+    sanitize: Callable[[str], str] | None = None,
+    max_chars: int = PREVIEW_MAX_CHARS,
+) -> str:
+    """The roster's one-line quote of a spoken message, built the ONE way.
+
+    Markdown is stripped first (:func:`strip_markdown_preview`), *sanitize* --
+    the caller's redaction chain -- runs on the stripped text, and only then is
+    the result cut to *max_chars* with a trailing ellipsis. Sanitization precedes
+    truncation so a boundary cannot hide a credential fragment from a
+    pattern-based redactor. Returns ``""`` when nothing visible remains.
+
+    Two writers spell a member's ``last_message``: the cold transcript read
+    (``last_speech_info``) and the live ``member/message``
+    event the dashboard appends as the row lands. They MUST agree byte for byte,
+    because the roster read corrects the folded preview whenever the two differ
+    and would otherwise append a correction after every formatted message. Both
+    call this and nothing else.
+    """
+    preview = strip_markdown_preview(text)
+    if not preview:
+        return ""
+    if sanitize is not None:
+        preview = sanitize(preview)
+    if len(preview) > max_chars:
+        preview = preview[:max_chars].rstrip() + "…"
+    return preview
 
 
 def strip_markdown_preview(text: str) -> str:

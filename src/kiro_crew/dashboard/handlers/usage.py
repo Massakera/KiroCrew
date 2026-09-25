@@ -312,13 +312,6 @@ _CONTEXT_TOP_SESSIONS = 500
 # Fingerprint + TTL cache, same contract as _TOKEN_CACHE: the Telemetry panel
 # polls every 5s, and the shards are append-only, so (name, mtime, size) over
 # the window invalidates exactly when a turn lands.
-# Rough characters-per-token for English prose, used ONLY to express the
-# un-instrumented remainder (kiro-cli's base prompt + tool catalogue + steering)
-# in the same unit as KiroCrew's own exactly-counted blocks. Never applied to
-# those blocks themselves, and every surface that shows the derived number
-# labels it as an estimate.
-_EST_CHARS_PER_TOKEN = 4.0
-
 _CONTEXT_CACHE: dict[str, Any] | None = None
 _CONTEXT_CACHE_KEY: tuple[Any, ...] | None = None
 _CONTEXT_CACHE_TS: float = 0.0
@@ -733,9 +726,9 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
 
     Reads the ``ctx_blocks`` / ``phase`` fields ``persist_token_record`` writes
     each turn and returns them in chronological order, plus per-block totals.
-    Each turn also carries the row's ``credits`` and ``duration_ms`` when the
-    shard recorded usable numbers: injection and billing live on the same row,
-    so the drill-down answers "what was injected and what it cost" in one read.
+    Billing stays out of the payload: :func:`slot_turn_usage` is the per-turn
+    reader for ``credits`` / ``duration_ms``, and this trace answers only "what
+    was injected".
 
     Kept out of the OTEL pipeline for the same reason as
     :func:`context_occupancy`: this is per-session, per-turn detail, and slot
@@ -747,13 +740,11 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
     are skipped, so the trace starts where the recording does rather than
     inventing zeros for history.
 
-    ``estimated_other_chars`` is the remainder of the model's context that
-    KiroCrew did NOT inject — kiro-cli's own base prompt, its tool catalogue and
-    its steering files. It is an ESTIMATE and labelled as one everywhere it is
-    surfaced: the provider reports occupancy in tokens while every KiroCrew
-    block here is counted in exact characters, so the two can only be compared
-    through :data:`_EST_CHARS_PER_TOKEN`. Zero when occupancy is unknown or the
-    subtraction would go negative.
+    ``peak_context_used`` (the largest ``context_used`` reading across the
+    turns, in tokens) and ``context_window`` (the newest non-zero window size)
+    are the occupancy pair the Session Breakdown tree reads. Block sizes are in
+    characters and occupancy is in tokens; the trace carries both as recorded
+    and derives nothing across the unit boundary.
     """
     turns: list[dict[str, Any]] = []
     totals: dict[str, int] = {}
@@ -786,14 +777,6 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
                         "context_window": _coerce_int(obj.get("context_window")),
                         "model": str(obj.get("model") or ""),
                     }
-                    # The same shard row also carries the turn's billing; the
-                    # trace returns it rather than making the panel walk the
-                    # shards a second time through the usage-turns reader and
-                    # re-join what was never apart.
-                    for field in ("credits", "duration_ms"):
-                        value = _usage_number(obj.get(field))
-                        if value is not None:
-                            turn_row[field] = value
                     turns.append(turn_row)
         except (OSError, UnicodeDecodeError):
             continue
@@ -803,16 +786,12 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
     # Occupancy is per-turn cumulative, so the largest reading in the session is
     # the closest thing to "how full did this window get".
     peak_used = max((int(t["context_used"]) for t in turns), default=0)
-    estimated_other = 0
-    if peak_used > 0:
-        estimated_other = max(0, int(peak_used * _EST_CHARS_PER_TOKEN) - injected)
     return {
         "slot": slot,
         "turns": turns,
         "totals": totals,
         "injected_chars": injected,
         "user_chars": totals.get(USER_LABEL, 0),
-        "estimated_other_chars": estimated_other,
         "peak_context_used": peak_used,
         "context_window": next(
             (int(t["context_window"]) for t in reversed(turns) if t["context_window"]), 0

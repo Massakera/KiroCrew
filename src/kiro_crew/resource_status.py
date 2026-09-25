@@ -197,7 +197,9 @@ def adaptive_summary_lines(state: dict | None = None) -> list[str]:
     against the user's ceiling, the spawn-gate capacity, whether dispatch is
     paused or probing, and the last decision's action and reason -- what the
     dashboard's resources popover and ``kirocrew doctor`` show as "effective
-    concurrency vs user max and the current pressure reason".
+    concurrency vs user max and the current pressure reason". When the state
+    carries ``recent_decisions``, the last five cap changes follow, newest
+    last, so a low cap can be traced to the samples that cut it.
     """
     if state is None:
         state = adaptive_state()
@@ -239,12 +241,27 @@ def adaptive_summary_lines(state: dict | None = None) -> list[str]:
             lines.append(
                 f"  Provider throttling (scoped, not a host signal): {', '.join(throttled)}"
             )
+    recent = state.get("recent_decisions")
+    if isinstance(recent, list) and recent:
+        lines.append("  Recent cap changes (newest last):")
+        for entry in recent[-5:]:
+            lag = entry.get("loop_lag_ms")
+            lag_text = "-" if lag is None else f"{lag}"
+            at = entry.get("at")
+            # The same ``%H:%M:%S`` local-time stamp gateway.log carries, so
+            # the line can be matched against the log without conversion.
+            at_text = (
+                time.strftime("%H:%M:%S", time.localtime(at))
+                if isinstance(at, (int, float))
+                else "--:--:--"
+            )
+            lines.append(
+                f"    {at_text} {entry.get('action')} -> exec {entry.get('exec_cap')} "
+                f"gate {entry.get('gate_cap')} lag {lag_text}ms ({entry.get('reason')})"
+            )
     counts = state.get("counts") or {}
     if counts:
-        lines.append(
-            "  Decisions: "
-            + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-        )
+        lines.append("  Decisions: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     return lines
 
 

@@ -214,6 +214,7 @@ The existing routes and payloads are:
 | Operation | Route | Payload |
 |---|---|---|
 | Create | `POST /api/session-control/create` | optional `title`, `agent`, `folder_id` |
+| Fork | `POST /api/session-control/fork` | optional `source`, `title`, `folder_id`, integer `at_message_index`; the child carries the source's transcript |
 | Send | `POST /api/session-control/send` | required `target`, `message` |
 | Read | `GET /api/session-control/read` | query `target`; optional integer `limit`, `since` |
 | Stop | `POST /api/session-control/stop` | required `target` |

@@ -125,6 +125,11 @@ function createIpcRegistrar({
       windows.chrome.setThemeAccent(hex));
     ipcMain.on("focus-mode-chrome", (event, visible) =>
       windows.chrome.focusMode(event.sender, visible));
+    // Arm/disarm the off-window cursor poll that dismisses a focus-mode reveal.
+    // A bare boolean: the window is the sender's, and the distance threshold is
+    // the main process's, so the renderer names neither.
+    ipcMain.on("focus-mode-watch-cursor", (event, watching) =>
+      windows.chrome.watchFocusCursor(event.sender, watching));
     ipcMain.on("window-control", (event, action) =>
       windows.chrome.windowControl(event.sender, action, event.senderFrame));
     ipcMain.on("theme-mode-changed", (_event, pref) =>

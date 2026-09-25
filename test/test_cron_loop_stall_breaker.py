@@ -343,7 +343,7 @@ class TestRunMarker:
         svc = await CronService.create(base_dir=tmp_path, on_job=on_job)
         job = svc.add_job(name="probe", message="m", every_secs=3600, strict_schedule=True)
         svc._running = True
-        await svc._run_job_isolated(job)
+        await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
         assert len(seen) == 1
         (marker,) = seen[0]
         assert marker.job_id == job.id and marker.name == "probe" and marker.pid == os.getpid()
@@ -356,7 +356,7 @@ class TestRunMarker:
         svc = await CronService.create(base_dir=tmp_path, on_job=on_job)
         job = svc.add_job(name="raiser", message="m", every_secs=3600, strict_schedule=True)
         svc._running = True
-        await svc._run_job_isolated(job)
+        await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
         assert cron_inflight.read_markers(tmp_path) == []
         assert svc.get_job(job.id).last_status == "error"  # type: ignore[union-attr]
 

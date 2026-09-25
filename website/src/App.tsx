@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -11,6 +11,7 @@ import { performAgentSlotSwitch } from './lib/agentSwitch'
 import './surfaces/builtins'
 import { getBuiltinSurfaces, getBuiltinSurface, selectSurfaceBadgeCount, selectSurfaceActivityCount, selectAllSurfacesAttention, surfaceLabel, surfacePreviewEnabled } from './surfaces/registry'
 import { createSlot, appendSlotMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
+import { mintSendId } from './utils/sendDelivery'
 import { queryComposerOrExpand } from './pages/chat/composerFocus'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
 import { applyNavIntentInMain, chatDeepLinkSlot } from './utils/navIntent'
@@ -43,7 +44,8 @@ import { useNotificationSound } from './hooks/useNotificationSound'
 import { recordSessionStart, recordEvent } from './rum'
 import { ZoomProvider } from './hooks/ZoomProvider'
 import { api, isAuthBannerShown } from './api/client'
-import type { KiroCreditUsage, KiroUsagePayload } from './api/client'
+import { parseKiroUsagePayload, type KiroUsageState } from './api/kiroUsage'
+import { isKiroBackend, type AcpBackendConfig } from './api/acpBackend'
 import { cronJobsQuery } from './api/cronJobsQuery'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
@@ -52,6 +54,8 @@ import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCir
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
+import MeetCrewmatesFlow, { MeetCrewmatesEligibilityNotice } from './components/MeetCrewmatesFlow'
+import { useMeetCrewmatesGate } from './hooks/useMeetCrewmatesGate'
 import AgentImportFlow from './components/AgentImportFlow'
 import ErrorNotice from './components/ErrorNotice'
 import PrivacyChapter from './components/PrivacyChapter'
@@ -142,7 +146,7 @@ import { getBuiltinIcon } from './apps/builtinIcons'
 import { getThemeBranding } from './themeBranding'
 import { getTopBarWidgets } from './apps/topBarWidgets'
 import { getCapsuleSegments } from './apps/capsuleSegments'
-import { FEATURE_REQUEST_PROMPT_FALLBACK } from './prompts/featureRequest'
+import { FEATURE_REQUEST_PROMPT_FALLBACK, FEATURE_REQUEST_ROW_META_KEY } from './prompts/featureRequest'
 import { useKeyboardShortcuts, IS_MAC } from './hooks/useKeyboardShortcuts'
 import { useNavShortcutHint } from './hooks/useNavShortcutHint'
 import { useInstanceShortcuts } from './hooks/useInstanceShortcuts'
@@ -204,9 +208,6 @@ const UpdatePill = lazy(() => import('./components/UpdatePill'))
 const DiscoverPage = lazy(() => import('./pages/apps/DiscoverPage'))
 const LibraryPage = lazy(() => import('./pages/apps/LibraryPage'))
 
-const MAX_KIRO_BONUS_GRANT_NAME_CHARS = 100
-const MAX_KIRO_BONUS_CREDITS = 1_000_000
-const MAX_KIRO_BONUS_DAYS_LEFT = 3_650
 type LogSubscribeFn = (cb: ((data: { level: string; msg: string }) => void) | null) => void
 
 /** Minimal shape of an entry from `GET /api/apps`, limited to the fields the
@@ -1062,6 +1063,53 @@ const NC_SHEET_CLEARANCE = 20
 const NC_CLOSE_BACKSTOP_MS = 1000
 
 /**
+ * True when the press landed on `el`'s own classic scrollbar.
+ *
+ * The one thing a material selector cannot express: a scrollbar hit-tests to
+ * the element it scrolls, so a press on the list's 6px thumb has the SAME
+ * target as a press on the empty strip below the last card. Only the pointer
+ * position tells them apart — the client box excludes the bar, so a pointer
+ * outside it (past the right edge, or the left edge under RTL where
+ * `clientLeft` already counts the bar) is on the bar. Overlay scrollbars take
+ * no layout space and cannot be told apart this way, but this dashboard styles
+ * `::-webkit-scrollbar`, which makes every Chromium and WebKit bar a classic
+ * one. Nothing to detect while the content does not overflow — which also
+ * covers a DOM with no layout at all, where every box measures zero.
+ */
+function onOwnScrollbar(el: Element, e: MouseEvent): boolean {
+  const r = el.getBoundingClientRect()
+  const x0 = r.left + el.clientLeft
+  const y0 = r.top + el.clientTop
+  const onVerticalBar = el.scrollHeight > el.clientHeight && (e.clientX < x0 || e.clientX >= x0 + el.clientWidth)
+  const onHorizontalBar = el.scrollWidth > el.clientWidth && (e.clientY < y0 || e.clientY >= y0 + el.clientHeight)
+  return onVerticalBar || onHorizontalBar
+}
+
+/**
+ * A press inside the popover that hit the sheet's own background rather than
+ * something on it.
+ *
+ * The sheet is transparent by design: the panel paints nothing and every
+ * readable element is a floating card, so the popover's box says nothing about
+ * what the user pressed. On a phone that box is the whole viewport under the
+ * top bar, on desktop it is the 400px column — so judging a press by the box
+ * left the strip below the last card inert while the identical-looking strip
+ * left of the column dismissed, and on a phone left nothing but the bell to
+ * dismiss with. A press is judged by what it landed on instead. "On it" means
+ * a card (`notif-material`, the index.css hook every card already carries), a
+ * row, the detail panel (`data-nc-material`) or any control — those keep the
+ * sheet; anything else inside the popover is its background and dismisses
+ * exactly like a press outside would. Labels that float directly on the
+ * background (group headings, the empty inbox) are background too — they are
+ * not cards and hold nothing to press. Judged for the pointerdown and again
+ * for the click that completes it.
+ */
+function isSheetBackgroundPress(target: Element, e: MouseEvent): boolean {
+  if (target.closest('.notif-material, [data-notif-row], [data-nc-material], button, a, input, textarea, select, [role="button"]')) return false
+  return !onOwnScrollbar(target, e)
+}
+
+/**
  * Topbar Notifications bell. The Notifications surface is `hiddenFromNav`, so
  * this is its entry point. Click opens an Activity Feed popover
  * (portaled to <body> to escape the topbar's backdrop-filter containing
@@ -1074,10 +1122,12 @@ function NotificationsBellButton() {
   // is the control Alt+N operates. Resolved through the same route-keyed helper
   // the rail uses, so the chord has exactly one derivation in the dashboard.
   const shortcut = useNavShortcutHint('/notifications')
-  // Both jumps out of this popover run inside the gate: the bell is reachable
-  // from every page, including one holding an unsaved draft, and each handler
-  // also CLOSES the popover — so asking around the `navigate` alone would leave
-  // the user's "keep my draft" answer with the panel shut behind it.
+  // Every in-app jump out of this popover runs inside the gate — the inbox
+  // link, and the crash fallback's agent hand-off (through the button's own
+  // `gate`): the bell is reachable from every page, including one holding an
+  // unsaved draft, and each handler also CLOSES the popover — so asking around
+  // the `navigate` alone would leave the user's "keep my draft" answer with
+  // the panel shut behind it.
   const leave = useGuardedLeave()
   const location = useLocation()
   const dispatch = useAppDispatch()
@@ -1234,14 +1284,58 @@ function NotificationsBellButton() {
 
   useEffect(() => {
     if (!open) return
+    // Where the pointer gesture in flight began and ended: on the sheet's own
+    // background (inside the popover, on no material — see
+    // isSheetBackgroundPress) or not. Set by every pointerdown and pointerup,
+    // consumed by the click that completes the same gesture.
+    let pressedBackground = false
+    let releasedBackground = false
+    const onBackground = (target: Node, e: MouseEvent) =>
+      // A pointer never targets a text node, so a node inside the popover is
+      // an Element.
+      (popoverRef.current?.contains(target) ?? false) && isSheetBackgroundPress(target as Element, e)
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as Node | null
       if (!target) return
       const inButton = containerRef.current?.contains(target) ?? false
       const inPopover = popoverRef.current?.contains(target) ?? false
+      pressedBackground = onBackground(target, e)
+      releasedBackground = false
       if (!inButton && !inPopover) {
         closePanel()
       }
+    }
+    const onPointerUp = (e: PointerEvent) => {
+      const target = e.target as Node | null
+      releasedBackground = !!target && onBackground(target, e)
+    }
+    // A press on the sheet's background dismisses too, because on a phone the
+    // popover's box is the whole viewport under the top bar and nothing else
+    // could. It is dismissed at CLICK, not at pointerdown, and only when the
+    // gesture both began AND ended there with nothing selected on the way:
+    // - at click the sheet is still hit-testable, so the gesture ends on the
+    //   sheet and never reaches the page under the transparent strip.
+    //   Dismissing at pointerdown made the leaving sheet pointer-transparent
+    //   and the same tap's click landed on whatever sat beneath — a
+    //   suggestion chip, a link;
+    // - a touch drag that starts in the gap between two cards to scroll the
+    //   list produces no click, so scrolling still works;
+    // - a drag that crosses a card's edge in EITHER direction (selecting its
+    //   text) clicks the common ancestor of its two ends, which is background
+    //   — requiring both ends to be background is what keeps that from
+    //   dismissing, whichever end was the card;
+    // - a drag between two background points sweeps the cards between them
+    //   into a selection; the selection is the intent, so a click that left
+    //   one is not a dismissal either.
+    const onClick = (e: MouseEvent) => {
+      const backgroundGesture = pressedBackground && releasedBackground
+      pressedBackground = false
+      releasedBackground = false
+      if (!backgroundGesture) return
+      const target = e.target as Node | null
+      if (!target || !popoverRef.current?.contains(target)) return
+      if (!(window.getSelection()?.isCollapsed ?? true)) return
+      if (isSheetBackgroundPress(target as Element, e)) closePanel()
     }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -1254,8 +1348,15 @@ function NotificationsBellButton() {
       }
     }
     document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('pointerup', onPointerUp)
+    document.addEventListener('click', onClick)
     document.addEventListener('keydown', onKey)
-    return () => { document.removeEventListener('pointerdown', onPointerDown); document.removeEventListener('keydown', onKey) }
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('pointerup', onPointerUp)
+      document.removeEventListener('click', onClick)
+      document.removeEventListener('keydown', onKey)
+    }
   }, [open, selectedTs, closePanel])
 
   // Auto-mark-read when opening a notification's detail -- ONCE per
@@ -1314,19 +1415,47 @@ function NotificationsBellButton() {
         >
           <ErrorBoundary
             scope="notifications-bell"
-            fallback={
-              <div {...leavingProps} className={`absolute top-0 right-0 ${closing ? 'pointer-events-none' : 'pointer-events-auto'} ${isMobile ? 'w-full' : 'w-[400px]'} glass-surface glass-static rounded-xl shadow-xl flex flex-col items-center justify-center gap-2 p-6 text-center`} style={{ maxHeight: 240 }}>
+            fallback={error => (
+              <div {...leavingProps} data-nc-material className={`absolute top-0 right-0 ${closing ? 'pointer-events-none' : 'pointer-events-auto'} ${isMobile ? 'w-full' : 'w-[400px]'} glass-surface glass-static rounded-xl shadow-xl flex flex-col items-center justify-center gap-2 p-6 text-center`} style={{ maxHeight: 240 }}>
                 <AlertTriangle size={20} className="text-warn" />
                 <div className="text-[13px] font-semibold text-text-strong">{i18nT('app.notifications_failed_to_load')}</div>
+                {/* The same hand-off as the boundary's default card this panel
+                    replaces. The crash's own message is what lets the button
+                    recover the journaled report at click time — `|| name` is
+                    the value the boundary journals for a message-less throw,
+                    and the button renders nothing for an empty string. SOFT,
+                    through the same gate as the inbox link below: the crash is
+                    contained to the sheet, so the router and store under it
+                    are sound, and a full load would rebuild the store and drop
+                    every draft it holds — a Remote Crew form under edit lives
+                    in `instances.crewForms` precisely so an in-app navigation
+                    keeps it, and `beforeunload` never sees a store-held draft.
+                    The gate is the button's own, so a veto stages nothing.
+                    `onHandoff` dismisses the sheet: a jump to another page
+                    closes it through the route change, but a hand-off raised
+                    ON the chat changes no route and would leave this panel
+                    sitting over the composer it just filled. */}
+                <AskAgentButton
+                  message={error.message || error.name}
+                  variant="solid"
+                  gate={proceed => leave(proceed, '/chat')}
+                  onHandoff={closePanel}
+                />
+                <div className="text-[12px] text-muted">{i18nT('app.notifications_ask_agent_help')}</div>
                 <button className="text-[12px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer" onClick={() => leave(() => { closePanel(); navigate('/notifications') }, '/notifications')}>{i18nT('app.open_the_full_inbox')}</button>
               </div>
-            }
+            )}
           >
           {/* Sheet — macOS Notification Center style: the panel itself is fully
               transparent (a tinted/blurred panel paints a hard edge at its left
               boundary — exactly what NC doesn't have). Every readable element
               (header, controls, notification rows) is its own floating
-              material card instead. */}
+              material card instead.
+              Invariant: everything composed into the sheet is material (a
+              `notif-material` card, a `data-notif-row`, `data-nc-material`, a
+              control) or background BY DECISION — an unmarked child dismisses
+              the sheet on press (`isSheetBackgroundPress`); the structural test
+              in App.notificationSheetBackgroundDismiss.test.tsx enforces it. */}
           <div
             ref={sheetRef}
             {...leavingProps}
@@ -1376,9 +1505,12 @@ function NotificationsBellButton() {
           </div>
           {/* Detail panel — overlays feed on mobile, sits beside it on desktop.
               Rendered plainly (no AnimatePresence): an exit animation here races
-              the portal teardown when the popover closes and throws removeChild. */}
+              the portal teardown when the popover closes and throws removeChild.
+              Material, not background: it is an opaque card, so a press on it
+              keeps the sheet like a press on a row does. */}
           {selected && (
             <div
+              data-nc-material
               className={`absolute top-0 bottom-0 pointer-events-auto ${isMobile ? 'left-0 right-0' : 'left-0 right-[408px]'} bg-card border border-border rounded-xl shadow-xl overflow-hidden`}
             >
               <NotificationDetailPanel
@@ -1723,6 +1855,9 @@ export default function App() {
     window.addEventListener('mc-start-import', replay)
     return () => window.removeEventListener('mc-start-import', replay)
   }, [])
+  // Meet CrewMates: the crewmate first-run chapter, gated on zero crewmates +
+  // zero custom agents (see the hook).
+  const meetCrewmates = useMeetCrewmatesGate()
   // Capture Electron update lifecycle events app-wide so UpdateModal fires on
   // any page, not just after the user has opened Settings > About.
   useUpdateSubscription()
@@ -1808,11 +1943,14 @@ export default function App() {
     // The revealed header doubles as the window-drag surface, and a drag region
     // eats pointer events before hit-testing — so closing must be POSITIONAL:
     // only a mousemove observed below the header band closes the bar, and event
-    // silence (pointer resting on the draggable empty region, dragging the
-    // window, or off-window) can never hide it. 42 is the header's height (its
+    // silence (pointer resting on the draggable empty region, or dragging the
+    // window) can never hide it. 42 is the header's height (its
     // inline style below); +6 slack so grazing the band's bottom edge does not
     // count as departure.
     departWhen: e => e.clientY > 48,
+    // The pointer LEAVING the window is the one case positional close cannot
+    // see, and the slam below opens the bar in exactly that state.
+    dismissOnWindowExit: true,
   })
   const railPeek = useHoverIntent({
     enabled: focusActive, openMs: 120, closeMs: 260,
@@ -1820,9 +1958,10 @@ export default function App() {
     // Positional close, same contract as the top peek: only a mousemove observed
     // to the RIGHT of the rail band closes it. Needed once edge-slam opening
     // exists — an overlay opened with the pointer OFF-window has no
-    // enter/leave history for the event-based close to work from. 236 is the
-    // rail track width; +12 slack.
-    departWhen: e => e.clientX > 248,
+    // enter/leave history for the event-based close to work from. The band is
+    // the rail track at the user's collapse state; +12 slack.
+    departWhen: e => e.clientX > railWidthFor({ isMobile: false, collapsed: navCollapsed }) + 12,
+    dismissOnWindowExit: true,
   })
   // Edge-slam reveal: overshooting a trigger straight OUT of the window must
   // OPEN the overlay, not cancel it (the overshoot fires mouseleave on its way
@@ -1838,7 +1977,10 @@ export default function App() {
   // no Electron bridge) and browser tabs. In a browser a trip to the tab strip
   // or URL bar also exits through the top and pops the header; that false
   // positive is transient (the header closes as soon as the pointer re-enters
-  // below the band) and is accepted in exchange for the slam working uniformly.
+  // below the band, or on blur or an outside click) and is accepted in exchange
+  // for the slam working uniformly. In the
+  // desktop app the same trip is not a false positive at all: the tab strip is
+  // inches away, so the cursor never crosses the dismissal distance.
   //
   // Depends on the two `openNow` callbacks, NOT on the hover-intent objects that
   // carry them: useHoverIntent returns a fresh object literal every render, so
@@ -1858,6 +2000,24 @@ export default function App() {
     document.addEventListener('mouseout', onOut)
     return () => document.removeEventListener('mouseout', onOut)
   }, [focusActive, openTopPeek, openRailPeek])
+  // One overlay at a time. The top-left corner sits on both trigger strips, so
+  // hovering or slamming there can open the header and the rail together. The
+  // one that opened LAST is the one the user just asked for, so it wins and the
+  // other is put away at once. A layout effect so the pair is never painted.
+  const { close: closeTopPeek } = topPeek
+  const { close: closeRailPeek } = railPeek
+  const prevPeekOpen = useRef({ top: false, rail: false })
+  useLayoutEffect(() => {
+    const prev = prevPeekOpen.current
+    const topRose = topPeek.open && !prev.top
+    const railRose = railPeek.open && !prev.rail
+    prevPeekOpen.current = { top: topPeek.open, rail: railPeek.open }
+    if (!(topPeek.open && railPeek.open)) return
+    // Both rising in one commit has no "latest"; prefer the header, the same
+    // tie-break the corner slam uses.
+    if (topRose) closeRailPeek()
+    else if (railRose) closeTopPeek()
+  }, [topPeek.open, railPeek.open, closeTopPeek, closeRailPeek])
   // A header-owned popover keeps the header on screen.
   //
   // The instance switcher's menu is portaled to document.body (Radix), so moving
@@ -2743,107 +2903,57 @@ export default function App() {
   // backend cache has not warmed yet" (null) apart from "the request failed"
   // (undefined) — both are falsy. Without it a failing endpoint renders as a
   // spinner that never resolves, since the 30s refetch keeps retrying forever.
-  const { data: kiroUsage, isError: kiroUsageFailed } = useQuery<KiroCreditUsage | 'none' | 'api-key' | 'scrape-disabled' | 'signin-required' | null>({
+  const { data: kiroUsage, isError: kiroUsageFailed } = useQuery<KiroUsageState>({
     queryKey: ['kiro-usage'],
-    queryFn: () => api.sessionsUsage().then(d => {
-      const u: KiroUsagePayload = d?.usage || {}
-      // Kiro credit plan (internal) — the only usage this pill surfaces.
-      // Number.isFinite guards against a stray NaN ever rendering as "NaN / NaN".
-      if (typeof u.credits_plan === 'number' && Number.isFinite(u.credits_plan)) {
-        const limit = Math.round(u.credits_plan)
-        // credits_used is the real total (backend sets it to covered + overage);
-        // fall back to 0 (not the limit) when the source omits it, so a partial
-        // payload never implies a maxed plan.
-        const used = typeof u.credits_used === 'number' && Number.isFinite(u.credits_used)
-          ? Math.round(u.credits_used)
-          : 0
-        const overage = typeof u.credits_overage === 'number' && Number.isFinite(u.credits_overage)
-          ? u.credits_overage
-          : Math.max(0, used - limit)
-        // Bonus grants come from untrusted CLI output. Validate every field so
-        // one malformed grant cannot poison the readout or account panel.
-        const bonusCredits = Array.isArray(u.bonus_credits)
-          ? u.bonus_credits.flatMap(grant => {
-              if (
-                !grant
-                || typeof grant.name !== 'string'
-                || !grant.name
-                || grant.name.length > MAX_KIRO_BONUS_GRANT_NAME_CHARS
-                || typeof grant.used !== 'number'
-                || !Number.isFinite(grant.used)
-                || grant.used < 0
-                || grant.used > MAX_KIRO_BONUS_CREDITS
-                || typeof grant.total !== 'number'
-                || !Number.isFinite(grant.total)
-                || grant.total <= 0
-                || grant.total > MAX_KIRO_BONUS_CREDITS
-                || (grant.days_left !== undefined
-                  && (typeof grant.days_left !== 'number'
-                    || !Number.isFinite(grant.days_left)
-                    || grant.days_left < 0
-                    || grant.days_left > MAX_KIRO_BONUS_DAYS_LEFT))
-              ) return []
-              return [{
-                name: grant.name,
-                used: grant.used,
-                total: grant.total,
-                daysLeft: grant.days_left,
-              }]
-            })
-          : []
-        const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
-        const parsedOverageRate = typeof u.overage_rate === 'number'
-          ? u.overage_rate
-          : Number.parseFloat(u.overage_rate ?? '')
-        const normalized: KiroCreditUsage = {
-          used,
-          limit,
-          overage,
-          resets: u.resets,
-          plan: u.plan,
-          costUsd: u.cost_usd,
-          overageRate: Number.isFinite(parsedOverageRate) ? parsedOverageRate : undefined,
-          bonusCredits,
-          stale: u.stale === true,
-          account: str(u.account),
-          email: str(u.email),
-          accountType: str(u.account_type),
-          startUrl: str(u.start_url),
-        }
-        return normalized
-      }
-      // Non-Kiro provider (kiro-cli absent) -> hide. API-key auth -> terminal
-      // "not available for this auth type" (the pill and modal explain instead
-      // of hiding, because for this account type the state is permanent, not a
-      // warming cache). Scrape opt-in off with no API plan -> same treatment:
-      // permanent until the user flips dashboard.usage_text_scrape_enabled, so
-      // explain rather than hide (#7623 — hiding left no hint a knob exists).
-      // No readable Kiro credential -> also terminal, but a DIFFERENT remedy:
-      // sign in again, which is free, where flipping the scrape knob spends
-      // credits on a fetch that cannot authenticate (#11602).
-      // Empty cache (Kiro warming) -> spinner.
-      if (u.available === false) {
-        if (u.reason === 'api_key_auth') return 'api-key' as const
-        if (u.reason === 'signin_required') return 'signin-required' as const
-        if (u.reason === 'scrape_disabled') return 'scrape-disabled' as const
-        return 'none' as const
-      }
-      return null
-    }),
+    // The parser is shared with the account modal's Refresh button, which
+    // writes its POST result into this same query: one normalization for both.
+    queryFn: () => api.sessionsUsage().then(parseKiroUsagePayload),
     refetchInterval: 30_000,
   })
-  // Auto-close the details modal if usage resolves to unavailable — the pill
-  // hides in that case, so a modal opened during loading would otherwise be stuck.
-  useEffect(() => {
-    if (kiroUsage === 'none') setKiroUsageOpen(false)
-  }, [kiroUsage])
   // ONE derivation feeds both the capsule segment and the account modal, so the
   // drill-in can never report a different state from the pill that opened it —
   // the modal spinning on "checking account" behind a pill that already says
   // "unavailable" is the same falsy-collapse defect one level down.
+  // The `none` dash is a Kiro-backend surface: it says "kiro-cli holds no
+  // reading yet; open to refresh", and that refresh is a kiro-cli read. On any
+  // other harness the same `available: false` means kiro-cli is not what runs
+  // agents here, so there is no balance to read and the segment stays hidden.
+  // Read POSITIVELY off the selected backend (the gateway's `is_kiro_backend`),
+  // never as "not claude": an unloaded config renders no dash.
+  const kirocrewCfgQuery = useQuery<AcpBackendConfig>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+  })
+  const { data: kirocrewCfg, isSuccess: kirocrewCfgLoaded } = kirocrewCfgQuery
+  const kiroCreditSurface = isKiroBackend(kirocrewCfg)
+  // "The config read failed" must survive its own retry: a data-less errored
+  // query goes back to `pending` (error cleared) for the whole refetch, and
+  // reading `isError` alone would drop the segment to the hidden non-Kiro shape
+  // for that second, then bring it back. The last SETTLED outcome is what
+  // counts: no data ever arrived and an error has -- so until data lands, the
+  // read is failed, in flight or not.
+  const kirocrewCfgFailed = kirocrewCfg === undefined && kirocrewCfgQuery.errorUpdatedAt > 0
+  // `config-unreadable`: the gateway holds no reading AND the config read that
+  // decides whether this is the Kiro backend FAILED. Neither "no plan" nor "not
+  // the kiro harness" is established, so the segment must not collapse into the
+  // hidden non-Kiro case (that is a verdict; this is a failed read): it renders
+  // its own dash, and the modal behind it retries the config read.
   const kiroUsageState: KiroAccountUsage = kiroUsageFailed && !kiroUsage
     ? 'failed'
-    : (kiroUsage ?? null)
+    : kiroUsage === 'none' && kirocrewCfgFailed
+      ? 'config-unreadable'
+      : (kiroUsage ?? null)
+  // The one state with NO segment on screen: `none` on a harness that is not
+  // kiro-cli. A modal opened while the cache was warming would otherwise be
+  // left open behind a pill that has just disappeared, with nothing under it
+  // to refresh. On the Kiro backend the dash stays and so does the modal (its
+  // Refresh is the recovery path), and until the config has LOADED nothing is
+  // decided -- an unloaded config hides the dash, but that is a pending state,
+  // not a verdict to close on.
+  const pillHidden = kirocrewCfgLoaded && kiroUsageState === 'none' && !kiroCreditSurface
+  useEffect(() => {
+    if (pillHidden) setKiroUsageOpen(false)
+  }, [pillHidden])
   const [metricsOpen, setMetricsOpen] = useState(() => localStorage.getItem('mc-topbar-metrics') === '1')
   // The inline metric readings are dropped by a CSS container-query rung when
   // the actions group runs out of room (the ladder in index.css, whose rungs
@@ -3223,6 +3333,20 @@ export default function App() {
   const requestFeature = useCallback(async () => {
     const result = await dispatch(createSlot(undefined)).unwrap()
     const slot = result.key
+    // This flow is an agent turn by design (the skill drafts and files the
+    // request), so it consumes metered inference and a spent plan allowance
+    // refuses it. The transcript can offer the non-inference route -- the
+    // repo's feature-request form -- on that refusal ONLY if it knows the
+    // refused turn was this one, which nothing else records (#13342). The
+    // record is the ROW: the send's `meta` carries the flow's stamp beside its
+    // `sendId` (`FEATURE_REQUEST_ROW_META_KEY`), and the gateway persists a
+    // send's `meta` verbatim on the user row and echoes it back, so the same
+    // stamp is on the optimistic bubble below, on the echo that reconciles it,
+    // on the row a reload rebuilds and in every other tab of the slot --
+    // nothing is kept on this client. A message the user types later in the
+    // same slot is an unstamped row, so its limit hit keeps today's card.
+    const sendId = mintSendId()
+    const meta = { sendId, [FEATURE_REQUEST_ROW_META_KEY]: true }
     const visibleMessage = i18nT('app.i_d_like_to_request_a_feature')
     navigate('/chat')
     // Both optimistic writes are addressed to the slot this flow CREATED, not
@@ -3232,7 +3356,7 @@ export default function App() {
     // put the bubble in an unrelated session's transcript, and an
     // unconditional running flag would mark that session busy for a turn it
     // never started (review finding on #4198).
-    dispatch(appendSlotMessage({ slot, message: { role: 'user', content: visibleMessage, cls: '', ts: new Date().toISOString() } }))
+    dispatch(appendSlotMessage({ slot, message: { role: 'user', content: visibleMessage, cls: '', ts: new Date().toISOString(), meta } }))
     if (appStore.getState().chat.activeSlot === slot) dispatch(setSlotRunning(true))
     // A send the server never accepted has to say so where the request landed
     // (#4198): an HTTP 4xx/5xx RESOLVES rather than rejecting, so the catch
@@ -3271,7 +3395,11 @@ export default function App() {
     } catch { /* Send the visible request even if hidden context is unavailable. */ }
     // The chat-core transport owns the receipt contract (`?ws=1` JSON receipt,
     // HTTP 4xx/5xx RESOLVE rather than reject, deadline) and never rejects.
-    const receipt = await sendTurn({ message: visibleMessage, slot, colorTheme })
+    // `meta` rides the wire exactly as a composer send's does: the gateway
+    // persists it on the user row and echoes it, so the echo reconciles the
+    // optimistic bubble by `sendId` and the persisted row keeps the stamp the
+    // transcript reads the refusal by.
+    const receipt = await sendTurn({ message: visibleMessage, slot, colorTheme, meta })
     // Resolution is not success: `refused` means the server accepted neither
     // `ok` nor `queued`, so no turn started and no WS response is coming, and
     // `transport-error` means the request never left. Both get the error row.
@@ -3287,13 +3415,7 @@ export default function App() {
 
   const toggleNav = () => {
     if (isMobile) { if (mobileNavPhaseRef.current === 'open') closeMobileNavDrawer(); else openMobileNav() }
-    else if (focusActive) {
-      // The rail is a hover-held overlay in focus mode and always full width, so
-      // there is no collapsed state to toggle into. The same control puts it away
-      // instead — which is what its left-pointing chevron already reads as, and it
-      // leaves the user's collapse preference untouched for when focus mode is off.
-      railPeek.close()
-    } else {
+    else {
       // The user has taken ownership of the rail: leaving preview expand mode
       // must not overwrite this with the pre-expand state.
       navAutoCollapsed.current = null
@@ -3314,12 +3436,9 @@ export default function App() {
   // Reset mobile nav state when leaving mobile viewport
   // Leaving mobile: drop the panel with no slide (no drawer exists on desktop).
   useEffect(() => { if (!isMobile) { setMobileNavPhase('closed'); takeOverDrawer(mobileNavX) } }, [isMobile, mobileNavX])
-  // Focus mode forces the rail EXPANDED regardless of the user's collapse
-  // preference. A collapsed rail is 74px, and as a hover-held overlay that is a
-  // hard target to keep the pointer inside — it puts itself away the moment you
-  // drift off it. `navCollapsed` still holds the preference, so leaving focus mode
-  // restores whatever the user had.
-  const effectiveCollapsed = navCollapsed && !isMobile && !focusActive
+  // Focus mode honours the collapse preference too: the overlay rail is as wide
+  // as the docked rail would be, and the collapse control toggles it the same way.
+  const effectiveCollapsed = navCollapsed && !isMobile
   // Publish the rail track so consumers outside the shell can size against the
   // space actually left for content — ChatPage's activity panel decides
   // beside-vs-fill from it. Kept in sync with the gridTemplateColumns value
@@ -3976,8 +4095,24 @@ export default function App() {
             }
             // Usage segment — Kiro credit plan from KiroCrew's own usage
             // cache. Spinner while the cache warms, a dash when the fetch
-            // failed, hidden when the provider has no credit plan at all.
-            if (kiroUsageState !== 'none') {
+            // failed or when the gateway holds no reading. On the Kiro
+            // backend every state keeps the segment on screen: the account
+            // modal it opens is where the user refreshes, so a hidden segment
+            // would make the one recovery path unreachable. `none` on any
+            // other harness (kiro-cli absent, or not the agent runtime) has
+            // nothing to refresh, so it hides the segment as it always did.
+            if (kiroUsageState === 'none' && kiroCreditSurface) {
+              // No reading: the API returned no plan and the /usage scrape
+              // found none either (or is parked). The label says what
+              // happened and where to act.
+              segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_no_reading')} aria-label={i18nT('app.kiro_credit_usage_no_reading')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
+            } else if (kiroUsageState === 'config-unreadable') {
+              // No reading AND the backend setting could not be read: not the
+              // hidden non-Kiro case (nothing proved that), a failed read with
+              // its retry behind the dash -- the modal re-asks for the config.
+              segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_config_unreadable')} aria-label={i18nT('app.kiro_credit_usage_config_unreadable')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
+            }
+            if (kiroUsageState !== 'none' && kiroUsageState !== 'config-unreadable') {
               if (kiroUsageState === 'failed') {
                 // Failed with nothing cached to fall back on. A dash says that;
                 // a spinner would claim a fetch is still in flight. A failure
@@ -3995,20 +4130,11 @@ export default function App() {
                 // flight), but the label says why, and clicking through opens
                 // the modal's fuller explanation.
                 segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_api_key')} aria-label={i18nT('app.kiro_credit_usage_api_key')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
-              } else if (kiroUsageState === 'scrape-disabled') {
-                // The free usage API returned no plan and the billed /usage
-                // text scrape is opted out (its default). Permanent until the
-                // user flips dashboard.usage_text_scrape_enabled, so render
-                // the same terminal dash as 'api-key' with a label that names
-                // the knob — hiding the segment here left users of v0.1.3-era
-                // dashboards with a pill that silently vanished (#7623).
-                segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_scrape_disabled')} aria-label={i18nT('app.kiro_credit_usage_scrape_disabled')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
               } else if (kiroUsageState === 'signin-required') {
                 // No live Kiro credential could be read (or it was rejected), so
                 // the free API never got an answer about this account. Terminal
-                // like 'scrape-disabled', but the label must name the FREE remedy,
-                // signing in again, because the scrape-disabled copy sent these
-                // users to a billed knob that cannot authenticate either (#11602).
+                // like 'api-key', but the label must name the remedy: signing in
+                // again.
                 segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_signin_required')} aria-label={i18nT('app.kiro_credit_usage_signin_required')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
               } else if (!kiroUsageState) {
                 segments.push(<button key="usage" className={`${seg} text-muted`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_checking')} aria-label={i18nT('app.kiro_credit_usage_checking_2')}><Coins size={12} /> {!isMobile && <Loader2 size={11} className="animate-spin" />}</button>)
@@ -4278,7 +4404,16 @@ export default function App() {
           onComplete={endFirstRun}
           onSkipAll={endFirstRun}
         />
+        {/* First-run chapter 4 — Meet CrewMates. Fires once, after the tour,
+            only for a user with no crewmates and no custom agents; also
+            reopened from the Crewmates page (mc-start-meet-crewmates). */}
+        <MeetCrewmatesFlow open={meetCrewmates.open} onDone={meetCrewmates.onDone} onCreated={meetCrewmates.onCreated} persistFailed={meetCrewmates.persistFailed} />
       </OnboardingShellHost>
+      {meetCrewmates.eligibilityError && !meetCrewmates.open && (
+        /* The Meet CrewMates eligibility read failed, so the chapter cannot
+           decide whether to fire. Said here rather than swallowed. */
+        <MeetCrewmatesEligibilityNotice onDismiss={meetCrewmates.dismissEligibilityError} />
+      )}
 
       {/* Mobile backdrop — opacity is animated by animateDrawer in lockstep
           with the panel (compositor), so there is no framer fade here; it

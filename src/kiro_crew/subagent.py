@@ -14,7 +14,6 @@ import logging
 import math
 import os
 import time
-import uuid
 from collections.abc import Awaitable, Callable, Container, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -38,6 +37,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401 - STOP_* resol
     STOP_CLASS_SUCCEEDED,
     STOP_RECOVERY_MAX_RETRIES,
     classify_stop_reason,
+    is_runtime_death,
 )
 from kiro_crew.executors import run_in_embed_pool
 
@@ -124,9 +124,15 @@ from kiro_crew.subagent_completion_meta import (
     single_completion_meta,
 )
 from kiro_crew.subagent_cost import (
+    _SAMPLE_MAX_AGE_SECS,
     append_cost_sample,
+    cap_buckets,
     compact_cost_log,
+    cost_log_identity,
+    learned_cost_for,
     read_learned_cost,
+    read_learned_costs,
+    read_learned_costs_checked,
 )
 from kiro_crew.subagent_manager import (
     CancellationCoordinator,
@@ -141,7 +147,10 @@ from kiro_crew.subagent_manager import (
     bind_component_globals,
     copy_component_docs,
 )
-from kiro_crew.subagent_manager.monitoring import tombstone_recovery_action
+from kiro_crew.subagent_manager.monitoring import (  # noqa: F401 - resolved by monitoring.py via bind_component_globals
+    orphan_resume_hint,
+    tombstone_recovery_action,
+)
 from kiro_crew.subagent_persistence import (
     _agent_dir,
     _cleanup_session_files_sync,
@@ -477,6 +486,16 @@ def _describe_exception(exc: BaseException) -> str:
 
 
 _MAX_DONE_RESULT_LEN = 50_000  # cap subagent_done payload to avoid bloating WS frames
+
+# Width of a run id, in hex characters. 16 characters is 8 bytes, and every one
+# of those 64 bits is random, which is what makes a uniqueness CHECK
+# unnecessary: 2000 draws on one host collide with probability about
+# 2000**2 / (2 * 2**64), roughly 1 in 10**13, against 1 in 2,100 at the 8
+# characters this replaces. Nothing in the product pins the width -- the only
+# consumers print or pass the id through -- so widening is cheaper than any
+# mechanism that would have to remember which ids are taken, and a durable row
+# outlives the process that wrote it, so remembering means reading the store.
+_RUN_ID_HEX_CHARS = 16
 
 
 def _done_result(text: str) -> str:
@@ -863,11 +882,12 @@ def check_memory_available(
     cgroup limit, returns (True, -1.0).
     """
     if path == "/proc/meminfo" and not platform_compat.IS_LINUX:
-        avail = (
-            _macos_available_memory_gb()
-            if platform_compat.IS_MACOS
-            else _windows_available_memory_gb() if platform_compat.IS_WINDOWS else -1.0
-        )
+        if platform_compat.IS_MACOS:
+            avail = _macos_available_memory_gb()
+        elif platform_compat.IS_WINDOWS:
+            avail = _windows_available_memory_gb()
+        else:
+            avail = -1.0
         return (True, -1.0) if avail < 0 else (avail >= min_gb, round(avail, 2))
     avail = -1.0
     try:
@@ -914,9 +934,10 @@ def _proc_subtree_sample(pid: Optional[int]) -> platform_compat.SubtreeSample:
 def _subtree_cpu_jiffies(pid: int, *, pids: Optional[list[int]] = None) -> int:
     """Sum utime+stime across ``pid`` and its descendants (clock ticks).
 
-    Asks the shared walker for the CPU reading alone, so the CPU subtree the
-    Sessions session rows read is the same subtree the task rows describe, and
-    the session rows pay no ``status`` read for an RSS figure they do not use.
+    Two routes, and the caller picks one by argument. WITHOUT ``pids`` it asks
+    the shared walker for the CPU reading alone, so the subtree is the one the
+    task rows describe and no ``status`` read is paid for an RSS figure the
+    caller does not use.
 
     ``pids`` is that subtree when the caller has ALREADY walked it, so the tree
     is not enumerated a second time to total the same processes -- the same
@@ -924,7 +945,10 @@ def _subtree_cpu_jiffies(pid: int, *, pids: Optional[list[int]] = None) -> int:
     the cost is the enumeration, not the per-process read. It also makes the CPU
     figure describe exactly the set the caller's other figures describe, where
     two enumerations could disagree (the walker stops at ``_SUBTREE_MAX_PROCS``
-    and a caller's own walk need not).
+    and a caller's own walk need not). This is the route the Sessions session
+    rows take, so their CPU figure spans their whole uncapped tree -- the same
+    set every other figure on those rows spans -- rather than the walker's first
+    ``_SUBTREE_MAX_PROCS`` processes.
     """
     if pids is not None:
         return platform_compat.proc_cpu_jiffies_for_pids(pids)
@@ -1347,23 +1371,125 @@ def _host_mem_term(cfg: KiroCrewConfig) -> int | None:
     return math.floor((avail_gb * buf - pool_size * mem_cost) / mem_cost)
 
 
+# Sweeps that must have measured a dedicated worker before the guard trusts its
+# own reading over the learned per-start price. One reading can land mid-growth
+# (a runtime started just before a sweep reads at a fraction of its size); two
+# readings an interval apart bound that exposure to one ``_REAPER_INTERVAL``.
+_RSS_SAMPLES_TO_SETTLE = 2
+
+
+def _live_dedicated(agents: list[SubagentInfo]) -> tuple[list[SubagentInfo], list[SubagentInfo]]:
+    live = [info for info in agents if not info.done and not info.queued]
+    return live, [info for info in live if not info._session_sharing]
+
+
+def _effective_next_start_gb(
+    agents: list[SubagentInfo], *, cost_gb: float, next_start_gb: float | None
+) -> float:
+    """What the NEXT dedicated start is actually priced at.
+
+    The larger of the configured cost, the caller's learned figure and every
+    live dedicated peak: a worker observed above the learned p90 is evidence
+    that starts on this host can cost that much. Shared by the reserve and by
+    the gate's deferral record, so the price an operator is shown is the price
+    the arithmetic used.
+    """
+    _live, dedicated = _live_dedicated(agents)
+    expected = max([0.0, cost_gb, *(info.peak_rss_gb for info in dedicated)])
+    return max([expected, next_start_gb if next_start_gb is not None else 0.0])
+
+
 def _startup_memory_reserve_gb(
-    agents: list[SubagentInfo], *, running_count: int, cost_gb: float
+    agents: list[SubagentInfo],
+    *,
+    running_count: int,
+    cost_gb: float,
+    next_start_gb: float | None = None,
 ) -> float:
     """Memory promised to cold dedicated starts but not observed in RSS yet.
 
     Include the next start and claims awaiting registration. Queued and terminal
     rows promise nothing; a yielded parent still owns its process. Confirmed
     shared sessions do not launch another process and incur no dedicated-start
-    reservation. Until sharing is known, reserve the configured process cost.
+    reservation. Until sharing is known, a row is priced as a warming
+    dedicated start, since it may yet become one.
+
+    Two prices, because two kinds of worker are live at once:
+
+    * A start that is not SETTLED yet -- the next one, a claim awaiting
+      registration, and a dedicated worker fewer than ``_RSS_SAMPLES_TO_SETTLE``
+      sweeps have measured -- owes ``next_start_gb`` (default ``cost_gb``; see
+      :func:`_effective_next_start_gb`) less whatever RSS it already holds. A
+      single reading can land mid-growth, so one sample does not yet say what
+      the worker will weigh; what it holds is subtracted so nothing is counted
+      twice, but the remainder stays reserved at the learned figure.
+    * A SETTLED dedicated worker owes only the gap between the larger of
+      ``cost_gb`` and its OWN peak and what it holds now. Its reservation retires
+      as its RSS is observed: a learned p90 far above what this particular
+      worker turned out to need must not become a phantom reserve that no later
+      sample can close -- and the phantom a warming worker can hold is bounded
+      to the sweeps before it settles.
     """
-    live = [info for info in agents if not info.done and not info.queued]
-    dedicated = [info for info in live if not info._session_sharing]
-    expected = max([0.0, cost_gb, *(info.peak_rss_gb for info in dedicated)])
+    live, dedicated = _live_dedicated(agents)
+    next_start = _effective_next_start_gb(agents, cost_gb=cost_gb, next_start_gb=next_start_gb)
     unregistered = max(0, running_count - sum(not info._slot_released for info in live))
-    return expected * (1 + unregistered) + sum(
-        max(0.0, expected - info.last_rss_gb) for info in dedicated
-    )
+    gaps = 0.0
+    for info in dedicated:
+        if info._rss_samples < _RSS_SAMPLES_TO_SETTLE:
+            gaps += max(0.0, next_start - info.last_rss_gb)
+        else:
+            gaps += max(0.0, max(cost_gb, info.peak_rss_gb) - info.last_rss_gb)
+    return next_start * (1 + unregistered) + gaps
+
+
+def _cost_bucket(agent: str, execution: Any) -> str:
+    """The cost-store key one run's samples are written under and priced from.
+
+    The explicit ``agent`` when the spawn named one, else the template the run
+    actually executes (``execution.template_id`` -- an agent-less spawn inherits
+    its parent's), so an inherited heavy template builds and reads its OWN
+    bucket instead of mixing into the default one. ONE function for the write
+    (``_record_cost``) and the read (the spawn guard), because a key that
+    differs between the two never converges. Empty when neither is known; the
+    store normalizes that to its default agent.
+    """
+    if agent:
+        return agent
+    return str(getattr(execution, "template_id", "") or "")
+
+
+def _startup_cost_gb(agent: Any, learned_gb: float | None) -> float:
+    """What one unmeasured dedicated start is priced at by the spawn guard.
+
+    The larger of the configured first-boot fallback (``subagent_cost_gb``) and
+    *learned_gb*, this run's own bucket's dedicated p90
+    (:func:`~kiro_crew.subagent_cost.read_learned_costs` with ``dedicated_only``,
+    refreshed off-loop by the reaper sweep and held on the manager, so this is
+    arithmetic only; ``None`` when the bucket has no such history). The
+    reserve is the ONLY thing that prices a start between admission and the
+    reaper's first RSS sample (60 s), and a dedicated runtime takes tens of
+    seconds to reach its resident size, so a burst of starts inside that window
+    is bounded by this number alone. Pricing it at the 0.5 GB fallback while the
+    store already knew a ~6 GB p90 let four starts each clear a raw free-memory
+    check and then grow into the same headroom together.
+
+    ``max`` rather than the cap's learned-over-configured
+    (:func:`_host_mem_term`), deliberately: the cap is a COUNT, and a learned
+    cost below the configured one should raise it -- that is what learning is
+    for -- while the reserve is a safety floor against an unrecoverable OOM, so
+    an operator's higher pin must never be lowered by a learned figure.
+    Over-reserving here only defers a start until the next sample; under-reserving
+    is the failure being guarded against.
+    """
+    try:
+        configured = float(agent.subagent_cost_gb)
+    except (AttributeError, TypeError, ValueError):
+        configured = 0.5
+    try:
+        learned = float(learned_gb) if learned_gb is not None else 0.0
+    except (TypeError, ValueError):
+        learned = 0.0
+    return max(configured, learned)
 
 
 def resolve_max_subagents(cfg: KiroCrewConfig) -> int:
@@ -1439,6 +1565,12 @@ def stage_boundary_owner_for_run(info: object) -> str:
     """Return a run's captured owner token; a missing token is unowned."""
     owner = getattr(info, "_stage_boundary_owner", "")
     return owner if isinstance(owner, str) else ""
+
+
+#: Reap reasons that end a run on purpose. A tombstone written with one of these
+#: is a neutral "stopped", never a failure, and the same set decides whether the
+#: reap-echo arm in ``_run`` and ``_force_reap``'s own record synthesize an error.
+_NEUTRAL_REAP_REASONS = frozenset({"user_stop", "parent_end", "stage_cancel"})
 
 
 @dataclass
@@ -1578,6 +1710,34 @@ class SubagentInfo:
     # SUCCESS). One flag cannot be both early and late; this one is the early
     # half — "do not respawn, a reap is in flight".
     _reap_started: bool = False
+    # WHY the reap in flight is happening, written next to ``_reap_started`` and
+    # read by the run loop when its stream dies UNDER that reap. ``_force_reap``
+    # tears the run's session down before it cancels the task, so the in-flight
+    # turn observes its own runtime being killed first and raises
+    # ``AcpProcessDied`` -- "killed (provider shutdown)". Without these two fields
+    # that echo was recorded as the run's failure: a ``cause="error"`` tombstone
+    # carrying the death text and an ERROR log, for a run a user had just pressed
+    # Stop on (or a parent end had cancelled). ``_reap_reason`` is the tombstone
+    # cause the reap itself would write (``user_stop`` / ``parent_end`` /
+    # ``reaped`` / ``startup_timeout``); ``_stop_origin`` is the one-line WHO/WHY
+    # for the record and the log ("stopped by user", "parent conversation ended
+    # (retire_kiro_identity_sessions)", "reaped after 900s (reaped)").
+    _reap_reason: str = ""
+    _stop_origin: str = ""
+
+    @property
+    def stop_is_neutral(self) -> bool:
+        """Whether the reap that owns this run is a deliberate stop, not a failure.
+
+        Decided by the FIRST stopper (``_reap_reason``), never by
+        ``user_stopped`` alone: a Stop that lands while a deadline reap is already
+        tearing the run down sets ``user_stopped`` too, and reading that flag would
+        let the late Stop convert a claimed deadline failure into a neutral stop.
+        A user Stop, a parent end and a stage cancel are neutral; a deadline or
+        startup reap is the run's own failure.
+        """
+        return self._reap_reason in _NEUTRAL_REAP_REASONS
+
     # Set by the gateway on the wave's FINAL member only: the held OK member
     # ids whose delivery tombstones must be settled once the digest has been
     # successfully handed off (i.e. after _on_done returns without raising —
@@ -1705,6 +1865,17 @@ class SubagentInfo:
     last_stubs: int | None = None
     _cpu_jiffies_prev: int = 0  # last subtree utime+stime sample (clock ticks)
     _cpu_sample_ts: float = 0.0  # monotonic time of the last CPU sample
+    # How many reaper sweeps have measured a non-zero RSS for this run. The
+    # spawn guard treats a dedicated worker as still WARMING until it has been
+    # seen by two sweeps (an interval apart), so a single reading taken
+    # mid-growth is not mistaken for the worker's size (see
+    # _startup_memory_reserve_gb).
+    _rss_samples: int = 0
+    # Bumped when the run gets a NEW process (the cancel-recovery respawn), so
+    # an off-loop sweep that read the old process cannot land its reading on
+    # the new one: the sweep snapshots this before reading and writes only if
+    # it is unchanged.
+    _rss_generation: int = 0
     # Session sharing — when True, this subagent runs as a session on the
     # parent's shared AcpRuntime instead of its own process. Cleanup skips
     # release/reset (no entry in SessionManager) and instead calls shutdown()
@@ -1913,6 +2084,7 @@ class _ReportFailureSnapshot:
     error: str
     elapsed: float
     user_stopped: bool
+    _stop_origin: str
     outcome: str
     partial: bool
     agent: str
@@ -1947,6 +2119,7 @@ class _ReportFailureSnapshot:
             error=bounded(info.error),
             elapsed=float(info.elapsed),
             user_stopped=bool(info.user_stopped),
+            _stop_origin=bounded(info._stop_origin),
             outcome=info.outcome,
             partial=bool(info.partial),
             agent=bounded(info.agent),
@@ -1977,6 +2150,7 @@ class _ReportFailureSnapshot:
             self.result,
             self.result_path,
             self.error,
+            self._stop_origin,
             self.outcome,
             self.agent,
             self.conversation_key,
@@ -2019,6 +2193,7 @@ class _ReportFailureSnapshot:
             acp_backend=self.acp_backend,
             conversation_key=self.conversation_key,
             user_stopped=self.user_stopped,
+            _stop_origin=self._stop_origin,
             stop_reason=self.stop_reason,
             stop_class=self.stop_class,
             partial=self.partial,
@@ -2133,12 +2308,19 @@ DELIVERY_ROUTING_FIELDS: "dict[str, str]" = {
     "_digest_flush_only": NOT_DELIVERY_STATE,
     # Run bookkeeping these modules also write. None of them says where an outcome is.
     "_finalized": NOT_DELIVERY_STATE,
+    "_reap_reason": NOT_DELIVERY_STATE,
     "_reap_started": NOT_DELIVERY_STATE,
     "_recovering": NOT_DELIVERY_STATE,
+    # The recovery respawn resets the dead process's RSS readings so the spawn
+    # guard prices the fresh process as warming; memory sizing, not delivery.
+    "_rss_generation": NOT_DELIVERY_STATE,
+    "_rss_samples": NOT_DELIVERY_STATE,
     "_slot_released": NOT_DELIVERY_STATE,
+    "_stop_origin": NOT_DELIVERY_STATE,
     "done": NOT_DELIVERY_STATE,
     "elapsed": NOT_DELIVERY_STATE,
     "error": NOT_DELIVERY_STATE,
+    "last_rss_gb": NOT_DELIVERY_STATE,
     # Owned continuation work is cancelled separately when a parent ends; its presence
     # says nothing about whether this run's terminal outcome reached that parent.
     "pending_followups": NOT_DELIVERY_STATE,
@@ -2378,6 +2560,19 @@ class SubagentManager:
         self._completion_keep = completion_keep
         self._completion_keep_chars = completion_keep_chars
         self._running_count = 0
+        # The learned per-run memory p90s (``read_learned_costs("mem_gb")``,
+        # keyed by cost bucket) the spawn guard prices a warming start from
+        # (``learned_cost_for`` → ``_startup_cost_gb``; a bucket with no
+        # dedicated history answers None and the configured cost plus live
+        # peaks prices it). Empty until the first off-loop
+        # refresh: the reaper sweep reads the cost log on the maintenance
+        # executor and publishes here, so the gate -- which runs on the event
+        # loop -- never opens the file itself. Stale by at most one sweep, far
+        # below the rate a 50-sample p90 can move at.
+        self._learned_costs_gb: dict[str, float] = {}
+        # The log identity the map was last merged from (``cost_log_identity``),
+        # so a replaced log -- new inode or shrunk -- is read fresh, not merged.
+        self._learned_costs_source: tuple[object, ...] | None = None
         # Strong refs to in-flight shielded terminal reports (see
         # `_spawn_terminal_report`); drained in `cancel_all`.
         self._report_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
@@ -2941,6 +3136,9 @@ class SubagentManager:
     def _sample_live_costs(self) -> None:
         return self._monitor._sample_live_costs_impl()
 
+    def _refresh_learned_cost(self) -> None:
+        return self._monitor._refresh_learned_cost_impl()
+
     def _record_cost(self, info: SubagentInfo) -> None:
         return self._monitor._record_cost_impl(info)
 
@@ -3393,6 +3591,33 @@ class SubagentManager:
         self._agents.pop(agent_id, None)
         self._tasks.pop(agent_id, None)
         return "delivered"
+
+    def _mint_agent_id(self) -> str:
+        """Draw a run id: :data:`_RUN_ID_HEX_CHARS` hex characters of random bytes.
+
+        Every spawn identity comes from here, which is the point -- one draw site
+        is what lets the width be a single number.
+
+        The width carries the uniqueness on its own, with nothing to remember and
+        nothing to read. At 8 characters the id was 32 bits, so 2000 spawns on
+        one host collided about once in 2,100 times, and the collision did not
+        read as one: identity is assigned before registration, so the caller was
+        handed the id and the accept then failed on the duplicate primary key,
+        reaching the user as ``task store write failed`` -- naming a subsystem
+        that was working correctly. 64 bits puts that at about 1 in 10**13.
+
+        Drawn from ``os.urandom`` rather than a ``uuid4`` prefix. A v4 UUID spends
+        its 13th hex character on the fixed version digit ``4``, so the first 16
+        characters of one carry 60 random bits, not 64 -- a 16-fold worse bound
+        than the width advertises, from a detail no reader of the slice can see.
+
+        A checked narrow draw would need to know which ids are taken, and a
+        durable task row outlives the process that wrote it, so it would have to
+        ask the store -- which the spawn path cannot do, because taking a
+        task-store connection on the event loop stalls every session's turn
+        (:mod:`kiro_crew.on_loop_db` refuses it). Widening removes the question.
+        """
+        return os.urandom(_RUN_ID_HEX_CHARS // 2).hex()
 
     async def _redeliver_boundary_report_payloads(self, parent: str, owner: str) -> bool:
         """Retry retained terminal payloads for one live stage boundary."""
@@ -3855,7 +4080,7 @@ class SubagentManager:
                     self._batch_progress_ts[batch_id] = time.time()
                 return self._announce_rejection(
                     SubagentInfo(
-                        id=kwargs.get("_preassigned_id") or uuid.uuid4().hex[:8],
+                        id=kwargs.get("_preassigned_id") or self._mint_agent_id(),
                         task=_redact(task),
                         parent_session_key=parent,
                         agent=str(kwargs.get("agent") or ""),
@@ -4647,6 +4872,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     VERDICT_UNKNOWN,
     VERDICT_WORKING,
     _AGENT_NAME_RE,
+    _SAMPLE_MAX_AGE_SECS,
     _agent_dir,
     _cleanup_session_files_sync,
     _subagents_dir,
@@ -4657,6 +4883,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     annotate_model_fallback,
     append_cost_sample,
     append_fallback_story,
+    cap_buckets,
     apply_completion_keep,
     asyncio,
     cached_admission_check,
@@ -4664,8 +4891,13 @@ _COMPONENT_GLOBAL_BINDINGS = (
     clear_tombstone,
     compact_cost_log,
     configured_fallback_chain,
+    _cost_bucket,
     consult_offloaded,
+    cost_log_identity,
     create_agent_folder,
+    learned_cost_for,
+    read_learned_costs,
+    read_learned_costs_checked,
     evict_completed_agents,
     extract_options,
     fire_tool_hooks,
@@ -4691,7 +4923,6 @@ _COMPONENT_GLOBAL_BINDINGS = (
     time,
     transient_retry_delay,
     update_state,
-    uuid,
     window_for_provider_client,
     write_result_chunk,
     write_tombstone,

@@ -589,7 +589,7 @@ class TestRunPathDoesNotPreTruncate:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_produce):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _rows(tmp_path, job.id)
         assert row["summary"] == result
@@ -612,7 +612,7 @@ class TestRunPathDoesNotPreTruncate:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_produce):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _rows(tmp_path, job.id)
         assert len(row["summary"]) <= _SUMMARY_CAP

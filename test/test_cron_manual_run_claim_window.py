@@ -1,14 +1,14 @@
 """Cancel must reach a manual run from the instant Run accepted it.
 
-``POST /api/crons/{id}/run`` stores the task it creates in ``_running_tasks``
+``POST /api/crons/{id}/run`` hands the task it creates to the job's run claim
 and returns; ``CronService.run_job`` then sits in its first ``await`` -- the
 offloaded ``_synced_snapshot``, up to a full store-lock spin. ``cancel()``'s
-guard reads only ``_executing``, so a claim that reaches ``_executing`` only
-after that await opens a window in which ``POST /api/crons/{id}/cancel``
-answers 409 "job is not running" while a second Run answers 409 "job is
-already running" about the same job, and the run then executes anyway. The
-claim is therefore taken synchronously while ``run_job(job_id)`` is evaluated,
-before the route's ``create_task`` has scheduled anything.
+guard reads that claim, so a claim taken only after that await opens a window
+in which ``POST /api/crons/{id}/cancel`` answers 409 "job is not running"
+while a second Run answers 409 "job is already running" about the same job,
+and the run then executes anyway. The claim is therefore taken synchronously
+while ``run_job(job_id)`` is evaluated, before the route's ``create_task`` has
+scheduled anything.
 
 The window is only open while the snapshot is held, which no product route
 holds on demand, so this harness is the bar: a gate parks ``run_job``'s
@@ -32,7 +32,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from kiro_crew import cron as cron_module
-from kiro_crew.cron import CronJob, CronService, _RunMarkers
+from kiro_crew.cron import CronJob, CronService, _RunClaim, _RunMarkers
 from kiro_crew.cron_inflight import clear_marker as _clear_marker
 from kiro_crew.cron_inflight import read_markers
 from kiro_crew.dashboard.handlers.cron import api_cron_cancel, api_cron_run
@@ -69,28 +69,36 @@ async def _parked(event: threading.Event, message: str) -> None:
     assert await asyncio.to_thread(event.wait, _HANDOFF_TIMEOUT), message
 
 
-class _TrackedTasks(dict):  # type: ignore[type-arg]
-    """``_running_tasks`` that reports the pop ``cancel()`` makes of a live wrapper.
+class _TrackedClaims(dict):  # type: ignore[type-arg]
+    """``_claims`` that reports the release ``cancel()`` makes of a live wrapper's claim.
 
-    ``cancel()`` pops the tracked task, cancels it and discards ``_executing``
-    in one synchronous step and then yields to its persist; the wrapper's
-    cancellation is delivered at the next loop step. The event is set inside
-    the pop, BEFORE that ``task.cancel()``, so the waiter's wake-up is
-    registered ahead of the wrapper's and ``call_soon`` callbacks run in
-    registration order: a test awaiting :attr:`live_popped` resumes in the step
-    after ``cancel()``'s release, with the wrapper's teardown still queued
-    behind it -- no polling, no sleep.
+    ``cancel()`` pops the taken claim and cancels its task in one synchronous
+    step and then yields to its persist; the wrapper's cancellation is
+    delivered at the next loop step. The event is set inside the release,
+    BEFORE that ``task.cancel()``, so the waiter's wake-up is registered ahead
+    of the wrapper's and ``call_soon`` callbacks run in registration order: a
+    test awaiting :attr:`live_popped` resumes in the step after ``cancel()``'s
+    release, with the wrapper's teardown still queued behind it -- no polling,
+    no sleep.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.live_popped = asyncio.Event()
 
-    def pop(self, key: str, *default: Any) -> Any:
-        task = super().pop(key, *default)
+    def _report(self, claim: Any) -> None:
+        task = getattr(claim, "task", None)
         if task is not None and not task.done():
             self.live_popped.set()
-        return task
+
+    def __delitem__(self, key: str) -> None:
+        self._report(self.get(key))
+        super().__delitem__(key)
+
+    def pop(self, key: str, *default: Any) -> Any:
+        claim = super().pop(key, *default)
+        self._report(claim)
+        return claim
 
 
 def _make_state(svc: CronService) -> MagicMock:
@@ -267,7 +275,7 @@ class TestCancelInsideTheClaimWindow:
                 async with TestClient(TestServer(_make_app(state))) as client:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
-                    wrapper = svc._running_tasks[job.id]
+                    wrapper = svc._claims[job.id].task
                     await _parked(gate.parked, "run_job never reached its store refresh")
 
                     # Inside the window Run says the job is already running ...
@@ -291,9 +299,7 @@ class TestCancelInsideTheClaimWindow:
         # The pending run was cancelled, not executed, and left no marker behind.
         assert wrapper is not None and wrapper.cancelled()
         assert executed == []
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
-        assert job.id not in svc._job_run_meta
+        assert job.id not in svc._claims
         assert not svc._cancelled_jobs._marks
         assert job.last_status == "error"
         assert (job.last_error or "").startswith("Cancelled by user")
@@ -341,7 +347,7 @@ class TestCancelInsideTheClaimWindow:
             async with TestClient(TestServer(_make_app(state))) as client:
                 run = await client.post(f"/api/crons/{job.id}/run")
                 assert run.status == 200
-                wrapper = svc._running_tasks[job.id]
+                wrapper = svc._claims[job.id].task
                 wrapper.add_done_callback(lambda _t: resumed.set())
                 await _parked(gate.parked, "run_job never reached its store refresh")
 
@@ -354,9 +360,7 @@ class TestCancelInsideTheClaimWindow:
             dispatched == []
         ), f"the run was dispatched {dispatched!r} while cancel() was tearing it down"
         assert wrapper.done() and not wrapper.cancelled() and wrapper.result() is False
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
-        assert job.id not in svc._job_run_meta
+        assert job.id not in svc._claims
         assert not svc._cancelled_jobs._marks
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 1
@@ -368,20 +372,20 @@ class TestCancelInsideTheClaimWindow:
     ) -> None:
         """A Run accepted while cancel() tears down the previous one keeps its claim.
 
-        cancel() pops ``_running_tasks``, cancels the parked wrapper and discards
-        ``_executing`` in one synchronous step, then yields to persist. The
-        cancelled wrapper's teardown -- the ``except`` around its refresh -- runs
-        at the wrapper's next scheduling, so a Run landing between the two passes
-        the route's guard and claims the job first. The teardown must see that
-        the stored claim is not its own and leave it alone; releasing it anyway
-        erases the replacement run's ``_executing`` entry and meta, so that run is
-        either dropped by its own claim re-check after the route answered
-        "started", or executes with Cancel answering 409 "job is not running".
+        cancel() pops the taken claim and cancels the parked wrapper in one
+        synchronous step, then yields to persist. The cancelled wrapper's
+        teardown -- the ``except`` around its refresh -- runs at the wrapper's
+        next scheduling, so a Run landing between the two passes the route's
+        guard and claims the job first. The teardown must see that the stored
+        claim is not its own and leave it alone; releasing it anyway erases the
+        replacement run's claim, so that run is either dropped by its own claim
+        re-check after the route answered "started", or executes with Cancel
+        answering 409 "job is not running".
 
-        The handoff is the pop itself: ``_TrackedTasks`` sets an event inside
-        cancel()'s pop, ahead of its ``task.cancel()``, so this coroutine is
-        registered to resume before the wrapper is (callbacks run in
-        registration order). The replacement is then driven through the real
+        The handoff is the release itself: ``_TrackedClaims`` sets an event
+        inside cancel()'s release, ahead of its ``task.cancel()``, so this
+        coroutine is registered to resume before the wrapper is (callbacks run
+        in registration order). The replacement is then driven through the real
         route without yielding -- its fresh-store lookup is made await-free
         (``_run_inside_the_gap``) -- so it claims the job before the wrapper's
         teardown gets its turn.
@@ -396,8 +400,8 @@ class TestCancelInsideTheClaimWindow:
             return None
 
         svc, job = await _service(tmp_path, on_job)
-        tracked_tasks = _TrackedTasks()
-        svc._running_tasks = tracked_tasks
+        tracked_claims = _TrackedClaims()
+        svc._claims = tracked_claims
         gate = _SnapshotGate(svc)
         state = _make_state(svc)
         app = _make_app(state)
@@ -406,12 +410,12 @@ class TestCancelInsideTheClaimWindow:
                 async with TestClient(TestServer(app)) as client:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
-                    first = svc._running_tasks[job.id]
+                    first = svc._claims[job.id].task
                     await _parked(gate.parked, "run_job never reached its store refresh")
 
                     cancelling = asyncio.ensure_future(client.post(f"/api/crons/{job.id}/cancel"))
-                    await asyncio.wait_for(tracked_tasks.live_popped.wait(), _HANDOFF_TIMEOUT)
-                    assert job.id not in svc._executing and job.id not in svc._running_tasks
+                    await asyncio.wait_for(tracked_claims.live_popped.wait(), _HANDOFF_TIMEOUT)
+                    assert job.id not in svc._claims
                     assert (
                         not first.done()
                     ), "the cancelled wrapper tore down before cancel() yielded"
@@ -419,18 +423,18 @@ class TestCancelInsideTheClaimWindow:
                     # Inside the gap: the replacement Run is accepted and claims the job.
                     replacement = await _run_inside_the_gap(svc, app, job.id)
                     assert replacement.status == 200
-                    second = svc._running_tasks[job.id]
+                    second = svc._claims[job.id].task
                     assert second is not first
-                    claim = svc._job_run_meta[job.id]
-                    assert claim[1] == "manual"
+                    claim = svc._claims[job.id]
+                    assert claim.trigger == "manual"
 
                     # Now the first wrapper's teardown runs, with a claim that is not its own.
                     await _settled(first)
                     assert first.cancelled()
-                    assert svc.is_running(job.id) and svc._job_run_meta.get(job.id) is claim, (
+                    assert svc.is_running(job.id) and svc._claims.get(job.id) is claim, (
                         "the cancelled wrapper's teardown erased the replacement run's claim: "
-                        f"_executing={sorted(svc._executing)!r}, "
-                        f"run meta={svc._job_run_meta.get(job.id)!r}"
+                        f"claims={sorted(svc._claims)!r}, "
+                        f"stored claim={svc._claims.get(job.id)!r}"
                     )
                     cancel = await cancelling
                     assert cancel.status == 200
@@ -450,9 +454,7 @@ class TestCancelInsideTheClaimWindow:
                 gate.release.set()
 
         assert second.done() and not second.cancelled() and second.result() is True
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
-        assert job.id not in svc._job_run_meta
+        assert job.id not in svc._claims
         assert not svc._cancelled_jobs._marks
         assert (job.last_error or "").startswith("Cancelled by user")
         runs, total = await svc._history.get_job_history(job.id)
@@ -466,14 +468,14 @@ class TestCancelInsideTheClaimWindow:
     ) -> None:
         """A Run accepted while a cancelled run is still finalizing keeps its claim.
 
-        cancel() releases the run it found -- meta, start stamps, ``_executing``,
-        ``_running_tasks`` -- and that run's own ``finally`` then spends a full
-        executor round trip (``cron_inflight.clear_marker``) before its marker
-        pops, so a Run accepted through the real route during that trip claims
-        the job first. The prior run's finalizer must leave that claim alone:
-        popping it anyway drops the replacement's ``_executing`` entry, run meta
-        and tracked task, so its claim re-check returns without dispatching after
-        the route answered "started" -- or, past the re-check, it runs with Cancel
+        cancel() takes the run it found and then pops its claim -- start stamp,
+        tracked task and all -- and that run's own ``finally`` then spends a
+        full executor round trip (``cron_inflight.clear_marker``) before its
+        release, so a Run accepted through the real route during that trip
+        claims the job first. The prior run's finalizer must leave that claim
+        alone: popping it anyway drops the replacement's claim and tracked task,
+        so its claim re-check returns without dispatching after the route
+        answered "started" -- or, past the re-check, it runs with Cancel
         answering 409 and a further Run accepted beside it.
         """
         started = asyncio.Event()
@@ -501,7 +503,7 @@ class TestCancelInsideTheClaimWindow:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
                     await asyncio.wait_for(started.wait(), _HANDOFF_TIMEOUT)
-                    prior = svc._running_tasks[job.id]
+                    prior = svc._claims[job.id].task
                     started.clear()
 
                     # Cancel releases the run and cancels it; its finalizer parks
@@ -512,8 +514,7 @@ class TestCancelInsideTheClaimWindow:
                         clearing.parked, "the cancelled run never reached its marker clear"
                     )
                     assert not prior.done()
-                    assert job.id not in svc._executing
-                    assert job.id not in svc._running_tasks
+                    assert job.id not in svc._claims
 
                     # The replacement is accepted through the real route and claims the job.
                     replacement = await client.post(f"/api/crons/{job.id}/run")
@@ -521,9 +522,9 @@ class TestCancelInsideTheClaimWindow:
                     await _parked(
                         snapshot.parked, "the replacement run never reached its store refresh"
                     )
-                    claim = svc._job_run_meta[job.id]
-                    assert claim[1] == "manual"
-                    tracked = svc._running_tasks[job.id]
+                    claim = svc._claims[job.id]
+                    assert claim.trigger == "manual"
+                    tracked = svc._claims[job.id].task
                     assert tracked is not prior
 
                     # Now the prior run's finalizer pops, holding a claim that is not its own.
@@ -532,13 +533,12 @@ class TestCancelInsideTheClaimWindow:
                     assert prior.cancelled()
                     assert (
                         svc.is_running(job.id)
-                        and svc._job_run_meta.get(job.id) is claim
-                        and svc._running_tasks.get(job.id) is tracked
+                        and svc._claims.get(job.id) is claim
+                        and svc._claims[job.id].task is tracked
                     ), (
                         "the prior run's finalizer erased the replacement run's claim: "
-                        f"_executing={sorted(svc._executing)!r}, "
-                        f"run meta={svc._job_run_meta.get(job.id)!r}, "
-                        f"tracked={sorted(svc._running_tasks)!r}"
+                        f"claims={sorted(svc._claims)!r}, "
+                        f"stored claim={svc._claims.get(job.id)!r}"
                     )
 
                     # The replacement dispatches, and Cancel reaches it.
@@ -557,11 +557,7 @@ class TestCancelInsideTheClaimWindow:
                 snapshot.release.set()
 
         assert tracked.done() and not tracked.cancelled() and tracked.result() is True
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
-        assert job.id not in svc._job_run_meta
-        assert job.id not in svc._job_start_times
-        assert job.id not in svc._job_start_monotonic
+        assert job.id not in svc._claims
         assert not svc._cancelled_jobs._marks
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 2
@@ -603,7 +599,7 @@ class TestCancelInsideTheClaimWindow:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
                     await asyncio.wait_for(started.wait(), _HANDOFF_TIMEOUT)
-                    prior = svc._running_tasks[job.id]
+                    prior = svc._claims[job.id].task
                     started.clear()
                     (prior_marker,) = read_markers(tmp_path)
                     assert prior_marker.job_id == job.id
@@ -621,7 +617,7 @@ class TestCancelInsideTheClaimWindow:
                     assert replacement.status == 200
                     await asyncio.wait_for(started.wait(), _HANDOFF_TIMEOUT)
                     assert executed == [job.id, job.id]
-                    tracked = svc._running_tasks[job.id]
+                    tracked = svc._claims[job.id].task
                     assert tracked is not prior
                     # Two files now: the token in each name is what tells them
                     # apart (their start stamps can be equal on a coarse clock).
@@ -649,8 +645,7 @@ class TestCancelInsideTheClaimWindow:
                 clearing.release.set()
 
         assert read_markers(tmp_path) == []
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
+        assert job.id not in svc._claims
         assert not svc._cancelled_jobs._marks
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 2
@@ -690,8 +685,8 @@ class TestCancelInsideTheClaimWindow:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
                     await asyncio.wait_for(started.wait(), _HANDOFF_TIMEOUT)
-                    prior = svc._running_tasks[job.id]
-                    prior_claim = svc._job_run_meta[job.id]
+                    prior = svc._claims[job.id].task
+                    prior_claim = svc._claims[job.id]
                     started.clear()
 
                     # Cancel the first run: its finalizer parks in the marker
@@ -709,9 +704,9 @@ class TestCancelInsideTheClaimWindow:
                     assert replacement.status == 200
                     await asyncio.wait_for(started.wait(), _HANDOFF_TIMEOUT)
                     assert executed == [job.id, job.id]
-                    later = svc._running_tasks[job.id]
+                    later = svc._claims[job.id].task
                     assert later is not prior
-                    later_claim = svc._job_run_meta[job.id]
+                    later_claim = svc._claims[job.id]
                     cancel_again = await client.post(f"/api/crons/{job.id}/cancel")
                     assert cancel_again.status == 200
                     assert (await cancel_again.json())["ok"] is True
@@ -744,9 +739,7 @@ class TestCancelInsideTheClaimWindow:
                 clearing.release_all()
 
         assert not svc._cancelled_jobs._marks
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
-        assert job.id not in svc._job_run_meta
+        assert job.id not in svc._claims
         runs, total = await svc._history.get_job_history(job.id)
         assert [r["status"] for r in runs] == ["cancelled", "cancelled"], (
             "the replacement run appended a row after its cancelled row: "
@@ -764,7 +757,7 @@ class TestCancelInsideTheClaimWindow:
         awaits its result merge and history append; the manual wrapper awaiting
         that task resumes only once it is done. A Run accepted in between claims
         the job, and the wrapper's backstop -- there for a finally cut short --
-        must not discard that run's ``_executing`` entry or its tracked task.
+        must not discard that run's claim or its tracked task.
         The gap is held open by parking the first run's merge in its worker.
         """
         executed: list[str] = []
@@ -788,19 +781,19 @@ class TestCancelInsideTheClaimWindow:
                 async with TestClient(TestServer(_make_app(state))) as client:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
-                    first = svc._running_tasks[job.id]
+                    first = svc._claims[job.id].task
                     # The first run has released its claim and parks in its merge;
                     # its wrapper resumes only once that merge and the history
                     # append are done.
                     await _parked(merging.parked, "the first run never reached its result merge")
-                    assert job.id not in svc._executing and job.id not in svc._running_tasks
+                    assert job.id not in svc._claims
                     assert not first.done(), "the wrapper resumed before its run's finally ended"
 
                     # Inside the gap: the replacement Run is accepted and claims the job.
                     replacement = await client.post(f"/api/crons/{job.id}/run")
                     assert replacement.status == 200
-                    second = svc._running_tasks[job.id]
-                    claim = svc._job_run_meta[job.id]
+                    second = svc._claims[job.id].task
+                    claim = svc._claims[job.id]
                     await _parked(
                         gate.parked, "the replacement run never reached its store refresh"
                     )
@@ -811,13 +804,12 @@ class TestCancelInsideTheClaimWindow:
                     assert first.result() is True
                     assert (
                         svc.is_running(job.id)
-                        and svc._job_run_meta.get(job.id) is claim
-                        and svc._running_tasks.get(job.id) is second
+                        and svc._claims.get(job.id) is claim
+                        and svc._claims[job.id].task is second
                     ), (
                         "the first wrapper's backstop erased the replacement run's claim: "
-                        f"_executing={sorted(svc._executing)!r}, "
-                        f"run meta={svc._job_run_meta.get(job.id)!r}, "
-                        f"tracked={sorted(svc._running_tasks)!r}"
+                        f"claims={sorted(svc._claims)!r}, "
+                        f"stored claim={svc._claims.get(job.id)!r}"
                     )
                     gate.release.set()
                     await _settled(second)
@@ -827,9 +819,7 @@ class TestCancelInsideTheClaimWindow:
 
         assert executed == [job.id, job.id]
         assert second.result() is True
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
-        assert job.id not in svc._job_run_meta
+        assert job.id not in svc._claims
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 2
         assert [r["status"] for r in runs] == ["success", "success"]
@@ -872,12 +862,12 @@ class TestCancelInsideTheClaimWindow:
                 async with TestClient(TestServer(_make_app(state))) as client:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
-                    prior = svc._running_tasks[job.id]
+                    prior = svc._claims[job.id].task
                     # The first run completes, releases its claim, and parks in
                     # its merge with its history append still ahead of it.
                     await _parked(merging.parked, "the first run never reached its result merge")
                     assert not prior.done()
-                    assert job.id not in svc._executing
+                    assert job.id not in svc._claims
 
                     # The replacement is accepted and starts executing on the
                     # same job object: its _execute has reset the status fields.
@@ -885,7 +875,7 @@ class TestCancelInsideTheClaimWindow:
                     assert replacement.status == 200
                     await asyncio.wait_for(started.wait(), _HANDOFF_TIMEOUT)
                     assert calls == 2
-                    tracked = svc._running_tasks[job.id]
+                    tracked = svc._claims[job.id].task
                     assert tracked is not prior
 
                     # Now the first run's merge and history append run.
@@ -911,9 +901,7 @@ class TestCancelInsideTheClaimWindow:
             finally:
                 merging.release.set()
 
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
-        assert job.id not in svc._job_run_meta
+        assert job.id not in svc._claims
         runs, total = await svc._history.get_job_history(job.id)
         assert total == 2
         assert sorted(r["status"] for r in runs) == ["cancelled", "success"]
@@ -955,18 +943,18 @@ class TestCancelInsideTheClaimWindow:
                 async with TestClient(TestServer(_make_app(state))) as client:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
-                    prior = svc._running_tasks[job.id]
+                    prior = svc._claims[job.id].task
                     # The first run fails, releases its claim, and parks in its
                     # merge -- the store lock is still ahead of it.
                     await _parked(merging.parked, "the first run never reached its result merge")
                     assert not prior.done()
-                    assert job.id not in svc._executing
+                    assert job.id not in svc._claims
 
                     # The replacement is accepted, succeeds, and its merge
                     # lands while the first run's is still pending.
                     replacement = await client.post(f"/api/crons/{job.id}/run")
                     assert replacement.status == 200
-                    tracked = svc._running_tasks[job.id]
+                    tracked = svc._claims[job.id].task
                     assert tracked is not prior
                     await _settled(tracked)
                     assert calls == 2 and merging.calls == 2
@@ -1002,7 +990,7 @@ class TestCancelInsideTheClaimWindow:
     ) -> None:
         """``cancel()``'s terminal merge sits behind its release too, and is fenced the same way.
 
-        ``cancel()`` pops the tracked task and the ``_executing`` entry, then
+        ``cancel()`` pops the taken claim with its tracked task, then
         persists its "Cancelled by user" record through an offloaded
         ``_merge_terminal_state_locked``. A Run accepted between the two can
         complete and merge first; the cancel's record then has to be
@@ -1030,20 +1018,20 @@ class TestCancelInsideTheClaimWindow:
                 async with TestClient(TestServer(_make_app(state))) as client:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
-                    prior = svc._running_tasks[job.id]
+                    prior = svc._claims[job.id].task
                     await asyncio.wait_for(started.wait(), _HANDOFF_TIMEOUT)
 
                     # Cancel releases the run, then parks in its terminal merge.
                     cancelling = asyncio.ensure_future(client.post(f"/api/crons/{job.id}/cancel"))
                     await _parked(merging.parked, "cancel() never reached its terminal merge")
-                    assert job.id not in svc._executing
+                    assert job.id not in svc._claims
                     assert not cancelling.done()
 
                     # The replacement is accepted, succeeds, and its merge
                     # lands while the cancel's is still pending.
                     replacement = await client.post(f"/api/crons/{job.id}/run")
                     assert replacement.status == 200
-                    tracked = svc._running_tasks[job.id]
+                    tracked = svc._claims[job.id].task
                     assert tracked is not prior
                     await _settled(tracked)
                     assert calls == 2
@@ -1122,11 +1110,11 @@ class TestCancelInsideTheClaimWindow:
                 async with TestClient(TestServer(_make_app(state))) as client:
                     run = await client.post(f"/api/crons/{job.id}/run")
                     assert run.status == 200
-                    prior = svc._running_tasks[job.id]
+                    prior = svc._claims[job.id].task
                     # The one-shot completes and parks in its merge: the delete
                     # that retires it is still ahead.
                     await _parked(merging.parked, "the one-shot never reached its result merge")
-                    assert job.id not in svc._executing
+                    assert job.id not in svc._claims
 
                     # A replacement Run is accepted (the job is still enabled --
                     # the consume is what retires it), then cancelled: its
@@ -1134,7 +1122,7 @@ class TestCancelInsideTheClaimWindow:
                     replacement = await client.post(f"/api/crons/{job.id}/run")
                     assert replacement.status == 200
                     await asyncio.wait_for(started.wait(), _HANDOFF_TIMEOUT)
-                    tracked = svc._running_tasks[job.id]
+                    tracked = svc._claims[job.id].task
                     cancel = await client.post(f"/api/crons/{job.id}/cancel")
                     assert cancel.status == 200
                     await _settled(tracked)
@@ -1180,7 +1168,7 @@ class TestCancelInsideTheClaimWindow:
         async with TestClient(TestServer(_make_app(state))) as client:
             run = await client.post(f"/api/crons/{job.id}/run")
             assert run.status == 200
-            wrapper = svc._running_tasks[job.id]
+            wrapper = svc._claims[job.id].task
             await asyncio.wait_for(started.wait(), _HANDOFF_TIMEOUT)
             assert svc.is_running(job.id)
 
@@ -1190,8 +1178,7 @@ class TestCancelInsideTheClaimWindow:
             await _settled(wrapper)
 
         assert executed == [job.id]
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
+        assert job.id not in svc._claims
         assert not svc._cancelled_jobs._marks
         assert (job.last_error or "").startswith("Cancelled by user")
         runs, total = await svc._history.get_job_history(job.id)
@@ -1205,18 +1192,20 @@ class TestCancelInsideTheClaimWindow:
     ) -> None:
         """Cancel between the due-scan's ``create_task`` and that task's first step.
 
-        The due-scan claims the job -- ``_executing``, the run meta, the tracked
-        task -- synchronously and returns with the task still unstarted; a Cancel
-        whose handler was queued behind the timer step runs next. ``cancel()``
-        finds the claim, pops the meta, marks the cancellation for THAT tuple,
-        and then awaits the process kill before it reaches ``task.cancel()``:
-        that await is the loop iteration in which the unstarted task takes its
-        first step. A task that reads its meta from the store there reads None,
-        runs on until the cancellation lands, and its finally asks the markers
-        about None -- the marker, keyed to the popped tuple, misses, and the run
-        is filed as a failure beside the cancelled row ``cancel()`` writes. The
-        dispatcher hands the claim to the task instead; a first step that finds
-        the claim gone does nothing: no stamps, no marker file, no second row.
+        The due-scan claims the job -- one claim carrying the trigger, the
+        start stamp and the tracked task -- synchronously and returns with the
+        task still unstarted; a Cancel whose handler was queued behind the timer
+        step runs next. ``cancel()`` finds the claim, takes it, marks the
+        cancellation for THAT claim, and then awaits the process kill before it
+        reaches ``task.cancel()``: that await is the loop iteration in which the
+        unstarted task takes its first step. A task that read its claim back
+        from the store there would find one that is not its own, run on
+        until the cancellation lands, and its finally would ask the markers
+        about the wrong run -- the marker, keyed to the taken claim, misses, and
+        the run is filed as a failure beside the cancelled row ``cancel()``
+        writes. The dispatcher hands the claim to the task instead; a first step
+        that finds the claim taken does nothing: no stamps, no marker file, no
+        second row.
         """
         executed: list[str] = []
 
@@ -1253,10 +1242,10 @@ class TestCancelInsideTheClaimWindow:
             await svc._on_timer()
             # The scan has claimed the job and created its task; the task has
             # not run, and this coroutine has not yielded since the scan returned.
-            assert job.id in svc._executing
-            task = svc._running_tasks[job.id]
-            claim = svc._job_run_meta[job.id]
-            assert claim[1] == "scheduled"
+            assert job.id in svc._claims
+            task = svc._claims[job.id].task
+            claim = svc._claims[job.id]
+            assert claim.trigger == "scheduled"
             assert not first_step
             # The Cancel route is await-free up to cancel(), which pops the claim
             # and marks it before its first await -- the process-kill executor
@@ -1283,26 +1272,23 @@ class TestCancelInsideTheClaimWindow:
         )
         assert executed == [], "the cancelled-before-start run executed"
         assert task.done()
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
-        assert job.id not in svc._job_run_meta
+        assert job.id not in svc._claims
         assert not svc._cancelled_jobs._marks, "the run's cancel marker was never consumed"
-        # Nothing the release fence would have had to leave behind: the task
-        # stamped nothing, so no start stamp or jitter outlives the release. A
-        # task handed the claim but not re-checking it stamps all three, and
-        # the finally's fence (a claim that is not its own) then keeps them.
-        orphaned = {
-            name: stamps[job.id]
-            for name, stamps in (
-                ("_job_start_times", svc._job_start_times),
-                ("_job_start_monotonic", svc._job_start_monotonic),
-                ("_job_jitter", svc._job_jitter),
+        # The task stamped nothing: a task handed the claim but not re-checking
+        # it would have drawn a generation and stamped the monotonic start and
+        # the jitter on a claim that is not its own to release.
+        stamped = {
+            name: value
+            for name, value in (
+                ("generation", claim.generation),
+                ("started_monotonic", claim.started_monotonic),
+                ("jitter", claim.jitter),
             )
-            if job.id in stamps
+            if value is not None
         }
-        assert not orphaned, (
-            "the cancelled-before-start run stamped state its own finally can no "
-            f"longer release: {orphaned!r}"
+        assert not stamped, (
+            "the cancelled-before-start run stamped state on a claim its own finally "
+            f"could no longer release: {stamped!r}"
         )
         assert read_markers(tmp_path) == []
         assert (job.last_error or "").startswith("Cancelled by user")
@@ -1311,22 +1297,21 @@ class TestCancelInsideTheClaimWindow:
 class TestRunJobClaim:
     @pytest.mark.asyncio
     async def test_claim_is_taken_when_run_job_is_called(self, tmp_path: Path) -> None:
-        """``_executing`` and the manual run meta exist before the first await."""
+        """The manual run's claim exists before the first await."""
         svc, job = await _service(tmp_path, None)
 
-        async def fake_run(job: CronJob, meta: tuple[float, str] | None = None) -> None:
-            assert meta is svc._job_run_meta[job.id]  # the wrapper hands the task its claim
+        async def fake_run(job: CronJob, claim: _RunClaim) -> None:
+            assert claim is svc._claims[job.id]  # the wrapper hands the task its claim
 
         with patch.object(svc, "_run_job_isolated", side_effect=fake_run):
             before = time.time()
             pending = svc.run_job(job.id)
             assert svc.is_running(job.id)
-            started_at, trigger = svc._job_run_meta[job.id]
-            assert trigger == "manual"
-            assert before <= started_at <= time.time()
+            claim = svc._claims[job.id]
+            assert claim.trigger == "manual"
+            assert before <= claim.claimed_at <= time.time()
             assert await pending is True
-        assert job.id not in svc._executing
-        assert job.id not in svc._running_tasks
+        assert job.id not in svc._claims
 
     @pytest.mark.asyncio
     async def test_claim_is_released_when_the_store_has_no_such_job(self, tmp_path: Path) -> None:
@@ -1335,30 +1320,27 @@ class TestRunJobClaim:
         pending = svc.run_job("ghost")
         assert svc.is_running("ghost")
         assert await pending is False
-        assert "ghost" not in svc._executing
-        assert "ghost" not in svc._job_run_meta
+        assert "ghost" not in svc._claims
 
     @pytest.mark.asyncio
     async def test_a_job_already_executing_is_refused_and_its_claim_untouched(
         self, tmp_path: Path
     ) -> None:
         svc, job = await _service(tmp_path, None)
-        meta = (time.time() - 5, "scheduled")
-        svc._executing.add(job.id)
-        svc._job_run_meta[job.id] = meta
+        claim = svc._claim_run(job.id, "scheduled")
 
         assert await svc.run_job(job.id) is False
         assert svc.is_running(job.id)
-        assert svc._job_run_meta[job.id] is meta
+        assert svc._claims[job.id] is claim
 
 
 class TestRunMarkers:
     def test_markers_are_keyed_by_run_identity_not_equality(self) -> None:
-        """Two equal meta tuples are two runs: each marker is consumed by its own run only."""
+        """Two like-for-like claims are two runs: each marker is consumed by its own run only."""
         markers = _RunMarkers()
-        first = (1.0, "manual")
-        second = (first[0], first[1])  # built at runtime: equal, not the folded constant
-        assert first == second and first is not second
+        first = _RunClaim(trigger="manual", claimed_at=1.0, marker_run="same")
+        second = _RunClaim(trigger="manual", claimed_at=1.0, marker_run="same")
+        assert first is not second
 
         markers.mark("job", first)
         markers.mark("job", first)  # marking the same run twice is one marker

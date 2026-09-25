@@ -22,6 +22,11 @@ def tombstone_terminal_state(cause: str) -> str | None:
     return {
         "delivered": taskq.DONE,
         "user_stop": taskq.CANCELLED,
+        # A parent end and a stage cancel are deliberate stops like a user's,
+        # written by the same reap: the row they leave behind is cancelled, not
+        # a run to recover on the next boot.
+        "parent_end": taskq.CANCELLED,
+        "stage_cancel": taskq.CANCELLED,
         "cancelled": taskq.CANCELLED,
         "error": taskq.FAILED,
         "timeout": taskq.FAILED,

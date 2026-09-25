@@ -86,11 +86,15 @@ Four mechanisms clean up processes. They are complementary — not redundant.
    runtime and its per-session MCP servers for the whole timeout, so the live
    process count is the number of unreaped sessions times the servers each one
    spawns.
-   **Known limitation**: ``last_used`` is only bumped on ``get_or_create()``,
-   not on every LLM round-trip. A task runner step doing continuous work for
-   >60 min without a new ``get_or_create()`` call could be swept. This is
-   accepted for now to prevent runaway tasks, but may need a heartbeat or
-   persistent-key mechanism if longer steps become common.
+   Both axes also refuse a session whose turn permit is held: ``_expire_idle``
+   tests ``session.semaphore.locked()`` and skips before it reads the clock at
+   all, and each reset it does elect is asked to skip a busy session again. That
+   guard is what bounds how coarse ``last_used`` is allowed to be. The clock is
+   advanced by the allocation paths and by ``touch()``, not on every LLM
+   round-trip, so a task runner step working continuously for longer than
+   ``timeout_secs`` does carry a stale timestamp; it survives regardless,
+   because it holds its permit for the whole step. The clock therefore measures
+   one thing: how long a session with no turn in flight has been quiet.
 
 """
 
@@ -200,6 +204,7 @@ from kiro_crew.session_lifecycle import (
 from kiro_crew.session_map import _kiro_sessions_dir  # noqa: F401
 from kiro_crew.session_map import (
     MIRROR_OPT_OUT_FLAG,
+    SUPPRESS_REPLAY_FLAG,
     BindListener,
 )
 from kiro_crew.session_map import SessionMap as SessionMap  # noqa: F401
@@ -1559,6 +1564,14 @@ class SessionManager:
         self._registry_state().subagent_runtime_locks = value
 
     @property
+    def _draining_subagent_runtimes(self) -> list["AcpRuntime"]:
+        return self._registry_state().draining_subagent_runtimes
+
+    @_draining_subagent_runtimes.setter
+    def _draining_subagent_runtimes(self, value: list["AcpRuntime"]) -> None:
+        self._registry_state().draining_subagent_runtimes = value
+
+    @property
     def _continuable_keys(self) -> set[str]:
         return self._registry_state().continuable_keys
 
@@ -1795,6 +1808,15 @@ class SessionManager:
         # Installed by the dashboard once its state exists (set_subagent_probe);
         # None means "no dashboard, so no children can be attached".
         self._subagent_probe: "Callable[[str], bool | Awaitable[bool]] | None" = None
+        # Installed by the dashboard once the Kiro prerequisite service exists
+        # (its ``read_spawn_identity``); None means "no identity store to stamp
+        # from" -- CLI entry points and tests -- and every spawn stays unstamped,
+        # which is the pre-stamping status quo. When wired, each kiro-backed
+        # provider records the account the store held as its process started,
+        # so the turn gate can retire a child that provably spawned under a
+        # different account than the live one even when no read ever observed
+        # the interim (see ``flag_identity_stamp_mismatches``).
+        self.spawn_identity_reader: "Callable[[], Awaitable[str]] | None" = None
         # Installed by the gateway once it owns this manager (set_injection_probe);
         # None means "no gateway, so no completion injection can be in flight".
         self._injection_probe: "Callable[[str], bool] | None" = None
@@ -2056,6 +2078,14 @@ class SessionManager:
         """Delegate reaping of drained displaced runtimes."""
         await self._background_runtime._reap_drained_bg_runtimes_locked()
 
+    async def _detach_bg_runtime_locked(
+        self, runtime: "AcpRuntime", cause: str, *, park_only: bool = False
+    ) -> None:
+        """Delegate freeing the ``_bg`` slot (kill idle / park busy to drain)."""
+        await self._background_runtime._detach_bg_runtime_locked(
+            cast(Any, runtime), cause, park_only=park_only
+        )
+
     async def _displace_bg_runtime_locked(
         self, runtime: "AcpRuntime", cached_backend: str, configured_backend: str
     ) -> None:
@@ -2234,7 +2264,9 @@ class SessionManager:
         to ``_collect_active_pids``:
 
         - ``self._subagent_runtimes`` — companion runtimes multiplexing a parent
-          session's subagents (alive for the parent's whole lifetime).
+          session's subagents (alive for the parent's whole lifetime), plus any
+          ``_draining_subagent_runtimes`` displaced by the spawn-identity gate
+          while their in-flight work finishes.
         - ``self._bg_runtime`` — the background runtime backing ``get_bg_session``
           (kirocrew-lite title-gen / memory consolidation), plus any
           ``_draining_bg_runtimes`` displaced by a backend switch or by
@@ -2246,7 +2278,10 @@ class SessionManager:
         runtimes contribute — a dead entry SHOULD be reaped. Returns a copy.
         """
         pids: set[int] = set()
-        for runtime in list(self._subagent_runtimes.values()):
+        for runtime in [
+            *self._subagent_runtimes.values(),
+            *self._draining_subagent_runtimes,
+        ]:
             try:
                 if runtime is not None and runtime.is_alive() and isinstance(runtime.pid, int):
                     pids.add(runtime.pid)
@@ -2399,6 +2434,20 @@ class SessionManager:
         """Delegate context accounting and compaction triggering."""
         return self._compaction.check_context_usage(key, provider)
 
+    def effective_autocompact_pct(self, key: str) -> float:
+        """Delegate *key*'s live compaction threshold: its override, else the global.
+
+        The READ half of :meth:`set_autocompact_pct`, for a caller that must know
+        what a context reading fires at before it changes that reading's window.
+
+        Adopts a newly published threshold first, for the reason
+        :meth:`_compaction_gate_decision` does: that ladder reads the threshold at the
+        END of a turn while this answers a caller deciding BEFORE it, so a read that
+        skipped the sync would measure one turn against two different numbers.
+        """
+        self._sync_autocompact_pct()
+        return self._compaction.effective_autocompact_pct(key)
+
     def set_autocompact_pct(self, key: str, pct: float | None) -> None:
         """Set or clear (``None``) *key*'s per-session compaction threshold.
 
@@ -2535,11 +2584,22 @@ class SessionManager:
         which nobody asked for.
         """
         folded = self._fold_key(key)
+        # BOTH markers are consumed, and the persisted one unconditionally — never as
+        # the `elif` tail of the in-memory branch. A gateway uninstall sets both (an
+        # in-memory one via `discard_conversation(replay=False)` and a durable one via
+        # `suppress_replay_persistently`), so a chain that stops at the first hit
+        # leaves the disk flag standing and a LATER cold start of the NEW installation
+        # starts empty for no reason — turning a fix for stale history into silent
+        # amnesia about live history.
+        persisted = self._consume_persisted_replay_suppression(key, folded)
+        in_memory = False
         if key in self._suppress_replay:
             self._suppress_replay.discard(key)
+            in_memory = True
         elif folded in self._suppress_replay:
             self._suppress_replay.discard(folded)
-        else:
+            in_memory = True
+        if not (in_memory or persisted):
             return False
         # The session that consumed the suppression starts with no history, so
         # its first confirmed reading is this key's floor. Marked here, on the
@@ -2549,6 +2609,37 @@ class SessionManager:
         if session is not None:
             session.floor_pending = True
         return True
+
+    def _consume_persisted_replay_suppression(self, key: str, folded: str) -> bool:
+        """Read *and clear* the on-disk half of the suppression, for either alias.
+
+        The in-memory set cannot be the whole answer. Its two writers are different
+        processes — ``kirocrew app uninstall`` has no live manager at all — and it
+        does not survive a gateway restart, so a reinstall after either would replay
+        the removed app's transcript with nothing left to stop it. Cleared as it is
+        read, matching the in-memory branch: the FIRST cold start after the uninstall
+        starts empty, and a later idle-timeout expiry on that key does not.
+        """
+        found = False
+        for candidate in (folded, key) if folded != key else (key,):
+            if self._session_map.get_flag(candidate, SUPPRESS_REPLAY_FLAG):
+                self._session_map.set_flag(candidate, SUPPRESS_REPLAY_FLAG, False)
+                found = True
+        # `set_flag` schedules the debounced flush rather than forcing one. A crash
+        # inside that window leaves the flag set, and the next cold start on this key
+        # then starts empty a second time — recoverable, and the transcript is intact
+        # on disk. Forcing a synchronous write here would put a disk write on the
+        # event loop on every cold start after an uninstall, which is the larger cost.
+        return found
+
+    def suppress_replay_persistently(self, key: str) -> None:
+        """Mark *key*'s next cold start to start empty, durably.
+
+        Written through THIS manager's map rather than a throwaway one, for the
+        reason ``SessionMap``'s rule 3 gives: a detached write is reversed by the
+        live map's next mutation and takes its unflushed rows with it.
+        """
+        self._session_map.set_flag(self._fold_key(key), SUPPRESS_REPLAY_FLAG, True)
 
     def set_child_teardown_handler(self, handler: Any) -> None:
         """Register the hook that ends a parent's sub-agent runs at parent end.
@@ -2682,6 +2773,10 @@ class SessionManager:
     async def retire_kiro_identity_sessions(self, fingerprint: str = "") -> tuple[list[str], bool]:
         """Retire idle processes that loaded a superseded Kiro identity."""
         return await self._lifecycle_boundary().retire_kiro_identity_sessions(fingerprint)
+
+    async def flag_identity_stamp_mismatches(self, live: str) -> list[str]:
+        """Mark sessions whose child provably spawned under a different account."""
+        return await self._lifecycle_boundary().flag_identity_stamp_mismatches(live)
 
     async def _retire_kiro_warm_pool(self) -> bool:
         """Delegate pooled-provider retirement after identity change."""
@@ -2850,6 +2945,18 @@ class SessionManager:
         """
         return self._allocation_boundary().mapped_sid(key)
 
+    def mapped_session_keys(self) -> frozenset[str]:
+        """Every folded key this gateway holds a session ID for, in memory.
+
+        The in-memory answer, which is the only correct one for a caller that
+        goes on to WRITE through this manager: a detached ``SessionMap`` reads
+        the file, and the file lags this map by whatever it has not flushed, so
+        an enumeration taken there can omit a key whose pointer already exists.
+        Pair it with :meth:`session_keys` to cover a key whose allocation is
+        still in flight and has not reached the map yet.
+        """
+        return self._allocation_boundary().mapped_session_keys()
+
     def seed_conversation(self, key: str, sid: str, *, provider: str = "", cwd: str = "") -> None:
         """Seed a persisted conversation mapping."""
         self._allocation_boundary().seed_conversation(key, sid, provider=provider, cwd=cwd)
@@ -2906,9 +3013,22 @@ class SessionManager:
         """Consume a queued-message cancellation marker."""
         return self._allocation_boundary().is_cancelled(key, msg_ts)
 
-    def clear_queue(self, key: str) -> None:
-        """Clear queued messages and their temporary paths."""
-        self._allocation_boundary().clear_queue(key)
+    def clear_queue(self, key: str, owned_by: Callable[[dict], bool] | None = None) -> None:
+        """Clear queued messages and their temporary paths.
+
+        *owned_by* narrows the clear to the entries it selects, for a caller acting for
+        ONE principal rather than for the whole session: under
+        ``messaging.dm_scope = "unified"`` every allow-listed person's direct messages
+        share one key and therefore one queue, so clearing all of it on one person's
+        ``/stop`` discards messages other people are still waiting for an answer to. The
+        predicate reads a queue entry's keyword arguments and nothing here interprets
+        them, so which fields name a principal stays with the channels that wrote them
+        (``messaging/queue_drain.py``).
+
+        Omitted, the whole queue goes, which is what a whole-session request means:
+        teardown, a generation bump, a fresh conversation.
+        """
+        self._allocation_boundary().clear_queue(key, owned_by)
 
     async def is_provider_alive(self, key: str) -> bool | None:
         """Probe a folded session provider outside the registry lock."""

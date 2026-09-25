@@ -450,6 +450,15 @@ html:lang(ko) {
   --ctx-src-skillidx:color-mix(in srgb, #8f7bff 74%, var(--card));
   --ctx-src-tool:color-mix(in srgb, #b98cff 74%, var(--card));
   --ctx-src-mute:color-mix(in srgb, var(--text) 30%, var(--card));
+  /* The Context Breakdown chart stacks five plain-language categories; the
+     user's message rides the accent, memory reuses its source hue so the tree
+     and the chart agree, and rules / skills get hues of their own, mixed into
+     the surface like the sources above. */
+  --ctx-cat-message:var(--accent);
+  --ctx-cat-memory:var(--ctx-src-memory);
+  --ctx-cat-rules:color-mix(in srgb, #9266cc 74%, var(--card));
+  --ctx-cat-skills:color-mix(in srgb, #d9a12b 74%, var(--card));
+  --ctx-cat-other:var(--ctx-src-mute);
   /* Terminal ANSI hues with no semantic equivalent. The other fourteen entries
      are derived from --bg / --text / --danger / --ok / --warn / --info, which
      every theme already defines; only magenta and cyan need a value of their
@@ -1809,6 +1818,8 @@ file-tree-container{
 .scrollbar-overlay::-webkit-scrollbar-thumb{background:transparent;border-radius:9999px;transition:background .2s}
 .scrollbar-overlay:hover::-webkit-scrollbar-thumb{background:var(--muted)}
 .scrollbar-overlay:hover::-webkit-scrollbar-thumb:hover{background:var(--text)}
+/* Thinner reveal for the side-panel nav rail: 5px rather than the overlay utility's 6px, so the hover/touch hint reads as a hint, not a bar. Colour is unchanged (--muted, the accessibility-floor token), only the width narrows. */
+.scrollbar-overlay-thin::-webkit-scrollbar{width:5px}
 /* On touch the overlay utility would stay perpetually transparent: a finger never
    produces the :hover that restores the thumb. A coarse pointer shows a persistent
    thin thumb instead, so a capped scroll surface keeps a real affordance. Fine

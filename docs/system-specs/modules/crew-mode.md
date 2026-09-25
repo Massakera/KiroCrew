@@ -39,9 +39,12 @@ Missing history must never silently turn a private topic into Global memory.
 | `src/kiro_crew/dashboard/handlers/agent_templates.py` | The Agent templates tab's roster (`/api/agents/templates`), create, delete with reference guard, and the read-only rule the detail PATCH applies to definition edits |
 | `website/src/pages/overview/AgentTemplatesTab.tsx` | The **Agent templates** tab of `CapabilitiesPage`: list by origin, edit the shared definition, create, delete, chat-with / enroll |
 | `src/kiro_crew/dashboard/handlers/members.py` | `/api/members` roster, thread get-or-create, rules, activity |
+| `src/kiro_crew/crew_teams.py` + `src/kiro_crew/dashboard/handlers/teams.py` | Crewmate teams (`teams.json` in the masked gateway-only data-home directory `crew-teams`; `/api/teams`): the Crewmates page's roster grouping and team view — specified under [learn-cron-dashboard](learn-cron-dashboard.md) with the members handlers |
 | `website/src/pages/KiroCrewAgentsPage.tsx` | The Crews UI, mounted as the **Crews** tab of `CapabilitiesPage` (Agent Capabilities) |
 | `website/src/components/crew/crewEditorSections.ts` | The crew editor's pane registry, including the Routing pane that edits `triggers` |
 | `website/src/components/CrewWakeSection.tsx` | "What wakes this agent" — schedules, deliberately distinct from `triggers` |
+| `website/src/components/chat/crewmateBubbles.ts` | A crewmate's chat: what the transcript draws (`filterCrewmateChat`) and the run / corner rule for its bubbles (`crewmateRunPosition`, `crewmateBubbleClass`) |
+| `website/src/pages/chat/CrewmateMessage.tsx` | One crewmate message in its chat: author line on the run opener, bubble in the avatar gutter |
 
 Crew creation reports `409 agent_exists` for both an existing name and a
 concurrent name collision. The member-titled form uses its translated duplicate
@@ -105,6 +108,41 @@ projection exposes it, so a same-name member and template are distinct sessions.
 member DM thread's pin covers the namespace too: the same name picked as a template
 is refused like any other re-bind (`409 member_thread_agent_pinned`).
 Request and error contract: [learn-cron-dashboard](learn-cron-dashboard.md) → Chat.
+
+## Template names the harness cannot activate
+
+A crewmate's private copy is named after the crewmate, and a published or
+created template after the user's choice. Three name classes are taken before
+either lookup runs: a Windows device basename (`CON`, `NUL`, ...), a stem the
+runtime rebuilds on boot (`OWNED_KIRO_AGENT_FILES`, present or not), and an id
+the KAS engine keeps for itself (`agent_files.KAS_RESERVED_AGENT_IDS`:
+`default` plus the built-in mode ids `vibe`, `spec`, `quick-spec`, `bug-fix`,
+`plan`, `autonomous`). The last class exists because the seeded first crewmate
+is itself named `default`, and because kiro-cli's v3 engine accepts a
+`customAgents` batch under any of those ids without an error and then does not
+run it: `default` is left out of `availableModes`, so `session/set_mode` finds
+nothing to switch to; a built-in id keeps the engine's own definition
+(`origin: bundled`), so `set_mode` would activate the built-in with the
+crewmate's name on it. Measured on kiro-cli 2.23.0, with each injected entry
+carrying a distinctive description: every case variant (`Default`, `Vibe`,
+`PLAN`) and every collision with an on-disk `~/.kiro/agents/<id>.json`
+(`kirocrew-conductor`) registered the client entry (`origin: client`, the wire
+definition replacing the on-disk one), so the match is exact and
+case-sensitive. The fork suffixes past a reserved stem (`default-2`), publish
+and create refuse it as `400 template_name_reserved_by_engine` (its own code,
+so the runtime-owned stems' `template_name_reserved` is not blamed on the
+engine), and the KAS projection
+(`acp/kas_agents.to_client_custom_agent`) refuses the id before the wire with
+the remedy in the dashboard's own labels -- the crewmate's Agent Template tab;
+on the crewmate's own copy 'Save as new template…' under another name, which
+moves the crewmate to the copy and keeps its edits, or 'Reset my changes' to the
+shared template; on a shared template bound under a reserved id, where neither
+control renders, the template picker at the top of the tab -- raised without the generic
+`cannot project agent ... onto KAS` prefix (`KasReservedAgentIdError`), instead of letting the activation guard report the spec as
+missing or a built-in run in the crewmate's place. The dashboard renders the
+refusal in the user's language inside the dialog that sent the name
+(`components.agentTemplateDetail.publish_name_reserved`,
+`pages.overview.agentTemplatesTab.err_name_reserved`), naming the typed name.
 
 ## Agent templates tab
 
@@ -803,6 +841,299 @@ Settings content — the built-from template, wake sources and schedules, the
 memory binding, cloud — lives only on the crew editor / detail page.
 Operator-facing memory diagnostics never render in the panel.
 
+## One-time prune of sync-generated crewmates (startup migration)
+
+Older dashboards called `POST /api/agents/sync` on every chat mount, and that
+sync enrolled every user-authored spec under `~/.kiro/agents` as a crewmate — a
+`config.agents` row with no `member_id`, on the shared `default` memory store,
+bound to the spec by name. An existing install therefore carries one crewmate
+per custom agent, most never opened. `crewmate_prune_migration.py` runs once at
+dashboard startup (`start_dashboard`: kicked as a tracked background task
+right after the listener binds — `_kick_crewmate_prune`, the same shape as the
+other post-bind `_kick_*` calls — and awaited by nothing on the startup path,
+so a scan whose cost scales with the session count never gates readiness. The
+slot restores do not wait for it either: a row the pass removes has no DM
+binding and no session whose metadata names it — either would have kept it —
+so no restore can rebuild a slot for it. The
+headless `start_api_server` / `--slack-only` entrypoint has no dashboard and
+does not run it) and settles that without any UI
+— removal only; nothing is created or rebound:
+
+- **Candidate** = a row that is exactly what the sync wrote: its name is its
+  `kiro_agent`; that spec is on disk, user-authored (`source == "builtin"`),
+  not the runtime's own (`kirocrew_owned`) and not a crew's private copy
+  (`private_to`); its `description` equals that spec's current description
+  (the sync copied it from there — a description the owner rewrote, or a spec
+  that moved on, is a row the sync did not write); and every other field is at
+  its default — no `member_id`, the `default` store, no model, effort, triggers,
+  colour, star, avatar or workspace, and no key the record does not declare
+  (`_is_fresh_sync_shape`, tested on the raw row as `config.json` holds it; a
+  missing declared key reads as its default). Both config layers are read: a
+  name that `config.local.json` mentions in its own `agents` section — a
+  `kirocrew config set --local agents.<name>.…` leaf, the capability writer's
+  overlay binding — is never a candidate, whatever the leaf says, because
+  deleting the base row would leave the overlay leaf as a crewmate bound to
+  nothing. A row the owner touched in any of those ways is the owner's and is
+  never a candidate. A hand-made crewmate has a `member_id`; a package's spec
+  has another source; a row whose spec is gone is left alone. No memory
+  directory is inspected.
+- **Chatted** = any of three: a session's metadata line names it as the
+  agent; its member activity log holds a session pointer for it (the
+  `activity/record` event `record_activity` appends once per session a chat
+  runs as that member — carrying the exact name, since slugs collide — in the
+  member event log or, on an install that has not folded it yet, the legacy
+  `activity.jsonl` / `activity.jsonl.1` in the member directory); or its DM
+  thread was opened (its binding file exists and its `member` is the row's
+  exact name — the thread route writes that file on first open). The metadata
+  `agent` is slot-owned and rewritten when the slot switches agents, so it
+  names only the last agent a session ran as; the activity record is what
+  survives a switch. All three are read strictly by the migration itself,
+  never through the roster's total-by-contract readers (`read_dm_binding`,
+  `read_activity`, `list_sessions`), which answer "absent" for a damaged
+  directory, an unreadable file or a malformed payload — a removal must not
+  mistake any of those for "never". Nothing is created or folded by the read.
+  Only a file that does not exist reads as no record; a session file that
+  reads and parses but whose first line is not a metadata record, or names
+  no `agent`, names nobody — it is evidence that speaks for nobody, not a
+  file the pass could not read (that case is below).
+- **Never chatted → removed** (`remove_never_chatted`): the row is deleted
+  through a delta mutate under the base config lock, and only while the base
+  row on disk still has the same `kiro_agent` and the fresh-sync shape against
+  the description the row was judged with, `config.local.json` still does not
+  name it — read under the overlay's own sidecar lock — AND the bound spec,
+  re-read from disk under `agents_spec_lock`, still carries that same
+  description (a hand edit of the spec file while the pass ran, or a spec
+  that vanished or stopped reading as a spec, is newer evidence). Both inner
+  locks are taken inside the base lock, overlay then spec (the order every
+  binding writer keeps), and both are held until the base write has
+  committed, so neither an overlay leaf for the name nor a spec edit can land
+  between its check and the delete. The fence is identity and shape, not equality with a default-filled
+  snapshot, so a row written by a build whose record had fewer keys is still
+  recognised. A row or spec that changed meanwhile — or a row that gained an
+  overlay leaf — is
+  **refused**: a refusal is not a commit, so the pass writes no marker, logs
+  the names, and the next boot re-judges them. Only the base row moves; the
+  overlay is never written and the spec is only read.
+- **Chatted → untouched.** A kept crewmate stays exactly as it is: on the
+  shared `default` store, with no `member_id`. A memory binding is identity and
+  is chosen only at creation; an existing member retains its exact V1 binding
+  ([memory-skills-hooks](memory-skills-hooks.md#member-memory-experience-and-lifecycle)),
+  and no startup pass rewrites it.
+- **Removal needs a complete history; the pass always finishes.** Two kinds
+  of session file are kept apart (`_session_agents_named`). One that READS
+  AND PARSES is evidence whatever it says: it names every agent its metadata
+  record carries — the union of `agent` and, inside `execution_context`,
+  `selection_name` and `template_id`, which an interrupted switch can leave
+  apart — or nobody (an older build's first line that is not a metadata
+  record, a record naming no agent, a session that ran as some other agent),
+  and it never voids the pass. Nothing below that line is read: message rows
+  carry no agent provenance and an agent switch rewrites the metadata line in
+  place without appending a row, so there is no switch marker and no earlier
+  agent to recover from a transcript. One that CANNOT BE READ — the open,
+  stat or read fails; the first line is not UTF-8; the file is empty (a
+  session file is born with its metadata line, so an empty one is a torn
+  write); the first line is over the 64 KiB budget; the first line is not
+  JSON — means the history is incomplete, and an incomplete history removes
+  nothing: every candidate is kept and listed under `doubted` with the reason,
+  and the files under `unreadable_sessions`. So does a file the listing saw
+  and the open did not find: whatever it named is gone. The one startup step
+  that deletes a transcript, the channel transcript migration
+  (`migrate_channel_transcripts`), merges but keeps its orphaned copies while
+  the pass has not settled — the copy's first line is the only record of the
+  agent its dashboard surface ran as — and a tracked follow-up
+  (`_kick_deferred_transcript_removal`) removes them once the pass has
+  returned, off the readiness path. The same holds per candidate for
+  the other two sources: a member event log that exists but cannot be loaded,
+  one whose segment files are present but hold nothing the store will read (a
+  zero-byte segment is what a torn write leaves, and the store answers
+  "absent" for it), a legacy activity file that cannot be read or parsed or is
+  over budget, a DM binding that cannot be resolved (a trust-root containment
+  refusal included), read or parsed — each keeps that candidate. No
+  conversation log at all keeps every candidate. Only a candidate that a
+  complete history nowhere names is removed. A link, a FIFO or any
+  non-regular file at a session or activity path is not a session file and is
+  "no record" — neither evidence nor doubt. The pass still completes and
+  writes the marker, so a bad file costs at most one boot's judgement and
+  never a prune that re-runs — and holds every write — on every later boot; a
+  row kept this way loses nothing by staying. One WARNING line names the
+  unreadable files, another the kept-on-doubt crewmates and why.
+- **Agent-writable paths are opened defensively.** Session files and the
+  legacy activity files are opened through `open_file_no_reparse`
+  (`O_NOFOLLOW` / reparse-point refusal in the same operation as the open,
+  `O_NONBLOCK` so a FIFO cannot hang the pass) and read only when `fstat` says
+  regular file; a link or anything else is "no record". The session scan reads
+  one line per file, capped; the legacy activity file is streamed under
+  `MAX_LEGACY_ACTIVITY_BYTES`, the event log's own budget for the same file,
+  and over budget is doubt for that candidate.
+- **One process runs the pass.** The whole pass — the marker check, the
+  history scan, every delete and the marker write — runs under an exclusive
+  cross-process lock on `<config dir>/crewmate_prune.lock`
+  (`platform_compat.file_lock`), and the marker is
+  created `O_EXCL`. A second gateway on the same data home cannot run its own
+  pass beside the first: its pass waits on the lock — and its own request
+  barrier holds its writers for as long as it waits — then finds the marker
+  and returns. The wait never gives up: every 120 s (`PRUNE_LOCK_WAIT_S`) it
+  logs one WARNING and tries again, counted in the report's `lock_waits`. A
+  pass that returned with the lock still held would settle its own barrier
+  and let a session bind a crewmate the holder had not judged yet, and the
+  holder would then delete a row in use. A holder that dies releases the lock
+  with its process. Between tries the marker is checked without the lock; it
+  is written last, under the lock, so its presence means every delete is
+  done. A process-local event alone would let the second process bind a
+  session to a candidate between the first's history scan and its delete.
+- **Serialized.** `DashboardState.crewmate_prune_settled` is cleared BEFORE
+  the listener binds (`_register_crewmate_prune_gate`, installed next to the
+  workflow gate) and set after the pass (in `finally`). That function's
+  middleware holds every request whose method is not `GET`, `HEAD` or
+  `OPTIONS` — on any path, so the route table never has to be mirrored — until
+  the event is set (bounded at 60 s, then 503 `prune_in_progress`). Every
+  writer that can bind an agent to a session while the gateway is up is such a
+  request (chat send, slot create, slot agent switch, member thread, channel
+  add, session import under `/api/`, and `POST /v1/chat/completions`), so no
+  session can bind an agent and no DM binding can appear between the history
+  snapshot and a candidate's delete. One READ is held too, whatever its
+  method: every request under `/api/members`
+  (`_CREWMATE_PRUNE_GATE_HELD_PREFIXES`). The roster read calls the member
+  log's `ensure` for every row, which folds a member's pre-log `activity.jsonl`
+  into the event log and retires the file, and `reconcile_member_config`
+  appends to that log — the two places `_activity_names_member` reads — so a
+  roster load beside the pass could move a crewmate's only record out from
+  under it. A held request that outlives the budget is answered 503 and writes
+  nothing; it does not stop the pass. The writers that do not come through HTTP
+  — the subagent pump, channel agent resume, cron dispatch — start only after
+  `await_crewmate_prune_settled` returns (`GatewayOrchestrator.run`, after the
+  memory barrier and past `KIROCREW_READY`, so readiness never waits; the
+  standalone dashboard before its inline channel resume), and that helper
+  returns only once the pass has RETURNED — never beside a pass that can still
+  delete. Its 60 s budget bounds how long the pass may keep deleting, not how
+  long the writer waits: on timeout the helper sets
+  `DashboardState.crewmate_prune_abandon`, which the pass polls before each
+  candidate and again inside the config lock right before each delete; the pass
+  then keeps whatever it has not judged (listed under `doubted` with
+  `ABANDONED_REASON`), writes its marker and returns, and the writer starts.
+  The pass always returns: its opens are non-blocking and its lock acquires are
+  bounded (`platform_compat.file_lock` raises rather than waits on a stuck
+  holder), and either path ends in `finally`. The pass is kicked immediately
+  after `_start_site` and runs alongside the rest of startup, so the hold is
+  the pass itself (one marker stat on every boot but the first). The fast path
+  is one `is_set()` read per request. Each candidate's check runs immediately
+  before its own removal, never once for the whole list.
+- **Marker.** A completed pass (a no-op included) writes
+  `<config dir>/crewmate_prune_migrated.json` with `{migrated_at, removed,
+  kept, doubted, unreadable_sessions}` — the same marker-file seam the config loader's one-shot migrations
+  use (`connections_ui_migrated.json`); later boots return at once. One INFO
+  line records the removal: `removed N unused auto-generated crewmates:
+  <names>`.
+
+Removed rows do not come back: since #12224 the dashboard pickers read
+`GET /api/agents/catalog` and nothing calls `POST /api/agents/sync`, so the rows
+this pass removes were written by builds before that change. The sync route's
+own contract is unchanged.
+
+The RFC's original screen 03 ("a user with custom agents but no crewmates is
+offered to add them") is superseded: #12224 ended the enrol-on-mount behaviour,
+and the Crewmates page's empty state with **New crewmate** (#12924) is the path
+from a custom agent to a crewmate. What an existing user actually has is the
+opposite problem — the crewmates that sync already made — and that is what this
+migration settles.
+## A crewmate's chat
+
+A member-mode slot's transcript is the crewmate's whole working record: the
+`[auto-nudge cycle N]` turns of its patrol loop, `[Cron notification …]` and
+`[Subagent completion event]` envelopes, every tool call, and the say-nothing
+reply a quiet patrol ends on. The Members page's chat pane shows **only what
+the crewmate says to the user** and the user's own messages. Everything else
+stays in the slot's history — the Work log reads it from there — and is
+filtered at render time by `filterCrewmateChat`
+(`website/src/components/chat/crewmateBubbles.ts`), which `ChatPane` applies
+when its host passes `crewmate`. Ordinary chats never pass it and are drawn
+unchanged.
+
+What is hidden: rows with role `nudge`, `inject`, `subagent`, `tool`,
+`tool_call`, `tool_result`, `thinking`; and an `assistant` row that is not
+speech — invisible-only content (the bare U+200B the model is instructed to
+answer a quiet patrol with, `isHiddenInvisibleAssistantRow`), a gateway system
+notice written under the assistant role (compaction, session reload), or an
+injected workflow completion. A turn that ends without addressing the user is
+therefore a turn whose final assistant text is empty: the model's own silence
+is the signal, and no heuristic over the words decides for it — a row with
+visible words is always shown, so a finding or a question can never be
+filtered away. No "N quiet patrols" divider is drawn in their place. Rows the
+user must see or act on stay: `user`, `error`, `notice`, `file`, `mcp_oauth`,
+`permission` (a pending approval is still the approval surface), the stop
+card, and the live `streaming` row. A stop card (a `system` row of kind
+`stop_event`) is drawn too, and like an error row it breaks a run. When the
+filter leaves NOTHING to draw although the transcript is not empty (a patroller
+that has never spoken), the pane's empty hint is the crewmate's — "<name> hasn't
+said anything to you yet." plus a verb-first second line pointing at where the
+work went ("See what it has been doing in its Work log."). That second line is a link when the host passes
+`onOpenCrewWorkLog` (the Members page does: it focuses the Work log tab and, in
+overlay mode, reveals the panel), plain text otherwise — words that read as a
+destination must be one. Never the fresh-thread "Session ready" line, which
+would read as lost history beside a panel counting its wakes; and the drawer's
+Recent activity counts the member's *runs* (`activity_chat_count`: one entry per
+session the crewmate ran — a patrol wake, a cron, a sub-agent, a chat you
+opened), not "chats", so it does not contradict a chat that just said the
+crewmate has not spoken. Not "sessions" either: the RFC's vocabulary table keeps
+that word out of user copy. The composer of a crewmate's chat
+addresses the crewmate by name ("Message <name>…"), not the product. The roster row
+beside the chat quotes the same thing the chat draws: its `last_message` is
+SPEECH only (`last_speech_info` on the cold read, a
+`member/message` event without `preview` for a machinery row on the live path —
+see [member-event-log](member-event-log.md)), so a never-spoken patroller's row
+is blank rather than quoting a shell command; recency still bumps on every row.
+What counts as speech is spelled twice — the user's rows plus
+`isCrewmateSpeech` in `crewmateBubbles.ts`, and `is_speech_row` in
+`dashboard/system_notices.py` — and `test/fixtures/crewmate_speech_rows.json`
+pins the two to one verdict per row from both test suites; a new status kind is
+added to the fixture first. Status written under the assistant role is not
+speech on either side: the compaction and session-reload notices, a workflow
+completion envelope whose header parses (under the assistant role only — the
+same text pasted by the user is the user speaking), and a sub-agent completion envelope
+whose header (or the gateway's `meta` facts) parses — the Slack gateway writes
+that last one as `assistant` on its delivery-timeout and orphan paths. The roster's quote itself is spelled once:
+`speech_preview` (`preview_text.py`: strip markdown, redact, cap with `…`) builds
+it on the cold read and on the live `member/message` event alike, so the fold
+and the read agree and the read's correction (below) fires only for a stale
+pre-speech-only preview. That correction is a compare-and-append: it refuses
+when the roster's quote or recency moved since the read observed it, so a
+message the crewmate speaks while a roster read is in flight is never
+overwritten by the older answer.
+
+How it is drawn: the crewmate's messages form Slack-style **runs**. The first
+message of a run carries the author line — `CrewAvatar` seeded by the crewmate's
+name (its `avatar` record when it has one) at 28px, the name, the message time
+through the locale seam — and every message is its own bubble (`bg-card`,
+`border-border`, `max-w-[72ch]`) in the text column right of the avatar gutter,
+so consecutive bubbles share one avatar. Corner rule on the run's (left) side:
+single = all corners full; first = bottom-left small; middle = top-left and
+bottom-left small; last = top-left small; right corners always full. A run is
+ONE TURN's bubbles (RFC screen 05): it breaks on a user message, on any row the
+user sees between two messages (an error, a pending approval), and at a turn
+boundary the unfiltered transcript still carries — a patrol wake, a cron or
+sub-agent envelope between two replies — which `crewmateRunPosition` reads off
+the `crewmateTranscript` the pane hands its renderer; there is no time rule. A
+turn's own machinery (tool rows, thinking, the wire-only `done`), a resolved
+approval or a state-only row between two messages does not split the run, and a
+streaming row continues it. The
+bubble is the ordinary `AssistantMessage` (markdown, `[OPTIONS:]` chips) with
+the bubble surface passed in as `bubbleClassName`; the SDK's footer rule
+(`renderAssistantBubble`) is shared, not copied, with two host overrides: the
+run's last bubble (`single` / `end`) always carries the footer and its hover
+actions — the SDK's own rule would withhold it when the next drawn row is
+another reply, but in this chat a run only ends on a boundary the user sees or
+on the silence gap, so the run end IS the turn end — and the steer-chip
+suppression (`turnHadPolicyBlock`) reads the UNFILTERED transcript the pane
+passes as `crewmateTranscript`, because the policy-block marker lives on an
+`inject` row the filter drops, and reading the filtered list would credit a
+system-forced continuation to the user. User messages keep their existing
+rendering. The run position is exported (`crewmateRunPosition`) for a
+reply-thread footer to reuse; no DOM attribute is stamped until that reader
+exists. The reply thread's own panel
+(`pages/members/ThreadPanel`, see history.md) is that reader: it draws the
+crewmate's replies on the same `crewmateRunPosition` / `crewmateBubbleClass`
+rule; the user's replies are always singles.
+
 ## Selection: the `select_crew` contract
 
 Discovery importing a provider template as a configured member does not rebind
@@ -931,6 +1262,7 @@ name, and it resolves an empty crew too so the concrete template stays inside
 | `test/test_crew_reasoning_effort.py` | Per-crew effort reaches a crew dispatch |
 | `test/test_members.py`, `test/test_members_dm_thread.py` | Slug validation and containment, activity recording and dedupe, DM-binding canonicality, rules and briefing reads, briefing endpoint |
 | `test/test_chat_send_agent_model_default.py` | The crew model default a new session starts on |
+| `website/src/components/chat/crewmateBubbles.test.ts` | What a crewmate's chat draws (machinery dropped, speech and user-facing rows kept, same array back when nothing is dropped) and the run rule (first/middle/last, single, breaks on a user row, a pending approval and the 5-minute gap, reads through a resolved approval and an untimestamped streaming row, corners on the left side only) |
 
 ## Retired: Crew Mode
 

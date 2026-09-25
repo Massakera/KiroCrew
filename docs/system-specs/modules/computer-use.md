@@ -220,11 +220,16 @@ the caller extension), and the key stays `unresolved:<pid>` — correct there, b
 one process is one session. It is ALSO what a pre-nonce gatewayd produces: `manager.py`
 adopts whatever healthy daemon already holds the socket, so a daemon that outlived a
 package upgrade keeps serving and injects nothing, and the backend cannot tell that
-apart from the 1:1 case (absence of both blocks is ambiguous by construction). That
-window is why `kirocrew-computer` stays in `_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD`
-rather than being reclassified shareable here — the classification is a config WRITE
-via `seed.py`, so it must not promise a separation the serving daemon may not
-implement. A stub that reconnects gets a fresh nonce and therefore a
+apart from the 1:1 case (absence of both blocks is ambiguous by construction). The
+backend therefore cannot be the layer that judges it; the HANDSHAKE is, because the
+daemon actually serving the frames says whether it mints a nonce. `gatewayd` advertises
+`tenant_nonce` in `REGISTERED_CAPABILITIES`, and a stub that asked to POOL this server
+against a daemon that does not advertise it runs `fallback_exec` instead
+(`stub.must_degrade_nonce_blind`, scoped by `mcp_caller.POOLING_REQUIRES_TENANT_NONCE`).
+An exclusive backend is exactly the topology where `unresolved:<pid>` is right, so the
+separation is restored rather than approximated — which is what lets
+`_MANAGED_SERVERS_CALLER_AWARE` carry `kirocrew-computer` even though the classification
+is a config WRITE via `seed.py`. A stub that reconnects gets a fresh nonce and therefore a
 fresh namespace: its earlier snapshots become unreachable, which surfaces as "call
 `computer_get_state` first" rather than as an action against a stale tree.
 

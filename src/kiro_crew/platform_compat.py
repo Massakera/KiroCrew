@@ -107,7 +107,11 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     _ensure_utf8_process_environment()
     resolved = executable or sys.executable
     argv0 = ntpath.basename(resolved) if IS_WINDOWS else resolved
-    argv = isolated_python_argv("-m", module, *args, executable=resolved)
+    # ``-P``: the successor inherits this process's cwd -- the home directory
+    # for a service-launched gateway -- and ``-m`` would put it first on
+    # sys.path, ahead of the standard library, so a stdlib-named directory
+    # there would shadow the stdlib in the restarted process.
+    argv = isolated_python_argv("-P", "-m", module, *args, executable=resolved)
     argv[0] = argv0
     os.execv(resolved, argv)
 
@@ -1035,14 +1039,16 @@ def file_lock(
         # strictly safer, and callers already run under `with`, so the fd is
         # cleaned up. `required` is kept for call-site intent and does not
         # change the outcome — both paths refuse to proceed lock-less.
-        ceiling = 0.0 if not wait else (_LOCK_TIMEOUT_SECS if timeout is None else timeout)
         # The waiting path with no explicit ceiling is called with no keyword, so
         # the default-argument call shape existing tests stub out is preserved.
         if not wait:
+            ceiling = 0.0
             acquired = _win_acquire_blocking(fd, timeout=0.0)
         elif timeout is None:
+            ceiling = _LOCK_TIMEOUT_SECS
             acquired = _win_acquire_blocking(fd)
         else:
+            ceiling = timeout
             acquired = _win_acquire_blocking(fd, timeout=timeout)
         if not acquired:
             if not wait:
@@ -4346,6 +4352,84 @@ def _windows_descendant_failure_details(
     )
 
 
+def _windows_process_query_creation(pid: int) -> int | None:
+    """Return *pid*'s creation FILETIME through a query-only handle, or ``None``.
+
+    Termination rights are not requested, so this answers for a process whose
+    termination handle is refused -- which is the only case that needs it.
+    ``None`` means the instant is unknown and nothing may be concluded from it.
+    """
+
+    handle = _open_process_query_handle(pid)
+    if handle is None:
+        return None
+    try:
+        identity = _windows_process_handle_identity(handle)
+    finally:
+        _close_process_handle(handle)
+    if identity is None or identity[0] != pid:
+        return None
+    return identity[1]
+
+
+def _windows_foreign_descendant_pids(
+    candidates: set[int],
+    observed: set[int],
+    parent_map: dict[int, int],
+    pinned: Mapping[int, int],
+    root_pid: int,
+    root_created: int,
+) -> set[int]:
+    """Return observed PIDs whose numeric ancestry creation order disproves them.
+
+    A descendant is created after the root it descends from, so a chain node that
+    already existed before the root holds a recycled PID naming an unrelated
+    process. Every observed PID reaching the root only through such a node is
+    foreign as well: its claimed parent's PID was taken over by a process older
+    than the root, so that parent died before the root started and cannot have
+    belonged to this tree.
+
+    Only *candidates* seed the reads, so a scan that opened every handle pays
+    nothing. A node in *pinned* is read from its own handle, whose object cannot
+    have been recycled; the rest are read once each by PID. An unreadable instant
+    disproves nothing and leaves its chain intact.
+    """
+
+    creations: dict[int, int | None] = {}
+
+    def created(process_pid: int) -> int | None:
+        if process_pid not in creations:
+            handle = pinned.get(process_pid)
+            if handle is None:
+                creations[process_pid] = _windows_process_query_creation(process_pid)
+            else:
+                identity = _windows_process_handle_identity(handle)
+                creations[process_pid] = (
+                    identity[1] if identity is not None and identity[0] == process_pid else None
+                )
+        return creations[process_pid]
+
+    disproven: set[int] = set()
+    for candidate_pid in sorted(candidates):
+        chain = _windows_chain_to_root(candidate_pid, root_pid, parent_map)
+        if not chain:
+            continue
+        for process_pid in chain:
+            if process_pid == root_pid:
+                continue
+            instant = created(process_pid)
+            if instant is not None and instant < root_created:
+                disproven.add(process_pid)
+    if not disproven:
+        return set()
+    foreign: set[int] = set()
+    for process_pid in observed:
+        chain = _windows_chain_to_root(process_pid, root_pid, parent_map)
+        if chain and not disproven.isdisjoint(chain):
+            foreign.add(process_pid)
+    return foreign
+
+
 def descendant_termination_handles(
     pid: int,
     retained_handles: Mapping[int, int] | None = None,
@@ -4358,8 +4442,9 @@ def descendant_termination_handles(
     from exact root, retained-parent, and newly-opened child handles in two
     snapshots. This admits a genuine child created before an immediate launcher
     exit while rejecting a tree attached to a recycled root or intermediate PID.
-    An unopenable candidate requires fresh full-snapshot absence; unreadable
-    identities or incomplete ancestry raise OSError, never certify a subset.
+    An unopenable candidate requires fresh full-snapshot absence, or a creation
+    instant proving it predates the root; unreadable identities or incomplete
+    ancestry raise OSError, never certify a subset.
     On failure only newly opened handles are closed; retained/root handles
     stay caller-owned.
     """
@@ -4407,6 +4492,28 @@ def descendant_termination_handles(
             # Enumeration errors propagate; pid_exists(False) is ambiguous.
             fresh_map = _windows_process_parent_map()
             remaining = unopened.intersection(fresh_map)
+            if remaining:
+                # A process that already existed before the root cannot descend
+                # from it, and that instant is readable through a query-only
+                # handle where a termination handle is refused. Drop such a
+                # stranger together with everything whose only route to the root
+                # runs through it, so a PID it inherited cannot turn the owned
+                # tree into a fatal incomplete one. A chain implicating a pinned
+                # retained identity stays fail-closed: dropping it would discard
+                # authority an earlier scan already proved.
+                foreign = _windows_foreign_descendant_pids(
+                    remaining,
+                    first,
+                    first_map,
+                    {**retained, **opened, pid: root_handle},
+                    pid,
+                    root_identity[1],
+                )
+                if foreign and foreign.isdisjoint(retained):
+                    unopened -= foreign
+                    for child_pid in sorted(foreign.intersection(opened)):
+                        close_process_handle(opened.pop(child_pid))
+                    remaining = unopened.intersection(fresh_map)
             if remaining:
                 errors = {child: opening_errors[child] for child in sorted(remaining)[:3]}
                 details = f"diagnostic_only=unknown; open_errors={errors}"
@@ -5872,7 +5979,8 @@ def pid_liveness(pid: int) -> str:
     a PID we merely can't signal is wrong) branch on ``PID_UNSIGNALABLE``.
 
     POSIX: ``os.kill(pid, 0)`` — ``ProcessLookupError`` -> DEAD,
-    ``PermissionError`` -> UNSIGNALABLE, success -> ALIVE.
+    ``PermissionError`` or an out-of-range PID -> UNSIGNALABLE, success ->
+    ALIVE.
     Windows: no EPERM distinction for our processes; map ``pid_exists`` onto
     DEAD/ALIVE (UNSIGNALABLE never returned).
     """
@@ -5883,6 +5991,11 @@ def pid_liveness(pid: int) -> str:
         except ProcessLookupError:
             return PID_DEAD
         except PermissionError:
+            return PID_UNSIGNALABLE
+        except OverflowError:
+            # The PID may have come from corrupt persistent state.  It is not
+            # evidence that the named process is dead, so preserve fail-closed
+            # callers by classifying it as unknown/unsignalable.
             return PID_UNSIGNALABLE
         except OSError:
             # Unknown errno — be conservative and treat as unsignalable
@@ -5991,7 +6104,7 @@ def pid_exists(pid: int) -> bool:
             return True
         except ProcessLookupError:
             return False
-        except (PermissionError, OSError):
+        except (PermissionError, OSError, OverflowError):
             return True  # exists but we can't signal it
     try:
         _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000  # noqa: N806 — Windows API constant
@@ -8355,6 +8468,13 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
 #: Upper bound on processes walked in one subtree sample. A real tree is tiny
 #: (a launcher plus a handful of workers); the cap only guards against a
 #: pathological or looping ``/proc`` graph.
+#:
+#: It bounds THIS WALK's work; it is not a display ceiling for a count, and a
+#: surface that already enumerates its own tree does not adopt it. Truncating a
+#: displayed count at this number would hand the card a plain integer no
+#: consumer can tell from a complete one, where ``procs``/``matched`` reserve
+#: ``None`` for "unmeasurable". A walk that needs bounding elsewhere wants a
+#: budget that yields ``None``, not a silent truncation.
 _SUBTREE_MAX_PROCS = 256
 
 

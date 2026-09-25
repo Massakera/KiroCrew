@@ -8,6 +8,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import hashlib
+import hmac
 import http.client
 import json
 import logging
@@ -1174,8 +1175,24 @@ def _open_contained_nofollow(base: Path, target: Path) -> int:
     )
 
 
+def _pinned_ancestors(path: Path) -> Path:
+    """Return *path* with its ancestors canonical and its own name literal.
+
+    The form :func:`kiro_crew.pinned_fs.pin_parent` asks its callers for: its
+    O_NOFOLLOW walk refuses an ancestor that has always been a link - a home
+    reached through one - exactly like one swapped mid-transaction. The final
+    name is left alone, or the walk follows a link planted AT the directory it
+    is pinning. ``realpath``, not ``Path.resolve``, which raises RuntimeError
+    on a cycle and escapes the OSError callers refuse with.
+    """
+    return Path(os.path.realpath(path.parent)) / path.name
+
+
 class _PinnedDir:
     """Pin the app data dir against link swaps for one provision transaction.
+
+    The path is pinned exactly as handed in, so the CALLER owns
+    :func:`_pinned_ancestors`: splitting it here would guess this one's depth.
 
     A path-based check-then-use is a TOCTOU window: a RUNNING app can swap
     ``data/`` for a symlink after the validation and have every later rename
@@ -1400,6 +1417,9 @@ def provision_app_deps(app_name: str, root: Path) -> str:
     descriptor), and the stamp check runs inside the lock, so a waiter that
     blocked behind a successful install skips pip on the stamp it left.
     """
+    # Every pinned call below derives its path from root, so one canonical
+    # base reaches all of them: requirements, staging snapshot, tree removals.
+    root = _pinned_ancestors(root)
     _req = root / "requirements.txt"
     if not _req.is_file():
         # is_file() follows a symlink, so it answers False for a DANGLING
@@ -2268,13 +2288,88 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     spawn_instance = uuid.uuid4().hex[:16]
     env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
     env[KIROCREW_SPAWN_INSTANCE_ENV] = spawn_instance
+    # Trusted gateway origin for the backend's own callbacks to this gateway
+    # (e.g. POST /api/notifications/push on a declared channel). It is injected
+    # ONLY from hard evidence of the port THIS gateway actually owns:
+    # KIROCREW_BOUND_PORT, which the gateway exports into its own environment
+    # the moment it reserves its port (bound and listening, not yet accepting;
+    # before this spawn pass can run — dashboard.server._reserve_dashboard_port).
+    # We require it to be present and to parse as an integer in 1..65535. We never fall back to KIROCREW_PORT (an
+    # inherited/--port guess), the app's own PORT, a config value, a run-marker,
+    # or a built-in default: any of those could point the child at a sibling
+    # gateway or at a port nothing is listening on. Absent or invalid evidence
+    # => omit the origin entirely, so a backend that needs a callback base fails
+    # closed (dormant) rather than trusting a guessed address. Generic name
+    # only; no app-specific env is set here.
+    bound_port = os.environ.get("KIROCREW_BOUND_PORT", "").strip()
+    bound_host_env = os.environ.get("KIROCREW_BOUND_HOST", "").strip()
+    gateway_origin = ""
+    if (
+        bound_port.isdigit()
+        and 1 <= int(bound_port) <= 65535
+        and bound_host_env in ("", "::1")
+    ):
+        # Host evidence: absent means loopback (the default bind shapes —
+        # loopback itself, or a wildcard bind loopback reaches); "::1" is the
+        # v6-loopback family marker. Only these two shapes are injected: a
+        # backend's callback arrives with no Origin header, and the gateway's
+        # CSRF barrier (origin.check_origin) trusts an Origin-less mutating
+        # request ONLY from a loopback peer. A gateway bound to a SPECIFIC
+        # interface exports that address, but injecting it would mint an
+        # origin whose every mutating callback is refused at the barrier —
+        # a half-alive backend, worse than designed dormancy — so that shape
+        # is omitted (fail closed, warned below) until such a request path is
+        # admitted. IPv6 literals are bracketed per RFC 3986.
+        bound_host = bound_host_env or "127.0.0.1"
+        if ":" in bound_host and not bound_host.startswith("["):
+            bound_host = f"[{bound_host}]"
+        gateway_origin = f"http://{bound_host}:{int(bound_port)}"
+        env["KIROCREW_GATEWAY_ORIGIN"] = gateway_origin
+    else:
+        # Dormancy is the DESIGNED outcome here, so the operator must be able
+        # to see it: an app that declares notification channels but gets no
+        # origin will silently never push. Warn for those; stay at debug for
+        # apps with no push surface. getattr defense: tests hand this function
+        # reduced manifest stand-ins without a notifications field.
+        _declares_channels = bool(
+            getattr(getattr(manifest, "notifications", None), "channels", None)
+        )
+        _why = (
+            "gateway bound to a specific interface"
+            if bound_host_env not in ("", "::1")
+            else "no valid KIROCREW_BOUND_PORT"
+        )
+        (logger.warning if _declares_channels else logger.debug)(
+            "%s; omitting KIROCREW_GATEWAY_ORIGIN for %s backend%s",
+            _why,
+            app_name,
+            (
+                " -- it declares notification channels and cannot push until"
+                " restarted with a valid origin"
+                if _declares_channels
+                else ""
+            ),
+        )
     # Inject the per-app proxy secret so the backend can verify the
     # X-KiroCrew-Proxy HMAC the gateway signs on every forwarded request
     # (CWE-306). Without it the loopback backend would trust any local caller.
+    # The same secret keys KIROCREW_GATEWAY_ORIGIN_PROOF, an
+    # HMAC-SHA256(secret, origin) the backend recomputes to confirm the origin
+    # value was minted by the gateway that alone holds this secret, rather than
+    # an inherited or spoofed env value. The proof is injected ONLY when the
+    # secret is readable AND the origin was injected above; a missing
+    # .app_secret is tolerated as before and yields neither the secret nor the
+    # proof (a secret-less legacy backend gets the origin only).
     try:
         _proxy_secret = (root / ".app_secret").read_text().strip()
         if _proxy_secret:
             env["KIROCREW_PROXY_SECRET"] = _proxy_secret
+            if gateway_origin:
+                env["KIROCREW_GATEWAY_ORIGIN_PROOF"] = hmac.new(
+                    _proxy_secret.encode("utf-8"),
+                    gateway_origin.encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
     except OSError:
         pass
     # Expose the provisioned deps dir (pip --target, above) to the child.

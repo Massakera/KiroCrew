@@ -255,6 +255,54 @@ subdirectories are derived.
 
 The CLI (`cli.py:main()`) auto-detects and sets the env var at startup.
 
+## Folder steering directories (`dashboard/chat_folders.py`)
+
+A chat folder record in `folders.json` may carry an optional `steering_dirs`
+list of absolute (or `~`-prefixed) directories, alongside its existing
+`project_dir`/`default_agent`/`color`/`tags`. Every chat in the folder's subtree
+loads each directory's `**/*.md` as steering, in addition to global and project
+steering. The key is omitted when empty (like `color`/`tags`), so "absent means
+none" is the single on-disk representation and a PATCH with `[]` clears it.
+
+- **Validation** (`_validate_steering_dirs`) reuses the `_validate_project_dir`
+  contract per entry — absolute or `~`-prefixed, `expanduser` + `realpath`,
+  `is_sensitive_path()` rejection (SEL-logged), and must be an existing
+  directory — plus a `MAX_FOLDER_STEERING_DIRS` (16) list cap and rejection of
+  duplicates within one folder (compared by resolved realpath). Failures return
+  `400` with code `steering_dirs_invalid`.
+- **Principal gate** (`_refuse_principal_steering_dirs`) runs at both write
+  sites BEFORE validation touches any path: only the person may declare a
+  non-empty list. A `POST`/`PATCH` carrying one from an app or crew-member
+  principal is refused `403` with code `steering_dirs_forbidden` and SEL-logged
+  as denied, because folder permission is not host-file permission -- the
+  gateway reads these files unsandboxed on the folder's behalf, and an app that
+  could point its own folder at an arbitrary readable Markdown tree would have
+  that read laundered into its own model session with no tool grant and no
+  signal. Clearing to `[]` stays allowed for every principal (it only removes
+  reads). The person may still declare steering on a folder an app or member
+  owns; delivery then routes it to that principal's chats as described below.
+- **Resolution** (`_resolve_folder_steering_dirs`) is ACCUMULATIVE up the
+  `parent_id` chain (root ancestor first, then descendants), unlike the
+  nearest-wins `project_dir` resolver: an org-standards folder above a per-repo
+  folder contributes both sets. The walk is cycle-guarded, re-validates each
+  stored path (never trusting `folders.json`, which can list a directory since
+  moved or made sensitive), and dedups by resolved realpath keeping the first
+  occurrence.
+- **Live resolution, no slot field.** The effective list is never cached on the
+  chat slot: `_ChatSlot` carries no steering field, and neither slot create nor
+  agent switch resolves one. The dashboard turn path
+  (`dashboard/chat_runner.py`) resolves it live from the slot's current
+  `folder_id` against the committed folder tree, on every fresh session and
+  every post-compaction reinjection turn. So editing a folder's `steering_dirs`
+  reaches the chats already filed in it at their next fresh session, with no
+  cache to invalidate; a slot with no `folder_id` contributes nothing. A
+  resolver error logs a warning naming the slot and the turn proceeds with no
+  folder steering, and a directory that has since disappeared is skipped at read
+  time rather than failing the turn. Delivery is performed once by the context
+  builder (`kiro_crew.context.ContextBuilder`) reading through
+  `kiro_crew.folder_steering` — the one layer every backend passes through, so
+  no provider can silently drop it. See [providers](providers.md).
+
 ## Named Memory Stores (`memory_stores.py`)
 
 The reserved `agents.default` assistant uses the existing Global Memory **V1**.
@@ -674,8 +722,20 @@ makes affirming it meaningless, and `--keep` refuses it by name rather than
 promising a setting that never takes effect. Left in place it is inert bytes that
 cost a warning on every load, forever, because a load never writes.
 
-One entry today: `stt.provider`, whose retired and unknown values degrade to
-`local`. The `is_coerced` predicate rides on the ENTRY, not in the detector's loop,
+One entry today: `stt.provider`. Its retired values (`whisper`, `mlx`, `parakeet`,
+`faster`) degrade to `local`; any other unknown value degrades to `off`, so a
+value nobody can account for never selects the in-process native recogniser
+(kirodotdev/KiroCrew#13179). Because the two resolutions differ, `resolves_to` is
+a callable of the stored value (delegating to `_validated_stt_provider`, the
+loader's own rule) and the entry carries the section `default`. `--adopt` uses
+both: it REWRITES a coerced key as what it resolves to, or deletes it only when
+that resolution IS the default (an absent key resolves to the default). So a
+retired name is adopted by removal and runs as `local` before and after, and an
+unknown name is adopted as the literal `"off"` and runs as `off` before and after.
+Adoption never moves the effective provider — deleting an unknown value would have
+made the default `local` apply, handing the incident's user back the engine they
+were escaping — and `coercion_summary` names the resolution instead of claiming
+removal changes nothing. The `is_coerced` predicate rides on the ENTRY, not in the detector's loop,
 so appending a retirement is genuinely sufficient — a detector switching on
 `dotted_key` would leave an appended entry silently unreported, with no test red and
 an operator stuck with a warning nothing can clear. That predicate delegates to
@@ -1676,8 +1736,20 @@ dispatcher; `WorkflowService` binds `agent.workflow_run_timeout_secs` to its
 `agent.max_channel_agents` to its cap setters, both with `live.bind`). Only the
 ones whose holder is `DashboardState`, or that must rebuild agent artifacts,
 live in `server.py::_register_config_watch` — `agent.provider`,
-`agent.role_models.background`, and `agent.log_level`
+`agent.model`, `agent.role_models.background`, and `agent.log_level`
 (→ `handlers/updates.py::apply_log_level_from_config`).
+Both model appliers rebuild the installed agent specifications before the
+watcher finishes dispatching the change. After a successful `agent.model`
+rebuild, its applier emits a refresh frame, so dashboard PATCH responses and
+that frame expose the new effective model only after the corresponding
+specification is ready, including when the value is cleared back to `auto`.
+If the rebuild fails, the applier logs the failure and emits no refresh frame;
+the previous specification and effective-model readout remain in force. It also
+raises an actionable dashboard notification and remains stale in the watcher,
+which retries the rebuild on later ticks until the generated spec catches up.
+The first successful retry emits both the refresh frame and a recovery
+notification, so the operator is not left with a stale failure message after
+the saved model becomes active.
 The provider applier only schedules the switch: `reload_provider_factory` clears
 the session registry and then shuts the retired providers down one at a time,
 which can outlast the applier bound, and a timed-out applier is retried on the
@@ -1975,6 +2047,7 @@ class DashboardConfig:
     language: str = ""             # dashboard UI language, BCP-47 (e.g. "en", "zh-CN"); empty = auto-detect from the browser. See "Dashboard UI language" below.
     onboarded: bool = False         # whether the "Choose your look" onboarding modal was completed
     import_onboarded: bool = False  # whether foreign-agent import was completed or skipped
+    crewmates_onboarded: bool = False  # whether the first-run Meet CrewMates flow was finished or dismissed
     tips_enabled: bool = True      # feature-discovery tips (GET /api/tips/next); live-read
     tips_cadence_hours: float = 6.0    # min hours between surfaced tips (server-side gate; clamped >= 0)
     tips_snooze_hours: float = 48.0    # hours before a snoozed tip is eligible again (clamped >= 0)
@@ -2634,6 +2707,103 @@ settings without copying them. Foreign credentials, security policy,
 approval/sandbox settings, agent/runtime state, hooks, and arbitrary unknown
 config sections cannot enter configuration through this path.
 
+### Meet CrewMates first-run state
+
+`DashboardConfig.crewmates_onboarded` records that the four-step "Meet CrewMates"
+flow (`website/src/components/MeetCrewmatesFlow.tsx`) was finished or dismissed.
+The flow fires once, after the other first-run chapters, only while the Crew
+Members preview (`PREVIEW_CREW`, Settings → Developer → Feature Previews — the
+switch that shows the Crewmates page) is on, and only for a workspace with no
+crewmate beyond the `default` row and no installed agent beyond the ones
+Kiro Crew itself wrote -- judged solely by the server's `kirocrew_owned` flag on
+each `GET /api/agents/installed` row (`useMeetCrewmatesGate`); a row without the
+flag is a custom agent; an existing user with custom agents is never shown
+the flow -- their earlier-sync crewmates are the launch migration's job
+(`docs/request-for-change/rfc-crewmates-launch.md`, "Existing installs"; no
+user-facing step exists for them), and a gate that cannot read the roster or
+the agent list fails safe by not firing. `POST /api/agents` now refuses a crew name that fails the shared agent-name
+grammar (`validation._AGENT_NAME_RE`, code `invalid_agent_name`), because `GET
+/api/members` skips such a row and the crew would exist with no roster able to
+show it; the rule lives at that route, for every client of it -- `kirocrew agent
+create` (`cli_commands.py`) still writes a name unchecked, a pre-existing level
+this change leaves as it is. The flow previews the
+same grammar under the name field as the user types (a plain hint, not an
+`ErrorNotice`; `test/test_meet_crewmates_builtin_pin.py` keeps the copy honest)
+and disables Next until it passes; a server `invalid_agent_name` or 409
+`agent_exists` lands as an `ErrorNotice` under the same field. A failed eligibility
+read (roster or installed agents) is surfaced by App as a dismissible
+`ErrorNotice` (`MeetCrewmatesEligibilityNotice`) rather than silently leaving
+the chapter unfired; the Crew Members page entry works regardless. Notices
+follow `errors-use-error-notice`: the agent hand-off is on where nothing can be
+lost (the eligibility notice, the step-4 schedule notices, the "done" notice on
+steps 1 and 4) and closes the flow the way that step's own exit does, since the
+chat it opens sits behind the dialog; it is off beside the unsaved name and job
+on steps 2-3, each such notice naming the draft. Its Create step is two
+existing writes — `POST /api/agents` (the crewmate, job text stored as
+`description`) and `POST /api/crons` with `member_id` naming the crewmate so the
+schedule runs on the crewmate's own memory. Delivery is mechanical, never an
+instruction to the model: the job is created non-`silent`, so every run rings
+the dashboard bell and — when Slack is connected — reaches the owner's Slack DM
+through the runtime's own leg (the flow's Slack row therefore only states that
+fact; it is not a switch), and "Its own chat" maps to `hide_in_chat`, the one
+delivery choice the runtime actually offers. The crewmate's identity is held
+only from a clean create response -- the immutable `member_id` the server
+allocates with its member memory, which `POST /api/agents` now returns beside
+`memory_store` -- and it is the one thing the flow binds to or reconciles
+against later; nothing is ever claimed by display NAME, because two
+openings prefill the same example name and a same-named crewmate the flow
+cannot prove it made is someone else's. So a 409 `agent_exists` is a taken name
+on every attempt (step 2, error under the field, with a button to the Crew
+Members page where that crewmate lives -- leaving dismisses the flow -- and the
+suggestion chip carrying that name marked "already exists"), a create the server refused
+(any other 4xx) says "could not be created" inline, and a create with no usable
+answer (a dropped response, a 5xx) stops on step 3 with a block notice that the
+crewmate "may or may not have been created", posts no schedule, and carries a
+button to the Crewmates page (leaving completes the flow) so the user checks
+before making a second one. The schedule is posted with `member_id` = that
+identity, never the display name (a name is late-resolved on the server, so a
+crewmate deleted and remade under the same name between the two writes would
+otherwise receive the job; the identity resolves to exactly the crewmate just
+made, or to nothing). A schedule write the server refused
+(4xx) is reported as "not saved"; any other failure after the request left (a
+dropped response, a 5xx) is reconciled against `GET /api/crons`, and only a job
+that IS the one asked for counts -- `member_id` equal to the held identity, the
+same name, the same message and the same schedule; an older or foreign job on
+the crewmate is not evidence that this write landed -- so only when nothing matches, or that read fails, is it
+reported as "may not have been saved", with a button to the Schedule page on
+the notice (leaving completes the flow) rather than inviting a duplicate. "Only when I ask" posts no schedule and step 4 then
+says nothing about reports or the Schedule page. An exit never waits for the
+server: `onDone` closes the chapter at once and persists `crewmates_onboarded`
+afterwards, because several exits navigate (`/members`, `/schedule`) and a
+full-screen chapter gated on a round trip would cover the page the user just
+asked for. A refused write is therefore shown where it can be: on the ready
+step when the create-time write failed (the flow is still open), on the NEXT
+entry when the write at exit failed (`persistFailed` carries it until a write
+succeeds). A refusal marks NOTHING locally: `markCrewmatesOnboarded` applies the
+render cache, the pending-mark clear and the in-memory flag only after the
+server accepted the write, so this browser is still due the chapter after a
+reload (which is what the notice says) instead of seeding a completion the
+server never recorded; within the same session the flow does not auto-fire
+again after it closed (the entry still opens it on demand). The flag is written
+through `PUT /api/config/theme` the moment the crewmate exists (the flow stays
+open for its ready step) and again when the user leaves.
+The Crewmates page re-opens the flow on demand; that run sets the flag too.
+`GET /api/theme/boot` exposes it beside the other first-run flags. The frontend
+mirrors it in `localStorage['mc-crewmates-onboarded']` as a render cache only,
+and — like `privacy_acked` — treats a workspace that was already `onboarded`
+before this chapter existed as done locally (never persisted): an existing user
+is not interrupted and reaches the flow from the Crewmates page, while a new
+user, whose tour completes in the same session, flows straight on. A new user
+who reloads or restarts BETWEEN the tour and this chapter is still due it: a
+FIRST tour completion (`markOnboarded` while not yet onboarded -- a replay from
+Settings by an existing user sets nothing) leaves `localStorage['mc-crewmates-pending']`
+on that browser, the seed and the boot rule both exempt a workspace carrying the
+mark from the "already onboarded counts as done" heuristic, and the mark is
+cleared when the chapter is marked done. Only a workspace onboarded with no such
+mark -- before this shipped, or from another machine -- is treated as an existing
+install. The same rule keeps the E2E and capture harnesses, which seed only
+`mc-onboarded`, clear of the chapter.
+
 ### `ChannelConfig.from_dict(data: dict) -> ChannelConfig`
 Parses a channel config entry from JSON. Invalid activation values fall back to `"mention"`.
 
@@ -2712,7 +2882,8 @@ It does **not** widen the TCP bind in the public build, which remains
 
 A **malformed** `dashboard.url` (e.g. an unterminated IPv6 literal `http://[::1` or a non-numeric port `http://host:notaport`) does **not** abort startup: `parse_dashboard_url` degrades to the defaults (`""` host, port `5476`) and logs a warning, so a single typo in the config can never take the gateway down on boot. `KIROCREW_PORT` still overrides the port regardless.
 
-Once the dashboard's TCP site is listening, the gateway **exports the
+The moment the dashboard's port is **reserved** (bound and listening, not yet
+accepting — before any app backend spawns), the gateway **exports the
 actually-bound port as `KIROCREW_BOUND_PORT`** into its own environment, so
 every child it spawns (kiro-cli sessions and their MCP stdio servers) inherits
 the truth instead of re-deriving a guess from `dashboard.url` — a portless URL
