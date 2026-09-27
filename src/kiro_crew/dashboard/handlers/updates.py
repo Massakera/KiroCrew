@@ -30,7 +30,10 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.dashboard.chat_utils import run_config_write
-from kiro_crew.dashboard.handlers._shared import read_capped_response
+from kiro_crew.dashboard.handlers._shared import (
+    read_capped_response,
+    require_owner_dashboard_request,
+)
 from kiro_crew.dashboard.state import DashboardState, chat_message_frame
 from kiro_crew.dashboard.status_counts import cached_status_snapshot
 from kiro_crew.executors import subprocess_executor
@@ -153,10 +156,6 @@ _last_update_check: float = 0.0
 #: coordinator, so every caller consumes one completed verdict.
 _check_task: asyncio.Task[None] | None = None
 _check_task_generation: int | None = None
-
-#: Release channels the installer publishes. Anything else in the channel file (a
-#: hand-edit, junk, a lane this build predates) falls back to ``stable``.
-_RELEASE_CHANNELS = ("stable", "insider", "nightly")
 
 #: ``schema`` every CLI artifact manifest carries. A payload without it is not a
 #: manifest and must not be read as one.
@@ -1244,6 +1243,9 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
 
 async def api_update_auto(request: web.Request) -> web.Response:
     """POST /api/update/auto — toggle auto-update on/off."""
+    owner_denied = await require_owner_dashboard_request(request, "update.auto")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -1576,6 +1578,9 @@ async def _restart_gateway(
 
 async def api_update_apply(request: web.Request) -> web.Response:
     """POST /api/update — git pull, rebuild, restart gateway."""
+    owner_denied = await require_owner_dashboard_request(request, "update.apply")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
 
     # A policy-defined provider OWNS the update on this host. Checked before the
@@ -1940,7 +1945,10 @@ def apply_log_level(level_name: str, *, source: str) -> bool:
 
     The one place the runtime level changes, shared by the dashboard endpoint
     and the ``agent.log_level`` config applier so a ``kirocrew config set`` or
-    an ``$EDITOR`` edit takes effect exactly like the Logs page toggle.
+    an ``$EDITOR`` edit takes effect exactly like the Logs page toggle. The
+    logger is the single level gate for every sink, ``gateway.log`` included:
+    the file handler and the queue handler ``cli._setup_cli_logging`` installs
+    carry no level of their own, so this one change reaches the file too.
     """
     name = str(level_name or "").upper()
     if name not in _LOG_LEVELS:
@@ -2297,6 +2305,9 @@ async def api_update_channel(request: web.Request) -> web.Response:
     own right — the profile parser fails closed on unknown keys, so a new key has
     to be rolled out before it can be set.
     """
+    owner_denied = await require_owner_dashboard_request(request, "update.channel")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -2419,6 +2430,9 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
     git checkout. Restart has no such precondition — it is valid on every
     layout, including a desktop bundle's embedded gateway.
     """
+    owner_denied = await require_owner_dashboard_request(request, "update.restart")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
 
     # Coalesce repeat clicks/requests BEFORE the response-flush sleep below.

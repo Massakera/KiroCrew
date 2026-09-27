@@ -374,6 +374,10 @@ from kiro_crew.memory_stores import (
     memory_store_name_defect,
 )
 
+# Runtime-budget policy and coercion live in the monitoring limits leaf module,
+# keeping the loader's compatibility facade free of duplicated bounds.
+from kiro_crew.monitoring.limits import coerce_runtime_ceiling
+
 # The speech-to-text defaults and the model catalog come from the package that
 # owns them, so the model menu this schema advertises cannot name a model that
 # cannot be downloaded, and a tuning knob cannot document a default the session
@@ -493,8 +497,19 @@ def _workspace_dir_file() -> Path:
     return config_dir() / "workspace_dir"
 
 
-def _resolve_workspace_root(root: Path) -> Path:
-    """Realpath-normalize a workspace root after ensuring it exists.
+def normalize_workspace_path(raw: str) -> Path:
+    """Drop ONE symmetric outer quote pair (keeping its inside verbatim), expand ``~``."""
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        raw = text[1:-1]
+    try:
+        return Path(raw).expanduser()
+    except RuntimeError:  # ``~unknown-user``: stays relative, so callers fall back
+        return Path(raw)
+
+
+def _resolve_workspace_root(root: Path, *, create: bool = True) -> Path:
+    """Realpath-normalize a workspace root, by default after ensuring it exists.
 
     On hosts with a symlinked ``$HOME``/workspace path (e.g. ``/home/<u> ->
     /local/home/<u>``, ``/home/<u>/workplace -> /workplace/<u>``) the symlink-form
@@ -507,34 +522,45 @@ def _resolve_workspace_root(root: Path) -> Path:
     Normalizing here, at the single source, makes the SAME resolved path flow into
     spawn cwd and the persisted session_map cwd so write and resume always agree.
     This mirrors the existing ``os.path.realpath`` in ``default_project_dir``.
+
+    ``create=False`` is for a read-only caller (the doctor) that must not leave a
+    workspace tree behind on a host where no gateway ever ran; realpath of a
+    missing path resolves the components that do exist.
     """
-    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_absolute():
+        # A relative root would be created under whatever CWD this process has.
+        logger.warning("workspace root %r is not absolute; using the default", str(root))
+        root = _default_workspace_base() / _WORKSPACE_DIR_NAME
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
     return Path(os.path.realpath(str(root)))
 
 
-def workspace_root() -> Path:
+def workspace_root(*, create: bool = True) -> Path:
     """Return the top-level workspace root for LLM sessions and tasks.
 
     Resolution order:
-    1. ``KIROCREW_WORKSPACE`` env var (used as-is, no subdirectory appended)
+    1. ``KIROCREW_WORKSPACE`` env var (no subdirectory appended)
     2. Saved path in ``config_dir()/workspace_dir`` (written by ``kirocrew setup``)
     3. Platform default with ``kirocrew-workspace`` subdirectory
 
+    Values are unquoted and ``~``-expanded; a non-absolute root is replaced by (3).
     The chosen root is realpath-normalized (see ``_resolve_workspace_root``) so
-    sessions resume correctly on hosts with a symlinked home/workspace path.
+    sessions resume correctly on hosts with a symlinked home/workspace path. It is
+    created unless ``create=False``, which only resolves the configured path.
     """
     override = os.environ.get("KIROCREW_WORKSPACE")
     if override:
-        return _resolve_workspace_root(Path(override))
+        return _resolve_workspace_root(normalize_workspace_path(override), create=create)
     if _workspace_dir_file().is_file():
         try:
             saved = _workspace_dir_file().read_text(encoding="utf-8").strip()
             if saved:
-                return _resolve_workspace_root(Path(saved))
+                return _resolve_workspace_root(normalize_workspace_path(saved), create=create)
         except OSError:
             pass
     base = _default_workspace_base()
-    return _resolve_workspace_root(base / _WORKSPACE_DIR_NAME)
+    return _resolve_workspace_root(base / _WORKSPACE_DIR_NAME, create=create)
 
 
 def _session_work_dir(session_key: str | None) -> Path:
@@ -1194,6 +1220,27 @@ def file_delivery_consent_path() -> Path:
     take. Respects ``KIROCREW_HOME``.
     """
     return config_dir() / "file_delivery_consent.json"
+
+
+def credential_redaction_path() -> Path:
+    """Return path to credential_redaction.json -- the credential-redaction switch.
+
+    Same KEYSTONE reasoning as :func:`file_delivery_consent_path`, and the leaf
+    is on ``security._CREW_SECRET_LEAVES`` for the same reason: turning the
+    credential scrubber OFF is an authorization, not a preference. Stored in the
+    agent-readable ``config.json`` it would be writable by any auto-approved agent
+    shell, so a prompt-injected agent could switch off the very pass that keeps
+    the secrets it can read out of the owner's dashboard file viewer (the one
+    surface the switch governs). ``is_sensitive_path`` blocks the tool path and
+    the OS sandbox mounts the keystone read-only for the shell.
+
+    Holds ``{"enabled": bool, "changed_at": str}``; a missing, unreadable or
+    malformed file reads as ENABLED (see ``security.redaction_switch``), so the
+    fail direction is always "keep redacting". The only writer is the
+    authenticated, OWNER-gated dashboard ``/api/security/credential-redaction``
+    handler. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "credential_redaction.json"
 
 
 def ssh_auth_sock_consent_path() -> Path:
@@ -2346,6 +2393,18 @@ def _default_memory_mode_from(raw: object) -> str:
     return raw if isinstance(raw, str) and raw in _DEFAULT_MEMORY_MODES else "temporary"
 
 
+def _folder_sort_from(raw: object) -> str:
+    """Normalize the sidebar folder sort mode; anything unknown is ``custom``.
+
+    ``custom`` is the stored-order behaviour every install had before the field
+    existed, so a missing, hand-edited or downgraded value changes nothing the
+    person sees. The sidebar's own reader makes the same choice.
+    """
+    if isinstance(raw, str) and raw in _sections.FOLDER_SORT_MODES:
+        return raw
+    return _sections.FOLDER_SORT_DEFAULT
+
+
 # (section, key, min, max) for each bounded field clamped at load time. The
 # mins match the runtime floors: subagent_auto_max has a floor of 3
 # (``subagent._LEGACY_DEFAULT_MAX`` — the auto-size minimum), so a value < 3 is
@@ -3077,6 +3136,7 @@ def _build_memory_config(memory_data: dict) -> MemoryConfig:
         persistence_enabled=_safe_bool(memory_data.get("persistence_enabled", True), True),
         inject_memory=_safe_bool(memory_data.get("inject_memory", True), True),
         inject_lessons=_safe_bool(memory_data.get("inject_lessons", True), True),
+        inject_activity=_safe_bool(memory_data.get("inject_activity", True), True),
         migrated=memory_data.get("migrated", False),
     )
 
@@ -3451,6 +3511,9 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             RECENT_TINT_COUNT_MIN,
             RECENT_TINT_COUNT_MAX,
         ),
+        folder_sort=_folder_sort_from(
+            dashboard_data.get("folder_sort", _sections.FOLDER_SORT_DEFAULT)
+        ),
         update_nudge=(
             dashboard_data.get("update_nudge", {})
             if isinstance(dashboard_data.get("update_nudge"), dict)
@@ -3628,9 +3691,15 @@ def _build_mcp_config(mcp_data: dict) -> McpConfig:
         extra_path_dirs=[
             d for d in _safe_list(mcp_data.get("extra_path_dirs", [])) if isinstance(d, str)
         ],
-        # Only a real ``true`` opts in: a hand-edited truthy string must not grant
-        # a gate bypass by accident.
-        honour_auto_approve=mcp_data.get("honour_auto_approve") is True,
+        # ABSENT takes the documented default (on): an ``autoApprove`` the owner
+        # wrote is respected, and nobody has to name this key to get that. Opting
+        # out takes a real ``false``; a value of the wrong type is removed by the
+        # schema validator before this runs, so it reads as absent and the default
+        # applies rather than a guess at what the text meant. The default lives
+        # here as well as on the dataclass field because this builder always sets
+        # the field explicitly, so the field's own default never reaches a loaded
+        # config.
+        honour_auto_approve=mcp_data.get("honour_auto_approve", True) is True,
     )
 
 
@@ -3831,6 +3900,13 @@ def _build_skills_config(skills_data: dict) -> SkillsConfig:
         project_skills_enabled=(
             skills_data.get("project_skills_enabled", d.project_skills_enabled) is True
         ),
+    )
+
+
+def _build_monitoring_config(data: dict, prefer_structured_arming: bool) -> MonitoringConfig:
+    return MonitoringConfig(
+        prefer_structured_arming=prefer_structured_arming,
+        max_runtime_secs=coerce_runtime_ceiling(data.get("max_runtime_secs")),
     )
 
 
@@ -4864,8 +4940,8 @@ class KiroCrewConfig:
                 connect_timeout_raw, instances_data, mint_timeout_raw
             ),
             heartbeat=HeartbeatConfig(default_deliver=heartbeat_default_deliver),
-            monitoring=MonitoringConfig(
-                prefer_structured_arming=monitoring_prefer_structured_arming
+            monitoring=_build_monitoring_config(
+                monitoring_data, monitoring_prefer_structured_arming
             ),
             decisions=DecisionsConfig.from_raw(decisions_data),
             skills=_build_skills_config(skills_data),
@@ -5628,6 +5704,7 @@ class KiroCrewConfig:
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
+        from kiro_crew.session_work_dir import is_disposable_session_key
 
         model = self.agent.model
         if model == DEFAULT_MODEL:
@@ -5676,6 +5753,13 @@ class KiroCrewConfig:
             # Per-spawn harness for a sub-agent (``None`` = no override; ``""``
             # names kiro). NAMED for the same reason as ``permission_mode``.
             acp_backend_override: str | None = None,
+            # The subagent manager's gate-exit start-clock reset for a DEDICATED
+            # subagent process. NAMED for the same reason ``permission_mode``
+            # is: swallowed by the catch-all, the dedicated path would silently
+            # keep charging session-start-gate queue time to the startup
+            # watchdog, which is the exact defect the callback exists to end.
+            on_gate_acquired: Callable[[float], None] | None = None,
+            on_gate_queued: Callable[[], None] | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -5816,6 +5900,12 @@ class KiroCrewConfig:
                 # the tree's work directory is mounted beside its own scratch
                 # and is what its ``$KIROCREW_SCRATCH`` names (agent_scratch).
                 shared_scratch=shared_scratch,
+                on_gate_acquired=on_gate_acquired,
+                on_gate_queued=on_gate_queued,
+                # Only a work dir DERIVED from a one-run key is the provider's
+                # to reclaim at shutdown; an explicit ``cwd`` is the caller's
+                # directory whatever the key says (session_work_dir).
+                disposable_work_dir=not cwd and is_disposable_session_key(session_key),
             )
 
         return _acp

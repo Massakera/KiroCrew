@@ -197,11 +197,11 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       'primitive (manual: notifications.volume)',
   },
   'RemoteCrewPanel.tsx': {
-    counts: { input: 6 },
+    counts: { input: 7 },
     reason:
       'setup-wizard AWS profile/region convenience fields (localStorage) behind a ' +
       'non-URL sub-tab a deep link cannot mount; plus the launch form\'s identity ' +
-      'choice (2 radios) and Identity Center start-URL/region fields — per-launch ' +
+      'choice (2 radios), Identity Center start-URL/region and subnet ID fields — per-launch ' +
       'arguments sent with the launch request, not persistent settings',
   },
   'SecretsPanel.tsx': {
@@ -373,5 +373,50 @@ describe('settings coverage gate — manual entries anchor to panel source', () 
       'source — the deep-link anchor is gone or renamed. Restore the ' +
       'data-setting-label anchor (or update/remove the manual entry).',
     ).toEqual([])
+  })
+})
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Rail pages: a search hit must name a page the Chat rail actually has      */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('settings coverage gate — Chat rail pages', () => {
+  it('every Chat control is tagged with a page the rail lists', () => {
+    const source = readPanel('ChatPanel.tsx')
+    const railStart = source.indexOf('= [', source.indexOf('const railItems'))
+    const railBlock = source.slice(railStart, source.indexOf('\n  ]', railStart))
+    const railKeys = [...railBlock.matchAll(/key: '([a-z0-9-]+)'/g)].map(m => m[1])
+    expect(railKeys.length).toBeGreaterThan(1)
+
+    const { entries } = extractFromSource(source, 'ChatPanel.tsx')
+    expect(entries.length).toBeGreaterThan(0)
+    const offRail = entries
+      .filter(e => !railKeys.includes(String(e.params?.sub)))
+      .map(e => `${e.label ?? e.labelKey} -> ${String(e.params?.sub)}`)
+    expect(offRail, 'search would open a page the rail does not have').toEqual([])
+  })
+
+  it('tags each control with the page whose case renders it', () => {
+    const { entries } = extractFromSource(
+      `switch (active) {
+        case 'composer':
+          return <SettingsToggle label="Quick Send" checked={x} onChange={f} />
+        case 'advanced':
+          return <SettingsToggle label="Prevent sleep" checked={x} onChange={f} />
+      }`,
+      'website/src/pages/settings/ChatPanel.tsx',
+    )
+    expect(entries.map(e => [e.label, e.params?.sub])).toEqual([
+      ['Quick Send', 'composer'],
+      ['Prevent sleep', 'advanced'],
+    ])
+  })
+
+  it('leaves panels without a rail untouched', () => {
+    const { entries } = extractFromSource(
+      `case 'x': return <SettingsToggle label="Mode" checked={x} onChange={f} />`,
+      'website/src/pages/settings/DisplayPanel.tsx',
+    )
+    expect(entries[0].params).toBeUndefined()
   })
 })

@@ -71,6 +71,17 @@ class TestSurvivesAcpResultParser:
         assert event.tool_final is True
         assert sd.decode(event.tool_output, "ask_question") == DIRECTIVE_ARGS
 
+    def test_codex_mcp_result_envelope_preserves_directive(self):
+        event = _build_tool_result_event(
+            {
+                "toolCallId": "exec-mcp",
+                "status": "completed",
+                "rawOutput": {"result": _mcp_envelope(_encoded()), "error": None},
+            }
+        )
+        assert event is not None
+        assert sd.decode(event.tool_output, "ask_question") == DIRECTIVE_ARGS
+
     def test_directive_survives_content_block_path(self):
         update = {
             "toolCallId": "tc-2",

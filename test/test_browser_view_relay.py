@@ -13,9 +13,15 @@ upstream died).
 
 from __future__ import annotations
 
+import ast
 import contextlib
+import errno
+import inspect
+import pathlib
+import socket
+import textwrap
 import time
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Iterator
 
 import aiohttp
 import pytest
@@ -42,6 +48,47 @@ INDEX_HTML = (
 )
 CSS_BODY = "@font-face{src:url(/assets/codicon-xyz.ttf)}"
 BINARY_BODY = bytes(range(256)) * 4
+
+
+def _stub_authorize(outcome: str, port: int | None = None) -> Callable[..., tuple[str, int | None]]:
+    """A fixed-verdict ``relay_authorize`` double that honors the real signature.
+
+    Every double in this module comes from here (or declares the same keyword),
+    because the handler calls the real function TWICE per connection and the
+    second call — the post-connect re-proof — passes ``proof_not_before`` as a
+    keyword. A double that takes ``candidate`` alone raises ``TypeError``
+    there, which is neither ``ClientError`` nor ``OSError``, so it escapes the
+    relay's unreachable-upstream handler and the wire answer becomes a generic
+    500 instead of the status under test. That is only reachable when the
+    connect SUCCEEDS, so a stub whose verdict denies before connect hides the
+    drift until someone changes its verdict.
+    ``test_every_relay_authorize_stub_accepts_the_post_connect_fence`` pins the
+    whole module against it.
+    """
+
+    def _authorize(
+        candidate: str, *, proof_not_before: float | None = None
+    ) -> tuple[str, int | None]:
+        return outcome, port
+
+    return _authorize
+
+
+@contextlib.contextmanager
+def _dead_upstream_port() -> Iterator[int]:
+    """Yield a port that provably has no listener, and HOLD it for the caller.
+
+    Binding without ever calling ``listen`` is what makes this deterministic
+    under xdist: the address stays occupied for the whole ``with`` body, so no
+    concurrent worker can take it, while a connect to it is refused because
+    there is no accept queue. Binding and releasing — reading a free port and
+    closing it — only samples a port that was free a moment ago; on a loaded
+    shard another worker binds it before the request goes out and the relay
+    then reaches a live stranger instead of a dead address.
+    """
+    with socket.socket() as held:
+        held.bind(("127.0.0.1", 0))
+        yield int(held.getsockname()[1])
 
 
 def _stub_upstream(hits: list[str]) -> web.Application:
@@ -379,7 +426,7 @@ async def test_wrong_token_answers_404_without_touching_upstream(
 async def test_view_not_running_answers_the_same_404(monkeypatch: pytest.MonkeyPatch) -> None:
     # Indistinguishable from a wrong token: an unauthenticated probe must not
     # learn whether a logged-in browser is up.
-    monkeypatch.setattr(browser_cli_view, "relay_authorize", lambda candidate: ("view_down", None))
+    monkeypatch.setattr(browser_cli_view, "relay_authorize", _stub_authorize("view_down"))
     client = TestClient(TestServer(_relay_app(), host="127.0.0.1"))
     await client.start_server()
     try:
@@ -401,7 +448,7 @@ async def test_supervisor_busy_answers_retryable_503(monkeypatch: pytest.MonkeyP
     # turning a transient lock hold into a broken document.
     recorder = _AuditRecorder()
     monkeypatch.setattr(browser_view_relay, "sel", lambda: recorder)
-    monkeypatch.setattr(browser_cli_view, "relay_authorize", lambda candidate: ("busy", None))
+    monkeypatch.setattr(browser_cli_view, "relay_authorize", _stub_authorize("busy"))
     client = TestClient(TestServer(_relay_app(), host="127.0.0.1"))
     await client.start_server()
     try:
@@ -416,23 +463,297 @@ async def test_supervisor_busy_answers_retryable_503(monkeypatch: pytest.MonkeyP
 
 
 async def test_dead_upstream_answers_502(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A port nothing listens on: bind-and-release to find one that is free.
-    # The caller HOLDS the valid token, so the run-state disclosure is fine.
-    import socket
+    # A port with no listener, HELD for the duration so no concurrent worker
+    # can take it: that is what makes the 502 a property of the address rather
+    # than of how busy the shard is. The caller HOLDS the valid token, so the
+    # run-state disclosure is fine.
+    with _dead_upstream_port() as dead_port:
+        monkeypatch.setattr(browser_cli_view, "relay_authorize", _stub_authorize("ok", dead_port))
+        client = TestClient(TestServer(_relay_app(), host="127.0.0.1"))
+        await client.start_server()
+        try:
+            resp = await client.get(f"/browser-view/{TOKEN}/")
+            assert resp.status == 502
+            payload: dict[str, Any] = await resp.json()
+            assert payload["code"] == "browser_view_unreachable"
+        finally:
+            await client.close()
 
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        dead_port = sock.getsockname()[1]
-    monkeypatch.setattr(browser_cli_view, "relay_authorize", lambda candidate: ("ok", dead_port))
-    client = TestClient(TestServer(_relay_app(), host="127.0.0.1"))
-    await client.start_server()
-    try:
-        resp = await client.get(f"/browser-view/{TOKEN}/")
-        assert resp.status == 502
-        payload: dict[str, Any] = await resp.json()
-        assert payload["code"] == "browser_view_unreachable"
-    finally:
-        await client.close()
+
+def test_dead_upstream_port_cannot_be_taken_by_a_concurrent_worker() -> None:
+    """The determinism the 502 above rests on: the address stays ours.
+
+    Bind-and-release samples a port that WAS free; between the release and the
+    request a concurrent xdist worker can bind it, and the relay then reaches a
+    live stranger rather than a dead address. Holding the socket bound (never
+    listening) removes the window: a rival bind is refused for as long as the
+    ``with`` body runs, and a connect still gets no accept queue.
+    """
+    with _dead_upstream_port() as dead_port:
+        with socket.socket() as rival:
+            with pytest.raises(OSError) as refused:
+                rival.bind(("127.0.0.1", dead_port))
+        assert refused.value.errno == errno.EADDRINUSE
+
+
+_FENCE = "proof_not_before"
+_RELAY_AUTHORIZE = "relay_authorize"
+# The exact number of ``relay_authorize`` doubles this module installs. Pinned,
+# so adding or deleting one is a deliberate edit here: a count that only has a
+# lower bound lets a double drop out of the checked population while the
+# self-check stays green.
+_RELAY_AUTHORIZE_INSTALLS = 9
+
+
+def _declares_fence(node: ast.AST) -> bool:
+    """True when ``node`` takes the post-connect fence as a keyword-only arg."""
+    args = getattr(node, "args", None)
+    if not isinstance(args, ast.arguments):
+        return False
+    return any(kwarg.arg == _FENCE for kwarg in args.kwonlyargs)
+
+
+def _relay_authorize_doubles(source: str) -> tuple[list[int], list[int]]:
+    """Scan ``source`` for ``relay_authorize`` installs; return (all, offenders).
+
+    Both values are line numbers. An offender is an installed double the scan
+    cannot show accepts the fence, which includes a double it cannot resolve at
+    all: a name whose definition is invisible to this scan is unproven, not
+    approved.
+
+    Every name is resolved AT ITS INSTALL SITE, walking outward through the
+    enclosing function scopes to module scope. That is what a single
+    name-to-node mapping cannot express -- this module binds ``_authorize`` in
+    three separate scopes, and one entry per name would check two of those
+    installs against a body that is not in their scope. A name bound more than
+    once inside one scope has to satisfy the fence in every form it takes.
+    """
+    tree = ast.parse(source)
+
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def _bindings(scope: ast.AST) -> dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]:
+        """Function names bound DIRECTLY in ``scope``, name -> every definition.
+
+        Descent stops at a nested ``def``, ``class`` or ``lambda`` so an inner
+        definition is attributed to its own scope rather than to the one that
+        encloses it.
+        """
+        found: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+        pending: list[ast.AST] = list(getattr(scope, "body", []))
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                found.setdefault(node.name, []).append(node)
+                continue
+            if isinstance(node, (ast.ClassDef, ast.Lambda)):
+                continue
+            pending.extend(ast.iter_child_nodes(node))
+        return found
+
+    def _resolve(name: str, site: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+        """Every definition ``name`` denotes at ``site``, from the nearest scope."""
+        scope: ast.AST | None = site
+        while scope is not None:
+            if isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)):
+                bound = _bindings(scope).get(name)
+                if bound:
+                    return bound
+            scope = parents.get(scope)
+        return []
+
+    installed: list[tuple[int, ast.expr]] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "setattr"
+        ):
+            continue
+        attribute: str | None = None
+        double: ast.expr | None = None
+        if len(node.args) == 3 and isinstance(node.args[1], ast.Constant):
+            # setattr(module, "relay_authorize", double)
+            named = node.args[1].value
+            attribute = named if isinstance(named, str) else None
+            double = node.args[2]
+        elif len(node.args) == 2 and isinstance(node.args[0], ast.Constant):
+            # setattr("pkg.mod.relay_authorize", double) -- monkeypatch's
+            # dotted-string form, where the attribute rides in the target.
+            dotted = node.args[0].value
+            attribute = dotted.rsplit(".", 1)[-1] if isinstance(dotted, str) else None
+            double = node.args[1]
+        if attribute != _RELAY_AUTHORIZE or double is None:
+            continue
+        installed.append((node.lineno, double))
+
+    offenders: list[int] = []
+    for lineno, double in installed:
+        if isinstance(double, ast.Lambda):
+            conforms = _declares_fence(double)
+        elif isinstance(double, ast.Name):
+            bound = _resolve(double.id, double)
+            conforms = bool(bound) and all(_declares_fence(node) for node in bound)
+        elif isinstance(double, ast.Call) and isinstance(double.func, ast.Name):
+            # A factory: the callable it RETURNS carries the signature.
+            factories = _resolve(double.func.id, double)
+            conforms = bool(factories) and all(
+                any(
+                    _declares_fence(child)
+                    for child in ast.walk(factory)
+                    if isinstance(child, (ast.FunctionDef, ast.Lambda)) and child is not factory
+                )
+                for factory in factories
+            )
+        else:  # pragma: no cover - an unrecognized shape must not pass silently
+            conforms = False
+        if not conforms:
+            offenders.append(lineno)
+
+    return sorted(lineno for lineno, _ in installed), sorted(offenders)
+
+
+def test_every_relay_authorize_stub_accepts_the_post_connect_fence() -> None:
+    """Every double this module installs must take ``proof_not_before``.
+
+    The handler calls ``relay_authorize`` twice per connection and the second
+    call — the post-connect re-proof — passes the fence as a KEYWORD. A double
+    declaring ``candidate`` alone raises ``TypeError`` there; that is neither
+    ``ClientError`` nor ``OSError``, so it escapes the relay's
+    unreachable-upstream handler and the wire answer is a generic 500 instead
+    of the status the test asserts. A verdict that denies before the connect
+    hides the drift, which is why this walks EVERY installed double instead of
+    the ones whose current verdict happens to reach the re-proof.
+
+    Read from the source with ``ast`` rather than by calling the stubs: the
+    drifted forms are inline lambdas inside async test bodies, so there is no
+    runtime handle on them to introspect.
+    """
+    source = pathlib.Path(__file__).read_text(encoding="utf-8")
+    installed, offenders = _relay_authorize_doubles(source)
+
+    # The guard is only meaningful if it sees the module's real population.
+    assert len(installed) == _RELAY_AUTHORIZE_INSTALLS, installed
+    assert offenders == [], offenders
+
+
+def test_the_drift_guard_resolves_each_double_in_its_own_scope() -> None:
+    """The scan reports a drifted double even when a sibling scope binds the name.
+
+    Pins the scan itself, because a name-keyed lookup passes this input: two
+    scopes bind ``_authorize``, only one of them drifted, and a single entry per
+    name checks both installs against whichever body it kept.
+
+    Also pins the rule INSIDE one scope: a name bound more than once there has
+    to satisfy the fence in every form it takes, on the direct branch and on
+    the factory branch alike. Each of those gets a case holding one conforming
+    and one drifted form, which a satisfied-by-one rule approves and the
+    every-form rule reports.
+    """
+    drifted = textwrap.dedent("""
+        def good(monkeypatch):
+            def _authorize(candidate, *, proof_not_before=None):
+                return "ok", 1
+
+            monkeypatch.setattr(mod, "relay_authorize", _authorize)
+
+
+        def bad(monkeypatch):
+            def _authorize(candidate):
+                return "ok", 1
+
+            monkeypatch.setattr(mod, "relay_authorize", _authorize)
+        """)
+    installed, offenders = _relay_authorize_doubles(drifted)
+    assert len(installed) == 2, installed
+    # The second install is the drifted one; the first must stay clean.
+    assert offenders == [installed[1]], (offenders, installed)
+
+    # ONE scope binding the name twice, one conforming form and one drifted.
+    # Both installs resolve to both bodies, so the every-binding rule reports
+    # both. This is the input a satisfied-by-one rule cannot decide: it finds
+    # the conforming body and approves installs the drifted body also serves.
+    mixed_direct = textwrap.dedent("""
+        def both(monkeypatch):
+            def _authorize(candidate, *, proof_not_before=None):
+                return "ok", 1
+
+            monkeypatch.setattr(mod, "relay_authorize", _authorize)
+
+            def _authorize(candidate):
+                return "ok", 1
+
+            monkeypatch.setattr(mod, "relay_authorize", _authorize)
+        """)
+    installed, offenders = _relay_authorize_doubles(mixed_direct)
+    assert len(installed) == 2, installed
+    assert offenders == installed, (offenders, installed)
+
+    # The same rule on the factory branch: one scope binding the factory name
+    # twice, one returning a conforming inner callable and one a drifted one.
+    # The install is reported because a drifted form of the factory reaches it.
+    mixed_factory = textwrap.dedent("""
+        def both(monkeypatch):
+            def _make():
+                def _authorize(candidate, *, proof_not_before=None):
+                    return "ok", 1
+
+                return _authorize
+
+            def _make():
+                def _authorize(candidate):
+                    return "ok", 1
+
+                return _authorize
+
+            monkeypatch.setattr(mod, "relay_authorize", _make())
+        """)
+    installed, offenders = _relay_authorize_doubles(mixed_factory)
+    assert len(installed) == 1, installed
+    assert offenders == installed, (offenders, installed)
+
+    # The dotted-string install form is counted and checked the same way.
+    dotted = textwrap.dedent("""
+        def bad(monkeypatch):
+            def _authorize(candidate):
+                return "ok", 1
+
+            monkeypatch.setattr("pkg.mod.relay_authorize", _authorize)
+        """)
+    installed, offenders = _relay_authorize_doubles(dotted)
+    assert len(installed) == 1, installed
+    assert offenders == installed, (offenders, installed)
+
+    # A double whose definition the scan cannot find is unproven, so it is
+    # reported rather than passed.
+    unresolvable = textwrap.dedent("""
+        def bad(monkeypatch):
+            monkeypatch.setattr(mod, "relay_authorize", imported_from_elsewhere)
+        """)
+    installed, offenders = _relay_authorize_doubles(unresolvable)
+    assert offenders == installed == [3], (offenders, installed)
+
+
+def test_the_stub_factory_matches_the_real_relay_authorize_signature() -> None:
+    """``_stub_authorize``'s product is call-compatible with the real function.
+
+    Pins the factory to the source of truth, so widening or renaming the real
+    fence parameter fails here loudly instead of resurfacing as a load-dependent
+    500 on a shared runner.
+    """
+    real = inspect.signature(browser_cli_view.relay_authorize)
+    stub = inspect.signature(_stub_authorize("ok", 1))
+    assert [name for name, p in real.parameters.items() if p.kind is p.KEYWORD_ONLY] == [
+        name for name, p in stub.parameters.items() if p.kind is p.KEYWORD_ONLY
+    ]
+    # And it really is callable the way the handler calls it.
+    assert _stub_authorize("ok", 4321)("tok", proof_not_before=time.monotonic()) == (
+        "ok",
+        4321,
+    )
 
 
 def test_relay_prefix_bypasses_cookie_auth_by_design() -> None:
@@ -696,7 +1017,7 @@ async def test_view_down_denial_is_audited_with_its_own_reason(
     # distinguish (SEL is not readable by the unauthenticated caller).
     recorder = _AuditRecorder()
     monkeypatch.setattr(browser_view_relay, "sel", lambda: recorder)
-    monkeypatch.setattr(browser_cli_view, "relay_authorize", lambda candidate: ("view_down", None))
+    monkeypatch.setattr(browser_cli_view, "relay_authorize", _stub_authorize("view_down"))
     client = TestClient(TestServer(_relay_app(), host="127.0.0.1"))
     await client.start_server()
     try:
@@ -713,7 +1034,9 @@ async def test_no_token_request_never_reaches_the_supervisor(
     # The pre-auth cost finding, wire side: a request with no token segment is
     # refused before the view supervisor is consulted at all — its lock and
     # ownership probes are never a cost an unauthenticated caller can impose.
-    def _must_not_be_called(candidate: str) -> tuple[str, int | None]:
+    def _must_not_be_called(
+        candidate: str, *, proof_not_before: float | None = None
+    ) -> tuple[str, int | None]:
         raise AssertionError("supervisor consulted for a tokenless request")
 
     recorder = _AuditRecorder()
@@ -740,9 +1063,7 @@ async def test_ownership_unproven_is_audited_with_its_own_reason(
     # proof: same uniform 404 on the wire, its own reason in the audit trail.
     recorder = _AuditRecorder()
     monkeypatch.setattr(browser_view_relay, "sel", lambda: recorder)
-    monkeypatch.setattr(
-        browser_cli_view, "relay_authorize", lambda candidate: ("ownership_unproven", None)
-    )
+    monkeypatch.setattr(browser_cli_view, "relay_authorize", _stub_authorize("ownership_unproven"))
     client = TestClient(TestServer(_relay_app(), host="127.0.0.1"))
     await client.start_server()
     try:

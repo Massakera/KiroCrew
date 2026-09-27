@@ -58,11 +58,11 @@ class TestIsSensitiveResolvedPath:
         calls = []
         generation = ["one"]
 
-        def resolve(path):
-            calls.append(path)
-            return path + generation[0]
+        def resolve(paths):
+            calls.extend(paths)
+            return [path + generation[0] for path in paths]
 
-        monkeypatch.setattr(security.paths, "_realpath_or_none", resolve)
+        monkeypatch.setattr(security.paths, "_realpaths_or_none", resolve)
         leaves = [".kiro/crew/token_signing.key", ".kirocrew/token_signing.key"]
         first = security.paths._home_dir_targets_uncached(leaves, roots)
         target = os.path.join(roots.crew_home, "token_signing.key")
@@ -180,6 +180,15 @@ _EXPECTED_GATE_CALL_SITES: dict[str, int] = {
     # the candidate there is what this endpoint must not do at all, since on Windows
     # it would follow a junction aimed at a share.
     "kiro_crew/dashboard/handlers/files.py": 3,
+    # ``_validate_spec_path``: ``validate_file_path`` has already rejected the
+    # candidate without following a UNC/link-laundered target.  This call only
+    # recovers the 403 classification for a lexically named sensitive path; an
+    # unresolved symlink spelling can therefore at worst stay a rejected 400,
+    # never be admitted or followed.  With ``pre_resolved=True`` the gate keeps
+    # the candidate lexical (input + ``normpath``) and resolves only its trusted
+    # anchors.  Both handler call sites run this helper via ``asyncio.to_thread``,
+    # so those inline anchor resolutions never block the event loop.
+    "kiro_crew/dashboard/handlers/taskrunner.py": 1,
     # ``security.is_sensitive_canonical_path``: the shared entry point for a
     # reader that canonicalised its path itself. It picks the gate by thread --
     # this pre-resolved gate off the event loop, the bounded gate on it -- so

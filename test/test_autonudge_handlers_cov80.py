@@ -39,6 +39,7 @@ class _FakeSvc:
     def __init__(self, loops: list[NudgeLoop] | None = None) -> None:
         self.loops = loops or []
         self.removed: list[str] = []
+        self.notes: list[tuple[str, str]] = []
 
     def list_all(self) -> list[NudgeLoop]:
         return list(self.loops)
@@ -49,8 +50,9 @@ class _FakeSvc:
     def get_by_id(self, loop_id: str) -> NudgeLoop | None:
         return next((lp for lp in self.loops if lp.id == loop_id), None)
 
-    async def remove(self, loop_id: str) -> None:
+    async def remove(self, loop_id: str, *, stop_reason: str = "", stop_detail: str = "") -> None:
         self.removed.append(loop_id)
+        self.notes.append((loop_id, stop_reason))
 
 
 def _loop(loop_id: str = "lp-1", slot_key: str = "chat-1-111") -> NudgeLoop:
@@ -436,6 +438,74 @@ async def test_monitor_create_uses_bounded_defaults(monkeypatch: pytest.MonkeyPa
     assert kwargs["monitor"].budgets.max_tokens == 250_000
     assert kwargs["monitor"].budgets.max_provider_errors == 3
     assert kwargs["replace_existing"] is False
+
+
+@pytest.mark.asyncio
+async def test_monitor_create_omitting_the_budget_succeeds_under_a_low_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shipped 14400 default is capped to the operator ceiling, so a body
+    that never named a budget is not refused for one."""
+    _svc(monkeypatch, _FakeSvc())
+    monkeypatch.setattr(h, "runtime_ceiling_secs", lambda: 3600)
+    authorize = AsyncMock(return_value=(_monitor_loop("new-mon"), None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+    request = _mk(
+        "POST",
+        "/api/monitors",
+        body={"slot_key": "chat-1-111", "target": "https://github.com/acme/widgets/pull/7"},
+    )
+    response = await h.api_monitor_create(request)
+    assert response.status == 200
+    assert authorize.await_args.kwargs["monitor"].budgets.max_runtime_secs == 3600
+
+    response = await h.api_monitor_create(
+        _mk(
+            "POST",
+            "/api/monitors",
+            body={
+                "slot_key": "chat-1-111",
+                "target": "https://github.com/acme/widgets/pull/7",
+                "max_runtime_secs": 3601,
+            },
+        )
+    )
+    assert response.status == 400
+    assert "between 1 and 3600" in _body(response)["error"]
+
+
+@pytest.mark.asyncio
+async def test_monitor_update_omitting_the_budget_leaves_a_stored_one_unjudged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored budget above a lowered ceiling belongs to the load path; a patch
+    that does not touch it is not refused for it, and one that names it is."""
+    loop = _monitor_loop()
+    assert loop.monitor is not None
+    loop.monitor.budgets = dataclasses.replace(loop.monitor.budgets, max_runtime_secs=7200)
+    _svc(monkeypatch, _FakeSvc([loop]))
+    monkeypatch.setattr(h, "runtime_ceiling_secs", lambda: 3600)
+    update = AsyncMock(return_value=(loop, None, 200))
+    monkeypatch.setattr(h, "authorize_and_update_monitor", update)
+
+    response = await h.api_monitor_update(
+        _mk("PATCH", "/api/monitors/mon-1", match={"monitor_id": "mon-1"}, body={"max_tokens": 5})
+    )
+    assert response.status == 200
+    assert update.await_args.kwargs["patch"] == {"budget_patch": {"max_tokens": 5}}
+
+    update.reset_mock()
+    response = await h.api_monitor_update(
+        _mk(
+            "PATCH",
+            "/api/monitors/mon-1",
+            match={"monitor_id": "mon-1"},
+            body={"max_runtime_secs": 7200},
+        )
+    )
+    assert response.status == 400
+    assert "between 1 and 3600" in _body(response)["error"]
+    update.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1225,6 +1295,40 @@ async def test_start_passes_create_only_coerced_values_to_the_authorizer(
 
 
 @pytest.mark.asyncio
+async def test_start_answers_an_over_ceiling_budget_with_the_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An integer above the ceiling is a bound failure, not a type failure: the
+    refusal quotes the range so the caller can lower the number."""
+    _svc(monkeypatch, _FakeSvc())
+    monkeypatch.setattr("kiro_crew.monitoring.limits.runtime_ceiling_secs", lambda: 3600)
+    request = _mk(
+        "POST", "/api/autonudge", body={"slot_key": "s", "message": "m", "max_runtime_secs": 7200}
+    )
+    response = await h.api_autonudge_start(request)
+    assert response.status == 400
+    error = _body(response)["error"]
+    assert "between 0 and 3600" in error and "1 hour" in error
+    assert "must be integers" not in error
+
+
+@pytest.mark.asyncio
+async def test_start_accepts_a_whole_number_float_budget_as_an_int(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    authorize = AsyncMock(return_value=(_loop("lp-new"), None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+    request = _mk(
+        "POST", "/api/autonudge", body={"slot_key": "s", "message": "m", "max_runtime_secs": 3600.0}
+    )
+    response = await h.api_autonudge_start(request)
+    assert response.status == 200
+    budget = authorize.await_args.kwargs["max_runtime_secs"]
+    assert budget == 3600 and type(budget) is int
+
+
+@pytest.mark.asyncio
 async def test_start_surfaces_the_authorizer_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
     _svc(monkeypatch, _FakeSvc())
     monkeypatch.setattr(
@@ -1317,6 +1421,7 @@ async def test_delete_removes_and_audits_the_owning_slot(
     request = _mk("DELETE", "/api/autonudge/lp-1", match={"loop_id": "lp-1"})
     assert _body(await h.api_autonudge_delete(request)) == {"ok": True}
     assert svc.removed == ["lp-1"]
+    assert svc.notes == [("lp-1", "dashboard_delete")]
     kwargs = sel_mock.log_tool_invocation.call_args.kwargs
     assert kwargs["session_key"] == "chat-5-555"
     assert kwargs["tool_name"] == "autonudge_delete"

@@ -52,10 +52,10 @@ from kiro_crew.dashboard.handlers.mcp import (
     api_mcp_active,
 )
 
-# One xdist worker for the whole module: the call-site ratchet below reads src/ through
-# ``test/source_corpus.py``'s shared, module-lifetime text cache. Under `--dist loadgroup`
-# an unmarked module is spread across workers and each worker re-pays that read and holds
-# its own copy of the corpus. Grouping keeps the cache single-copy per run.
+# One xdist worker for the whole module: the call-site ratchet below streams src/ through
+# ``test/source_corpus.py`` once per target and memoises only its own small result. Under
+# `--dist loadgroup` an unmarked module is spread across workers and each worker re-pays
+# every one of those scans. Grouping keeps them single-copy per run.
 pytestmark = pytest.mark.xdist_group(name="tree_scan_test_agent_spec_hardened_reads")
 
 # The two refusal shapes cheap enough to plant per surface. "oversized" is the
@@ -1126,6 +1126,11 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("forward:operation", "forward:source"),
         ("resolve_agent_model", "unknown"),
     ],
+    # The spawn gate walks every spec for the PARENT agent's
+    # ``toolsSettings.subagent.availableAgents`` allowlist, and keeps a file the
+    # reader refuses as unreadable (refuse) rather than as "no spec"; a denial
+    # there belongs to the sub-agent surface that asked to spawn.
+    "kiro_crew/subagent.py": [("spawn_available_agents", "subagent")],
 }
 
 
@@ -1156,10 +1161,13 @@ _EXPECTED_PROJECT_FILES_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("agent_project_shadow", "unknown"),
         ("markdown_spec_lookup", "unknown"),
     ],
-    "kiro_crew/agent_discovery.py": [
-        ("forward:operation", "forward:source"),
-        ("list_agents", "unknown"),
-    ],
+    # No ``kiro_crew/agent_discovery.py`` entry on purpose. The two in-module
+    # readers (``list_agents``, ``project_agent_names``) decide this scope's
+    # sensitivity THEMSELVES -- pinned in
+    # ``_EXPECTED_SCOPE_GUARD_CALL_SITE_LABELS`` -- and then scan through the
+    # unguarded ``_scan_project_agent_files``. Re-entering this reader would
+    # decide a second time on the same scope, and a second verdict that
+    # disagreed would record a denial for a tree the caller already read.
     "kiro_crew/cli_doctor.py": [("doctor", "cli")],
     # The base-spec read and the shadow check are one surface's two questions
     # about the same checkout, so one label covers both.
@@ -1209,7 +1217,7 @@ def _labelled_call_sites(target: str) -> dict[str, list[tuple[str | None, str | 
 
     Cached per *target*: the source tree cannot change mid-run and both tests in
     ``TestCallSiteLabelRatchet`` ask the same targets. The scan itself goes through
-    ``test/source_corpus.py``: one shared read of ``src/`` for the module, and a
+    ``test/source_corpus.py``: one streamed read of ``src/`` per target, and a
     parse of only the files whose text names *target* at all. That narrowing cannot
     hide a site -- every match above is an identifier equal to *target* (a ``Name``
     id, an ``Attribute`` attr, or a positional ``Name`` argument), and the corpus
@@ -1312,7 +1320,23 @@ _EXPECTED_STRICT_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
 }
 
 
+# The guard those three paths share. It is not a reader -- it decides, and emits
+# the denial row when the answer is "protected tree" -- but it is where the
+# ``operation``/``source`` pair now reaches the log, so a literal written here in
+# place of a forward would erase the asking surface from every denial the
+# enclosing function records. ``list_agents`` is the one in-module caller that IS
+# the surface, so its literals are the pinned exception.
+_EXPECTED_SCOPE_GUARD_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/agent_discovery.py": [
+        ("forward:operation", "forward:source"),
+        ("forward:operation", "forward:source"),
+        ("list_agents", "unknown"),
+    ],
+}
+
+
 _RATCHET_INVENTORY: dict[str, dict[str, list[tuple[str, str]]]] = {
+    "_project_scope_denied": _EXPECTED_SCOPE_GUARD_CALL_SITE_LABELS,
     "_read_agent_spec": _EXPECTED_CALL_SITE_LABELS,
     "parsed_agent_specs": _EXPECTED_PARSED_SPECS_CALL_SITE_LABELS,
     "project_agent_files": _EXPECTED_PROJECT_FILES_CALL_SITE_LABELS,

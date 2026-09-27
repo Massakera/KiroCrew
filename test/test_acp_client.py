@@ -63,6 +63,18 @@ _POSIX_EXEC_PATHS_ONLY = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
+def _pin_the_installed_kiro_cli_version(monkeypatch):
+    """The writer gate in ``_write_derived_permissions`` reads
+    ``installed_kiro_cli_version`` function-locally, and on a host with a kiro-cli
+    installed that is one REAL ``kiro-cli --version`` spawn per binary identity --
+    32 per full run of this file on a five-run hygiene sweep, from tests that drive
+    protocol and process doubles. The version the gate sees is a property of the
+    host, not of the client under test; ``None`` is the "cannot be established"
+    branch every host without the binary already takes."""
+    monkeypatch.setattr("kiro_crew.kiro_cli.installed_kiro_cli_version", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _native_projection_for_fake_processes(monkeypatch):
     from kiro_crew.acp import skill_projection
 
@@ -71,7 +83,9 @@ def _native_projection_for_fake_processes(monkeypatch):
     monkeypatch.setattr(
         skill_projection,
         "prepare_native_skill_projection",
-        lambda work_dir: skill_projection.NativeSkillProjection({"kirocrew": "kirocrew"}),
+        lambda work_dir, **_kwargs: skill_projection.NativeSkillProjection(
+            {"kirocrew": "kirocrew"}
+        ),
     )
 
 
@@ -4336,8 +4350,8 @@ class TestSendPipeErrors:
                 pass
 
     @pytest.mark.asyncio
-    async def test_stale_eligible_re_enabled_after_tool_then_text(self):
-        """Text after tool re-enables _stale_eligible — synthetic complete fires."""
+    async def test_stale_eligible_re_enabled_after_completed_tool_then_text(self):
+        """Text after a completed tool permits synthetic completion."""
         from kiro_crew.acp.types import (
             EVENT_COMPLETE,
             EVENT_TEXT_CHUNK,
@@ -4365,9 +4379,20 @@ class TestSendPipeErrors:
             params={
                 "update": {
                     "sessionUpdate": UPDATE_TOOL_CALL,
-                    "toolUseId": "tool_1",
+                    "toolCallId": "tool_1",
                     "name": "Read",
                     "input": "{}",
+                }
+            },
+        )
+        result_msg = JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tool_1",
+                    "status": "completed",
+                    "content": [{"content": {"type": "text", "text": "ok"}}],
                 }
             },
         )
@@ -4384,8 +4409,9 @@ class TestSendPipeErrors:
         async def fake_prompt_loop(req_id, timeout):
             yield "update", text1
             yield "update", tool_msg
+            yield "update", result_msg
             yield "update", text2
-            # No "complete" — text after tool, stale eligible again.
+            # No "complete" — the completed tool leaves the model idle.
 
         client.ensure_ready = AsyncMock()
         client._send_prompt = AsyncMock(return_value=1)
@@ -7751,9 +7777,9 @@ class TestDispatchToolResultContentShapes:
         to abort the turn it is reporting on."""
         import logging
 
-        from kiro_crew.acp._dispatch import _build_tool_result_event, redacted_tool_id
+        from kiro_crew.acp._dispatch import _build_tool_result_event, _loggable_request_id
 
-        assert redacted_tool_id(1234) == "1234"
+        assert _loggable_request_id(1234) == "1234"
 
         with caplog.at_level(logging.WARNING, logger="kiro_crew.acp._dispatch"):
             assert (
@@ -7773,9 +7799,18 @@ class TestDispatchToolResultContentShapes:
         entry, so a frame that pads them cannot be held in memory in full. Bounds
         are applied AFTER redaction, never before -- a cut taken first can split a
         credential into fragments no pattern matches."""
-        from kiro_crew.acp._dispatch import redacted_tool_id, unrenderable_content_shapes
+        from kiro_crew.acp._dispatch import (
+            _REQUEST_ID_LOG_CAP,
+            _loggable_request_id,
+            unrenderable_content_shapes,
+        )
 
-        assert len(redacted_tool_id("t" * 100_000)) == 200
+        # Under the input cap and left intact by the redactor (a single repeated
+        # letter matches no credential pattern), so the display slice is what
+        # bounds it -- pinned by equality.
+        assert len(_loggable_request_id("t" * 3000)) == _REQUEST_ID_LOG_CAP
+        # Over the input cap the value is replaced by the length-only marker.
+        assert _loggable_request_id("t" * 100_000).startswith("<id too long: ")
         padded = [{"type": f"x{i}", "pad": "y" * 200} for i in range(2000)]
         assert len(unrenderable_content_shapes(padded)) == 4000
 
@@ -8461,7 +8496,7 @@ class TestWaitForResponseDeferral:
             [{"name": "ready"}, {"name": "broken"}, {"name": "silent"}]
         )
 
-        assert "2/3 MCP server(s) reported" in progress
+        assert "2/3 session-injected MCP server(s) reported" in progress
         assert "no report from silent" in progress
         assert "failed: broken" in progress
         assert "supersecret" not in progress

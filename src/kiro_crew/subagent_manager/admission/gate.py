@@ -8,9 +8,17 @@ from .._component import ManagerComponent
 from .types import ClaimPoint, PreparedSpawn
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from ...execution_context import ExecutionContext
     from ...subagent import (
+        AGENT_NOT_AVAILABLE_CODE,
+        QUEUED_REASON_ADAPTIVE_CAP_ZERO,
+        QUEUED_REASON_CONCURRENCY_LIMIT,
+        QUEUED_REASON_LOW_MEMORY,
+        QUEUED_REASON_POSTURE_CRITICAL,
         KiroCrewConfig,
+        ParentSpawnPolicy,
         SubagentInfo,
         _cost_bucket,
         _effective_next_start_gb,
@@ -18,12 +26,14 @@ if TYPE_CHECKING:
         _startup_memory_reserve_gb,
         _validate_agent,
         _validate_app_agent_ownership,
+        _vet_parent_available_agents,
         _vet_spawn_governance,
         asyncio,
         cached_admission_check,
         check_memory_available,
         learned_cost_for,
         logger,
+        parent_spawn_policy,
         platform_compat,
         redact_credentials,
         redact_exfiltration_urls,
@@ -139,9 +149,16 @@ class _GateMixin(ManagerComponent):
             )
         execution = execution.with_mode(_memory_mode)
         if agent and not conversation_key:
-            execution = replace(execution, template_id=agent)
             if not crew and not target_member:
-                execution = replace(execution, selection_kind="template", selection_name=agent)
+                # The delegate split: the parent's store and identity, the selected
+                # template's namespace. A member with no persisted id has no
+                # identity field, so its child is a plain template run on the
+                # parent's store (the `session_create` arm keeps that member's
+                # selection instead; the record cannot say "this member, under
+                # that template" on either path).
+                execution = execution.with_template(agent, agent)
+            else:
+                execution = replace(execution, template_id=agent)
         if execution.app and app and execution.app != app:
             raise ValueError("subagent app ownership does not match its parent")
         app = execution.app or app
@@ -189,6 +206,7 @@ class _GateMixin(ManagerComponent):
         _execution_context: dict | None = None,
         _stage_boundary_owner: str = "",
         acp_backend: str = "",
+        _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
     ) -> "SubagentInfo | PreparedSpawn | ClaimPoint | None":
         """Spawn a subagent for *task*.
 
@@ -490,8 +508,62 @@ class _GateMixin(ManagerComponent):
                 )
             )
 
+        # --- Parent agent spec: ``toolsSettings.subagent.availableAgents`` ---
+        # kiro-cli's own allowlist of what THIS agent may spawn, honoured here
+        # because Kiro Crew's sub-agents bypass kiro-cli's built-in ``subagent``
+        # tool. Checked against the EFFECTIVE child template (explicit,
+        # inherited, or a member's), so ``crew=`` cannot route around it, and
+        # only when the parent's spec declares the key -- omitted is "allow
+        # all", the unchanged case. An intersection with the governance gate
+        # above: both must admit.
+        # ``_parent_spawn_policy`` is the event-loop callers' OFF-loop read
+        # (``spawn_async``, ``/api/spawn`` and the durable pump resolve it
+        # through ``to_thread``). The inline fallback serves the synchronous
+        # ``spawn()`` callers and the in-memory queue's synchronous drain, which
+        # re-enters WITHOUT a stored copy so the declaration is read fresh at
+        # dispatch (``queue_params`` below says why).
+        if _gate and _parent_spawn_policy is None:
+            _parent_spawn_policy = parent_spawn_policy(parent_session_key)
+        allowlist_err = (
+            _vet_parent_available_agents(_parent_spawn_policy, execution.template_id, app=app)
+            if _gate and _parent_spawn_policy is not None
+            else None
+        )
+        if allowlist_err:
+            if _persistent_diagnostics:
+                logger.warning("Subagent spawn refused by parent agent spec: %s", allowlist_err)
+            else:
+                logger.warning("Subagent %s refused by parent agent spec", agent_id)
+            sel().log_tool_invocation(
+                session_key=parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="denied",
+                error=allowlist_err if _persistent_diagnostics else "spawn denied by agent spec",
+                metadata=(
+                    {"agent": execution.template_id, **_task_audit}
+                    if _persistent_diagnostics
+                    else _task_audit
+                ),
+            )
+            return _refuse_row(
+                SubagentInfo(
+                    id=agent_id,
+                    task=_redacted_task,
+                    memory_mode=_memory_mode,
+                    agent=agent,
+                    parent_session_key=parent_session_key,
+                    done=True,
+                    error=f"spawn refused: {allowlist_err}",
+                    error_code=AGENT_NOT_AVAILABLE_CODE,
+                    batch_id=batch_id,
+                    batch_total=max(0, int(batch_total)),
+                )
+            )
+
         # --- Persist BEFORE any resource check: write-before-ack. Policy refusals
-        # above (empty task, memory identity, cwd, governance) never reach the
+        # above (empty task, memory identity, cwd, governance, the parent spec's
+        # allowlist) never reach the
         # store, so a refused spawn leaves no row; from here on the row exists
         # and every later exit either starts it, defers it, or marks it failed.
         # A drained spawn (_from_queue) already has its row. ---
@@ -525,6 +597,15 @@ class _GateMixin(ManagerComponent):
             # of the crew it was handed to.
             "memory_store": memory_store,
             "_execution_context": execution.to_record(),
+            # Deliberately NOT queued: ``_parent_spawn_policy``. The queued
+            # entry waits on capacity, so the wait is unbounded in time, and
+            # the declaration it was admitted under may have been tightened
+            # while it waited. Every drain re-reads it: the durable pump
+            # off-loop before its re-check, the in-memory synchronous drain
+            # through the gate's inline fallback above -- a memo-pinned
+            # directory read (``_PARENT_ALLOWLIST_MEMO``), so a ``scandir``
+            # in the ordinary case, and a full parse only when the memo
+            # declines to pin.
             "crew": crew,
             "_stage_boundary_owner": _stage_boundary_owner,
             "_memory_mode": _memory_mode,
@@ -592,7 +673,9 @@ class _GateMixin(ManagerComponent):
         )
         admitted_memory_mode: str = _memory_mode
 
-        def _deferred(reason: str, refused: SubagentInfo) -> SubagentInfo | None:
+        def _deferred(
+            reason: str, refused: SubagentInfo, *, wait: dict[str, Any]
+        ) -> SubagentInfo | None:
             # Pressure is a scheduling fact, not a verdict on the task: the row
             # stays queued, holds nothing, and is re-checked after the admit
             # wait. None when the store holds no such row (a legacy in-memory
@@ -607,6 +690,14 @@ class _GateMixin(ManagerComponent):
             # loop to hand it to takes ``BEGIN IMMEDIATE`` here -- on the loop
             # that wait is the whole busy timeout, with chat and the heartbeat
             # behind it.
+            # ``wait`` is the same verdict as a label: it rides on the returned
+            # record and on the ``subagent_queued`` event, so the UI and
+            # ``POST /api/spawn`` can say a MEMORY deferral is one instead of
+            # rendering it as the capacity queue. It is published only by the
+            # emit that FOLLOWS a successful defer write (each branch below
+            # carries it to its own emit), so a row the store turned out not to
+            # hold -- refused, not queued -- leaves no label behind for the
+            # parent's other rows to wear.
             queued = SubagentInfo(
                 id=agent_id,
                 task=_redacted_task,
@@ -615,6 +706,8 @@ class _GateMixin(ManagerComponent):
                 app=app,
                 parent_session_key=parent_session_key,
                 queued=True,
+                queued_reason=str(wait.get("reason", "")),
+                queued_reason_detail=reason,
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
                 delegation=dict(delegation or {}),
@@ -632,11 +725,12 @@ class _GateMixin(ManagerComponent):
                     batch_id=batch_id,
                     queued=queued,
                     refused=refused,
+                    wait=wait,
                 )
                 return queued
             elif not self._manager._admission.taskq_defer(agent_id, reason=reason):
                 return None
-            self._manager._emit_queue_depth(parent_session_key, batch_id)
+            self._manager._emit_queue_depth(parent_session_key, batch_id, wait=wait)
             return queued
 
         # --- Memory guard: defer (durable) or refuse (legacy) while host memory
@@ -749,6 +843,11 @@ class _GateMixin(ManagerComponent):
                     f"low memory: {avail_gb:.1f} GB available, need {min_mem:.0f} GB "
                     f"({next_start_price:.1f} GB per warming start, from the {price_source})",
                     info,
+                    wait={
+                        "reason": QUEUED_REASON_LOW_MEMORY,
+                        "available_gb": round(float(avail_gb), 2),
+                        "required_gb": round(float(min_mem), 2),
+                    },
                 )
                 if _durable
                 else None
@@ -829,7 +928,18 @@ class _GateMixin(ManagerComponent):
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
             )
-            deferred = _deferred(str(admission.reason), info) if _durable else None
+            deferred = (
+                _deferred(
+                    str(admission.reason),
+                    info,
+                    wait={
+                        "reason": QUEUED_REASON_POSTURE_CRITICAL,
+                        "available_gb": round(float(admission.available_gb), 2),
+                    },
+                )
+                if _durable
+                else None
+            )
             if deferred is not None:
                 return deferred
             return self._manager._announce_rejection(info)
@@ -904,15 +1014,42 @@ class _GateMixin(ManagerComponent):
             ):
                 self._manager._queue.append(queue_params)
             logger.info(
-                "Subagent queued (%d running, %d queued, slot_free=%s)",
+                "Subagent queued (%d running, %d queued, slot_free=%s, in_startup=%d/%d)",
                 self._manager._running_count,
                 len(self._manager._queue),
                 slot_free,
+                self._manager._startup_population(),
+                self._manager._startup_cap(),
+            )
+            # Which wait this is. A cap the adaptive controller has squeezed to 0
+            # is the one capacity queue "behind the concurrency limit" misreads:
+            # nothing runs, the configured cap still reads N, and the row waits
+            # for the controller's probe, not for a slot. The stagger tick and a
+            # genuinely full cap both clear on their own and keep the default.
+            # The paused kind is answered to callers as a DEFERRAL, so it carries
+            # the same human sentence the memory kinds do; the ordinary kind is
+            # never surfaced as prose and stays bare.
+            adaptive_paused = self._manager._max_concurrent <= 0
+            capacity_wait = {
+                "reason": (
+                    QUEUED_REASON_ADAPTIVE_CAP_ZERO
+                    if adaptive_paused
+                    else QUEUED_REASON_CONCURRENCY_LIMIT
+                )
+            }
+            capacity_detail = (
+                (
+                    "dispatch paused: the host is low on memory or overloaded, so no new "
+                    "subagent starts until it recovers (configured cap "
+                    f"{self._manager._user_max_concurrent}, effective cap 0)"
+                )
+                if adaptive_paused
+                else ""
             )
             # Advisory UI signal: tell the chip how many agents are now waiting
             # to start for this parent so it can appear immediately and show a
             # "waiting" count instead of only running/completed ones.
-            self._manager._emit_queue_depth(parent_session_key, batch_id)
+            self._manager._emit_queue_depth(parent_session_key, batch_id, wait=capacity_wait)
             # If a slot is free, no running agent will trigger the drain on
             # completion — schedule the staggered pump at the interval boundary
             # so the queued spawn still launches.
@@ -931,6 +1068,8 @@ class _GateMixin(ManagerComponent):
                 app=app,
                 parent_session_key=parent_session_key,
                 queued=True,
+                queued_reason=str(capacity_wait["reason"]),
+                queued_reason_detail=capacity_detail,
                 memory_mode=_memory_mode,
                 execution_context=execution,
                 batch_id=batch_id,
@@ -1018,6 +1157,11 @@ class _GateMixin(ManagerComponent):
                 # awaits the claim, so nothing admitted during that await can
                 # overshoot the cap or skip the stagger.
                 self._manager._running_count += 1
+                # The reservation is also an admitted-but-unstarted agent
+                # for the in-startup bound (``_startup_population``): the
+                # re-entry skips the admission gate, so it must have been
+                # counted by every admission decided in between.
+                self._manager._startup_reservations += 1
                 self._manager._last_spawn_ts = time.monotonic()
                 return ClaimPoint(agent_id, parent_session_key, _stage_boundary_owner)
             taskq_generation, proceed, claim_reason = self._manager._admission.taskq_claim(agent_id)
@@ -1113,6 +1257,12 @@ class _GateMixin(ManagerComponent):
         self._record_crew_log_dispatch(info, from_queue=_from_queue, asked=_crew_log_asked)
         if not _dispatch_now:  # a ClaimPoint re-entry already holds its reservation
             self._manager._running_count += 1
+        else:
+            # Registered: the info now counts in ``_startup_population``
+            # itself, so the reservation stands down.
+            self._manager._startup_reservations = max(
+                0, int(self._manager._startup_reservations) - 1
+            )
         self._manager._last_spawn_ts = time.monotonic()  # stagger gate: one start per interval
         # Batch lifecycle: announce the wave ONCE, on its first member to
         # actually start (queued members haven't started yet — the event marks
@@ -1224,7 +1374,7 @@ class _GateMixin(ManagerComponent):
         else:
             # Registered and handed to a run (or to the approval prompt, which
             # is part of starting): admitted -> starting. ``running`` is written
-            # by the run itself at its first stream event.
+            # by the run itself at its first stream event addressed to its session.
             self._manager._admission.taskq_mark(info, "starting")
             # Nested: a parent blocked in spawn_sub_agents yields its lane slot
             # for this child (taskq.waits, W3); an event-loop caller awaits the

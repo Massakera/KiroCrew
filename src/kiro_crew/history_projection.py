@@ -17,6 +17,7 @@ import os
 import secrets
 import time as _time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, AbstractSet, Any, Literal, overload
@@ -28,8 +29,13 @@ from kiro_crew.chat_attachments import (
     restore_staged_attachments,
     stage_attachments_removal,
 )
-from kiro_crew.history_cache import _FileChangeCacheEntry
-from kiro_crew.jsonl_util import bounded_raw_records
+from kiro_crew.execution_context import STRICTEST_MEMORY_MODE
+from kiro_crew.history_cache import FileStamp, _FileChangeCacheEntry, _TranscriptRowIndexEntry
+from kiro_crew.jsonl_util import (
+    bounded_raw_records,
+    raise_if_splitlines_boundary,
+    strict_raw_records_with_offsets,
+)
 from kiro_crew.preview_text import speech_preview
 
 if TYPE_CHECKING:
@@ -46,6 +52,20 @@ if TYPE_CHECKING:
 #: same rows of the same files.
 _HISTORY_LOGGER = logging.getLogger("kiro_crew.history")
 
+#: What :meth:`TranscriptReadProjection.metadata_line_state` answers about a
+#: transcript's first line. ``get_metadata_status`` folds the last two into one
+#: ``readable=False``, which is the right answer for every READER (a line whose
+#: contract cannot be seen is refused either way) but not for a WRITER: a
+#: ``transient`` failure (the file could not be opened or decoded as UTF-8 after
+#: the bounded retries) clears on its own and the write is deferred, while a
+#: ``corrupt`` line (bytes on disk that are not JSON) never will, so a writer
+#: that keeps deferring on it never persists another row. The two-tuple API is
+#: kept for readers; writers ask this companion only once the tuple says
+#: unreadable.
+METADATA_LINE_READABLE = "readable"
+METADATA_LINE_TRANSIENT = "transient"
+METADATA_LINE_CORRUPT = "corrupt"
+
 
 def _history_facade() -> Any:
     """Return the facade lazily, after its component imports have completed."""
@@ -57,6 +77,33 @@ def _history_facade() -> Any:
 def _facade_flock_acquire_timeout() -> float:
     """Read the one timeout with an established facade rebind seam."""
     return float(_history_facade()._FLOCK_ACQUIRE_TIMEOUT_S)
+
+
+_TRANSCRIPT_PAGE_INDEX_STRIDE = 128
+#: Ceiling on retained ``(row, offset)`` checkpoints per index entry. Past it the
+#: stride doubles, so a transcript of any length costs at most this many pairs
+#: (about 100 KiB) and a warm page decodes at most one stride of extra rows,
+#: where the stride is the smallest power-of-two multiple of the base that fits.
+_TRANSCRIPT_PAGE_INDEX_MAX_CHECKPOINTS = 1024
+_TRANSCRIPT_PAGE_READ_ATTEMPTS = 2
+
+#: ``(key, file stamp or None when the file does not exist, generation)`` per chain member.
+ChainRevision = tuple[tuple[str, FileStamp | None, int], ...]
+
+
+class TranscriptRevisionChanged(RuntimeError):
+    """A chained transcript changed between reads composing one response."""
+
+
+@dataclass(frozen=True)
+class TranscriptPage:
+    """One exact page in chained durable-message index space."""
+
+    messages: list[dict]
+    total: int
+    next_before: int
+    has_more: bool
+    revision: ChainRevision
 
 
 def drop_persisted_tail_prefix(
@@ -305,17 +352,35 @@ class TranscriptReadProjection:
             )
         return messages
 
-    def read_messages_chained(self, key: str) -> list[dict]:
-        """Concatenate chronologically ordered files sharing the same tab id."""
+    def _chain_keys(self, key: str) -> list[str]:
+        """Return the established chronological tab chain for *key* (never empty)."""
+        return self.chained_keys(key) or [key]
+
+    def chained_keys(self, key: str) -> list[str]:
+        """Every transcript key ``read_messages_chained(key)`` concatenates, in order.
+
+        EMPTY when the key carries no ``tab_id`` or the index knows no chain for
+        it: the chained read then serves ``_read_messages(key)``'s object itself
+        (on a cache hit the shared cached list, which callers treat as immutable
+        and the fork path relies on by identity), while any indexed chain -- a
+        single member included -- builds a fresh concatenation, exactly as
+        before. Exposed so a caller that must validate or lock EVERY file the
+        chained read touches (the derivation seam) can name them before reading;
+        such a caller reads an empty result as ``[key]``.
+        """
         metadata = self._log.get_metadata(key)
         tab_id = metadata.get("tab_id")
         if not tab_id:
-            return self._log._read_messages(key)
+            return []
         with self._log._lock:
             if self._log._tab_id_index is None:
                 self._log._rebuild_tab_id_index()
             index = self._log._tab_id_index or {}
-            keys = list(index.get(tab_id, []))
+            return list(index.get(tab_id, []))
+
+    def read_messages_chained(self, key: str) -> list[dict]:
+        """Concatenate chronologically ordered files sharing the same tab id."""
+        keys = self.chained_keys(key)
         if not keys:
             return self._log._read_messages(key)
         messages: list[dict] = []
@@ -647,6 +712,244 @@ class TranscriptReadProjection:
                     f"mid-rotation probe for {chained_key} could not enumerate the archive"
                 ) from exc
         return False
+
+    @staticmethod
+    def _message_record(raw: bytes) -> dict | None:
+        """Decode one record using the full-reader's skip semantics.
+
+        Malformed JSON is skipped exactly as the full reader skips it. Bytes that
+        are not valid UTF-8 are NOT skipped: the full reader's strict text-mode
+        read fails closed on them, and a skipped row here would undercount
+        ``total`` and shift every cursor above it. The strict ``decode`` below raises
+        ``UnicodeDecodeError`` before any JSON parsing. Decoding explicitly, rather than
+        letting ``json.loads(bytes)`` sniff a BOM or accept ``surrogatepass``
+        escapes, keeps this reader's notion of a valid row identical to the strict
+        text-mode full reader's. A record the full reader's ``splitlines()``
+        would break into several fragments is refused outright
+        (:class:`SplitlinesBoundaryRecord`): the caller hands the read to that
+        reader instead of building an index that disagrees with it.
+        """
+        text = raw.decode("utf-8")
+        raise_if_splitlines_boundary(text)
+        # ``str.strip`` removes Unicode whitespace (NBSP, ideographic space)
+        # that ``json.loads`` does not treat as JSON whitespace; the full
+        # reader strips each line the same way, so a padded row counts
+        # identically in both.
+        #
+        # Only ``json.JSONDecodeError`` is a skip, because that is the only
+        # exception the full reader skips. Any other ``ValueError`` from
+        # ``json.loads`` (an integer literal past
+        # ``sys.get_int_max_str_digits()``) makes the full reader fail closed,
+        # so it propagates here too; swallowing it would drop a row this reader
+        # counts and the authoritative one refuses, shifting every cursor above.
+        try:
+            data = json.loads(text.strip())
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or data.get("_type") == "metadata":
+            return None
+        return data
+
+    @staticmethod
+    def _file_stamp(path: Path) -> FileStamp | None:
+        """Stat ``path``; ``None`` only when it does not exist.
+
+        Only a missing file is the empty transcript. Any other ``OSError`` (a
+        permission denial, an I/O error) propagates so the caller retries or
+        answers unreadable, instead of serving ``total=0`` for history that is
+        there but could not be stat'ed.
+
+        ``st_ctime_ns`` is part of the stamp because a writer outside this
+        process can restore ``mtime`` after a same-size in-place rewrite, and
+        such a writer never bumps the invalidation generation; on POSIX
+        ``ctime`` cannot be set from user space, so that rewrite still misses
+        the cache. (Windows reports creation time here, so the component is
+        inert there and the generation remains the in-process guard.)
+        """
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino, stat.st_dev)
+
+    def _row_index(self, key: str) -> _TranscriptRowIndexEntry:
+        """Return a sparse valid-message-row index for one file revision."""
+        path = self._log._path(key)
+        generation = self._log._cache_gen(key)
+        stamp = self._file_stamp(path)
+        if stamp is None:
+            # No file yet (a slot that has not flushed): report a stable empty
+            # revision. ``None`` is what the stability re-stat also returns.
+            self._log._page_index_cache.pop(key, None)
+            return _TranscriptRowIndexEntry(None, generation, 0, ())
+        cached = self._log._page_index_cache.get(key)
+        if cached is not None and cached.stamp == stamp and cached.generation == generation:
+            return cached
+
+        row_count = 0
+        stride = _TRANSCRIPT_PAGE_INDEX_STRIDE
+        checkpoints: list[tuple[int, int]] = []
+        with open(path, "rb") as handle:
+            records = strict_raw_records_with_offsets(handle, path)
+            for start, _end, raw in records:
+                if self._message_record(raw) is None:
+                    continue
+                if row_count % stride == 0:
+                    checkpoints.append((row_count, start))
+                    if len(checkpoints) > _TRANSCRIPT_PAGE_INDEX_MAX_CHECKPOINTS:
+                        # Bound the retained index: keep every other checkpoint and
+                        # double the stride. Kept rows are multiples of the old
+                        # stride at even positions, hence of the new stride too.
+                        checkpoints = checkpoints[::2]
+                        stride *= 2
+                row_count += 1
+
+        entry = _TranscriptRowIndexEntry(
+            stamp,
+            generation,
+            row_count,
+            tuple(checkpoints),
+        )
+        if self._file_stamp(path) == stamp:
+            self._log._publish_if_current(
+                self._log._page_index_cache,
+                key,
+                entry,
+                key=key,
+                gen=generation,
+            )
+        return entry
+
+    def _read_message_range(
+        self,
+        key: str,
+        start: int,
+        end: int,
+        index: _TranscriptRowIndexEntry,
+    ) -> list[dict]:
+        """Read ``[start, end)`` while decoding at most one extra index stride."""
+        if start >= end or index.row_count == 0:
+            return []
+        checkpoint_row = 0
+        checkpoint_offset = 0
+        for row, offset in index.checkpoints:
+            if row > start:
+                break
+            checkpoint_row, checkpoint_offset = row, offset
+
+        path = self._log._path(key)
+        messages: list[dict] = []
+        logical_row = checkpoint_row
+        with open(path, "rb") as handle:
+            handle.seek(checkpoint_offset)
+            records = strict_raw_records_with_offsets(handle, path)
+            for _record_start, _record_end, raw in records:
+                message = self._message_record(raw)
+                if message is None:
+                    continue
+                if logical_row >= end:
+                    break
+                if logical_row >= start:
+                    messages.append(message)
+                logical_row += 1
+        return messages
+
+    def _read_messages_chained_page_once(
+        self,
+        key: str,
+        *,
+        limit: int,
+        before: int | None,
+    ) -> tuple[TranscriptPage, list[tuple[str, _TranscriptRowIndexEntry]], list[str]]:
+        keys = self._chain_keys(key)
+        indexed = [(chained_key, self._row_index(chained_key)) for chained_key in keys]
+        total = sum(index.row_count for _chained_key, index in indexed)
+        if total == 0 and keys != [key]:
+            # Mirror ``read_messages_chained``'s terminal fallback: a chain whose
+            # members yield no rows is served from *key*'s own file.
+            indexed = [(key, self._row_index(key))]
+            total = indexed[0][1].row_count
+        end = total if before is None else max(0, min(before, total))
+        start = max(0, end - limit)
+
+        messages: list[dict] = []
+        base = 0
+        for chained_key, index in indexed:
+            file_end = base + index.row_count
+            overlap_start = max(start, base)
+            overlap_end = min(end, file_end)
+            if overlap_start < overlap_end:
+                messages.extend(
+                    self._read_message_range(
+                        chained_key,
+                        overlap_start - base,
+                        overlap_end - base,
+                        index,
+                    )
+                )
+            base = file_end
+            if base >= end:
+                break
+        revision: ChainRevision = tuple(
+            (chained_key, index.stamp, index.generation) for chained_key, index in indexed
+        )
+        return TranscriptPage(messages, total, start, start > 0, revision), indexed, keys
+
+    def read_messages_chained_page(
+        self,
+        key: str,
+        *,
+        limit: int,
+        before: int | None = None,
+        expected_revision: ChainRevision | None = None,
+    ) -> TranscriptPage:
+        """Read one exact chained page without materialising complete transcripts.
+
+        A stable revision decodes the requested page plus at most one sparse-index
+        stride per intersecting file. A file changing during the read is retried.
+        ``expected_revision`` pins the several range reads composing one HTTP
+        response to the same chain membership, file stamps, and generations.
+        ``limit=0`` is the total/revision probe: it composes the indexes and
+        decodes no rows.
+        """
+        if limit < 0:
+            raise ValueError("limit must be >= 0")
+        # A pinned read cannot succeed on a second attempt: the file stamp that
+        # broke the pin includes mtime_ns and size, so the expected revision is
+        # gone for good. One attempt, then the caller's retry policy decides.
+        attempts = 1 if expected_revision is not None else _TRANSCRIPT_PAGE_READ_ATTEMPTS
+        for _attempt in range(attempts):
+            page, indexed, keys = self._read_messages_chained_page_once(
+                key, limit=limit, before=before
+            )
+            stable = self._chain_keys(key) == keys and all(
+                self._file_stamp(self._log._path(chained_key)) == index.stamp
+                and self._log._cache_gen(chained_key) == index.generation
+                for chained_key, index in indexed
+            )
+            if stable and (expected_revision is None or page.revision == expected_revision):
+                return page
+        if expected_revision is not None:
+            raise TranscriptRevisionChanged("chained transcript changed during page composition")
+
+        for _attempt in range(_TRANSCRIPT_PAGE_READ_ATTEMPTS):
+            keys = self._chain_keys(key)
+            indexed = [(chained_key, self._row_index(chained_key)) for chained_key in keys]
+            revision: ChainRevision = tuple(
+                (chained_key, index.stamp, index.generation) for chained_key, index in indexed
+            )
+            messages = self.read_messages_chained(key)
+            stable = self._chain_keys(key) == keys and all(
+                self._file_stamp(self._log._path(chained_key)) == index.stamp
+                and self._log._cache_gen(chained_key) == index.generation
+                for chained_key, index in indexed
+            )
+            if stable:
+                total = len(messages)
+                end = total if before is None else max(0, min(before, total))
+                start = max(0, end - limit)
+                return TranscriptPage(messages[start:end], total, start, start > 0, revision)
+        raise TranscriptRevisionChanged("chained transcript changed during full-read fallback")
 
     def _rebuild_tab_id_index(self) -> None:
         """Rebuild the tab-id chain index while the owner lock is held."""
@@ -1139,6 +1442,18 @@ class TranscriptReadProjection:
         """Return metadata plus whether an existing file was readable."""
         return self._log._read_metadata_status(key)
 
+    def metadata_line_state(self, key: str) -> str:
+        """Say WHY a first line is unreadable: one of the ``METADATA_LINE_*`` values.
+
+        For a writer that met ``readable=False`` from :meth:`get_metadata_status`:
+        ``METADATA_LINE_TRANSIENT`` means defer and retry, ``METADATA_LINE_CORRUPT``
+        means no retry will ever read the line. A ``METADATA_LINE_READABLE`` answer
+        after an unreadable tuple means the file changed between the two reads,
+        which a writer treats as transient. Readers do not need this: the
+        two-tuple already tells them to refuse.
+        """
+        return self._log._read_metadata_state(key)[1]
+
     def _pause_for_transient_retry(self) -> None:
         """Sleep between read attempts only when off the event loop."""
         on_loop = True
@@ -1154,11 +1469,21 @@ class TranscriptReadProjection:
         return self._log._read_metadata_status(key)[0]
 
     def _read_metadata_status(self, key: str) -> tuple[dict, bool]:
-        """Read the first JSONL line with guarded caching and bounded retries."""
+        """The two-tuple view of :meth:`_read_metadata_state`: readable or not."""
+        metadata, state = self._log._read_metadata_state(key)
+        return metadata, state == METADATA_LINE_READABLE
+
+    def _read_metadata_state(self, key: str) -> tuple[dict, str]:
+        """Read the first JSONL line with guarded caching and bounded retries.
+
+        Returns the metadata plus one of the ``METADATA_LINE_*`` states: an absent
+        file, an empty first line and a first line that is JSON but not a
+        metadata object all read as ``({}, METADATA_LINE_READABLE)``.
+        """
         path = self._log._path(key)
         if not path.exists():
             self._log._meta_cache.pop(key, None)
-            return {}, True
+            return {}, METADATA_LINE_READABLE
         attempts = _history_facade()._METADATA_READ_ATTEMPTS
         for attempt in range(attempts):
             generation = self._log._cache_gen(key)
@@ -1166,7 +1491,7 @@ class TranscriptReadProjection:
                 identity = self._log._cache_identity(path.stat())
                 cached = self._log._meta_cache.get(key)
                 if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
-                    return cached[2], True
+                    return cached[2], METADATA_LINE_READABLE
                 with open(path, encoding="utf-8") as handle:
                     first = handle.readline().strip()
             except (OSError, UnicodeError):
@@ -1180,9 +1505,9 @@ class TranscriptReadProjection:
                     attempts,
                     exc_info=True,
                 )
-                return {}, False
+                return {}, METADATA_LINE_TRANSIENT
             if not first:
-                return {}, True
+                return {}, METADATA_LINE_READABLE
             try:
                 data = json.loads(first)
                 metadata = (
@@ -1192,7 +1517,9 @@ class TranscriptReadProjection:
                 # A damaged first line cannot establish whether this was a
                 # member session. Keep get_metadata's legacy empty-dict view,
                 # but tell identity-sensitive readers to refuse the operation.
-                return {}, False
+                # Every line writer replaces the file atomically, so bytes that
+                # are not JSON are not a write in flight: no retry reads them.
+                return {}, METADATA_LINE_CORRUPT
             self._log._publish_if_current(
                 self._log._meta_cache,
                 key,
@@ -1200,8 +1527,8 @@ class TranscriptReadProjection:
                 key=key,
                 gen=generation,
             )
-            return metadata, True
-        return {}, True
+            return metadata, METADATA_LINE_READABLE
+        return {}, METADATA_LINE_READABLE
 
     def sliding_window(
         self,
@@ -1500,6 +1827,7 @@ class SessionMetadataProjection:
         guard: Callable[[dict], bool],
         *,
         require_existing: bool = False,
+        after_commit_under_lock: Callable[[], None] | None = None,
     ) -> bool:
         """Merge fields only when the locked on-disk metadata passes a guard.
 
@@ -1515,6 +1843,10 @@ class SessionMetadataProjection:
         Decided INSIDE the lock the write takes, which is the whole point: a
         deletion landing between a checked-then-written pair is precisely the
         window this closes, so the caller cannot do it for itself beforehand.
+        ``after_commit_under_lock`` runs after the atomic metadata rewrite but
+        before that lock is released. It is for an in-process witness whose
+        ordering against readers must match the line commit; it must not perform
+        I/O or mutate event-loop-affine state.
 
         Off by default, per caller rather than for everyone, because creating the
         line is the documented behaviour some callers depend on:
@@ -1523,28 +1855,71 @@ class SessionMetadataProjection:
         yet must still end up carrying the mode it was admitted under. Refusing
         there would leave a restricted session with no durable record of being
         restricted, which is worse than the stub this flag prevents.
+        Refuses to write over a line it cannot read -- with one distinction. A
+        TRANSIENT read failure defers: the guard is not run and ``False`` is
+        returned, so the caller retries later. A CORRUPT first line (bytes that
+        are not JSON) will never become readable, and a writer that kept
+        deferring on it would never persist anything again -- an empty tab's
+        ``closed`` could never land and the tab would resurrect on every
+        restart. So the guard is run against the line as the write below will
+        REBUILD it: no identity, no store, ``memory_mode`` at
+        :data:`~kiro_crew.execution_context.STRICTEST_MEMORY_MODE`. The line's
+        real contract is unknowable and the ratchet forbids relabelling it
+        looser, so the strictest mode is the only value the rewrite may carry;
+        :meth:`_update_metadata_locked` enforces the same fold on the bytes it
+        writes, whatever *fields* say.
         """
         with self._log._locked(key):
             if require_existing and not self._log._path(key).exists():
                 return False
             metadata, readable = self._log._read_metadata_status(key)
-            if not readable or not guard(metadata):
+            if not readable:
+                if self._log.metadata_line_state(key) != METADATA_LINE_CORRUPT:
+                    return False
+                metadata = {"memory_mode": STRICTEST_MEMORY_MODE}
+            if not guard(metadata):
                 return False
             self._log._update_metadata_locked(key, fields)
+            if after_commit_under_lock is not None:
+                after_commit_under_lock()
         if "tab_id" in fields:
             self._log.invalidate_tab_id_cache()
         return True
 
     def _update_metadata_locked(self, key: str, fields: dict) -> None:
-        """Merge or upsert one metadata line while the owner lock is held."""
+        """Merge or upsert one metadata line while the owner lock is held.
+
+        A first line that is not JSON is REWRITTEN rather than left alone: the
+        old bytes are dropped, the rows after them are kept, and the new line
+        carries no ``created_at`` (the identity is unknowable, and a minted one
+        would read to the owning slot's next save as a fresh incarnation born
+        after a delete -- an absent field fails that check open, the way a
+        legacy line does, and the slot's save restores its recorded identity),
+        no ``memory_store`` (a restricted line names none) and ``memory_mode``
+        at the strictest value, whatever *fields* carry. A first line that IS
+        JSON but not a metadata object (a legacy row-first file) is left as it
+        was, as before.
+        """
         path = self._log._path(key)
         previous_mtime = _history_facade()._safe_mtime(path)
         lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
+        healing_corrupt_line = False
         if lines:
             try:
                 metadata = json.loads(lines[0])
             except json.JSONDecodeError:
-                return
+                _HISTORY_LOGGER.warning(
+                    "history: metadata line for %s is corrupt (not JSON); rewriting it "
+                    "under the %s mode so the transcript can be written again",
+                    key,
+                    STRICTEST_MEMORY_MODE,
+                )
+                healing_corrupt_line = True
+                metadata = {
+                    "_type": "metadata",
+                    "last_consolidated": 0,
+                    "memory_mode": STRICTEST_MEMORY_MODE,
+                }
             if not isinstance(metadata, dict):
                 return
             if metadata.get("_type") != "metadata":
@@ -1559,6 +1934,9 @@ class SessionMetadataProjection:
             lines = [""]
 
         metadata.update(fields)
+        if healing_corrupt_line:
+            metadata["memory_mode"] = STRICTEST_MEMORY_MODE
+            metadata.pop("memory_store", None)
         lines[0] = json.dumps(metadata) + "\n"
 
         # This hot one-line edit remains crash-atomic without paying for an

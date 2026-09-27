@@ -239,6 +239,28 @@ def make_dir_link(link: pathlib.Path, target: pathlib.Path) -> None:
     link.symlink_to(target, target_is_directory=True)
 
 
+def plant_day_link(link: pathlib.Path, secret_file: pathlib.Path) -> None:
+    """Plant a reparse point at the dated history name ``link`` that leads outside.
+
+    The property under test is that a memory reader never publishes bytes that
+    live outside the memory tree when the agent-writable dated ``.md`` name is a
+    reparse point. On POSIX the planted shape is a FILE symlink to
+    ``secret_file``, the exact credential-exfiltration vector. On Windows a file
+    symlink needs SeCreateSymbolicLinkPrivilege, so the stand-in is a directory
+    JUNCTION at ``link`` pointing at ``secret_file.parent``: a junction needs no
+    privilege, is a reparse point at the same dated name, and the guarded reader
+    refuses it through ``is_link_or_junction`` and its non-regular check, so the
+    outside directory's contents can never be read as a day. Both variants keep
+    the assertion running on every CI platform instead of skipping it.
+    """
+    if platform_compat.IS_WINDOWS:
+        import _winapi
+
+        _winapi.CreateJunction(str(secret_file.parent), str(link))
+        return
+    link.symlink_to(secret_file)
+
+
 def host_abs(*parts: str) -> str:
     """A fixture path that is absolute on THIS host: ``/opt/shims`` or ``C:\\opt\\shims``.
 
@@ -487,13 +509,15 @@ def _windows_restrict_to_owner_stub(request, _floor_monkeypatch):
 
 @pytest.fixture(autouse=True, scope="module")
 def _release_source_corpus_after_module():
-    """Drop ``test/source_corpus.py``'s whole-tree caches at every module's teardown.
+    """Drop ``test/source_corpus.py``'s cached file list at every module's teardown.
 
-    The corpus helper memoizes the raw and NFKC-normalized text of every module
-    under ``src/`` (~160 MB) the first time any ratchet in a module asks for it,
-    and an ``lru_cache`` global otherwise lives for the rest of the xdist
-    worker -- paid by every later test on that worker. Module scope keeps the
-    sharing the ratchets rely on (one parse per module) while bounding the
+    The corpus helper streams file text (read, normalise, filter, parse, drop --
+    one file live at a time) and memoizes only the sorted path list of the tree
+    (a megabyte of ``Path`` objects), so what this hook releases is small. It
+    stays because that list is an ``lru_cache`` global that would otherwise live
+    for the rest of the xdist worker, and a module that plants a file under
+    ``src/`` to prove its ratchet still fails needs the next module to re-walk.
+    Module scope keeps the sharing the ratchets rely on while bounding the
     retention to the module that needed it. Import is deferred and tolerant so a
     module that never touches the corpus pays nothing.
     """
@@ -1066,6 +1090,109 @@ def _reset_session_switch_locks(monkeypatch):
     monkeypatch.setattr(llm_helpers, "_slot_switch_session_locks", weakref.WeakValueDictionary())
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _knowledge_store_cross_thread_close():
+    """Let ``KnowledgeStore._close_all_for_tests()`` close other threads' handles.
+
+    Production connections keep SQLite's thread-affinity guard; the test seam
+    needs it relaxed so a teardown on the loop thread can close the connections
+    executor threads opened. Flipped once per session, before any store is built
+    (the flag is read at connect time), and restored at session end.
+    """
+    from kiro_crew.knowledge import store as knowledge_store
+
+    previous = knowledge_store._ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS
+    knowledge_store._ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS = True
+    try:
+        yield
+    finally:
+        knowledge_store._ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS = previous
+
+
+@pytest.fixture
+def opened():
+    """Close every store a test hands it, whichever way the test ends.
+
+    ``store = opened(VectorMemoryStore(...))`` / ``opened(KnowledgeStore(...))`` /
+    ``opened(SkillsLoader(...))``: the object comes back unchanged and is closed
+    at teardown in reverse order of registration. An unclosed
+    ``sqlite3.Connection`` is a reference cycle on CPython 3.11+ (its statement
+    cache is an ``lru_cache`` wrapping the connection itself), so a store that is
+    merely dropped keeps its ``db``/``-wal``/``-shm`` descriptors until the cyclic
+    collector runs -- the tenth hygiene pass measured 52 tests at +5..+9
+    descriptors from exactly that. A ``KnowledgeStore`` hands each THREAD its own
+    connection, and ``close()`` releases only the calling thread's, so for it the
+    test-only every-thread seam is used; every other store closes through
+    ``close()``.
+    """
+    stores: list = []
+
+    def _track(store):
+        stores.append(store)
+        return store
+
+    yield _track
+    for store in reversed(stores):
+        closer = getattr(store, "_close_all_for_tests", None) or store.close
+        closer()
+
+
+@pytest.fixture
+def close_skills_loaders(monkeypatch):
+    """Close every ``SkillsLoader`` built while the test runs, the default one included.
+
+    Construction opens the skill search index (a SQLite connection: ``db`` +
+    ``-wal`` + ``-shm``) and the first discovery starts the ``skill-catalog-refresh``
+    worker; production closes both by exiting, and a ``ContextBuilder`` built
+    inline in a test never does, so every builder leaked three descriptors and a
+    thread -- sixty of each from the twenty examples of one property test. Tracks
+    every instance through ``SkillsLoader.__init__`` and releases it at teardown,
+    the shape ``test_spawn_reasoning_effort`` uses for managers. Opt-in, not
+    autouse: patching the constructor for all 126k tests to serve the few dozen
+    that build loaders inline is not worth its cost, so a module that builds
+    ``ContextBuilder``s requests it from a one-line module-level autouse fixture.
+    """
+    from kiro_crew.skills import SkillsLoader
+
+    created: list = []
+    orig_init = SkillsLoader.__init__
+
+    def _tracking_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(SkillsLoader, "__init__", _tracking_init)
+    try:
+        yield
+    finally:
+        for loader in created:
+            loader.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_boot_sandbox_sweep(monkeypatch):
+    """A real ``SessionManager`` must not sweep the host's sandbox profiles from a test.
+
+    ``SessionManager.get_or_create`` arms the cleanup loop, whose boot reclaim
+    submits ``kiro_crew.session.cleanup_stale_sandbox_profiles`` -- the REAL
+    ``/proc`` pin scan over the data home -- to the shared ``mc-maint`` executor.
+    ``close_all()`` cancels the asyncio task but cannot stop the executor
+    thread, so on a loaded xdist worker the scan finishes seconds later, inside
+    whichever test is then running, and logs at WARNING on
+    ``kiro_crew.sandbox`` (the tenth sweep caught it as a second record in an
+    unrelated test's ``caplog``). The seam is the name the session module
+    rebinds at import, so the module is imported here rather than looked up in
+    ``sys.modules``: a guard on "already loaded" would let the first test on a
+    worker that imports the session module inside its body reach the real
+    sweep. This conftest's own imports already load it, so the import costs
+    nothing extra. A test of the sweep itself patches the same name inside its
+    body (``TestCleanupLoop``) and so overrides this.
+    """
+    from kiro_crew import session as session_mod
+
+    monkeypatch.setattr(session_mod, "cleanup_stale_sandbox_profiles", lambda *a, **kw: 0)
+
+
 @pytest.fixture(autouse=True)
 def _reset_options_control_state():
     """Clear the per-message OPTIONS registries between tests.
@@ -1284,16 +1411,15 @@ class MockSlackClient(SlackClientOps):
         self._fetch_message_result: str | None = None
         self._fetch_thread_replies_result: list[dict] = []
 
-    async def post_message(self, channel, text, thread_ts=None, unfurl_links=None, unfurl_media=None):
+    async def post_message(self, channel, text, thread_ts=None):
         ts = f"{self._next_ts}.000000"
         self._next_ts += 1
         self.actions.append(
-            ("post", {"channel": channel, "text": text, "thread_ts": thread_ts, "ts": ts,
-                      "unfurl_links": unfurl_links, "unfurl_media": unfurl_media})
+            ("post", {"channel": channel, "text": text, "thread_ts": thread_ts, "ts": ts})
         )
         return ts
 
-    async def post_blocks(self, channel, blocks, text, thread_ts=None, unfurl_links=None, unfurl_media=None):
+    async def post_blocks(self, channel, blocks, text, thread_ts=None):
         ts = f"{self._next_ts}.000000"
         self._next_ts += 1
         self.actions.append(
@@ -1305,8 +1431,6 @@ class MockSlackClient(SlackClientOps):
                     "text": text,
                     "thread_ts": thread_ts,
                     "ts": ts,
-                    "unfurl_links": unfurl_links,
-                    "unfurl_media": unfurl_media,
                 },
             )
         )

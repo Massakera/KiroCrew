@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import unicodedata
 import uuid
 import weakref
@@ -524,10 +525,17 @@ def _folder_project_overlap_denied(resolved: str) -> str | None:
     return conflict
 
 
-def _resolve_folder_project_dir(
+def _folder_declared_project(
     folders: list[dict[str, Any]], folder_id: str
-) -> tuple[str, str | None]:
-    """Return the nearest validated project directory inherited by a folder."""
+) -> tuple[str | None, str | None]:
+    """Walk *folder_id*'s ancestor chain for the nearest declared ``project_dir``.
+
+    A dict walk with no filesystem access, so it is safe on the event loop.
+    Returns ``(raw_project, None)`` for the nearest folder that declares one
+    (stripped, not yet validated), ``("", error)`` when that declaration is not
+    a string, and ``(None, None)`` when no folder in the chain declares a
+    project: a missing id and a parent cycle both end the walk there.
+    """
     by_id = {str(folder.get("id") or ""): folder for folder in folders if isinstance(folder, dict)}
     seen: set[str] = set()
     current_id = folder_id
@@ -540,9 +548,37 @@ def _resolve_folder_project_dir(
         if raw_project:
             if not isinstance(raw_project, str):
                 return "", "project_dir must be a string"
-            return _validate_project_dir(raw_project.strip())
+            return raw_project.strip(), None
         current_id = str(folder.get("parent_id") or "")
-    return "", None
+    return None, None
+
+
+def _resolve_folder_project_dir(
+    folders: list[dict[str, Any]], folder_id: str
+) -> tuple[str, str | None]:
+    """Return the nearest validated project directory inherited by a folder."""
+    raw_project, error = _folder_declared_project(folders, folder_id)
+    if raw_project is None or error:
+        return "", error
+    return _validate_project_dir(raw_project)
+
+
+async def resolve_folder_project_dir_off_loop(
+    folders: list[dict[str, Any]], folder_id: str
+) -> tuple[str, str | None]:
+    """:func:`_resolve_folder_project_dir` for callers on the event loop.
+
+    The chain walk is a dict lookup and runs here; only the validation, which
+    ``stat``s the directory, hops to a worker thread, and only when a folder in
+    the chain declares a project. Most folders declare none, and for those a
+    thread hop resolves to ``""`` after queueing on the shared default executor,
+    which on a busy gateway makes a folder create (or an agent switch inside a
+    folder) slower than the same request on an unfiled chat.
+    """
+    raw_project, error = _folder_declared_project(folders, folder_id)
+    if raw_project is None or error:
+        return "", error
+    return await asyncio.to_thread(_validate_project_dir, raw_project)
 
 
 #: Ceiling on the extra steering directories one folder may declare. Small on
@@ -1165,6 +1201,11 @@ async def create_folder_record(
         "parent_id": parent_id,
         "project_dir": project_dir,
         "default_agent": default_agent,
+        # Epoch seconds, a JSON number, so the sidebar and the MCP tree read it
+        # with the same rule they read ``order`` by. It is what the sidebar's
+        # ``created`` folder sort orders on; a row from before this key existed
+        # has none and sorts as older than every stamped row.
+        "created_at": time.time(),
     }
     if color:
         folder["color"] = color
@@ -2219,6 +2260,10 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     # per slot object and persisted, so echoing it back is the caller's proof
     # that the slot it is filing is the one it resolved.
     expected_created = str(body.get("expected_created") or "")
+    # Filing into a hidden folder unhides it, which changes the folder tree the
+    # full slots frame carries; only a placement that left the tree alone can
+    # travel as a one-row patch.
+    folders_generation_before = state.folders_generation()
     # Serialize the whole re-check/mutate/persist/rollback span under the
     # state-wide metadata txn lock (rebind-stable; see _slot_meta_txn_lock):
     # with awaits inside the span, a second concurrent request would capture
@@ -2299,7 +2344,10 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
         # occupied. Inside the lock, in the same span as the save it attests to:
         # recorded outside it, a refused save could still leave the claim behind.
         note_folder_filed(state, folder_id)
-    state.push_slots_update()
+    if state.folders_generation() == folders_generation_before:
+        state.push_slot_patch(slot.key, ("folder_id",))
+    else:
+        state.push_slots_update()
     source, caller = _audit_origin(request)
     sel().log_api_access(
         caller=caller,
@@ -2319,29 +2367,75 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    # The same three ownership fences api_chat_slot_folder applies, in the same
+    # order and with the same indistinguishable 404: pinning is a write to a
+    # session's own sidebar state, and the ``chat_session_pin`` MCP tool reaches
+    # this route on behalf of app agents and crew members, not only the person.
+    if (refusal := refuse_unattributable_caller(state, request, "chat.slot_pin")) is not None:
+        return refusal
+    if (refusal := member_slot_write_refused(state, request, slot, "chat.slot_pin")) is not None:
+        return refusal
+    request_app = _effective_request_app(state, request)
+    if request_app and getattr(slot, "_app", "") != request_app:
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.slot_pin",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={slot.key}",
+            error=(
+                "app cannot access unscoped slots"
+                if not getattr(slot, "_app", "")
+                else "app does not own this slot"
+            ),
+        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
     # Capture the transcript key the lookup above just covered, BEFORE the
     # body-parse await — the same rebind window api_chat_slot_folder
     # documents. The re-check below and the save's expected_history_key pin
     # together keep this request's write on the transcript it was authorized
     # against.
     authorized_history_key = slot_history_key(slot)
+    if not app_owns_transcript(state._slots, request_app, authorized_history_key):
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.slot_pin",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={slot.key}",
+            error="app does not own this slot's transcript",
+        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    # Optional generation token, the same one api_chat_slot_folder reads: the
+    # ``chat_session_pin`` MCP tool resolves the slot from an earlier
+    # ``/api/chat/slots`` read, and the slot key can be recreated for a
+    # different conversation before this PATCH arrives. Echoing the resolved
+    # ``created`` back proves the slot being pinned is the one resolved.
+    expected_created = str(body.get("expected_created") or "")
     # Serialize the re-check/mutate/persist/rollback span under the
     # state-wide metadata txn lock — same rationale as api_chat_slot_folder.
     async with _slot_meta_txn_lock(state):
         # Re-authorize after the awaits above (body parse, lock acquisition):
         # same slot OBJECT still registered under the name, routing still on
-        # the transcript captured before the first await. No await between
-        # this check and the save dispatch.
-        if state._slots.get(name) is not slot or slot_history_key(slot) != authorized_history_key:
+        # the transcript captured before the first await, and the slot
+        # generation the caller resolved. No await between this check and the
+        # save dispatch.
+        if (
+            state._slots.get(name) is not slot
+            or slot_history_key(slot) != authorized_history_key
+            or (expected_created and slot.created_at != expected_created)
+            or not app_owns_transcript(state._slots, request_app, authorized_history_key)
+        ):
+            source, caller = _audit_origin(request)
             sel().log_api_access(
-                caller="dashboard",
+                caller=caller,
                 operation="chat.slot_pin",
                 outcome="denied",
-                source="dashboard",
+                source=source,
                 resources=name,
                 error="session was deleted or rebound",
             )
@@ -2358,7 +2452,11 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
                 {"error": "pinned must be a boolean", "code": "pinned_not_bool"}, status=400
             )
         slot.pinned = new_pinned
-        if not await save_slot_off_loop(
+        # Decided here, under the lock and after the generation and ownership
+        # re-checks, so a caller told "no change" is told the truth about the
+        # slot it resolved rather than about an earlier list read.
+        changed = prior_pinned != new_pinned
+        if changed and not await save_slot_off_loop(
             state, slot, force=True, expected_history_key=authorized_history_key
         ):
             # Refused without writing: the session was permanently deleted or
@@ -2371,26 +2469,28 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
             # value while this save awaited (review-caught): mark dirty so the
             # next flush reconverges the durable record to the live state.
             slot._dirty = True
+            source, caller = _audit_origin(request)
             sel().log_api_access(
-                caller="dashboard",
+                caller=caller,
                 operation="chat.slot_pin",
                 outcome="denied",
-                source="dashboard",
+                source=source,
                 resources=name,
                 error="session was deleted or rebound",
             )
             return web.json_response(
                 {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
             )
-    state.push_slots_update()
+    state.push_slot_patch(slot.key, ("pinned",))
+    source, caller = _audit_origin(request)
     sel().log_api_access(
-        caller="dashboard",
+        caller=caller,
         operation="chat.slot_pin",
         outcome="allowed",
-        source="dashboard",
+        source=source,
         resources=name,
     )
-    return web.json_response({"ok": True, "pinned": slot.pinned})
+    return web.json_response({"ok": True, "pinned": slot.pinned, "changed": changed})
 
 
 _VALID_MODES = ("", "orchestrator")

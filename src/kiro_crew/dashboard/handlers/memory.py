@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from kiro_crew import memory_schema
+from kiro_crew.apps.registry import minimal_env
 from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewConfig,
@@ -73,6 +74,7 @@ from ._shared import (
     _redact_memory_field,
     markdown_memory_for_store,
     read_bounded_json,
+    require_owner_dashboard_request,
     resolve_lesson_memory_store,
     resolve_requested_memory_store,
     vector_memory_for_store,
@@ -213,6 +215,12 @@ async def _memory_write_gate(
     ``blocks_persisted_mode=is_incognito_transcript`` because every caller mutates
     durable memory: writes block every private persisted mode.
     """
+    # Owner first: every caller of this gate writes the owner's durable memory,
+    # and the store resolution below only asks for the owner when ``?store=``
+    # is present.
+    owner_denied = await require_owner_dashboard_request(request, operation)
+    if owner_denied is not None:
+        return owner_denied
     if operation != "memory.consolidate":
         _, refusal = await resolve_requested_memory_store(request, state, operation)
         if refusal is not None:
@@ -1288,7 +1296,13 @@ async def api_memory_embedding_model(request: web.Request) -> web.Response:
 
     The dimension is NOT taken from the caller: it is read off the loaded model
     (``n_embd``), so the user cannot get it wrong and the UI needs no dim field.
+
+    Owner-gated first: an apply rewrites the owner's config and re-embeds the
+    owner's whole vector store.
     """
+    owner_denied = await require_owner_dashboard_request(request, "memory.embedding_model")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if _is_restricted_session(state, request):
         sk = request.headers.get("X-Session-Key", "")
@@ -1597,6 +1611,12 @@ async def _ensure_pip_available() -> tuple[bool, str]:
             *sandboxed_argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # don't leak secrets to pip subprocesses (same reason and same
+            # helper as the sibling pip spawn in apps/backend.py): `standard`
+            # mode scrubs only _SENSITIVE_ENV_PREFIXES, and on a host where no
+            # launcher runs at all nothing else strips the gateway's channel
+            # tokens or owner id from a child that executes packaging code.
+            env=minimal_env(),
         )
         try:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
@@ -1746,6 +1766,15 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
                         *sandboxed_argv,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        # don't leak secrets to pip subprocesses. The allowlist
+                        # keeps what an install needs (PATH, HOME, TMPDIR,
+                        # PYTHONPATH, VIRTUAL_ENV, XDG_CACHE_HOME) and drops
+                        # proxy/CA/PIP_* hints, so a host that reaches PyPI only
+                        # through an env-configured proxy installs faiss from
+                        # pip.conf (HOME is kept) or by hand -- faiss is an
+                        # accelerator and recall falls back to the stdlib cosine
+                        # path, which is the cheaper side of this trade.
+                        env=minimal_env(),
                     )
                     try:
                         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)

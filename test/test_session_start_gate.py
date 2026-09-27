@@ -234,6 +234,44 @@ async def test_gate_exit_callback_reports_queue_wait_not_start_time(monkeypatch)
     assert waits[0] == pytest.approx(20.0), waits  # ms: exactly the hold
 
 
+@pytest.mark.asyncio
+async def test_gate_entry_callback_fires_before_the_wait_and_exit_after(monkeypatch):
+    """``on_gate_queued`` fires immediately before the wait for a permit and
+    ``on_gate_acquired`` at gate EXIT -- the two edges the subagent manager
+    freezes and restarts its startup clock on, so a start queued behind a held
+    gate is charged for none of the queue."""
+    rt, _, _ = _make_runtime()
+    release = asyncio.Event()
+    order: list[str] = []
+
+    async def _fake_send(method, params, timeout=None):
+        if method == METHOD_SESSION_NEW:
+            order.append("session/new")
+            await release.wait()
+            return {"sessionId": "sid"}
+        return {}
+
+    monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+    gate = await _gate()
+    permits = [await gate.acquire() for _ in range(gate.limit)]
+    observed = asyncio.create_task(
+        rt.create_session(
+            cwd="/w",
+            mcp_servers=[],
+            on_gate_queued=lambda: order.append("queued"),
+            on_gate_acquired=lambda _ms: order.append("acquired"),
+        )
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert order == ["queued"], "entry fires while queued, exit does not"
+    for p in permits:
+        p.release()
+    release.set()
+    await observed
+    assert order == ["queued", "acquired", "session/new"]
+
+
 # ── the collector ─────────────────────────────────────────────────────────────
 
 
@@ -385,7 +423,7 @@ async def test_a_settled_collector_leaks_no_frames_into_the_next_start(answer_la
 
         with pytest.raises(AcpSessionStartTimeout) as second:
             await rt.create_session(cwd="/w", mcp_servers=_roster("alpha"))
-        assert "0/1 MCP server(s) reported" in str(second.value)
+        assert "0/1 session-injected MCP server(s) reported" in str(second.value)
         assert "no report from alpha" in str(second.value)
         assert rt._session_inits_in_flight == 0
         # Settle the second collector too, so no task outlives the test.

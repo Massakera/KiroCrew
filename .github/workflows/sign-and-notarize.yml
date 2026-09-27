@@ -120,7 +120,9 @@ jobs:
     name: Sign with signing service (${{ inputs.channel }})
     if: ${{ !inputs.promote }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Upload of a ~1 GB zip plus sign.sh's 45-minute poll window (MAX_WAIT)
+    # must both fit; the notarize job keeps its own budget.
+    timeout-minutes: 60
     # OIDC subject alignment: tag-triggered callers (release.yml) present
     # ref:refs/tags/<tag>, which the signing role does not trust. The prod
     # environment switches the subject to environment:prod, which it does.
@@ -146,9 +148,21 @@ jobs:
           path: artifacts
 
       - name: Flatten artifacts
+        # Every artifact of the run lands under artifacts/<artifact-name>/.
+        # The two single-arch macOS artifacts (build-desktop.yml's
+        # `build-desktop-mac-single-arch` job, on when the caller passes
+        # `mac_single_arch: true`) are build-only and stay OUT of release/:
+        # the "*-mac.zip | head -1" pick and the exactly-one-DMG assertion
+        # below both assume the universal build is the only mac artifact here,
+        # and this lane signs and feeds one DMG. Excluding them by artifact
+        # name (not by file name) keeps the universal path byte-identical to
+        # before those legs existed. Per-arch signing gets its own lane.
         run: |
           mkdir -p release
-          find artifacts -type f \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.dmg" -o -name "*.zip" -o -name "*.AppImage" \) -exec cp {} release/ \;
+          find artifacts -type f \
+            -not -path "artifacts/unsigned-build-darwin-arm64/*" \
+            -not -path "artifacts/unsigned-build-darwin-x64/*" \
+            \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.dmg" -o -name "*.zip" -o -name "*.AppImage" \) -exec cp {} release/ \;
           ls -la release/
 
       - name: Attest build provenance

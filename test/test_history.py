@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -853,6 +854,146 @@ class TestSearchSessions:
             "threshold where title evidence dominates."
         )
 
+    def test_short_needle_digit_noise_does_not_bury_a_title_phrase_match(self, tmp_path):
+        """A titled ``case 5`` session outranks a long transcript dense in digit 5s.
+
+        ``5`` is a one-character substring needle, and agent transcripts are
+        dense in digits (timestamps, account ids, commit hashes), so on raw
+        frequency a long session that merely CONTAINS thousands of 5s out-scores
+        the session whose TITLE is the query. This pins the fix at realistic scale
+        (~10,000 digit-5 hits in a ~45 KB transcript): the body hit count of a
+        short needle is saturated, so digit noise cannot beat a
+        ``_TITLE_BOOST``-weighted whole-phrase title hit. The noisy session is
+        written NEWER so recency alone would rank it
+        first — only the ranking change can flip it.
+        """
+        # ~10,000 digit-5 hits spread over a realistic transcript: ISO timestamps
+        # and account ids on every line, plus a handful of real "case 5" mentions.
+        noisy_lines = []
+        for i in range(400):
+            noisy_lines.append(
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"2026-05-15T15:55:{i % 60:02d} ledger 5555-5555-5555 "
+                            f"instance i-5f5e5d5c5b5a5{i:04d} rebooted; "
+                            + ("edge case 5 needs live discovery" if i % 40 == 0 else "ok")
+                        ),
+                    }
+                )
+            )
+        (tmp_path / "noisy.jsonl").write_text(
+            '{"_type": "metadata", "title": "DR-11898 edge cases sweep"}\n'
+            + "\n".join(noisy_lines)
+            + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "titled.jsonl").write_text(
+            '{"_type": "metadata", "title": "Case 5 ARM64 failback"}\n'
+            '{"role": "user", "content": "unrelated text"}\n',
+            encoding="utf-8",
+        )
+        os.utime(tmp_path / "titled.jsonl", (1000, 1000))
+        os.utime(tmp_path / "noisy.jsonl", (2000, 2000))
+        log = ConversationLog(base_dir=tmp_path)
+
+        results = log.search_sessions("case 5")
+
+        assert [s["key"] for s in results] == ["titled", "noisy"], (
+            "the session titled with the whole query must outrank a long "
+            "transcript whose only advantage is thousands of incidental digit-5 "
+            "substring hits"
+        )
+
+    def test_short_forge_needle_digit_noise_does_not_bury_a_title_match(self, tmp_path):
+        noisy_lines = []
+        for i in range(400):
+            noisy_lines.append(
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"2026-05-15T15:55:{i % 60:02d} ledger 5555-5555-5555 "
+                            f"instance i-5f5e5d5c5b5a5{i:04d} rebooted; "
+                            + ("edge case 5 needs live discovery" if i % 40 == 0 else "ok")
+                        ),
+                    }
+                )
+            )
+        (tmp_path / "noisy.jsonl").write_text(
+            '{"_type": "metadata", "title": "DR-11898 edge cases sweep"}\n'
+            + "\n".join(noisy_lines)
+            + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "titled.jsonl").write_text(
+            '{"_type": "metadata", "title": "Case 5 ARM64 failback"}\n'
+            '{"role": "user", "content": "unrelated text"}\n',
+            encoding="utf-8",
+        )
+        os.utime(tmp_path / "titled.jsonl", (1000, 1000))
+        os.utime(tmp_path / "noisy.jsonl", (2000, 2000))
+        log = ConversationLog(base_dir=tmp_path)
+
+        results = log.search_sessions("issue 5")
+
+        assert results[0]["key"] == "titled"
+
+    def test_short_needle_saturation_keeps_substantive_long_session_ahead(self, tmp_path):
+        """Saturation must not invert body-only order for a short token.
+
+        Query ``s3``: a long session that discusses S3 two hundred times must
+        still outrank a short session with one incidental ``s3`` mention. The
+        saturated count is the length-NORMALIZED one, so the length norm is
+        applied once; saturating the raw count and then dividing by the norm
+        compounds two penalties on the long session and flips this order.
+        The short session is written NEWER so recency favors it.
+        """
+        long_lines = [
+            json.dumps({"role": "assistant", "content": f"bucket policy for s3 step {i}: " + "x" * 400})
+            for i in range(200)
+        ]
+        (tmp_path / "long-substantive.jsonl").write_text(
+            '{"_type": "metadata", "title": "storage design"}\n' + "\n".join(long_lines) + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "short-incidental.jsonl").write_text(
+            '{"_type": "metadata", "title": "quick question"}\n'
+            '{"role": "user", "content": "copied it from s3 once, unrelated otherwise"}\n',
+            encoding="utf-8",
+        )
+        os.utime(tmp_path / "long-substantive.jsonl", (1000, 1000))
+        os.utime(tmp_path / "short-incidental.jsonl", (2000, 2000))
+        log = ConversationLog(base_dir=tmp_path)
+
+        results = log.search_sessions("s3")
+
+        assert [s["key"] for s in results] == ["long-substantive", "short-incidental"]
+
+    def test_short_needle_still_gates_on_body_presence(self, tmp_path):
+        """Dampening is a ranking change only: a body-only short token still matches.
+
+        The ``5`` in ``case 5`` may appear ONLY in a session's content. Dropping
+        short needles from the body scan would fail the AND gate for exactly
+        the sessions the query is for, so the gate is untouched and only the
+        weight moves.
+        """
+        (tmp_path / "body-only.jsonl").write_text(
+            '{"_type": "metadata", "title": "edge cases"}\n'
+            '{"role": "user", "content": "case 5 needs live discovery"}\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "miss.jsonl").write_text(
+            '{"_type": "metadata", "title": "edge cases"}\n'
+            '{"role": "user", "content": "case four needs live discovery"}\n',
+            encoding="utf-8",
+        )
+        log = ConversationLog(base_dir=tmp_path)
+
+        assert [s["key"] for s in log.search_sessions("case 5")] == ["body-only"]
+        assert [s["key"] for s in log.search_sessions("5")] == ["body-only"]
+
     def test_scan_window_caps_files_scored(self, tmp_path, monkeypatch):
         """Only the ``_SEARCH_SCAN_WINDOW`` newest files are scored.
 
@@ -1235,6 +1376,95 @@ class TestParseSearchQuery:
         needles, _, _ = history.parse_search_query("泄")
 
         assert needles == [history.SearchNeedle("泄", 1.0, True)]
+
+    def test_short_ascii_terms_saturate_body_only(self):
+        """``5`` and ``s3`` keep full title weight and full gate strength.
+
+        Only their CONTENT hit count is saturated (``saturate_body``): a one-
+        or two-character substring matches incidental text (timestamps, ids,
+        hashes) so often that its raw body frequency is noise, not relevance.
+        Length is the whole test, digits included: incidental frequency falls
+        roughly 10x per extra character, so ``4411`` keeps raw frequency
+        alongside longer words -- saturating it would cap the specific term of
+        a query like ``timeout 50051`` while its ordinary co-term stays
+        linear, inverting which term drives body-only ranking. ``555`` and
+        ``pod`` pin the boundary at exactly three characters.
+        """
+        needles, _, _ = history.parse_search_query("case 5 s3 555 pod 4411 deploy")
+
+        by_text = {n.text: n for n in needles if n.required}
+        for unsaturated in ("case", "deploy", "555", "pod", "4411"):
+            assert by_text[unsaturated].saturate_body is False, unsaturated
+        for short in ("5", "s3"):
+            needle = by_text[short]
+            assert needle.weight == 1.0, short
+            assert needle.required is True, short
+            assert needle.saturate_body is True, short
+
+    @pytest.mark.parametrize("query", ["issue 5", "pr 5"])
+    def test_forge_needles_with_a_short_spelling_are_saturated(self, query):
+        needles, _, _ = history.parse_search_query(query)
+        required = [needle for needle in needles if needle.required]
+
+        assert len(required) == 1
+        assert required[0].saturate_body is True
+
+    def test_duplicate_reference_alt_merge_recomputes_saturation(self):
+        """A duplicate reference recomputes saturation after merging a bare alt."""
+        needles, _, _ = history.parse_search_query("#42 issue 42")
+        required = [needle for needle in needles if needle.required]
+
+        assert len(required) == 1
+        needle = required[0]
+        assert "42" in needle.alts
+        assert needle.saturate_body is True
+
+        needles, _, _ = history.parse_search_query("#4411 issue 4411")
+        required = [needle for needle in needles if needle.required]
+
+        assert len(required) == 1
+        needle = required[0]
+        assert "4411" in needle.alts
+        assert needle.saturate_body is False
+
+    @pytest.mark.parametrize("query", ["PR 4411", "#4411", "pull/4411"])
+    def test_forge_needles_without_a_short_spelling_are_not_saturated(self, query):
+        needles, _, _ = history.parse_search_query(query)
+        required = [needle for needle in needles if needle.required]
+
+        assert len(required) == 1
+        assert required[0].saturate_body is False
+
+    @pytest.mark.parametrize("query, expected", [("5", True), ("4411", False)])
+    def test_bare_number_ranking_hint_saturation(self, query, expected):
+        needles, _, _ = history.parse_search_query(query)
+        ranking = [needle for needle in needles if not needle.required]
+
+        assert len(ranking) == 1
+        assert ranking[0].saturate_body is expected
+
+    def test_cjk_needles_are_not_saturated(self):
+        """The short-token rule is an ASCII noise rule; CJK ranking is untouched.
+
+        A CJK bigram is two characters long and a lone character is one, and
+        both are the module's *intended* CJK signal — the character needles
+        already carry their own ``_CJK_CHAR_WEIGHT``.
+        """
+        needles, _, _ = history.parse_search_query("内存 泄")
+
+        assert not any(n.saturate_body for n in needles), needles
+
+    def test_short_non_ascii_words_are_not_saturated(self):
+        """A two-character Hangul word is a whole word, not digit noise.
+
+        Hangul is space-separated so it is NOT segmented as a CJK run and
+        arrives on the plain-term path; the short-token rule must not treat
+        ``한글`` like ``s3``. Same for a short accented Latin term.
+        """
+        needles, _, _ = history.parse_search_query("한글 où")
+
+        assert [n.text for n in needles] == ["한글", "où"]
+        assert not any(n.saturate_body for n in needles), needles
 
     def test_scoring_extras_are_capped(self):
         """Bigrams cost one scan each, so they get their own bound."""
@@ -1979,6 +2209,20 @@ class TestProviderSearchRefSeam:
         assert needle.text == "ref-987654321"
         assert set(needle.alts) == {"items/ref-987654321", "ref 987654321"}
         assert needle.digit_bounded is True
+
+    def test_a_provider_reference_with_a_short_spelling_is_saturated(self):
+        """A provider reference saturates when any spelling is short."""
+        history_search.register_search_ref_resolver(
+            lambda token: ("x5", ("items/x5", "5"))
+            if token.casefold() == "x5"
+            else None
+        )
+
+        assert self._needle("X5").saturate_body is True
+
+        history_search.register_search_ref_resolver(self._resolver)
+
+        assert self._needle("REF-987654321").saturate_body is False
 
     def test_every_provider_spelling_finds_every_spelling(self, tmp_path):
         """A URL mention and a prose mention answer the same query."""
@@ -4103,7 +4347,7 @@ class TestSkillDetectionFullWindow:
 
         recorded: dict = {}
 
-        def fake_process(result, k):
+        def fake_process(result, k, **_kwargs):
             recorded["result"], recorded["key"] = result, k
 
         c._event_loop = _asyncio.get_running_loop()
@@ -4114,6 +4358,89 @@ class TestSkillDetectionFullWindow:
             "skill detection must fire from the full-session window even when the "
             "unconsolidated tail is trivial"
         )
+
+    @pytest.mark.asyncio
+    async def test_restricted_line_discards_candidate_before_publication(self, tmp_path, caplog):
+        """A mode tightening during extraction wins before skill staging."""
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.skills import SkillsLoader
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        c = HistoryConsolidator(
+            log=conv_log,
+            memory=mem,
+            skills_loader=skills,
+            auto_skills_enabled=True,
+            approval_required=True,
+            auto_min_tool_calls=2,
+        )
+        key = "dashboard:chat-private-skill"
+        for i in range(3):
+            conv_log.append(key, "assistant", f"step {i}", tools=["execute_bash"])
+
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
+            await asyncio.to_thread(conv_log.update_metadata, key, {"memory_mode": "incognito"})
+            return {
+                "new_skill": {
+                    "slug": "private-procedure",
+                    "description": "Repeat a private procedure",
+                    "triggers": "private, procedure",
+                    "procedure_md": "## When to use\nNever\n## Steps\n1. Stop\n## Gotchas\nNone",
+                }
+            }
+
+        c._event_loop = asyncio.get_running_loop()
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.history"):
+            with patch.object(c, "_call_llm", side_effect=fake_llm):
+                await c._run_skill_detection(key)
+
+        assert skills.list_pending_skills() == []
+        assert "Discarding skill detection result" in caplog.text
+        assert "transcript became restricted during extraction" in caplog.text
+
+    def test_lock_timeout_discards_candidate_before_publication(self, tmp_path, monkeypatch):
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.skills import SkillsLoader
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        c = HistoryConsolidator(
+            log=conv_log,
+            memory=mem,
+            skills_loader=skills,
+            auto_skills_enabled=True,
+            approval_required=True,
+        )
+        key = "dashboard:chat-busy-skill"
+        conv_log.append(key, "assistant", "step", tools=["execute_bash"])
+
+        @contextlib.contextmanager
+        def _timeout(self, stems):
+            raise history.HistoryLockTimeout("skill publication lock held")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(type(conv_log), "locked_stems", _timeout)
+        c._process_auto_skills(
+            {
+                "new_skill": {
+                    "slug": "busy-procedure",
+                    "description": "Repeat a procedure",
+                    "triggers": "repeat, procedure",
+                    "procedure_md": "## When to use\nOften\n## Steps\n1. Act\n## Gotchas\nNone",
+                }
+            },
+            key,
+            guard_publication=True,
+        )
+
+        assert skills.list_pending_skills() == []
 
     @pytest.mark.asyncio
     async def test_length_guard_skips_unchanged_session(self, tmp_path):
@@ -4149,6 +4476,84 @@ class TestSkillDetectionFullWindow:
                     "an unchanged session must NOT be re-judged on the next "
                     "consolidation (length guard)"
                 )
+
+    @pytest.mark.asyncio
+    async def test_claim_lock_stall_reopens_detection_on_the_next_pass(self, tmp_path):
+        """A candidate refused by the slug claim lock must be re-judged immediately.
+
+        The length guard above is what makes the lock refusal lossy: the marker is
+        recorded before staging runs, so a pass that staged nothing because another
+        process held the claim lock would be skipped until a further message changed
+        the count or a restart cleared the marker. A session that goes quiet right
+        after the stall would drop the candidate. The claim path reports that one
+        refusal as retryable and the marker is retracted, so the next pass re-judges
+        the SAME unchanged session -- no new message and no rotation.
+        """
+        import asyncio as _asyncio
+        from unittest.mock import patch
+
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.skills import SkillsLoader
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        c = HistoryConsolidator(
+            log=conv_log,
+            memory=mem,
+            skills_loader=skills,
+            auto_skills_enabled=True,
+            approval_required=True,
+            auto_min_tool_calls=5,
+        )
+        key = "dashboard:chat-claim-stall"
+        for i in range(6):
+            conv_log.append(key, "assistant", f"step {i}", tools=["execute_bash"])
+        c._event_loop = _asyncio.get_running_loop()
+
+        stalled = True
+
+        def refuse_once(result, k, refusal=None, **_kwargs):
+            # Stand in for whichever claim path ran: the first pass loses the lock,
+            # the second acquires it and reaches a real decision. The parameter is
+            # accepted untyped on purpose -- the pin is that the detection pass
+            # OFFERS somewhere to report the refusal and acts on it, so a tree that
+            # never passes one fails the marker assertion below rather than failing
+            # to import a name. ``**_kwargs`` absorbs the publication-guard
+            # arguments the real caller also passes, so this double pins the
+            # refusal contract without freezing the rest of the signature.
+            if stalled and refusal is not None:
+                refusal.retryable = True
+
+        with patch.object(c, "_call_llm", return_value={"new_skill": {"slug": "x"}}) as m1:
+            with patch.object(c, "_process_auto_skills", side_effect=refuse_once):
+                await c._run_skill_detection(key)
+                assert m1.call_count == 1
+                assert key not in c._last_skillgen_marker, (
+                    "a claim-lock refusal must not leave a marker that suppresses "
+                    "the retry the lock helper documents"
+                )
+                await c._run_skill_detection(key)
+                assert m1.call_count == 2, (
+                    "the pass after a claim-lock stall must re-judge the same "
+                    "unchanged session, with no new message and no rotation"
+                )
+                # The control: once the lock is free the refusal is not reported, so
+                # the marker stands again and the guard resumes skipping.
+                stalled = False
+                await c._run_skill_detection(key)
+                assert m1.call_count == 3  # the pass that records a clean marker
+                await c._run_skill_detection(key)
+                assert m1.call_count == 3, (
+                    "a pass that was not refused by the lock must still record its "
+                    "marker, or every session would be re-judged forever"
+                )
+        assert conv_log.unconsolidated_count(key) == 6, (
+            "retracting the detection marker must not rewind the consolidation "
+            "offset that history, semantic and lesson extraction share"
+        )
 
     @pytest.mark.asyncio
     async def test_rotation_forces_fresh_pass_despite_equal_count(self, tmp_path):

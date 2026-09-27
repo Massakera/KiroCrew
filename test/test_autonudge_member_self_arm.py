@@ -1133,32 +1133,45 @@ async def test_self_arm_denies_when_no_free_id_can_be_reserved(
 # ── the slot's own loop wake is the second admitted producer ─────────────────
 
 
+def _arm_args(kind: str) -> dict[str, Any]:
+    if kind == "monitor_start":
+        return {"message": "patrol"}
+    return {
+        "kind": "github_pull_request",
+        "target": "https://github.com/acme/widgets/pull/7",
+        "objective": "review_ready",
+        "cadence_secs": 300,
+        "max_runtime_secs": 14_400,
+        "max_agent_turns": 8,
+        "max_tokens": 250_000,
+        "max_provider_errors": 3,
+    }
+
+
+def _wake_svc(row: Any) -> SimpleNamespace:
+    """A service whose only loop is *row*, reachable by id and by slot."""
+    return SimpleNamespace(
+        get_by_id=lambda loop_id: row if row is not None and row.id == loop_id else None,
+        get_by_slot=lambda slot_key: row,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
 async def test_the_slots_own_wake_turn_may_re_arm_its_loop(kind: str) -> None:
     """(a) A member's loop firing on the member's slot is the member keeping
     itself awake; the arm it issues from inside that cycle is its own act, so
-    the consumer hands the authorizer the session's binding as initiator."""
+    the consumer hands the authorizer the session's binding as initiator. The
+    wake's own row is still present, so the arm is not a stale one."""
     captured: dict[str, Any] = {}
 
     async def _authz(**kw: Any) -> tuple[Any, None, int]:
         captured.update(kw)
         return SimpleNamespace(id="loop-1", monitor=None, gate=False, next_due_ts=0.0), None, 200
 
-    args: dict[str, Any] = {"message": "patrol"}
-    if kind == "monitor_watch":
-        args = {
-            "kind": "github_pull_request",
-            "target": "https://github.com/acme/widgets/pull/7",
-            "objective": "review_ready",
-            "cadence_secs": 300,
-            "max_runtime_secs": 14_400,
-            "max_agent_turns": 8,
-            "max_tokens": 250_000,
-            "max_provider_errors": 3,
-        }
+    live_row = SimpleNamespace(id="loop-1", active=True, monitor=None, stopped_reason="")
     with (
-        patch("kiro_crew.autonudge.get_instance", return_value=object()),
+        patch("kiro_crew.autonudge.get_instance", return_value=_wake_svc(live_row)),
         patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", _authz),
         patch.object(sda, "_audit"),
     ):
@@ -1167,10 +1180,118 @@ async def test_the_slots_own_wake_turn_may_re_arm_its_loop(kind: str) -> None:
             SimpleNamespace(key="member-conductor", _app="", messages=[]),
             "dashboard:member-conductor",
             kind,
-            args,
+            _arm_args(kind),
             producer_is_self_wake=True,  # human flag left False: a nudge turn
+            producer_wake_loop_id="loop-1",
         )
     assert captured["initiator_slot_key"] == "member-conductor"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
+async def test_a_wake_whose_loop_row_is_gone_cannot_arm_a_replacement(kind: str) -> None:
+    """A prompt-loop Stop REMOVES its row, and the wake it interrupted may still
+    be running: that stale turn must not create a replacement automation."""
+    captured: dict[str, Any] = {}
+
+    async def _authz(**kw: Any) -> tuple[Any, None, int]:
+        captured.update(kw)
+        return SimpleNamespace(id="loop-2", monitor=None, gate=False, next_due_ts=0.0), None, 200
+
+    with (
+        patch("kiro_crew.autonudge.get_instance", return_value=_wake_svc(None)),
+        patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", _authz),
+        patch.object(sda, "_audit"),
+    ):
+        result = await sda.apply_session_directive(
+            SimpleNamespace(),
+            SimpleNamespace(key="member-conductor", _app="", messages=[]),
+            "dashboard:member-conductor",
+            kind,
+            _arm_args(kind),
+            producer_is_self_wake=True,
+            producer_wake_loop_id="loop-1",
+        )
+    assert not captured
+    assert "NOT armed" in result and "stopped or removed" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
+async def test_a_wake_whose_loop_a_person_stopped_cannot_arm_a_replacement(kind: str) -> None:
+    """A structured stop RETAINS the row as ``USER_STOP``; a manual pause keeps
+    a legacy row with reason ``manual``. Both are a person's decision, so the
+    wake that outlived them is refused before the authorizer is consulted."""
+    from kiro_crew.monitoring.models import MonitorOutcome
+
+    captured: dict[str, Any] = {}
+
+    async def _authz(**kw: Any) -> tuple[Any, None, int]:
+        captured.update(kw)
+        return SimpleNamespace(id="loop-2", monitor=None, gate=False, next_due_ts=0.0), None, 200
+
+    stopped_rows = [
+        SimpleNamespace(
+            id="loop-1",
+            active=False,
+            stopped_reason="",
+            monitor=SimpleNamespace(outcome=MonitorOutcome.USER_STOP, stopped_reason="user"),
+        ),
+        SimpleNamespace(id="loop-1", active=False, stopped_reason="manual", monitor=None),
+    ]
+    for row in stopped_rows:
+        with (
+            patch("kiro_crew.autonudge.get_instance", return_value=_wake_svc(row)),
+            patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", _authz),
+            patch.object(sda, "_audit"),
+        ):
+            result = await sda.apply_session_directive(
+                SimpleNamespace(),
+                SimpleNamespace(key="member-conductor", _app="", messages=[]),
+                "dashboard:member-conductor",
+                kind,
+                _arm_args(kind),
+                producer_is_self_wake=True,
+                producer_wake_loop_id="loop-1",
+            )
+        assert not captured
+        assert "NOT armed" in result and "stopped by a person" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
+async def test_a_wake_whose_loop_hit_its_own_bound_may_arm_a_replacement(kind: str) -> None:
+    """A loop its OWN cycle cap or runtime budget deactivated was never stopped
+    by a person: the final-cycle wake may arm its successor, and the existing
+    ``replace_stopped`` rule is what then displaces the spent row."""
+    for reason in ("cycle_cap", "runtime_budget"):
+        captured: dict[str, Any] = {}
+
+        async def _authz(**kw: Any) -> tuple[Any, None, int]:
+            captured.update(kw)
+            return (
+                SimpleNamespace(id="loop-2", monitor=None, gate=False, next_due_ts=0.0),
+                None,
+                200,
+            )
+
+        spent_row = SimpleNamespace(id="loop-1", active=False, stopped_reason=reason, monitor=None)
+        with (
+            patch("kiro_crew.autonudge.get_instance", return_value=_wake_svc(spent_row)),
+            patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", _authz),
+            patch.object(sda, "_audit"),
+        ):
+            await sda.apply_session_directive(
+                SimpleNamespace(),
+                SimpleNamespace(key="member-conductor", _app="", messages=[]),
+                "dashboard:member-conductor",
+                kind,
+                _arm_args(kind),
+                producer_is_self_wake=True,
+                producer_wake_loop_id="loop-1",
+            )
+        assert captured["initiator_slot_key"] == "member-conductor"
+        assert captured["replace_stopped"] is True
 
 
 @pytest.mark.asyncio
@@ -1182,7 +1303,11 @@ async def test_the_slots_own_wake_turn_may_revise_its_structured_monitor() -> No
         return SimpleNamespace(id="monitor-1"), None, 200
 
     structured_loop = SimpleNamespace(
-        id="monitor-1", slot_key="member-conductor", gate=False, monitor=SimpleNamespace()
+        id="monitor-1",
+        slot_key="member-conductor",
+        active=True,
+        gate=False,
+        monitor=SimpleNamespace(),
     )
     with (
         patch(

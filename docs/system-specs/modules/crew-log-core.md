@@ -344,14 +344,42 @@ same slot was writing before. Same citation shape as `parent`, written once at c
 rewritten, absent rather than empty when there is nothing to name -- the slot's first crew log, a
 predecessor the gateway could not name, and one whose own header does not name this slot are all
 "nothing to follow". No `slot` is repeated inside it,
-because it is the slot in `data.slot`. The id comes from the persisted slot-to-session mapping, read
-without pruning before allocation publishes the successor over it. One limit is recorded rather than
-handled: an allocation whose replay is still pending does not publish its fresh id over the mapping,
-so for that window a mapping read can
-name the crew log BEFORE the newest one -- two successive crew logs then cite one predecessor
-and the crew log between them is cited by nobody, which is a chain gap tracked with the rest of the
-supersede work in #12148. A successful resume answers the same id and the emitter writes no edge,
+because it is the slot in `data.slot`. The id is resolved in three tiers. The store this slot
+last handed to a `session/opened`, recorded on the slot as that entry's edge is spent, is
+first: the create is queued to a writer thread, so it is the only source that can name a crew
+log whose unit is not on disk yet. The slot's own newest unit IN THE STORE -- the unit no other
+unit of that slot cites as `previous` -- is next, and it is the durable one: the record above
+dies with its process, and this does not. It answers UNDECIDED when the units cannot be listed
+or read, or do not say which is newest, and no edge is written then -- but the entry does record
+`previous_undecided`, and an entry the read proves is the slot's first records `previous_none`,
+because neither meaning may rest on a key being ABSENT. A log that merely omits every
+predecessor key is one written before these keys existed, and its silence is equally "I am
+first" and "I could not tell": without the two fields the state a later fold must refuse on is
+byte-identical to the state it may pass over, and passing over it elects the log before it.
+The persisted
+slot-to-session mapping,
+read without pruning, is last, for a slot the store says has no unit at all -- which includes a
+store that is not at the name, the ordinary launch of a crew log switched off, and a slot whose
+units all predate this edge and so record no succession to read. It cannot be
+higher, and inside the replay-pending window it is not cited at all: an allocation whose
+replay is still
+pending holds the prior resumable id in the mapping on purpose, so that a restart can still
+resume it, and the mapping is then a generation
+behind -- two successive crew logs would cite one predecessor
+and the crew log between them would be cited by nobody, the one chain gap a reader cannot see.
+Whether that window is open is asked where a SESSION EXISTS to answer, as the edge is handed to
+an entry, and not where the id is read: the marker belongs to a live session, the read runs
+before this turn's session is allocated, and asked from there it answers "no replay owed" both
+when none is owed and when there is nobody to ask -- the second being a cold start, which is the
+restart this whole tier exists to survive. So a mapped id is carried provisional and becomes a
+recorded break at that point instead; what this process itself recorded is never provisional.
+A successful resume answers the same id and the emitter writes no edge,
 since a crew log cannot be its own predecessor.
+
+An empty answer from that mapping is a FINDING only when the store holds no unit of the slot at
+all. When it holds units this read could not rank, the mapping having nothing to give says nothing
+about the slot, so the entry records no predecessor key rather than stating it has none -- which
+would let a later fold pass over a log whose siblings sit uncited beside it.
 
 The edge is a citation and nothing else. Recording it opens no store for writing but this session's
 own, and no writer here appends to the crew log it names. It does READ that crew log's header, because
@@ -448,6 +476,10 @@ This layer claims no authorization, so it has none to deny: a check defaulting t
 A resume's belief that the previous writer is gone is not verifiable from the file, so it is not the only check. **Writes to a unit are owned, and the arbiter is the kernel.** The owner holds a non-blocking advisory lock on a `.lease` file beside the log, and a process that cannot take it is REFUSED with `already_owned` rather than made to wait: it appends nothing and repairs nothing, so the file keeps one writer's account of a turn instead of two interleaved ones. This is what stands between a resume in a second gateway and a turn that reads as completed-as-interrupted and then, further down, completed for real, with one tool call closed both `unknown` and `completed` -- a shape a fold cannot resolve and no later pass can undo.
 
 Ownership is taken LAZILY, on a handle's first write, and never by `open` itself, because `open` also serves readers: `iter_from`, `page` and `resolve` need no ownership, and making a reader contend with the writer would buy nothing. `open(repair=True)` claims it before the closers, and that is the same rule rather than an exception -- the closers are appends. `create` claims nothing: it publishes a header for a unit that has none, and two processes racing it are already settled by `already_exists` under the per-append lock.
+
+`append_if` adds a THIRD append outcome beside written and refused: **declined**, reported as `None`. It takes `max_tail_seq`, the seq the caller's decision was made against, and writes the entry only while the tail read under ownership is still at or below it. The outcome exists because a decision that governs append ORDER cannot be made outside the hold that assigns the order: another process's entry committed between a caller's decision and its own write lands first, and for a reader that takes the last word per field that ordering is the whole result. Comparing the caller's seq here is what proves nothing was committed in between. A decline appends nothing; it is NOT byte-identical, because the torn-tail repair above it is unconditional and a decline can leave that repair behind.
+
+A seq rather than a callback, and that choice is load-bearing. The comparison runs while the lease and the per-append lock are both held, so anything done there is a window in which every other process's append to the unit is refused `already_owned` -- and a peer that exhausts its own retry budget loses its entry for good, since this file has no compaction and nothing replays it. An int cannot parse the file or write to it, so no caller can turn that window into a long one. A caller whose decision needs the log's contents reads it BEFORE calling and passes the tail that read reached.
 
 The lock is REFCOUNTED PER PROCESS, keyed by the lease file's path. That is a correctness requirement rather than an optimization: a POSIX lock belongs to an open file description rather than to a process, so a second `open()` of the lease path inside one process contends exactly as another process would -- and one process legitimately holds several handles for one unit, since the emitter's cached handle and the handle a session claim opens overlap while the cache entry is replaced. So the first writer in a process takes the kernel lock, every later handle shares it, and the last handle to be dropped gives it up. The path is the key rather than `(kind, id)` because the data home is repointable and the kernel locks a file, not a name. Acquire and release both run under one module lock, for the same reason the count exists: two threads reaching for one unit must share a descriptor rather than race two of them and have one refuse the other.
 

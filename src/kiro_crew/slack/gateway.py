@@ -50,6 +50,7 @@ from kiro_crew import (
     dep_sync,
     name_grant,
     platform_compat,
+    session_work_dir,
     shutdown_event,
     work_root,
 )
@@ -94,9 +95,10 @@ from kiro_crew.config.loader import (
     build_provider_factory,
     config_dir,
     data_home,
+    workspace_root,
 )
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.constants import DATA_WARNING, SUBAGENT_COMPLETION_META_KEY, strip_control_comments
+from kiro_crew.constants import SUBAGENT_COMPLETION_META_KEY, strip_control_comments
 from kiro_crew.context import ContextBuilder, session_store_for_turn
 from kiro_crew.context_management import summarize_result
 from kiro_crew.cron import (
@@ -196,7 +198,7 @@ from kiro_crew.heartbeat import (
 )
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, HooksConfig, hooks_config_from_config_dict
-from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, pin_kiro_cli
+from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, is_bundled_kiro_cli, pin_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
@@ -606,6 +608,33 @@ _BACKGROUND_APPROVAL_SOURCES = frozenset({"cron", "heartbeat", "taskrunner", "au
 # Slack Block Kit section.text hard limit is 3000 chars.
 # We split cron output at this boundary so each chunk fits in a section block.
 _CRON_MSG_LIMIT = 3000
+
+
+def _live_session_work_dirs(sessions: Any) -> list[str]:
+    """The work directories of every provider the session registry holds now."""
+    if sessions is None:
+        return []
+    return [
+        path
+        for path in (str(getattr(p, "cwd", "") or "") for p in sessions.active_providers())
+        if path
+    ]
+
+
+def _sweep_predecessor_session_work_dirs(live_work_dirs: list[str]) -> int:
+    """Sweep the run directories a dead predecessor of this data home left, off-loop.
+
+    The evidence is this home's own: its pid ledger (``retained_gateway_pids``,
+    read under the ledger's lock) and *live_work_dirs* from its session
+    registry. An unreadable ledger raises, and the callers then sweep nothing.
+    """
+    from kiro_crew.session_pid import retained_gateway_pids
+
+    return session_work_dir.sweep_predecessor_work_dirs(
+        workspace_root(),
+        retained_gateway_pids=retained_gateway_pids(),
+        live_work_dirs=live_work_dirs,
+    )
 
 
 def _heartbeat_slack_parts(title: str, result_text: str) -> list[str]:
@@ -8220,31 +8249,21 @@ class GatewayOrchestrator:
                 return list(rows), int(cursor) if isinstance(cursor, int) else since
 
             async def _read_pr(target: str) -> dict | None:
-                # The observation the typed probe ALREADY made this tick, never a fresh
-                # fetch: re-asking the forge would spend a subprocess to learn what the
+                # The reading the fetcher ALREADY made this tick, never a fresh fetch:
+                # re-asking the forge would spend a subprocess to learn what the
                 # monitor record already holds, and the judge's job is the owner's own
                 # prose criterion read against those facts.
                 monitor = loop.monitor
                 observed = getattr(monitor, "last_observation", None) if monitor else None
                 if monitor is None or not isinstance(observed, dict):
                     return None
-                # A factless observation is an UNREAD target only when nothing read the
-                # subject this tick. The canonical field has one writer, the structured
-                # controller's provider, and a judged loop is a GATED one observing
-                # through the raise-based kernel, whose verdict carries no facts -- so
-                # this reader sees an empty canonical for every loop the judge screens.
-                # On that path the probe HAS read this subject and returned quiet, which
-                # is the only reason the judge is being asked, so the subject is read and
-                # this target is not a drop: it contributes nothing and the probe's own
-                # quiet stands. Calling it unread would fire a turn the probe already
-                # settled, every interval, for the life of the watch.
-                probe_covers_subject = monitor.outcome is None and bool(
-                    getattr(loop, "gate", False)
-                )
-                if _judge.pr_target_is_unread(observed, probe_covers_subject=probe_covers_subject):
+                if _judge.pr_target_is_unread(observed):
+                    # No reading, or one whose own status says it is short. A partial
+                    # reading counts as unread: a quiet drawn from the half that was
+                    # read would be a quiet about the wrong half.
                     logger.debug(
-                        "AutoNudge: no pull-request reading for loop %s -- counting the "
-                        "target as unread",
+                        "AutoNudge: no whole pull-request reading for loop %s -- counting "
+                        "the target as unread",
                         loop.id,
                     )
                     return None
@@ -8262,12 +8281,22 @@ class GatewayOrchestrator:
                         "AutoNudge: a judge brief named a pull request this loop does not watch"
                     )
                     return None
-                # ``last_observed_at`` is a SIBLING field of the canonical object, not a
-                # key inside it, so the collector cannot age the reading without being
-                # handed it. Added to the copy, which leaves the monitor's own canonical
-                # dict -- whose exact shape is pinned by equality tests and hashed into
-                # the wake fingerprint -- untouched.
-                payload = dict(observed)
+                # Bodies are merged into a COPY. They live in memory for this tick
+                # only, and the record the copy is taken from carries who said
+                # something and when, never what -- so filling them in place is
+                # exactly how review prose would reach the disk.
+                stashed, stash_dropped = _judge.take_pr_bodies(loop.id)
+                payload = _judge.payload_for_judge(observed, stashed, stash_dropped)
+                if payload is None:
+                    logger.debug(
+                        "AutoNudge: loop %s lost its stashed remark bodies -- counting "
+                        "the target as unread rather than judging prose the judge never got",
+                        loop.id,
+                    )
+                    return None
+                # ``last_observed_at`` is a SIBLING field of the fact object, not a key
+                # inside it, so the collector cannot age the reading without being
+                # handed it.
                 at = getattr(monitor, "last_observed_at", 0.0)
                 if isinstance(at, (int, float)) and not isinstance(at, bool) and at > 0:
                     payload["observed_at"] = float(at)
@@ -13325,6 +13354,16 @@ class GatewayOrchestrator:
             # skipped like any absent backend, which this step already treats as
             # non-fatal.
             kiro_cli_bin = await _pinned_kiro_cli("the optional kiro-cli backend update")
+            # The desktop app's bundled copy is skipped too: it sits inside the
+            # signed app bundle, where an in-place self-update would break the
+            # codesign seal, and the app update is what replaces it. Checked
+            # against the live environment because that is where the Electron
+            # shell publishes the bundled directory.
+            if kiro_cli_bin is not None and is_bundled_kiro_cli(kiro_cli_bin, os.environ):
+                logger.debug(
+                    "Auto-update: kiro-cli is the app's bundled copy, not updated in place"
+                )
+                kiro_cli_bin = None
             if kiro_cli_bin is not None:
                 kiro_update: asyncio.subprocess.Process | None = None
                 try:
@@ -13500,10 +13539,16 @@ class GatewayOrchestrator:
             logger.warning("Auto-update failed", exc_info=True)
             if self.dashboard_state:
                 # Surface the platform-correct manual restart command so a failed
-                # auto-restart doesn't leave the user guessing.
-                self.dashboard_state.push_update_progress(
-                    "failed", f"Restart failed — run: {restart_command_hint()}"
-                )
+                # auto-restart doesn't leave the user guessing. Resolved OFF the
+                # loop thread: the hint stats the two unit-file locations, and
+                # the per-user one is under the account's home, which can be a
+                # network mount — a stat against a disconnected mount blocks for
+                # as long as the mount does, and on this thread that freezes
+                # chat and the liveness heartbeat together with nothing in-band
+                # to clear it (the watchdog's kill is the only exit). A worker
+                # thread waits in its place; the loop keeps serving.
+                hint = await asyncio.to_thread(restart_command_hint)
+                self.dashboard_state.push_update_progress("failed", f"Restart failed — run: {hint}")
 
     async def _auto_apply_wheel_update(self) -> None:
         """Auto-apply a wheel/cli.sh update by re-running the signed installer.
@@ -13990,6 +14035,24 @@ class GatewayOrchestrator:
 
         self._install_shutdown_signal_handlers()
 
+        # The run directories a PREDECESSOR gateway of this data home left behind
+        # (session_work_dir). Ordered after ``cleanup_orphaned_sessions`` above,
+        # which reaped this home's pid ledger -- the ledger's remaining entries
+        # are what the sweep keeps -- and before any session writer below can
+        # create a directory. Past KIROCREW_READY so readiness does not wait for
+        # it (no-new-work-on-gateway-boot-path); off-loop, bounded by entries and
+        # wall clock, fail-open, and skipped in test_mode like the hourly wake.
+        # Nothing this process has marked is ever its business, so the ordering
+        # is for determinism, not safety.
+        if not self._test_mode:
+            try:
+                await asyncio.to_thread(
+                    _sweep_predecessor_session_work_dirs,
+                    _live_session_work_dirs(self.sessions),
+                )
+            except Exception:
+                logger.debug("boot session work-dir sweep failed", exc_info=True)
+
         # TaskRunner + workflow agent calls join the durable task queue and the
         # runner lane now that both consumers exist (the WorkflowService is
         # built by the dashboard server). AFTER the READY print, not before it:
@@ -14301,7 +14364,6 @@ class GatewayOrchestrator:
         _watchdog.add_done_callback(self._background_tasks.discard)
 
         print("👻 Kiro Crew gateway starting…")
-        print(f"\n{DATA_WARNING}\n")
 
         connected = await self._connect_slack()
         # Record the real socket outcome so status surfaces (e.g. the Slack
@@ -15423,6 +15485,12 @@ async def run_gateway(
                         kiro_agents_dir(),
                         sweep_backups=cfg.agent.sweep_agents_backups,
                     )
+                    # The per-spawn skill-view prune is capped, so a backlog
+                    # left by earlier builds would take hundreds of spawns to
+                    # clear. Drain it once here, in lock-bounded batches.
+                    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+                    acp_driver.drain_skill_view_aliases()
 
                 await asyncio.to_thread(_sweep_in_thread)
             except Exception:
@@ -15467,6 +15535,24 @@ async def run_gateway(
                     await asyncio.to_thread(work_root.sweep_work_root)
                 except Exception:
                     logging.getLogger(__name__).debug("work-root sweep failed", exc_info=True)
+                # The per-run work directories of subagent and stateless cron
+                # sessions ride the same wake. The ordinary end of a run reclaims
+                # its own (AcpProvider.shutdown); the boot sweep took what a dead
+                # predecessor of this data home left, and this re-runs the SAME
+                # predecessor-only rule for whatever its bounds left over. A
+                # directory this process marked is never its business; one a
+                # registered provider names is skipped whatever it holds.
+                # ``orchestrator`` is bound later in this function and read only
+                # here, an hour in.
+                try:
+                    await asyncio.to_thread(
+                        _sweep_predecessor_session_work_dirs,
+                        _live_session_work_dirs(getattr(orchestrator, "sessions", None)),
+                    )
+                except Exception:
+                    logging.getLogger(__name__).debug(
+                        "session work-dir sweep failed", exc_info=True
+                    )
 
         _AGENT_SCRATCH_SWEEP_TASK = asyncio.create_task(
             _run_agent_scratch_sweep(), name="agent-scratch-sweep"

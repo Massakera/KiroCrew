@@ -735,9 +735,10 @@ every write-side unit test still green — so test the round-trip
 - **Sensitive paths** — every read and write goes through
   the sensitive-path fence. The store's own file helpers (`_read_text` /
   `_write_text` / `_read_bytes` / `_write_bytes`) canonicalise the path with
-  `os.path.realpath` and ask `security.is_sensitive_canonical_path()` (through
-  `_fence_refuses`), the shared entry point for a caller-canonicalised path: it
-  answers with `security.is_sensitive_path()` on the event loop and with
+  `os.path.realpath` and ask `security.canonical_path_refusal()` (through
+  `_fence_refusal`), the reason-or-None form of the shared entry point for a
+  caller-canonicalised path: it answers with `security.sensitive_path_refusal()`
+  on the event loop and with
   `security.is_sensitive_resolved_path()` off it, so a caller earns the
   off-pool gate by offloading, never by declaring anything; `GET
   /api/artifacts` runs `store.list()` on a worker for that reason. The two read
@@ -745,9 +746,11 @@ every write-side unit test still green — so test the round-trip
   `_open_pinned_for_read`): a link at the final name is refused, the inode must
   be a regular file with one link, and the fence judges the kernel's path for
   the opened inode whenever it differs from the path already judged. The root
-  check and the file-backed `source_path` pointers stay on
-  `security.is_sensitive_path()` unconditionally; the store refuses to
-  instantiate at any sensitive root.
+  check asks `security.sensitive_path_refusal()`: the store refuses to
+  instantiate at any sensitive root, and a resolver stall is refused like a
+  match but raised with the producer's own "could not be verified" wording.
+  The file-backed `source_path` pointers stay on the bounded
+  `security.is_sensitive_path()` and fall back to the snapshot silently.
 - **Relocate root confinement** — `PATCH /api/artifacts/{slug}/relocate`
   points a file-backed artifact at a `source_path`; a later GET reads
   that file, so an unconfined relocate would be an agent-reachable
@@ -977,11 +980,13 @@ adding a parallel watcher (see `kiro_crew.knowledge.artifact_ingest`):
   `ensure_artifact_source`, `refresh_artifact_name`, `ingest_artifact`'s
   `_get_state` read and `release_stale_claim` write, the per-job
   `get_job_status` read in `reconcile_artifacts`, and `remove_artifact` (a
-  `delete_items_batch` → graph rebuild). The one take still on the loop is
-  `ingest_artifact`'s post-ingest `get_job_status` read: it sits between the
-  commit and the fallback ownership write, so offloading it belongs with the
-  ownership-write change that keeps those two from being separated by a
-  cancellation point. The ordering the handler describes is preserved across
+  `delete_items_batch` → graph rebuild). `ingest_artifact`'s post-ingest
+  `get_job_status` read travels with the fallback ownership write as one
+  `run_to_completion` unit, so no cancellation point separates them. That
+  fallback, and the in-hop retry of a failed ownership write, go through
+  `_write_ownership_if_intact`: under `BEGIN IMMEDIATE` it names the group only
+  while every committed id still exists, so a concurrent dedup verdict on the
+  row is never overwritten. The ordering the handler describes is preserved across
   the hops — name refresh before ingest, the kind-change reconcile before the
   ingest — and the deduped/ownership finalizers still run on the pipeline's own
   worker hop, not the loop.

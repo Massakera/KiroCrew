@@ -34,7 +34,7 @@ this spec states the target and that one states the present.
 | Observation | `partial` | the `MonitorCondition` type and the `MonitorSeverity` / `MonitorResetsOn` vocabulary live in `monitoring/models.py`, all four pull-request kinds derive their named conditions in `monitoring/pull_request.py`, and `monitoring/decision.py` masks, ages and resets per condition; `irq.py` keeps its own copy of the vocabulary while the cron driver lives, and a subject's fingerprint is still derived from the canonical facts rather than from the conditions |
 | Decision | `partial` | `decide_monitor` is IO-free but state-mutating: it coalesces successive changes to one subject over time through a window on `MonitorState` (a floor and a head-change reset) and derives its dedup comparison so an unresolved change re-asserts on a re-alert interval. It writes the window fields on the staged state and READS the alert map; the caller stamps the alert map on a wake and persists the same staged state, so decide-and-persist is a required pairing. `irq.py` keeps its own multi-signal coalescing for the cron path |
 | Persistence | `partial` | versioned in `monitoring/`; unversioned in `irq.py`, which also holds decision logic |
-| Driver | `implemented` | in-session timer in `autonudge.py`; out-of-session script cron in `babysit/scripts/pr_watch.py` |
+| Driver | `implemented` | in-session timer in `autonudge.py`, which reads the subject each tick and screens it with the wake judge |
 | Delivery | `implemented` | session directive keyed by the call's input digest, shared by both arming paths |
 
 ## Three prerequisites
@@ -154,6 +154,50 @@ because `test_monitor_conditions.py` pins them member-for-member and pins the tw
 key-space characters. And the cron path's plural batch assembly is a driver
 change, which is the consolidation's own step. Until that step an author adding a
 cron-path kind still subclasses `irq.Probe`.
+
+## Runtime bounds and activation evidence
+
+`monitoring.max_runtime_secs` supplies the operator's finite runtime ceiling,
+shared by MCP validation and API creation/update and applied when a budget is
+written. The shipped
+ceiling is seven days; setting 2592000 permits a 30-day request without changing
+any stored deadline or unrelated arming default. Daily prompt maintenance uses
+`interval_secs=86400`, `gate=false`, and an explicitly bounded runtime and cycle
+count. Expiry is measured from the original creation timestamp across restarts.
+Tool descriptors advertise the configured limit in the stdio server. Name-only
+discovery on the gateway event loop skips config reads; descriptor read failures
+fall back to the shipped bound without weakening invocation-time validation.
+The runtime policy applies to structured budgets and legacy outer runtimes;
+legacy observation metadata has unused budgets and retains only structural bounds.
+The ceiling is enforced only where a budget is written: legacy and structured
+creation, a legacy or structured update that supplies a budget, the API handlers
+and the MCP arming tools. `_load` never rewrites a persisted budget against the
+ceiling: a stored budget above the current ceiling stays exactly as stored, the
+row keeps its stored `active` state and its deadline (creation time plus budget),
+and the budget is validated again only when it is next written. Lowering the
+ceiling therefore never deactivates a running loop, and raising it never resumes
+one. Only a record the model cannot parse is quarantined, which includes a
+structured budget above the absolute `MonitorBudgets` maximum (2592000). A
+create or update carrying a budget rejected by the current policy returns an
+audited HTTP 400 with the valid range; an update that omits the budget keeps the
+stored one and is not re-checked. API creation caps the shipped runtime default
+to the ceiling and bound-checks only a budget the caller supplied.
+Explicit stops remain available.
+Quarantine remains inspectable even below the ordinary four-hour default.
+
+A tool's “requested” response proves receipt only. The gateway's applied notice
+and a subsequent `monitor_inspect` prove activation. Unmatched directive delivery
+produces an application-failure notice appended to the tool's own result text; its
+agent instruction names `monitor_inspect` only for the monitor tools and stays
+tool-neutral for every other directive tool, as does the turn-end notice for a parked
+record no call claimed. A delivered maintenance wake may outlive
+a user's Stop, including the prompt-loop path that removes its row, so the wake
+carries its loop id and an arm it issues is refused when that row is gone or
+was stopped by a person (a retained `USER_STOP`, a manual pause); a row that is
+active or that its own cycle cap or runtime budget deactivated admits the arm.
+The wake cannot revive a stopped loop except one its own bound deactivated, by
+raising that bound. Existing update, stop, terminal and repair-budget rules
+still apply.
 
 ## A monitor is a field, not a system
 
@@ -499,6 +543,15 @@ Four things the shape decides, each for a reason worth keeping:
   for the same reason that function does, so it cannot disagree with the fold that
   decided the stop. Both writers of `stopped_reason` otherwise copy the
   observation's own code and would file a stall as `checks_failed`.
+
+Every stop, whichever writer decided it, is also reported once more after the
+store commits: `autonudge_stop_log` compares the loops active in the previous
+committed store with the new one, logs each loop that stopped at WARNING with its
+`stopped_reason`. That line in `gateway.log` is the kept record; grep it for
+`AutoNudge:`.
+A removed legacy loop has no row to carry a reason, so `remove()` takes a
+`stop_reason` for that record alone. A new stop path needs nothing extra to be
+recorded; a new REMOVAL path should pass its reason.
 
 Streak counters do exist and are about something else: `quiet_streak` with
 `floor_ticks` counts consecutive quiet observations and the deliveries they

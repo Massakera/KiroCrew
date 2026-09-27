@@ -107,6 +107,7 @@ from kiro_crew.embeddings import (
 from kiro_crew.eval.judge import LLMJudge
 from kiro_crew.eval.runner import EvalRunner, format_results, score_by_dimension
 from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
+from kiro_crew.external_text import external_text_requires_redaction
 from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.learn import LessonStore
@@ -117,6 +118,7 @@ from kiro_crew.mcp_cron import (
     _vet_shell_command,
 )
 from kiro_crew.member_memory_auth import require_member_memory_creation
+from kiro_crew.members import MemberNameError, validate_member_name
 from kiro_crew.memory import MemoryStore
 from kiro_crew.memory_stores import (
     DEFAULT_MEMORY_STORE,
@@ -159,6 +161,7 @@ from kiro_crew.validation import (
     CHANNEL_MAX_LEN,
     CRON_ADD_SCHEMA,
     MAX_SHORT_STRING,
+    TEMPLATE_NAME_RE,
     WORKSPACE_NAME_RE,
     normalize_lesson_category,
 )
@@ -379,14 +382,31 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         sys.exit(1)
 
     agent_id = result["id"]
+    # A row the gate DEFERRED (memory floor, critical posture, paused cap) is
+    # accepted under this id but not running; the gateway says so with
+    # ``status: "queued"`` and its own sentence, and this reader must not
+    # claim a start the gateway did not make.
+    queued_note = ""
+    if result.get("status") == "queued":
+        queued_note = str(result.get("reason_detail") or result.get("reason") or "deferred")
 
     if args.fire_and_forget:
-        print(f"Spawned subagent {agent_id}: {result['task']}")
+        if queued_note:
+            print(f"Queued subagent {agent_id}: {result['task']} (not started yet: {queued_note})")
+        else:
+            print(f"Spawned subagent {agent_id}: {result['task']}")
         return
 
     # Block: poll until done
 
-    print(f"Spawned subagent {agent_id}, waiting for result...", file=sys.stderr)
+    if queued_note:
+        print(
+            f"Queued subagent {agent_id} (not started yet: {queued_note}); "
+            "waiting for it to start and finish...",
+            file=sys.stderr,
+        )
+    else:
+        print(f"Spawned subagent {agent_id}, waiting for result...", file=sys.stderr)
     poll_url = f"{base}/api/spawn/{agent_id}"
     secret = _internal_secret(args.port)
     told_awaiting = False
@@ -1413,8 +1433,19 @@ def _handle_agent(args: argparse.Namespace) -> None:
             )
 
     elif action == "create":
+        if external_text_requires_redaction(args.name):
+            print("Error: invalid Crew Member name (credential-shaped text)", file=sys.stderr)
+            sys.exit(1)
+        try:
+            validate_member_name(args.name)
+        except MemberNameError as exc:
+            print(f"Error: invalid Crew Member name ({exc})", file=sys.stderr)
+            sys.exit(1)
         if args.name in cfg.agents:
             print(f"Error: agent '{args.name}' already exists", file=sys.stderr)
+            sys.exit(1)
+        if not TEMPLATE_NAME_RE.fullmatch(args.kiro_agent):
+            print("Error: invalid kiro agent name", file=sys.stderr)
             sys.exit(1)
         memory_store = _memory_store_or_exit(args.memory_store)
         if memory_store not in ("", DEFAULT_MEMORY_STORE):
@@ -1474,6 +1505,9 @@ def _handle_agent(args: argparse.Namespace) -> None:
             print("Error: a member's memory cannot be rebound or shared", file=sys.stderr)
             sys.exit(1)
         if args.kiro_agent is not None:
+            if not TEMPLATE_NAME_RE.fullmatch(args.kiro_agent):
+                print("Error: invalid kiro agent name", file=sys.stderr)
+                sys.exit(1)
             agent.kiro_agent = args.kiro_agent
         if args.workspace is not None:
             agent.workspace = args.workspace

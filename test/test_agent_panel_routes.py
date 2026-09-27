@@ -134,6 +134,17 @@ class _Sessions:
         self._namespace = namespace
         self.unit = _unit_for(agent) if agent else ""
 
+    def has_session(self, _key) -> bool:
+        """Whether a live allocation exists for the caller.
+
+        The gate asks this before it asks WHICH crew, because the two answers are
+        different refusals. This stub models one live session per mounted state,
+        so ``agent=None`` is a state with no allocation to resolve -- which is a
+        distinct case from an allocation that resolved to no crew, and the real
+        allocation tests below are what hold the key-exactness this cannot.
+        """
+        return self._agent is not None
+
     def get_agent_selection(self, _key) -> tuple[str, str]:
         if self._agent is None:
             return "template", ""
@@ -148,7 +159,7 @@ class _Sessions:
 class _State:
     """Just enough DashboardState for the crew resolver, plus a broadcast log."""
 
-    def __init__(self, agent: str | None, *, namespace: str = "member"):
+    def __init__(self, agent: str | None, *, namespace: str = "member", sessions: Any = None):
         self._agent = agent
         # What the allocation SELECTED, which is the crew binding the resolver
         # trusts. ``get_slot().agent`` carries the same string for a provider
@@ -156,7 +167,10 @@ class _State:
         # the resolver keeps them separate: a template selection must not read as
         # a crew binding.
         self._namespace = namespace
-        self.sessions = _Sessions(agent, namespace)
+        # A REAL ``SessionManager`` when one is injected, which is the only way to
+        # exercise the key the resolver hands the registry -- the stub answers
+        # whatever key it is given.
+        self.sessions = _Sessions(agent, namespace) if sessions is None else sessions
         self.broadcasts: list[tuple[str, object]] = []
 
     def get_slot(self, _name):
@@ -169,7 +183,11 @@ class _State:
 
 
 def _mounted(
-    agent: str | None = CREW, *, internal: bool = True, namespace: str = "member"
+    agent: str | None = CREW,
+    *,
+    internal: bool = True,
+    namespace: str = "member",
+    sessions: Any = None,
 ) -> web.Application:
     """The panel routes on a bare app.
 
@@ -180,9 +198,12 @@ def _mounted(
 
     ``namespace`` is what the allocation selected: ``member`` for a crew, or
     ``template`` for a provider template that merely shares the name.
+
+    ``sessions`` replaces the stub with a real ``SessionManager``, for the tests
+    that have to see which KEY the resolver looks the caller up under.
     """
     app = web.Application()
-    app["state"] = _State(agent, namespace=namespace)
+    app["state"] = _State(agent, namespace=namespace, sessions=sessions)
     if internal:
 
         @web.middleware
@@ -223,7 +244,13 @@ def vetted(monkeypatch):
 
 
 @asynccontextmanager
-async def _client(agent: str | None = CREW, *, internal: bool = True, namespace: str = "member"):
+async def _client(
+    agent: str | None = CREW,
+    *,
+    internal: bool = True,
+    namespace: str = "member",
+    sessions: Any = None,
+):
     """A started client that always closes.
 
     An ``async with`` helper rather than an ``@pytest_asyncio.fixture``, by this
@@ -236,7 +263,9 @@ async def _client(agent: str | None = CREW, *, internal: bool = True, namespace:
     does say so -- "Unclosed client session" -- but on stderr, where a green run
     hides it.
     """
-    c = TestClient(TestServer(_mounted(agent, internal=internal, namespace=namespace)))
+    c = TestClient(
+        TestServer(_mounted(agent, internal=internal, namespace=namespace, sessions=sessions))
+    )
     await c.start_server()
     try:
         yield c
@@ -424,8 +453,16 @@ async def test_the_crew_is_not_taken_from_the_body(vetted):
         assert agent_panel.read("research-lab") is None
 
 
-async def test_a_session_with_no_crew_is_refused_plainly(vetted):
-    """A conductor publishing every cycle into a void looks like a broken feature."""
+async def test_a_session_with_no_dashboard_slot_is_told_that_and_nothing_else(vetted):
+    """A conductor publishing every cycle into a void looks like a broken feature.
+
+    Three causes, three messages. A caller with no dashboard slot is told THAT --
+    not that its allocation could not be resolved, which for such a caller is
+    false: a subagent inheriting its parent's member selection resolves perfectly
+    well and is refused because publishing is confined to the crew's own thread.
+    Collapsing the two would reintroduce, one case over, the conflation this
+    change exists to remove.
+    """
     async with _client(agent=None) as c:
         resp = await c.post(
             "/api/agent-panel/publish",
@@ -433,7 +470,7 @@ async def test_a_session_with_no_crew_is_refused_plainly(vetted):
             headers={"X-Session-Key": "dashboard:chat-1"},
         )
         assert resp.status == 400
-        assert (await resp.json())["code"] == "no_crew"
+        assert (await resp.json())["code"] == "no_dashboard_slot"
 
 
 async def test_an_omitted_template_resolves_to_the_crews_own(vetted):
@@ -790,6 +827,10 @@ def test_the_stub_matches_where_the_real_selection_lives():
     assert hasattr(_State(CREW).sessions, "get_agent_selection")
     # And NOT on the state itself, which is what made the wrong receiver pass.
     assert not hasattr(_State(CREW), "get_agent_selection")
+    # Same for the existence question that tells the two refusals apart.
+    assert hasattr(SessionManager, "has_session")
+    assert hasattr(_State(CREW).sessions, "has_session")
+    assert not hasattr(_State(CREW), "has_session")
 
 
 async def test_a_same_named_provider_template_cannot_publish_as_the_crew(vetted):
@@ -827,6 +868,224 @@ async def test_a_same_named_provider_template_cannot_publish_as_the_crew(vetted)
     assert after is not None
     assert after["crew"] == CREW
     assert after["data"] == {"cycle": 47}
+
+
+# ------------------------------------------------- through a real allocation
+
+
+def _member_session_key(crew_name: str = CREW) -> str:
+    """The key the SESSION REGISTRY holds a crew's DM session under.
+
+    Production's own derivation rather than a string spelled a second way here,
+    because a key spelled a second way is the entire bug this section guards.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    slug = members_mod.member_slug(crew_name)
+    try:
+        _slot, store = routes._member_thread_slot(KiroCrewConfig.load(), crew_name, slug)
+    except Exception:
+        store = ""
+    return members_mod.member_thread_session_alias(slug, store)
+
+
+def _real_allocation(crew_name: str = CREW, *, member: str | None = None):
+    """A REAL ``SessionManager`` holding *crew_name*'s DM session under its real key.
+
+    Every other test here drives the resolver through ``_Sessions``, whose
+    ``get_agent_selection`` ignores the key it is handed. That blindness is what
+    let the resolver ask the registry with a key the registry never holds and
+    stay green, so the regression cannot be written against that stub: the
+    assertion needed is about WHICH key reaches a live allocation, and only a
+    real registry has an opinion about that.
+
+    ``member`` is the allocation's ``capability_member`` -- the crew binding
+    itself. Empty models the other cause the issue names: a session created with
+    a blank ``crew_agent``, which is a live allocation that genuinely selected a
+    provider template.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.session import SessionManager, _Session
+
+    sessions = SessionManager(KiroCrewConfig())
+    session = _Session(provider=SimpleNamespace(session_id=_unit_for(crew_name)), agent=crew_name)
+    session.capability_member = crew_name if member is None else member
+    sessions._sessions[_member_session_key(crew_name)] = session
+    return sessions
+
+
+def test_the_registry_key_is_the_slot_key_behind_a_transport_prefix():
+    """The two keyspaces, pinned, so a future reader cannot merge them back.
+
+    ``_normalize_slot_key`` STRIPS the prefix, so its output addresses the slot
+    layer and nothing else. Handing it to the registry is a guaranteed miss, and
+    a guaranteed miss on the only session this tool is mounted on refused every
+    member.
+    """
+    from kiro_crew.dashboard.state import _normalize_slot_key
+
+    registry_key = _member_session_key()
+    slot_key = _crew_slot(CREW)
+    assert registry_key == f"dashboard:{slot_key}"
+    assert _normalize_slot_key(registry_key) == slot_key
+    assert _normalize_slot_key(registry_key) != registry_key
+
+
+async def test_a_real_member_allocation_can_publish(vetted):
+    """The accepting path against a real allocation, which nothing covered.
+
+    This is the issue's own case: a member's DM session, the one session the
+    panel tool is ever mounted on, publishing with valid arguments. It was
+    refused ``no_crew`` for every member because the resolver looked the caller
+    up by slot key in a registry keyed by session key.
+    """
+    sessions = _real_allocation()
+    async with _client(CREW, sessions=sessions) as c:
+        resp = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 47}, "title": "fleet"},
+            headers={"X-Session-Key": _member_session_key()},
+        )
+        assert resp.status == 200, await resp.text()
+        assert (await resp.json())["ok"] is True
+    record = _folded()
+    assert record is not None
+    assert record["crew"] == CREW
+    assert record["data"] == {"cycle": 47}
+
+
+def test_every_refusal_in_the_crew_resolver_audits_its_denial():
+    """No denial may return without a denied SEL event, on any exit.
+
+    ``_recognize_session`` writes an ``outcome="allowed"`` event before this
+    resolver reaches its own checks, so a refusal that returns without its own
+    event leaves the audit trail ending on the ALLOW -- the record says the caller
+    was let through while the HTTP response is the only trace that it was not.
+
+    Asserted structurally over the function's AST rather than by exercising each
+    branch: a per-branch test proves only the branches someone remembered to
+    write, and this finding was exactly a branch nobody had. Every ``return None,
+    web.json_response(...)`` in the resolver must be preceded, within its own
+    block, by a ``log_api_access`` call.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(routes._resolve_publishing_crew)))
+
+    def audits(body: list[ast.stmt]) -> list[str]:
+        """Names of refusal statements in *body* that no preceding call audits."""
+        unaudited: list[str] = []
+        seen_audit = False
+        for node in body:
+            src = ast.dump(node)
+            if "log_api_access" in src:
+                seen_audit = True
+            returns_refusal = isinstance(node, ast.Return) and "json_response" in src
+            if returns_refusal and not seen_audit:
+                unaudited.append(ast.dump(node)[:80])
+            for field in ("body", "orelse", "finalbody", "handlers"):
+                inner = getattr(node, field, None)
+                if isinstance(inner, list) and inner and isinstance(inner[0], ast.stmt):
+                    unaudited.extend(audits(inner))
+                elif isinstance(inner, list):
+                    for handler in inner:
+                        unaudited.extend(audits(getattr(handler, "body", [])))
+        return unaudited
+
+    refusals = sum(
+        1
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Return) and "json_response" in ast.dump(node)
+    )
+    # Every refusal this resolver can return: internal secret, crew_panel off,
+    # restricted session, no dashboard slot, unresolved session, no crew, bad slug.
+    assert refusals == 7, refusals
+    assert audits(tree.body[0].body) == []
+
+
+async def test_the_unresolved_session_denial_is_audited(vetted, monkeypatch):
+    """The finding's own case, exercised rather than only asserted structurally."""
+    events: list[dict[str, Any]] = []
+
+    class _Sel:
+        def log_api_access(self, **kw):
+            events.append(kw)
+
+    monkeypatch.setattr(routes, "sel", lambda: _Sel())
+    sessions = _real_allocation()
+    async with _client(CREW, sessions=sessions) as c:
+        resp = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 51}},
+            headers={"X-Session-Key": "dashboard:chat-not-a-member"},
+        )
+        assert resp.status == 400
+        assert (await resp.json())["code"] == "session_not_resolved"
+    denied = [e for e in events if e.get("outcome") == "denied"]
+    assert denied, events
+    assert denied[-1]["error"] == "caller's allocation could not be resolved"
+
+
+async def test_a_bare_slot_key_is_refused_rather_than_re_prefixed(vetted):
+    """A bare slot name resolves to nothing, and that refusal is deliberate.
+
+    Every identity source the strict gate accepts yields the full session key,
+    and it requires its caller to send back the key it returned, so no caller of
+    this route presents a bare name. Re-adding the prefix to rescue one would
+    hide the anomaly of the gate having returned something unexpected -- which is
+    the very thing the separated refusal exists to surface.
+    """
+    sessions = _real_allocation()
+    async with _client(CREW, sessions=sessions) as c:
+        resp = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 48}},
+            headers={"X-Session-Key": _crew_slot(CREW)},
+        )
+        assert resp.status == 400, await resp.text()
+        assert (await resp.json())["code"] == "session_not_resolved"
+    assert _folded() is None
+
+
+async def test_a_real_allocation_that_selected_a_template_is_refused_no_crew(vetted):
+    """The other cause the issue names, and it keeps the ``no_crew`` message.
+
+    A live allocation whose ``capability_member`` is empty selected the provider
+    template. That IS an absent crew binding, so this refusal is the accurate
+    one -- and it stays distinguishable from the key that reached no allocation
+    at all.
+    """
+    sessions = _real_allocation(member="")
+    async with _client(CREW, sessions=sessions) as c:
+        resp = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 49}},
+            headers={"X-Session-Key": _member_session_key()},
+        )
+        assert resp.status == 400, await resp.text()
+        assert (await resp.json())["code"] == "no_crew"
+    assert _folded() is None
+
+
+async def test_a_key_the_registry_does_not_hold_is_refused_as_unresolved(vetted):
+    """A live member allocation exists, but not under the key the caller presents.
+
+    Reported as an unresolved session rather than a missing crew binding, which
+    is the difference an operator needs: nothing about this caller says it has no
+    crew.
+    """
+    sessions = _real_allocation()
+    async with _client(CREW, sessions=sessions) as c:
+        resp = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 50}},
+            headers={"X-Session-Key": "dashboard:chat-not-a-member"},
+        )
+        assert resp.status == 400, await resp.text()
+        assert (await resp.json())["code"] == "session_not_resolved"
+    assert _folded() is None
 
 
 async def test_a_degraded_roster_refuses_takeover_rather_than_granting_it(vetted, monkeypatch):
@@ -873,54 +1132,64 @@ async def test_a_degraded_roster_refuses_takeover_rather_than_granting_it(vetted
     assert kept["data"] == {"cycle": 47}
 
 
-async def test_a_name_the_grammar_rejects_still_holds_its_panel(vetted, monkeypatch):
-    """Existing is not the same question as addressable.
+async def test_a_free_form_name_can_read_its_panel(vetted):
+    name = "dr. eggbot"
+    slug = members_mod.slug_for_name(name)
+    async with _client(name) as owner:
+        response = await owner.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 47}},
+            headers={"X-Session-Key": "dashboard:chat-1"},
+        )
+        assert response.status == 200, await response.text()
+        read_response = await owner.get(f"/api/members/{slug}/panel", params={"member": name})
+        assert read_response.status == 200
+        assert (await read_response.json())["panel"]["crew"] == name
 
-    The create route validates a crew name only against the credential-shape
-    check, so ``"On call"`` -- a space, which the agent-name grammar rejects -- is
-    a real crew that derives the slug ``on-call``. The liveness check asks whether
-    the recorded owner is still there, and enumerating only the ADDRESSABLE names
-    drops that crew, reports its owner as gone, and hands the colliding publisher
-    its record.
-    """
-    spaced = "On call"
-    spaced_slug = members_mod.slug_for_name(spaced)
-    async with _client(spaced) as owner:
-        assert (
-            await owner.post(
-                "/api/agent-panel/publish",
-                json={"data": {"cycle": 47}},
-                headers={"X-Session-Key": "dashboard:chat-1"},
-            )
-        ).status == 200, "the space-named crew could not publish at all"
-    kept = agent_panel.read(spaced_slug)
-    assert kept is not None and kept["crew"] == spaced
 
-    # The roster holds the space-named crew and nothing else, so the ONLY reason
-    # the enumeration could miss it is the grammar filter.
+async def test_an_invalid_legacy_name_still_holds_its_panel(vetted, monkeypatch):
+    legacy_name = "Cafe\u0301"
+    legacy_slug = members_mod.slug_for_name(legacy_name)
+    async with _client(legacy_name) as owner:
+        response = await owner.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 47}},
+            headers={"X-Session-Key": "dashboard:chat-1"},
+        )
+        assert response.status == 200, await response.text()
+        read_response = await owner.get(
+            f"/api/members/{legacy_slug}/panel", params={"member": legacy_name}
+        )
+        assert read_response.status == 200
+        assert (await read_response.json())["panel"]["data"] == {"cycle": 47}
+    kept = agent_panel.read(legacy_slug)
+    assert kept is not None
+    assert kept["crew_key"] == agent_panel.crew_key(legacy_name)
+    assert kept["data"] == {"cycle": 47}
+
     real_load = routes.KiroCrewConfig.load
 
-    def _roster_with_the_spaced_crew(*a, **kw):
+    def _roster_with_the_legacy_crew(*a, **kw):
         cfg = real_load(*a, **kw)
         cfg.agents.clear()
-        cfg.agents[spaced] = SimpleNamespace(name=spaced)
+        cfg.agents[legacy_name] = SimpleNamespace(name=legacy_name)
         return cfg
 
-    monkeypatch.setattr(routes.KiroCrewConfig, "load", staticmethod(_roster_with_the_spaced_crew))
+    monkeypatch.setattr(routes.KiroCrewConfig, "load", staticmethod(_roster_with_the_legacy_crew))
 
-    colliding = "on-call"
-    assert members_mod.slug_for_name(colliding) == spaced_slug, "fixture no longer collides"
+    colliding = "cafe"
+    assert members_mod.slug_for_name(colliding) == legacy_slug, "fixture no longer collides"
     async with _client(colliding) as impostor:
-        resp = await impostor.post(
+        response = await impostor.post(
             "/api/agent-panel/publish",
             json={"data": {"cycle": 999}},
             headers={"X-Session-Key": "dashboard:chat-2"},
         )
-        assert resp.status == 400, await resp.text()
+        assert response.status == 400, await response.text()
 
-    after = agent_panel.read(spaced_slug)
+    after = agent_panel.read(legacy_slug)
     assert after is not None
-    assert after["crew"] == spaced
+    assert after["crew_key"] == agent_panel.crew_key(legacy_name)
     assert after["data"] == {"cycle": 47}
 
 
@@ -1118,48 +1387,41 @@ async def test_the_read_requires_the_exact_crew_name(vetted):
 async def test_a_hostile_member_name_is_refused_on_the_read(vetted):
     """The name is validated, not just compared."""
     async with _client() as c:
-        for hostile in ("../../etc/passwd", "a\nb", "x" * 300, "a;b"):
+        for hostile in (
+            "a\nb",
+            " leading",
+            "hidden\u200bname",
+            "x" * (members_mod.MEMBER_NAME_MAX_CHARS + 1),
+        ):
             resp = await c.get(
                 f"/api/members/{SLUG}/panel?member={quote(hostile, safe='')}",
             )
             assert resp.status == 400, f"{hostile!r} was accepted"
 
 
-async def test_a_credential_shaped_crew_name_can_still_read_its_own_panel(vetted):
-    """Two of our own guards collided, and only this shape shows it.
-
-    Redaction scrubs the stored ``crew`` because a crew name is untrusted text
-    rendered to the operator. The read check compares the EXACT name because
-    slugification is lossy. Together they locked out any crew whose name happens to
-    look credential-shaped: the stored owner became ``[REDACTED: credential]``,
-    which equals no exact name, so that crew could never read its own panel.
-
-    Ownership is decided on a digest of the exact name; the display text stays
-    redacted. Nobody would think to try this name, which is exactly why it is
-    pinned.
-    """
-    # An AKIA-prefixed 20-character name is enough to trip the credential detector.
-    # Assembled rather than written literally; see test_mcp_panel_runtime.py.
+async def test_a_credential_shaped_legacy_crew_can_read_its_redacted_panel(vetted):
     shaped = "".join(["AKIA", "IOSFODNN7", "EXAMPLE"])
     assert agent_panel._scrub(shaped) != shaped, "fixture is no longer redacted"
 
     slug = members_mod.slug_for_name(shaped)
-    async with _client(agent=shaped) as c:
-        pub = await c.post(
+    async with _client(agent=shaped) as client:
+        publish_response = await client.post(
             "/api/agent-panel/publish",
             json={"data": {"cycle": 47}},
             headers={"X-Session-Key": "dashboard:chat-1"},
         )
-        assert pub.status == 200, await pub.text()
+        assert publish_response.status == 200, await publish_response.text()
 
-        body = await (await c.get(f"/api/members/{slug}/panel?member={shaped}")).json()
-        assert body["panel"] is not None, "the crew was locked out of its own panel"
-        assert body["html"], "no document returned to the owning crew"
+        read_response = await client.get(f"/api/members/{slug}/panel", params={"member": shaped})
+        assert read_response.status == 200
+        body = await read_response.json()
         assert body["panel"]["data"] == {"cycle": 47}
-        # The DISPLAY text is still redacted -- the fix must not have simply stopped
-        # scrubbing the name to make the comparison work.
-        assert shaped not in json.dumps(body), "an unredacted credential-shaped name was served"
+        assert shaped not in json.dumps(body)
         assert "REDACTED" in body["panel"]["crew"]
+
+    stored = agent_panel.read(slug)
+    assert stored is not None
+    assert stored["crew_key"] == agent_panel.crew_key(shaped)
 
 
 async def test_a_linked_record_is_a_coded_refusal_not_a_500(vetted):
@@ -1445,4 +1707,264 @@ async def test_the_gateway_registers_exactly_these_paths_without_importing_us():
         f"{sorted(missing)} are registered by this module but the gateway boot path "
         "does not bind them through the deferred binder, so they are either "
         "unserved or imported eagerly"
+    )
+
+
+# ------------------------------------------------- the publish ordering contract
+#
+# ``_panel_record`` prefers the FILE over the fold, and its docstring states the
+# one thing that makes that selection safe: the publish route writes the file
+# BEFORE it appends the history entry, and returns without appending if that write
+# fails. So every publish is in the file while only the ones whose append landed
+# are in the fold, and the file can never be the staler of the two. The five pins
+# below are that sentence made executable -- the order, the call-level fail-closed
+# branch, its end state on the fold, every refusal branch, and the size of the
+# caller population it holds for.
+
+
+def _publish_handler_ast():
+    """The publish route's function definition, parsed from its own source file.
+
+    Read off disk rather than through ``inspect.getsource`` so the enclosing
+    module's import graph is irrelevant to a structural assertion about it.
+    """
+    import ast
+    from pathlib import Path
+
+    import kiro_crew
+
+    path = Path(kiro_crew.__file__).parent / "dashboard" / "handlers" / "agent_panel.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "api_agent_panel_publish":
+            return ast, node
+    raise AssertionError("api_agent_panel_publish is not defined in the handler module")
+
+
+async def test_the_file_is_written_before_the_history_is_appended(vetted, monkeypatch):
+    """The file write completes BEFORE the history append begins.
+
+    This is the order ``_panel_record``'s file-wins selection rests on. Reversed,
+    the fold could hold a cycle the file does not, and the drawer would serve a
+    panel older than the one the publish just wrote while reporting success -- a
+    viewer cannot tell a stale dashboard from a current one.
+
+    Both spies delegate to the real callables, so the publish under test really
+    writes and really appends; what is recorded is only WHEN each happened.
+    """
+    order: list[str] = []
+    real_publish = agent_panel.publish
+    real_append = crew_log_emit.on_panel_published
+
+    def _spy_publish(*a: Any, **kw: Any):
+        record = real_publish(*a, **kw)
+        # Recorded AFTER the real write returns, so the marker means "the file is
+        # on disk" rather than "the write was attempted".
+        order.append("file")
+        return record
+
+    def _spy_append(*a: Any, **kw: Any):
+        order.append("append")
+        return real_append(*a, **kw)
+
+    monkeypatch.setattr(agent_panel, "publish", _spy_publish)
+    monkeypatch.setattr(crew_log_emit, "on_panel_published", _spy_append)
+
+    async with _client() as c:
+        resp = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 47}, "title": "fleet"},
+            headers={"X-Session-Key": "dashboard:chat-1"},
+        )
+        assert resp.status == 200, await resp.text()
+
+    assert order == ["file", "append"], (
+        f"the publish route ran {order}; the file must be written before the history "
+        "is appended, because _panel_record prefers the file on the strength of that order"
+    )
+
+
+async def test_a_failed_file_write_appends_no_history_row(vetted, monkeypatch):
+    """A file write that fails never reaches the history append at all.
+
+    The CALL-level half of the guarantee: the emitter is not invoked. Its
+    end-state half -- that the fold holds no record either -- is measured by
+    ``test_the_fold_never_holds_a_publish_the_file_lacks``, which runs the real
+    emitter and so can observe a fold that a spy would leave empty whatever the
+    route did.
+    """
+    appended: list[tuple[Any, ...]] = []
+    real_append = crew_log_emit.on_panel_published
+
+    def _refuse_write(*_a: Any, **_kw: Any):
+        raise OSError("the record could not be written")
+
+    def _spy_append(*a: Any, **kw: Any) -> bool:
+        appended.append(a)
+        # Delegates rather than answering True, so the spy adds an observation
+        # instead of replacing the emitter's effect. A recording-only spy makes
+        # every downstream read of the fold answer empty for its own reason.
+        return real_append(*a, **kw)
+
+    monkeypatch.setattr(agent_panel, "publish", _refuse_write)
+    monkeypatch.setattr(crew_log_emit, "on_panel_published", _spy_append)
+
+    async with _client() as c:
+        resp = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 47}, "title": "fleet"},
+            headers={"X-Session-Key": "dashboard:chat-1"},
+        )
+        assert resp.status == 503, await resp.text()
+        assert (await resp.json())["code"] == "panel_write_failed"
+
+    assert appended == [], "a publish whose file write failed still appended a history row"
+
+
+async def test_the_fold_never_holds_a_publish_the_file_lacks(vetted, monkeypatch):
+    """END STATE: the fold never gets AHEAD of the file.
+
+    The property ``_panel_record``'s file-wins branch is written to be free of, and
+    it is asserted on the two records themselves rather than on a call count, so a
+    writer that reaches the log by any route -- not only through the emitter this
+    file spies on elsewhere -- is still caught.
+
+    A first publish is allowed to land, so both halves compare VALUES. Asserting
+    absence after a single failed publish would prove nothing on either side:
+    ``read`` answers ``None`` for a malformed file as readily as for a missing one,
+    so it cannot see a partial record, and an empty fold is what an empty log looks
+    like anyway.
+
+    The second publish is refused at the WRITE SEAM, so the real ``publish`` runs
+    its lock, its ownership check and its write attempt. Refusing ``publish``
+    itself would exercise none of that -- it is the record's only writer, so the
+    file would be untouched by construction rather than by the code under test.
+    """
+    async with _client() as c:
+        first = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 1}, "title": "landed"},
+            headers={"X-Session-Key": "dashboard:chat-1"},
+        )
+        assert first.status == 200, await first.text()
+
+    def _refuse_write(*_a: Any, **_kw: Any):
+        raise OSError("the record could not be written")
+
+    monkeypatch.setattr(agent_panel, "atomic_write", _refuse_write)
+
+    async with _client() as c:
+        resp = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"cycle": 2}, "title": "refused"},
+            headers={"X-Session-Key": "dashboard:chat-1"},
+        )
+        assert resp.status == 503, await resp.text()
+
+    stored = agent_panel.read(SLUG)
+    assert stored is not None, "the first publish left no file to compare against"
+    assert stored["data"] == {"cycle": 1}, "the refused write changed the stored record"
+
+    folded = _folded()
+    assert folded is not None, "the first publish recorded no history"
+    assert folded["data"] == {"cycle": 1}, "the fold holds a publish the file never received"
+    assert folded["publishes"] == 1, "the fold counted a publish the file never received"
+
+
+async def test_every_refused_publish_returns_before_the_history_append():
+    """EVERY handler of the publish write cannot fall through to the append.
+
+    Enumerated from the route's own source rather than listed here, because the
+    recurrence is a refusal branch nobody has written yet: a handler added below
+    the existing ones, logging and then falling through, would append a history
+    row for a publish that never reached the file. Asserting over the handlers
+    that ARE there covers the next one by construction.
+
+    A handler ending in ``raise`` satisfies this as squarely as one ending in
+    ``return``: neither reaches the append.
+    """
+    ast, handler = _publish_handler_ast()
+
+    blocks = [
+        node
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(inner, ast.Attribute) and inner.attr == "publish"
+            for stmt in node.body
+            for inner in ast.walk(stmt)
+        )
+    ]
+    assert len(blocks) == 1, (
+        f"found {len(blocks)} try blocks calling agent_panel.publish; the pin below "
+        "reads the one that guards the file write"
+    )
+
+    fell_through = [
+        ast.unparse(h.type) if h.type is not None else "bare except"
+        for h in blocks[0].handlers
+        if not isinstance(h.body[-1], (ast.Return, ast.Raise))
+    ]
+    assert not fell_through, (
+        f"{fell_through} handle a failed panel write without returning or raising, so a "
+        "publish the file never received can still reach the history append"
+    )
+    assert blocks[0].handlers, "the publish write is unguarded, so a failure cannot be refused"
+
+
+# On this test alone, not on ``pytestmark``: it is the only item here that reads
+# ``test/source_corpus.py``'s shared text cache, and grouping the module's other
+# tests with it would cost them their parallelism to buy a de-duplication that
+# cannot happen -- a single corpus reader lands on one worker either way.
+@pytest.mark.xdist_group(name="tree_scan_test_agent_panel_routes")
+async def test_the_history_append_has_exactly_one_call_site():
+    """``on_panel_published`` is called from exactly one place in the package.
+
+    The emitter is public and applies no ordering rule of its own, so the write
+    order lives entirely in its caller. One caller is what makes the pins above a
+    statement about the whole package rather than about one route.
+
+    This cannot check a NEW caller's ordering -- it makes one impossible to add
+    silently. A second call site fails here, and extending the order pin to cover
+    it is what clears the failure.
+    """
+    import ast
+
+    import source_corpus
+
+    root = source_corpus.src_root()
+    # Only files whose TEXT holds the identifier are parsed. `ast` cannot produce a
+    # call to a name the source does not contain, so the rest of the package cannot
+    # contribute a site, and parsing it all is the cost `source_corpus` exists to
+    # remove -- its corpus read is cached once per module rather than per test.
+    candidates = list(source_corpus.parsed_candidates(require_all=("on_panel_published",)))
+    sites: list[str] = []
+    for path, _text, tree in candidates:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                name = func.attr
+            elif isinstance(func, ast.Name):
+                name = func.id
+            else:
+                name = ""
+            if name == "on_panel_published":
+                # The MODULE, not the line: a line number turns every unrelated edit
+                # above the call into a failure of this pin. The COUNT is kept beside
+                # it so a second caller inside this same module is caught too.
+                #
+                # ``as_posix``, not ``str``: on a Windows shard the native rendering
+                # is backslash-separated and would never equal the literal below.
+                sites.append(path.relative_to(root).as_posix())
+
+    # Said out loud so a reader sees the scan reached something. A filter that matched
+    # nothing would leave ``sites`` empty, and an empty list is also what a package
+    # with no emitter at all looks like -- this pin must not read those two alike.
+    assert candidates, "the corpus filter matched no file, so this pin measured nothing"
+
+    assert sites == ["dashboard/handlers/agent_panel.py"], (
+        f"on_panel_published is called from {sites}; the publish order is the caller's "
+        "to keep, so every call site needs the ordering pins in this file extended to it"
     )

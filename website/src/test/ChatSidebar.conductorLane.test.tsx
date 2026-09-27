@@ -20,6 +20,13 @@ import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
 
 // Render framer-motion elements as plain DOM (jsdom can't run projection).
+//
+// `animate` is stripped like every other framer prop EXCEPT for its opacity, which is
+// applied as inline style. Real Motion writes its animation targets to the element's
+// style, so an `animate` opacity OUTRANKS an opacity utility class on the same element;
+// a mock that drops `animate` shows the class winning and cannot see that the pixels
+// disagree. Opacity is the one property this lane decides a row's meaning with -- a
+// dimmed row is context rather than a match -- so it is the one the mock reproduces.
 vi.mock('framer-motion', async () => {
   const React = await import('react')
   const FRAMER_PROPS = new Set([
@@ -27,6 +34,11 @@ vi.mock('framer-motion', async () => {
     'transition', 'variants', 'whileHover', 'whileTap', 'whileInView',
     'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
   ])
+  const animatedOpacity = (animate: unknown): number | undefined => {
+    if (!animate || typeof animate !== 'object' || Array.isArray(animate)) return undefined
+    const value = (animate as Record<string, unknown>).opacity
+    return typeof value === 'number' ? value : undefined
+  }
   const make = (tag: string) =>
     React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
       const clean: Record<string, unknown> = {}
@@ -35,6 +47,10 @@ vi.mock('framer-motion', async () => {
         if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
+      }
+      const opacity = animatedOpacity(props.animate)
+      if (opacity !== undefined) {
+        clean.style = { ...(props.style as object | undefined), opacity }
       }
       return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
@@ -55,7 +71,15 @@ vi.mock('../pages/chat/ChatSettings', () => ({
 // `chatSlots` is a STABLE spy, unlike the proxy's per-access `vi.fn()`: the
 // provisional-lineage test asserts on whether the sidebar came back for a second
 // read, which a fresh mock per property access cannot record.
-const mocks = vi.hoisted(() => ({ folders: [] as unknown[], chatSlots: vi.fn() }))
+const mocks = vi.hoisted(() => ({ folders: [] as unknown[], chatSlots: vi.fn(), navigate: vi.fn() }))
+
+// The router is real (MemoryRouter below); only `useNavigate` is a spy, so a row that
+// leaves the chat page can be asked WHERE it went rather than inferred from a route
+// that this harness does not mount.
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom')
+  return { ...actual, useNavigate: () => mocks.navigate }
+})
 
 vi.mock('../api/client', () => ({
   SEARCH_MIN_CHARS: 2,
@@ -103,12 +127,18 @@ function renderSidebar(
   folders: unknown[] = [],
   revealRequest: { kind: string; target: string } | null = null,
   chatExtra: Record<string, unknown> = {},
+  unreadSlots: string[] = [],
+  /** What the STORE holds, when it is wider than what the sidebar is handed. `ChatPage`
+   *  filters `dashboard.slots` by surface before passing it down, so a member's own DM
+   *  thread is in the store and absent from the prop -- the split the creator-anchor
+   *  tests need. Defaults to `slots`, the everyday case where the two agree. */
+  storeSlots: TestSlot[] = slots,
 ) {
   mocks.folders = folders
   const store = createTestStore({
     dashboard: {
-      status: {}, connected: true, slots, approvalMode: 'normal',
-      channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
+      status: {}, connected: true, slots: storeSlots, approvalMode: 'normal',
+      channelTrusted: false, refreshTrigger: 0, unreadSlots, updateProgress: null,
       slotsLoaded: true,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
@@ -123,7 +153,7 @@ function renderSidebar(
         <ThemeProvider>
           <MemoryRouter>
             <ChatSidebar
-              slots={rows as never} activeSlot={null} unreadSlots={[]}
+              slots={rows as never} activeSlot={null} unreadSlots={unreadSlots as never}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />
           </MemoryRouter>
@@ -144,12 +174,27 @@ function laneRows(lane: HTMLElement): string[] {
   return Array.from(lane.querySelectorAll('[data-slot-key]')).map(el => el.getAttribute('data-slot-key') ?? '')
 }
 
+/** Every row a fixture in this file cites as a creator. The lane is COLLAPSED by
+ *  default, so a test about nesting, filters or adoption -- not about the default --
+ *  opens these first; `openAllBut` names the rows a test wants shut. */
+const CREATORS = [
+  'k-conductor', 'k-worker-a', 'k-new', 'k-root', 'k-old', 'k-a', 'k-lead',
+  'member-pipeline', 'cron-nightly', 'k-released',
+  ...Array.from({ length: 10 }, (_, i) => `lvl-${i}`),
+]
+function openAllBut(...shut: string[]) {
+  localStorage.setItem('mc-sidebar-conductor-expanded', JSON.stringify(CREATORS.filter(k => !shut.includes(k))))
+}
+const openedSet = () => JSON.parse(localStorage.getItem('mc-sidebar-conductor-expanded') ?? '[]') as string[]
+
 beforeEach(() => {
   localStorage.clear()
   localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  openAllBut()
   // A default, so a test that sets its own resolved value cannot leak it into the next.
   mocks.chatSlots.mockReset()
   mocks.chatSlots.mockResolvedValue([])
+  mocks.navigate.mockReset()
 })
 afterEach(() => {
   vi.clearAllMocks()
@@ -221,25 +266,40 @@ describe('chat sidebar — conductor lane', () => {
     expect(getByTestId('conductor-view-lane')).toBeTruthy()
   })
 
-  it('is COLLAPSED by default: only roots render', () => {
+  it('is COLLAPSED by default: one row per crew, the workers behind the chevron', () => {
+    // The lane exists so a conductor and its workers read as ONE unit of work. Fifteen
+    // rows is not one unit; a row with a count and the subtree's badges on it is. The
+    // System page's Sessions tab is where every row is shown at once.
+    localStorage.removeItem('mc-sidebar-conductor-expanded')
     localStorage.setItem('mc-sidebar-lane', 'conductor')
     const { getByTestId } = renderSidebar()
     expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-conductor'])
+    expect(getByTestId('conductor-child-count-k-conductor').textContent).toBe('2')
   })
 
-  it('expanding shows the direct children only, not the whole subtree', () => {
+  it('every level is shut by default, not just the root', () => {
+    // Opening the conductor shows its workers and nothing below them: a worker that
+    // opened workers of its own is one row with a count too.
+    localStorage.removeItem('mc-sidebar-conductor-expanded')
     localStorage.setItem('mc-sidebar-lane', 'conductor')
     const { getByTestId } = renderSidebar()
     fireEvent.click(getByTestId('conductor-chevron-k-conductor'))
-    // k-deep is behind Worker A's own chevron, still closed.
     expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-conductor', 'k-worker-a', 'k-worker-b'])
+    expect(getByTestId('conductor-child-count-k-worker-a').textContent).toBe('1')
   })
 
-  it('expands to three levels, one chevron at a time', () => {
+  it('collapsing hides that row\u2019s subtree and nothing else', () => {
     localStorage.setItem('mc-sidebar-lane', 'conductor')
     const { getByTestId } = renderSidebar()
-    fireEvent.click(getByTestId('conductor-chevron-k-conductor'))
     fireEvent.click(getByTestId('conductor-chevron-k-worker-a'))
+    // Only Worker A's branch folds; Worker B is a sibling and stays.
+    expect(laneRows(getByTestId('conductor-view-lane')))
+      .toEqual(['k-conductor', 'k-worker-a', 'k-worker-b'])
+  })
+
+  it('renders three levels open, with depth on the row', () => {
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    const { getByTestId } = renderSidebar()
     const lane = getByTestId('conductor-view-lane')
     expect(laneRows(lane)).toEqual(['k-conductor', 'k-worker-a', 'k-deep', 'k-worker-b'])
     // Depth is on the row wrapper, which is what drives the indentation.
@@ -247,19 +307,21 @@ describe('chat sidebar — conductor lane', () => {
     expect(deep?.getAttribute('data-conductor-depth')).toBe('2')
   })
 
-  it('persists the expanded set', () => {
+  it('persists the opened set', () => {
+    localStorage.removeItem('mc-sidebar-conductor-expanded')
     localStorage.setItem('mc-sidebar-lane', 'conductor')
     const first = renderSidebar()
     fireEvent.click(first.getByTestId('conductor-chevron-k-conductor'))
-    expect(JSON.parse(localStorage.getItem('mc-sidebar-conductor-expanded') ?? '[]')).toContain('k-conductor')
+    expect(openedSet()).toContain('k-conductor')
     first.unmount()
 
     const second = renderSidebar()
-    expect(laneRows(second.getByTestId('conductor-view-lane'))).toContain('k-worker-a')
+    expect(laneRows(second.getByTestId('conductor-view-lane'))).toEqual(['k-conductor', 'k-worker-a', 'k-worker-b'])
   })
 
   it('a collapsed conductor shows its child count', () => {
     localStorage.setItem('mc-sidebar-lane', 'conductor')
+    openAllBut('k-conductor')
     const { getByTestId } = renderSidebar()
     // Two DIRECT children; the count is the chevron's subject, not the subtree size.
     expect(getByTestId('conductor-child-count-k-conductor').textContent).toBe('2')
@@ -267,6 +329,7 @@ describe('chat sidebar — conductor lane', () => {
 
   it('a collapsed conductor bubbles its subtree needs-you and running counts', () => {
     localStorage.setItem('mc-sidebar-lane', 'conductor')
+    openAllBut('k-conductor')
     const { getByTestId } = renderSidebar()
     // k-deep needs input (two levels down) and k-worker-a is running.
     expect(getByTestId('conductor-needs-you-k-conductor').textContent).toBe('1')
@@ -275,10 +338,154 @@ describe('chat sidebar — conductor lane', () => {
 
   it('stops bubbling once expanded, so no session is counted twice on screen', () => {
     localStorage.setItem('mc-sidebar-lane', 'conductor')
-    localStorage.setItem('mc-sidebar-conductor-expanded', JSON.stringify(['k-conductor', 'k-worker-a']))
     const { queryByTestId } = renderSidebar()
     expect(queryByTestId('conductor-needs-you-k-conductor')).toBeNull()
     expect(queryByTestId('conductor-running-k-conductor')).toBeNull()
+  })
+
+  it('keeps a filtered-out conductor as the anchor its workers hang from', () => {
+    /* The Unread filter admits the two workers and not the conductor that opened them.
+       Built from the filtered list the tree had no row with that key, so each worker
+       resolved no parent and rendered as a top-level orphan -- a conductor's workers
+       scattered across the lane while the System page nested all of them. */
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    localStorage.setItem('mc-session-unread-only', '1')
+    const { getByTestId } = renderSidebar(NESTED, [], null, {}, ['k-worker-a', 'k-worker-b'])
+    const lane = getByTestId('conductor-view-lane')
+
+    expect(laneRows(lane)).toEqual(['k-conductor', 'k-worker-a', 'k-worker-b'])
+    const worker = lane.querySelector('[data-slot-key="k-worker-a"]')!.closest('[data-conductor-depth]')
+    expect(worker?.getAttribute('data-conductor-depth')).toBe('1')
+    // k-deep is not unread and nothing under it is, so it is not kept at all.
+    expect(lane.querySelector('[data-slot-key="k-deep"]')).toBeNull()
+  })
+
+  it('dims the anchor, because it is context rather than a match', () => {
+    /* The RENDERED opacity, not the marker attribute and not a utility class. The row is
+       a motion element whose animation target includes opacity, and Motion writes that
+       target to the element's own style -- so an opacity class on the same row loses to
+       it and the anchor paints at full strength. The marker attribute would still be
+       there, which is what makes an attribute-only assertion agree with a lane whose
+       every row looks identical. Dimming is the ONE signal separating a row kept for
+       context from a row the filter admitted, so it is asserted where a person sees it. */
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    localStorage.setItem('mc-session-unread-only', '1')
+    const { getByTestId } = renderSidebar(NESTED, [], null, {}, ['k-worker-a'])
+    const lane = getByTestId('conductor-view-lane')
+    const anchor = lane.querySelector('[data-slot-key="k-conductor"]')!.closest('[data-conductor-depth]')
+    expect(anchor?.getAttribute('data-conductor-anchor')).toBe('true')
+    expect((anchor as HTMLElement).style.opacity).toBe('0.55')
+    const match = lane.querySelector('[data-slot-key="k-worker-a"]')!.closest('[data-conductor-depth]')
+    expect(match?.getAttribute('data-conductor-anchor')).toBeNull()
+    expect((match as HTMLElement).style.opacity).toBe('1')
+  })
+
+  it('keeps a collapsed conductor folded when a filter matches only its children', () => {
+    /* The two controls compose rather than override each other: the filter decides WHICH
+       rows the lane may show, the fold decides how much of the kept tree is on screen.
+       So a conductor the user closed stays closed, and the match beneath it stays behind
+       the chevron -- with the row carrying that subtree's kept-child count and its
+       needs-you aggregate, which is what says something is in there.
+
+       Pinned because nothing else does: without it the intended answer here is only
+       implied, and the alternative -- a filter-scoped "effective expanded" that overrides
+       the persisted set -- would put a second source of truth on the fold and make the
+       chevron a no-op while a filter is live. */
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    localStorage.setItem('mc-session-unread-only', '1')
+    openAllBut('k-conductor')
+    const { getByTestId } = renderSidebar(NESTED, [], null, {}, ['k-worker-a'])
+    const lane = getByTestId('conductor-view-lane')
+
+    // The conductor is the only row: its matching child is folded away, not promoted.
+    expect(laneRows(lane)).toEqual(['k-conductor'])
+    const row = lane.querySelector('[data-slot-key="k-conductor"]')!.closest('[data-conductor-depth]')
+    expect(row?.getAttribute('data-conductor-anchor')).toBe('true')
+    // The count is over the KEPT subtree, so it says one thing is in there, not three.
+    expect(getByTestId('conductor-child-count-k-conductor').textContent).toBe('1')
+  })
+
+  it('drops the superseded collapsed-set key rather than leaving it in storage', () => {
+    /* The old key held the opposite sense and no reading of it produces the new one, so
+       the honest migration is to remove it and take the new default. Left behind it would
+       outlive every build that understands it. */
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    localStorage.setItem('mc-sidebar-conductor-collapsed', JSON.stringify(['k-conductor']))
+    const { getByTestId } = renderSidebar()
+
+    expect(getByTestId('conductor-view-lane')).toBeTruthy()
+    expect(localStorage.getItem('mc-sidebar-conductor-collapsed')).toBeNull()
+  })
+
+  it('opens the destination when a row the FILTER excludes is adopted', () => {
+    /* The row is on screen as a dimmed anchor, so the no-disappearance promise covers it
+       -- but it is absent from the filtered set. Tracking citation changes over the
+       filtered set alone missed exactly these rows: the anchor moves under a conductor the
+       user had collapsed, nothing opens the destination, and its whole subtree leaves the
+       screen with no signal. Tracked over every row instead. */
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    localStorage.setItem('mc-session-unread-only', '1')
+    openAllBut('k-new')
+    const before = [
+      { key: 'k-new', title: 'New conductor', messages: 1, running: false, modified: 5000 },
+      ...NESTED,
+    ]
+    // Only `k-worker-a` is unread, so `k-conductor` renders as an anchor: on screen, and
+    // outside the filtered set the tracker used to read.
+    const { getByTestId, pushFrame } = renderSidebar(before as never, [], null, {}, ['k-worker-a'])
+    expect(laneRows(getByTestId('conductor-view-lane'))).toContain('k-conductor')
+
+    pushFrame(before.map(row =>
+      row.key === 'k-conductor' ? { ...row, parent: { slot: 'k-new', key: 'k-new' } } : row,
+    ) as never)
+
+    // The destination was opened, so the moved anchor is still on screen rather than
+    // folded away inside a row the person never touched.
+    expect(openedSet()).toContain('k-new')
+    expect(laneRows(getByTestId('conductor-view-lane'))).toContain('k-conductor')
+  })
+
+  it('keeps an intermediate worker as an anchor so a deep match still nests', () => {
+    /* Two levels of anchor: only the deepest row matches, and both rows above it are
+       needed for it to render where it belongs. */
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    localStorage.setItem('mc-session-unread-only', '1')
+    const { getByTestId } = renderSidebar(NESTED, [], null, {}, ['k-deep'])
+    const lane = getByTestId('conductor-view-lane')
+
+    expect(laneRows(lane)).toEqual(['k-conductor', 'k-worker-a', 'k-deep'])
+    const deep = lane.querySelector('[data-slot-key="k-deep"]')!.closest('[data-conductor-depth]')
+    expect(deep?.getAttribute('data-conductor-depth')).toBe('2')
+  })
+
+  it('keeps the lane available when a filter hides every row that carries a creator', () => {
+    /* `lineageAvailable` gates the whole lane, so computed from the filtered list a
+       filter admitting only parentless rows took the conductor view away entirely --
+       the nesting appeared and vanished with no control touched that says so. */
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    localStorage.setItem('mc-session-unread-only', '1')
+    const { getByTestId } = renderSidebar(NESTED, [], null, {}, ['k-conductor'])
+    expect(getByTestId('conductor-view-lane')).toBeTruthy()
+    expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-conductor'])
+  })
+
+  it('gives a member DM conductor a row of its own, so its workers nest under it', () => {
+    /* A crew member's thread and a cron's session are creators like any other, and the
+       System page lists both as parents. A lane that had no row for them left every
+       worker they opened at the top level with an orphan mark. */
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    const { getByTestId } = renderSidebar([
+      { key: 'member-pipeline', title: 'Pipeline Work', messages: 1, running: false, modified: 3000 },
+      { key: 'cron-nightly', title: 'Nightly sweep', messages: 1, running: false, modified: 2500 },
+      { key: 'k-worker', title: 'Worker', messages: 1, running: false, modified: 2000, parent: { slot: 'member-pipeline', key: 'member-pipeline' } },
+      { key: 'k-cron-kid', title: 'Cron worker', messages: 1, running: false, modified: 1000, parent: { slot: 'cron-nightly', key: 'cron-nightly' } },
+    ])
+    const lane = getByTestId('conductor-view-lane')
+    expect(laneRows(lane)).toEqual(['member-pipeline', 'k-worker', 'cron-nightly', 'k-cron-kid'])
+    const worker = lane.querySelector('[data-slot-key="k-worker"]')!.closest('[data-conductor-depth]')
+    expect(worker?.getAttribute('data-conductor-depth')).toBe('1')
+    const cronKid = lane.querySelector('[data-slot-key="k-cron-kid"]')!.closest('[data-conductor-depth]')
+    expect(cronKid?.getAttribute('data-conductor-depth')).toBe('1')
   })
 
   it('marks an orphan as a root that still names the session that opened it', () => {
@@ -314,13 +521,8 @@ describe('chat sidebar — conductor lane', () => {
       ),
     ]
     const { getByTestId } = renderSidebar(adopted as never)
-    expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-new'])
-    fireEvent.click(getByTestId('conductor-chevron-k-new'))
-    fireEvent.click(getByTestId('conductor-chevron-k-conductor'))
-    // Re-queried after each press: the lane element is replaced on re-render, so a
-    // node captured before the clicks is detached and reports the old rows.
     const lane = getByTestId('conductor-view-lane')
-    expect(laneRows(lane)).toEqual(['k-new', 'k-conductor', 'k-worker-a', 'k-worker-b'])
+    expect(laneRows(lane)).toEqual(['k-new', 'k-conductor', 'k-worker-a', 'k-deep', 'k-worker-b'])
     const moved = lane
       .querySelector('[data-slot-key="k-worker-a"]')!
       .closest('[data-conductor-depth]')
@@ -336,22 +538,21 @@ describe('chat sidebar — conductor lane', () => {
       row.key === 'k-worker-a' ? { ...row, parent: null } : row,
     )
     const { getByTestId } = renderSidebar(released as never)
-    expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-conductor', 'k-worker-a'])
-    fireEvent.click(getByTestId('conductor-chevron-k-worker-a'))
     const lane = getByTestId('conductor-view-lane')
-    expect(laneRows(lane)).toContain('k-deep')
+    expect(laneRows(lane)).toEqual(['k-conductor', 'k-worker-b', 'k-worker-a', 'k-deep'])
+    const root = lane.querySelector('[data-slot-key="k-worker-a"]')!.closest('[data-conductor-depth]')
+    expect(root?.getAttribute('data-conductor-depth')).toBe('0')
     expect(within(lane).queryByTestId('conductor-orphan-k-worker-a')).toBeNull()
   })
 
   it('opens the new parent when a row MOVES there, so an adoption never hides its own result', () => {
-    /* Collapsed-by-default is right for a session the person opened and wrong for one
-       that moves on its own. `k-conductor` is on screen under nobody, then an adoption
-       re-parents it under `k-new` -- which is collapsed, because nobody has ever opened
-       it. Without the expand the row and its whole branch unmount on an action the
-       person did not take, leaving a child count where their sessions were. The
-       assertion is the row still being THERE on the second frame: collapsed, the lane
-       would render `k-new` alone. */
+    /* A session the person folded away stays folded; one that moves on its own must
+       not disappear into it. `k-new` is COLLAPSED here, then an adoption re-parents
+       `k-conductor` under it. Without the expand the row and its whole branch unmount
+       on an action the person did not take, leaving a child count where their sessions
+       were. The assertion is the row still being THERE on the second frame. */
     localStorage.setItem('mc-sidebar-lane', 'conductor')
+    openAllBut('k-new', 'k-conductor')
     const before = [
       { key: 'k-new', title: 'New conductor', messages: 1, running: false, modified: 5000 },
       ...NESTED,
@@ -374,10 +575,12 @@ describe('chat sidebar — conductor lane', () => {
        gateway whose tree is not seeded yet the lane is suppressed. Clearing the citation
        map on those frames looked harmless and was not: the FIRST adoption is the frame
        that both activates the lane and carries the move, so with no baseline behind it the
-       row reads as newly created -- collapsed default, and the session the person was
-       looking at is replaced by a child count on an action they did not take. The baseline
-       has to predate the move, so the bookkeeping cannot be gated on the lane. */
+       row reads as newly created -- so the collapse the person set on `k-new` stands and
+       the session they were looking at is replaced by a child count on an action they did
+       not take. The baseline has to predate the move, so the bookkeeping cannot be gated
+       on the lane. */
     localStorage.setItem('mc-sidebar-lane', 'conductor')
+    openAllBut('k-new')
     const flat = [
       { key: 'k-new', title: 'New conductor', messages: 1, running: false, modified: 5000 },
       { key: 'k-conductor', title: 'Conductor', messages: 2, running: false, modified: 4000 },
@@ -400,10 +603,12 @@ describe('chat sidebar — conductor lane', () => {
     /* `flatSlots` is search- and folder-filtered, so a row the current filter excludes is
        absent from a frame without having gone anywhere. Rebuilding the citation map from
        that frame alone evicts its baseline, and the adoption that lands while the filter is
-       active is then read as a creation once the filter clears -- collapsed default, and the
-       row that moved is hidden. Same failure as the suppressed-lane case above, by a
-       different route, so the map carries forward instead of being replaced. */
+       active is then read as a creation once the filter clears -- so the collapse on
+       `k-new` stands and the row that moved is hidden. Same failure as the suppressed-lane
+       case above, by a different route, so the map carries forward instead of being
+       replaced. */
     localStorage.setItem('mc-sidebar-lane', 'conductor')
+    openAllBut('k-new')
     const flat = [
       { key: 'k-new', title: 'New conductor', messages: 1, running: false, modified: 5000 },
       { key: 'k-conductor', title: 'Conductor', messages: 2, running: false, modified: 4000 },
@@ -423,14 +628,14 @@ describe('chat sidebar — conductor lane', () => {
     expect(moved?.getAttribute('data-conductor-depth')).toBe('1')
   })
 
-  it('leaves a NEWLY created session collapsed, which is the default it belongs to', () => {
+  it('respects a collapse when a NEW session is created under it', () => {
     /* The mirror, and the reason the lane compares citations rather than counting rows.
-       A row absent from the last frame was just opened -- `session_create`, whose
-       collapsed default is the whole point of the lane -- so a conductor that spawns
-       fourteen workers still reads as one row. Only a row that was ALREADY listed under
-       one creator and now names another was moved by something other than the person
-       looking at it. */
+       A row absent from the last frame was just opened -- `session_create` -- so a
+       conductor the person folded away keeps its fourteen new workers folded with it.
+       Only a row that was ALREADY listed under one creator and now names another was
+       moved by something other than the person looking at it. */
     localStorage.setItem('mc-sidebar-lane', 'conductor')
+    openAllBut('k-conductor')
     const { getByTestId, pushFrame } = renderSidebar()
     expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-conductor'])
 
@@ -449,13 +654,15 @@ describe('chat sidebar — conductor lane', () => {
        front of it. Opening the creator it just left would re-show the branch the person
        detached it from, which is the opposite of what they asked for. */
     localStorage.setItem('mc-sidebar-lane', 'conductor')
+    openAllBut('k-conductor')
     const { getByTestId, pushFrame } = renderSidebar()
     expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-conductor'])
 
     pushFrame(NESTED.map(row => (row.key === 'k-worker-a' ? { ...row, parent: null } : row)) as never)
 
-    expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-conductor', 'k-worker-a'])
-    expect(localStorage.getItem('mc-sidebar-conductor-expanded')).toBeNull()
+    // `k-worker-a` is a root now, so it shows; `k-conductor` stays folded, untouched.
+    expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-conductor', 'k-worker-a', 'k-deep'])
+    expect(openedSet()).not.toContain('k-conductor')
   })
 
   it('does not mark a released session as an orphan: the two mean different things', () => {
@@ -512,9 +719,8 @@ describe('chat sidebar — conductor lane', () => {
     // The peer row is top-level: its citation names a slot on the PEER's gateway, so
     // it must not resolve to a local session whose key merely matches.
     expect(within(lane).queryByTestId('conductor-orphan-peer-1:k-worker')).toBeTruthy()
-    fireEvent.click(within(lane).getByTestId('conductor-chevron-k-conductor'))
-    // Three distinct cards once the conductor is open -- the collision cost none.
-    expect(laneRows(getByTestId('conductor-view-lane')).length).toBe(3)
+    // Three distinct cards -- the collision cost none.
+    expect(laneRows(lane).length).toBe(3)
   })
 
   it('caps the indent past six levels and names the level in the tooltip', () => {
@@ -531,7 +737,6 @@ describe('chat sidebar — conductor lane', () => {
       modified: 9000 - i,
       ...(i === 0 ? {} : { parent: { slot: `lvl-${i - 1}`, key: `lvl-${i - 1}` } }),
     }))
-    localStorage.setItem('mc-sidebar-conductor-expanded', JSON.stringify(chain.map(r => r.key)))
 
     const { getByTestId, queryByTestId } = renderSidebar(chain)
     const lane = getByTestId('conductor-view-lane')
@@ -592,6 +797,7 @@ describe('chat sidebar — conductor lane', () => {
 
   it('pairs each aggregate count with the glyph its children show, not a tint alone', () => {
     localStorage.setItem('mc-sidebar-lane', 'conductor')
+    openAllBut('k-conductor')
     const { getByTestId } = renderSidebar()
     // Same collapsed root as the bubbling test above: one child needs input, one runs.
     const needsYou = getByTestId('conductor-needs-you-k-conductor')
@@ -613,6 +819,7 @@ describe('chat sidebar — conductor lane', () => {
     // This child is NOT running its own turn; a live workflow is what makes it active.
     // Its own row shows the running state, so the collapsed parent must agree: an
     // aggregate that disagrees with the glyphs it stands for is worse than no aggregate.
+    openAllBut('k-root')
     const { getByTestId, queryByTestId } = renderSidebar(
       [
         { key: 'k-root', title: 'Conductor', messages: 1, running: false, modified: 3000 },
@@ -669,6 +876,30 @@ describe('chat sidebar — conductor lane', () => {
     }
   })
 
+  it('does not read the cold-start seed as an adoption, so the collapsed default survives a reload', () => {
+    /* The provisional frame ships every row `parent: null` with `lineage_pending`, and
+       the settling frame then carries the real citations. Bookkeeping that recorded the
+       nulls would see every null -> key transition as a MOVE and persist every crew open,
+       which inverts the PR's own default on every cold start and writes that inversion
+       to localStorage. A provisional row is not a baseline: skip it, so the settling
+       frame reads as the first sighting -- a creation -- and nothing expands. */
+    localStorage.removeItem('mc-sidebar-conductor-expanded')
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    const { queryByTestId, getByTestId, pushFrame } = renderSidebar([
+      { key: 'k-root', title: 'Conductor', messages: 1, running: false, modified: 2000, parent: null, lineage_pending: true },
+      { key: 'k-kid', title: 'Worker', messages: 1, running: false, modified: 1000, parent: null, lineage_pending: true },
+    ])
+    expect(queryByTestId('conductor-view-lane')).toBeNull()
+    pushFrame([
+      { key: 'k-root', title: 'Conductor', messages: 1, running: false, modified: 2000, parent: null },
+      { key: 'k-kid', title: 'Worker', messages: 1, running: false, modified: 1000, parent: { slot: 'k-root', key: 'k-root' } },
+    ])
+    const lane = getByTestId('conductor-view-lane')
+    expect(laneRows(lane)).toEqual(['k-root'])
+    expect(getByTestId('conductor-child-count-k-root').textContent).toBe('1')
+    expect(openedSet()).toEqual([])
+  })
+
   it('keeps root order the same as the flat lane', () => {
     localStorage.setItem('mc-sidebar-lane', 'conductor')
     const { getByTestId } = renderSidebar([
@@ -678,7 +909,7 @@ describe('chat sidebar — conductor lane', () => {
     ])
     // Default sort is date-desc, so the newer root leads — exactly as the flat lane
     // would order the same two rows.
-    expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-new', 'k-old'])
+    expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-new', 'k-old', 'k-kid'])
   })
 
   it('a childless row gets no chevron', () => {
@@ -703,7 +934,7 @@ describe('chat sidebar — conductor lane', () => {
     localStorage.setItem('mc-sidebar-lane', 'conductor')
     const { getByTestId, getByPlaceholderText } = renderSidebar()
     const lane = () => getByTestId('conductor-view-lane')
-    expect(laneRows(lane())).toEqual(['k-conductor'])
+    expect(laneRows(lane())).toEqual(['k-conductor', 'k-worker-a', 'k-deep', 'k-worker-b'])
     const search = getByPlaceholderText(/search/i)
     fireEvent.change(search, { target: { value: 'Deep' } })
     // The match is two levels down and renders without any expanding.
@@ -726,5 +957,128 @@ describe('chat sidebar — conductor lane', () => {
     // while the lane is flattened, and one tooltip for both facts would be a lie.
     expect(marker.getAttribute('title') ?? '').not.toMatch(/closed/i)
     expect(queryByTestId('conductor-orphan-k-kid')).toBeNull()
+  })
+
+  describe('a creator this page does not list (a crew member\u2019s own thread)', () => {
+    /* The gateway ran a member-driven crew: the pipeline conductor is a crew MEMBER,
+       its session is the member's own DM thread (`surface: 'member'`), and every
+       worker it opened cites that slot. The backend resolved each citation to a live
+       `parent.key`, and the System page nested all of them. `ChatPage`, though, hands
+       this sidebar only chat-surface rows, so the member's row never reached the lane:
+       every worker resolved no parent, rendered at the top level, and wore the glyph
+       that says its creator CLOSED -- about a session that was open and dispatching. */
+    const MEMBER: TestSlot = {
+      key: 'member-pipeline', title: 'Pipeline Work Focus On Issues', messages: 40, running: true,
+      modified: 5000, mode: 'member', surface: 'member', agent: 'kirocrew-pipeline-conductor',
+    }
+    const WORKERS: TestSlot[] = [
+      { key: 'k-fix-1', title: 'issue-fix: #1', messages: 1, running: true, modified: 4000, parent: { slot: 'member-pipeline', key: 'member-pipeline' } },
+      { key: 'k-fix-2', title: 'issue-fix: #2', messages: 1, running: false, modified: 3000, parent: { slot: 'member-pipeline', key: 'member-pipeline' } },
+      { key: 'k-solo', title: 'Unrelated chat', messages: 1, running: false, modified: 2000 },
+    ]
+    /** What ChatPage passes (chat surfaces only) vs. what the store holds (everything). */
+    const listed = WORKERS
+    const inStore = [MEMBER, ...WORKERS]
+
+    it('draws the member as an anchor and nests its workers under it', () => {
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const { getByTestId, queryByTestId } = renderSidebar(listed, [], null, {}, [], inStore)
+      const lane = getByTestId('conductor-view-lane')
+      expect(laneRows(lane)).toEqual(['member-pipeline', 'k-fix-1', 'k-fix-2', 'k-solo'])
+      for (const key of ['k-fix-1', 'k-fix-2']) {
+        const row = lane.querySelector(`[data-slot-key="${key}"]`)!.closest('[data-conductor-depth]')
+        expect(row?.getAttribute('data-conductor-depth')).toBe('1')
+        // Nested, so neither citation glyph: the indent already says who opened it, and
+        // the orphan copy in particular would be false about a live creator.
+        expect(queryByTestId(`conductor-orphan-${key}`)).toBeNull()
+        expect(queryByTestId(`conductor-cites-parent-${key}`)).toBeNull()
+      }
+      // Context, not a match: the filter this page applies never admitted the row.
+      const anchor = lane.querySelector('[data-slot-key="member-pipeline"]')!.closest('[data-conductor-depth]')
+      expect(anchor?.getAttribute('data-conductor-anchor')).toBe('true')
+      expect(anchor?.getAttribute('data-conductor-depth')).toBe('0')
+    })
+
+    it('the anchor is drawn only while a worker of it is on screen', () => {
+      // No listed row cites the member: nothing to hang, so nothing borrowed from the
+      // store. The lane must not become a second Members page. (An unrelated chat
+      // conductor supplies the one edge the lane needs to be offered at all.)
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const { getByTestId } = renderSidebar(NESTED, [], null, {}, [], [MEMBER, ...NESTED])
+      expect(laneRows(getByTestId('conductor-view-lane')))
+        .toEqual(['k-conductor', 'k-worker-a', 'k-deep', 'k-worker-b'])
+    })
+
+    it('follows a chain of unlisted creators, not just one level', () => {
+      // member -> lead (a chat session, listed) -> worker (listed). The member is the
+      // only unlisted row, but it is reached THROUGH the lead's citation, so the walk
+      // must continue from every admitted row rather than stop at the listed set.
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const lead: TestSlot = { key: 'k-lead', title: 'Lead', messages: 1, running: true, modified: 4500, parent: { slot: 'member-pipeline', key: 'member-pipeline' } }
+      const worker: TestSlot = { key: 'k-w', title: 'Worker', messages: 1, running: false, modified: 4400, parent: { slot: 'k-lead', key: 'k-lead' } }
+      const { getByTestId } = renderSidebar([lead, worker], [], null, {}, [], [MEMBER, lead, worker])
+      const lane = getByTestId('conductor-view-lane')
+      expect(laneRows(lane)).toEqual(['member-pipeline', 'k-lead', 'k-w'])
+      expect(lane.querySelector('[data-slot-key="k-w"]')!.closest('[data-conductor-depth]')?.getAttribute('data-conductor-depth')).toBe('2')
+    })
+
+    it('clicking the anchor goes to the member on the Members page, not to the chat pane', () => {
+      // The chat pane cannot show a member's thread (the page's own surface filter
+      // says so), so `switchSlot` would strand the user on the previous transcript.
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const { getByTestId, store } = renderSidebar(listed, [], null, {}, [], inStore)
+      const row = getByTestId('conductor-view-lane').querySelector('[data-session-row="member-pipeline"]') as HTMLElement
+      fireEvent.click(row)
+      expect(mocks.navigate).toHaveBeenCalledWith('/members?member=kirocrew-pipeline-conductor')
+      expect(store.getState().chat.activeSlot).toBeNull()
+      // Enter does the same as click, per WCAG 2.1.1.
+      mocks.navigate.mockReset()
+      fireEvent.keyDown(row, { key: 'Enter' })
+      expect(mocks.navigate).toHaveBeenCalledWith('/members?member=kirocrew-pipeline-conductor')
+    })
+
+    it('withholds the local-only affordances from the anchor, as it does for a peer row', () => {
+      // Rename, close, fork, drag: the slot's lifecycle belongs to the Members page. A
+      // control that looks live and does nothing (or worse, closes a member's thread
+      // from a list that does not otherwise show it) is not offered.
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const { getByTestId } = renderSidebar(listed, [], null, {}, [], inStore)
+      const lane = getByTestId('conductor-view-lane')
+      const anchor = lane.querySelector('[data-session-row="member-pipeline"]') as HTMLElement
+      expect(anchor.getAttribute('data-draggable')).toBe('false')
+      expect(anchor.getAttribute('title') ?? '').toMatch(/Members page/)
+      // The destination is also VISIBLE text, not hover-only: a touch reader gets no
+      // title, and a page jump with no cue on the row is unexplained.
+      expect(anchor.querySelector('[data-testid="members-page-chip"]')?.textContent).toBe('Members page')
+      expect(anchor.querySelector('[data-close]')).toBeNull()
+      expect(anchor.querySelector('[data-fork]')).toBeNull()
+      // A listed worker beside it keeps everything, and wears no destination chip.
+      const worker = lane.querySelector('[data-session-row="k-fix-1"]') as HTMLElement
+      expect(worker.getAttribute('data-draggable')).toBe('true')
+      expect(worker.querySelector('[data-testid="members-page-chip"]')).toBeNull()
+    })
+
+    it('names the unit of the child count for a reader who cannot see the chevron', () => {
+      // A bare "2" in front of a crew reads as "a count of something": unread, needs-you,
+      // children. The accessible name and the tooltip say which, with the number.
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const { getByTestId } = renderSidebar(listed, [], null, {}, [], inStore)
+      const count = getByTestId('conductor-child-count-member-pipeline')
+      expect(count.textContent).toBe('2')
+      expect(count.getAttribute('aria-label')).toBe('2 sessions this one opened')
+      expect(count.getAttribute('title')).toBe('2 sessions this one opened')
+    })
+
+    it('a creator that is genuinely gone still reads as an orphan', () => {
+      // The store has no such slot, so nothing is borrowed and the glyph's "closed"
+      // reading stays true. This is the case the anchor must not swallow.
+      localStorage.setItem('mc-sidebar-lane', 'conductor')
+      const rows: TestSlot[] = [
+        { key: 'k-left', title: 'Left behind', messages: 1, running: false, modified: 1000, parent: { slot: 'member-gone', key: null } },
+      ]
+      const { getByTestId } = renderSidebar(rows, [], null, {}, [], rows)
+      expect(laneRows(getByTestId('conductor-view-lane'))).toEqual(['k-left'])
+      expect(getByTestId('conductor-orphan-k-left').getAttribute('data-orphan-of')).toBe('member-gone')
+    })
   })
 })

@@ -21,7 +21,7 @@ from kiro_crew.config.loader import (
     config_path,
     update_config_locked,
 )
-from kiro_crew.constants import BANNER, DATA_WARNING
+from kiro_crew.constants import BANNER
 from kiro_crew.hooks import (
     TOOL_DENY,
     HookManager,
@@ -847,6 +847,7 @@ async def _answer_permission(
             mcp_server_name=event.mcp_server_name,
             mcp_tool_name=event.tool_name,
             mcp_identity_trusted=event.mcp_identity_trusted,
+            spawn_target=event.spawn_target,
         )
     except Exception:
         logger.warning("CLI permission gate failed; refusing the request", exc_info=True)
@@ -885,9 +886,15 @@ async def _answer_permission(
         await provider.reject_tool(event.request_id)
         try:
             safe_title = _for_consent(title, stream=sys.stderr)
+            # Name what actually failed. A request whose kind reads as a command
+            # claimed one; a request with no classification at all claimed
+            # nothing, and saying it did sends the reader after the wrong defect.
+            if is_shell_kind(_kind_text(event)):
+                what = "claims to run a command, but its command could not be verified"
+            else:
+                what = "could not be identified as a known tool call, so it cannot be verified"
             _print_permission_notice(
-                f"\nDenied automatically: {safe_title} claims to run a command, "
-                "but its command could not be verified.\n"
+                f"\nDenied automatically: {safe_title} {what}.\n"
                 "   Ask the agent to retry the tool call."
             )
         except Exception:
@@ -1062,7 +1069,6 @@ async def _interactive(
 ) -> None:
     """REPL loop — read user input, stream responses, auto-compact at configured threshold."""
     print(BANNER)
-    print(DATA_WARNING)
     print()
 
     print("Type your message (Ctrl+D or 'exit' to quit)\n")

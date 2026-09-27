@@ -1,5 +1,5 @@
 import { Loader2 } from 'lucide-react'
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
 import { useZoomCtx } from '../../hooks/ZoomProvider'
 import type { FontFamily } from '../../hooks/useZoom'
@@ -8,7 +8,7 @@ import type { ColorTheme } from '../../hooks/useTheme'
 import { useUIMode } from '../../hooks/useUIMode'
 import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, SettingsButtonGroup, SettingsInput, SettingsCombobox, SettingsToggle } from '../../components/settings'
 import SimpleSelect from '../../components/SimpleSelect'
-import { Input } from '../../components/ui'
+import { Btn, Input } from '../../components/ui'
 import { useThemeEditor, ThemeEditorPanel } from '../../components/themeEditor'
 import Modal from '../../components/Modal'
 import { useAppSelector, useAppDispatch } from '../../store'
@@ -31,7 +31,7 @@ import {
 } from '../../hooks/useTerminalFont'
 import { FONT_FAMILY_OPTIONS, OPENDYSLEXIC_MONO_FAMILY_NAME } from '../../utils/fontFamilyOptions'
 import { useFontOptions } from '../../hooks/useFontOptions'
-import { isFontInstalled, monospaceFontStack } from '../../utils/fontDetect'
+import { isFontInstalled, monospaceFontStack, proportionalFontStack } from '../../utils/fontDetect'
 
 import { i18nT } from '../../i18n/t'
 import { ThemeDroppedRulesNotice } from './ThemeDroppedRulesNotice'
@@ -72,8 +72,8 @@ function StatusIndicator({ label }: { label: string }) {
 
 export function DisplayPanel() {
   const ime = useImeGuard()
-  const { language, detected: detectedLanguage, setLanguage, syncFailed: langSyncFailed } = useLanguage()
-  const { zoom, zoomSupported, zoomIn, zoomOut, reset, family, setFontFamily } = useZoomCtx()
+  const { language, detected: detectedLanguage, setLanguage, syncFailed: langSyncFailed, catalogFailed: langCatalogFailed } = useLanguage()
+  const { zoom, zoomSupported, zoomIn, zoomOut, reset, family, setFontFamily, customFontFamily, setCustomFontFamily, customFontLigatures, setCustomFontLigatures } = useZoomCtx()
   // Shortcut label for the zoom hint/description: ⌘ on macOS, Ctrl elsewhere.
   const modKey = /mac/i.test(navigator.platform) ? '⌘' : 'Ctrl'
   const {
@@ -82,10 +82,13 @@ export function DisplayPanel() {
     colorTheme,
     setColorTheme,
     allThemes,
+    customThemesUpdatedAt,
     loadCustomThemes,
     themeSwitching,
     overridesDropReport,
     installedThemeLoadFailed,
+    customThemesLoadError,
+    customThemesLoaded,
   } = useTheme()
   // The load-error notice is shown only for a pack that is actually unstyled.
   // `installedThemeLoadFailed` is derived in the provider from the selection,
@@ -154,6 +157,41 @@ export function DisplayPanel() {
         : fontDetectResult === 'none'
           ? i18nT('pages.settings.displayPanel.terminal_font_detect_none')
           : undefined
+
+  // ── Custom font picker ──
+  // Shown only when the Font Family option below is "Custom". It names any
+  // installed family, which useZoom applies to --font-body app-wide (the custom
+  // family flows to chat, titles and folders by inheritance). Same component and
+  // two-layer detection as the terminal picker, but 'all' mode (this is prose,
+  // so proportional families are offered too) with previews in a proportional
+  // stack. Empty string = nothing typed yet; useZoom then falls back to the Sans
+  // stack, so Custom never renders as the browser default serif.
+  const {
+    families: customFontFamilies,
+    accessSupported: customFontAccessSupported,
+    lastResult: customFontDetectResult,
+    enumerate: enumerateCustomFonts,
+  } = useFontOptions('all')
+  const customFontPreview = (fam: string) => ({ previewFontFamily: proportionalFontStack(fam) })
+  const customFontOptions = useMemo(
+    () => customFontFamilies.map(fam => ({ value: fam, label: fam, ...customFontPreview(fam) })),
+    [customFontFamilies],
+  )
+  const customFontDetectStatus = customFontDetectResult === 'checking'
+    ? i18nT('pages.settings.displayPanel.custom_font_detect_checking')
+    : customFontDetectResult === 'added'
+      ? i18nT('pages.settings.displayPanel.custom_font_detect_added')
+      : customFontDetectResult === 'none'
+          ? i18nT('pages.settings.displayPanel.custom_font_detect_none')
+          : undefined
+  // A denied Local Font Access permission is an error, not a plain status line:
+  // it is surfaced through ErrorNotice (errors-use-error-notice) rather than the
+  // combobox's actionStatus slot, which styles its text as recede-into-the-
+  // background metadata. The typed free-text path still works, so this is a
+  // notice, not a blocker.
+  const customFontDetectError = customFontDetectResult === 'denied'
+    ? i18nT('pages.settings.displayPanel.custom_font_detect_denied')
+    : null
 
   const dispatch = useAppDispatch()
   const { paletteColors: colors, colorMode, paletteName, intensity, boost } = useSessionPalette()
@@ -280,6 +318,45 @@ export function DisplayPanel() {
   const [installValue, setInstallValue] = useState('')
   const [installBusy, setInstallBusy] = useState(false)
   const [installError, setInstallError] = useState<string | null>(null)
+  // An install landed but the follow-up catalog refresh failed, so the new pack
+  // is not listed yet and was not selected. That failure is rendered at once
+  // under the picker (it must not wait for the invalidated refetch to SETTLE in
+  // error, which may take a retry); the user picks the pack from the list once
+  // it is current. No deferred auto-select: a selection made minutes later by a
+  // background refetch, possibly with the user gone, is a theme swap nobody
+  // asked for. The notice is withdrawn the next time the list changes.
+  const [installRefreshFailed, setInstallRefreshFailed] = useState(false)
+  // The slug that install left unlisted, so a USER-INITIATED Retry that
+  // succeeds can finish the install by selecting it -- the notice's own
+  // instruction, kept. Never read by an effect: a background refetch landing
+  // minutes later must not restyle the dashboard unprompted.
+  const installedUnlistedSlugRef = useRef<string | null>(null)
+  // `customThemesUpdatedAt` moves whenever a catalog fetch LANDS. Neither
+  // `allThemes` (rebuilt every render) nor `customThemes` (structurally shared:
+  // a deep-equal listing, e.g. a reinstall of an already-listed pack, keeps its
+  // reference) can serve as that signal.
+  const catalogSeenRef = useRef(customThemesUpdatedAt)
+  useEffect(() => {
+    if (catalogSeenRef.current !== customThemesUpdatedAt) {
+      catalogSeenRef.current = customThemesUpdatedAt
+      setInstallRefreshFailed(false)
+      installedUnlistedSlugRef.current = null
+    }
+  }, [customThemesUpdatedAt])
+  // Retry of the catalog list from its notice: busy while the fetch runs so a
+  // failed retry is visibly a retry that ran, not a click that did nothing.
+  const [catalogRetrying, setCatalogRetrying] = useState(false)
+  const retryCatalog = async () => {
+    setCatalogRetrying(true)
+    try {
+      if (await loadCustomThemes()) {
+        setInstallRefreshFailed(false)
+        const slug = installedUnlistedSlugRef.current
+        installedUnlistedSlugRef.current = null
+        if (slug) setColorTheme(`custom-${slug}` as ColorTheme)
+      }
+    } finally { setCatalogRetrying(false) }
+  }
   // Phase for the install status indicator: fetching (api.installTheme in
   // flight) → applying (auto-selecting the freshly installed theme).
   const [installPhase, setInstallPhase] = useState<'fetching' | 'applying' | null>(null)
@@ -289,6 +366,10 @@ export function DisplayPanel() {
     if (!v || installBusy) return
     setInstallBusy(true)
     setInstallError(null)
+    // A new attempt owns the notices: the previous attempt's stale-list state
+    // is replaced by this one's outcome.
+    setInstallRefreshFailed(false)
+    installedUnlistedSlugRef.current = null
     setInstallPhase('fetching')
     try {
       const source =
@@ -301,8 +382,23 @@ export function DisplayPanel() {
         return
       }
       setInstallPhase('applying')
-      await loadCustomThemes()
-      if (res.slug) setColorTheme(`custom-${res.slug}` as ColorTheme)
+      // Select only once the catalog carries the new pack: selecting a slug the
+      // catalog lacks is read by self-repair as dangling and reset. On a failed
+      // refresh the pack is installed but not yet listed; the failure is the
+      // catalog query's to report (`customThemesLoadError` -> the
+      // `installed_themes_refresh_failed` notice under the picker), and the
+      // user picks the pack from the list once it is current.
+      const refreshed = await loadCustomThemes()
+      if (refreshed && res.slug) {
+        setColorTheme(`custom-${res.slug}` as ColorTheme)
+      } else if (!refreshed) {
+        // The install landed but the list refresh did not: the picker's notice
+        // says so at once (it keys on this state, not only on a SETTLED catalog
+        // error, which the invalidated refetch may take a retry to reach) and
+        // carries the Retry.
+        setInstallRefreshFailed(true)
+        installedUnlistedSlugRef.current = res.slug ?? null
+      }
       setInstallValue('')
     } catch (e) {
       setInstallError(e instanceof Error ? e.message : i18nT('pages.settings.displayPanel.install_failed'))
@@ -338,15 +434,25 @@ export function DisplayPanel() {
             ]}
             onChange={setLanguage}
           />
-          {/* A failed write means the choice is browser-local only, and the next
-              load will silently revert it to the server's value. Say so rather
-              than letting the user discover it on reload. No hand-off: the
-              `shellDraft` and `installValue` fields further down this panel are
-              unsaved local state, and the navigation unmounts the panel. */}
-          <ErrorNotice
-            variant="inline"
-            message={langSyncFailed ? i18nT('settings.display.language.sync_failed') : null}
-          />
+          {/* A catalog failure leaves the previous language active even though
+              the picker preserves the user's choice. Keep that mismatch visible
+              until a later switch succeeds. Persistence can fail independently,
+              so each active failure keeps its own notice. Neither offers a
+              hand-off: navigating away would discard `shellDraft` or
+              `installValue` further down this panel when either contains
+              unsaved input. */}
+          {langCatalogFailed && (
+            <ErrorNotice
+              variant="inline"
+              message={i18nT('settings.display.language.catalog_failed')}
+            />
+          )}
+          {langSyncFailed && (
+            <ErrorNotice
+              variant="inline"
+              message={i18nT('settings.display.language.sync_failed')}
+            />
+          )}
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.interface')} description={i18nT('pages.settings.displayPanel.chat_bubbles_or_cli_style_line_by_line_output')} value={uiMode}
             options={[
               { value: 'chat', label: 'Chat' },
@@ -377,6 +483,52 @@ export function DisplayPanel() {
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.font_family')} description={i18nT('pages.settings.displayPanel.ui_font_family_for_the_dashboard_code_font_follo')} value={family}
             options={FONT_FAMILY_OPTIONS.map(o => ({ value: o.value, label: o.labelKey ? i18nT(o.labelKey) : o.label! }))}
             onChange={v => setFontFamily(v as FontFamily)} />
+          {/* Only when "Custom" is picked above: choose ANY installed family for
+              --font-body app-wide (chat, titles and folders inherit it). Same
+              browser-side detection as the terminal picker; a Nerd Font renders
+              its glyphs and index.css turns on ligatures while Custom is active.
+              Empty = nothing chosen yet, and useZoom falls back to the Sans stack. */}
+          {family === 'custom' && (
+            <>
+            <SettingsCombobox
+              label={i18nT('pages.settings.displayPanel.custom_font_family')}
+              description={i18nT('pages.settings.displayPanel.custom_font_family_desc')}
+              value={customFontFamily}
+              options={customFontOptions}
+              onChange={setCustomFontFamily}
+              triggerFallback={customFontFamily || i18nT('pages.settings.displayPanel.custom_font_choose')}
+              searchPlaceholder={i18nT('pages.settings.displayPanel.custom_font_search')}
+              customValueOption={typed => (isFontInstalled(typed)
+                ? {
+                  label: i18nT('pages.settings.displayPanel.custom_font_use_typed', { value: typed }),
+                  ...customFontPreview(typed),
+                }
+                : {
+                  label: i18nT('pages.settings.displayPanel.custom_font_use_typed', { value: typed }),
+                  sublabel: i18nT('pages.settings.displayPanel.custom_font_not_detected'),
+                })}
+              action={customFontAccessSupported
+                ? { label: i18nT('pages.settings.displayPanel.custom_font_detect'), onSelect: enumerateCustomFonts }
+                : undefined}
+              actionStatus={customFontDetectStatus}
+            />
+            {/* A denied Local Font Access permission surfaces here, not as a
+                muted status line. askAgent ON: the Custom font value persists
+                live on change and the typed free-text path stays available, so
+                there is no unsaved draft to lose — the hand-off may navigate to
+                chat freely. */}
+            <ErrorNotice message={customFontDetectError} variant="inline" askAgent />
+            {/* Ligatures are the reason many pick a coding font here, so default
+                on — but a programming font's =>/!= ligatures are divisive, so this
+                turns them off without leaving Custom. Only shown in Custom mode. */}
+            <SettingsToggle
+              label={i18nT('pages.settings.displayPanel.custom_font_ligatures')}
+              description={i18nT('pages.settings.displayPanel.custom_font_ligatures_desc')}
+              checked={customFontLigatures}
+              onChange={setCustomFontLigatures}
+            />
+            </>
+          )}
         </SettingsCard>
       </SettingsSection>
 
@@ -488,6 +640,41 @@ export function DisplayPanel() {
             </div>
             {themeSwitching && <StatusIndicator label={i18nT('pages.settings.displayPanel.applying')} />}
           </div>
+          {/* The installed-theme catalog failed to load (gateway still booting,
+              tunnel error): without this the picker just lacks the installed
+              rows and the selected theme renders unstyled with no reason on
+              screen. The provider keeps retrying; this reports the wait.
+              No hand-off: `installValue` (the GitHub URL / local path below) may
+              be half-typed, and the hand-off's navigation would discard it. */}
+          {(customThemesLoadError || installRefreshFailed) && (
+            <div className="flex items-center gap-3">
+              <ErrorNotice
+                variant="inline"
+                message={i18nT(
+                  installRefreshFailed
+                    ? 'pages.settings.displayPanel.installed_themes_refresh_failed_after_install'
+                    : customThemesLoaded
+                      ? 'pages.settings.displayPanel.installed_themes_refresh_failed'
+                      : 'pages.settings.displayPanel.installed_themes_load_failed',
+                )}
+              />
+              {/* A settled refetch failure does not retry on its own (the boot
+                  loop does, hence no button while nothing has loaded), so the
+                  notice carries the retry rather than being a dead end. */}
+              {(customThemesLoaded || installRefreshFailed) && (
+                <Btn
+                  type="button"
+                  disabled={catalogRetrying}
+                  aria-busy={catalogRetrying || undefined}
+                  onClick={() => { void retryCatalog() }}
+                >
+                  {i18nT(catalogRetrying
+                    ? 'pages.settings.displayPanel.retrying_theme_list'
+                    : 'pages.settings.displayPanel.retry_theme_list')}
+                </Btn>
+              )}
+            </div>
+          )}
           {/* Surface scoper-dropped overrides.css rules for the ACTIVE
               theme. The slug guard is belt-and-braces for the switch race — the
               provider clears the report on theme change, but a stale report must

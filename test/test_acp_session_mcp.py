@@ -23,12 +23,31 @@ from kiro_crew.acp import client as client_mod
 from kiro_crew.acp import session_mcp
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
 from kiro_crew.providers.mirrors import claude_code as claude_mirror
 from kiro_crew.providers.mirrors import registry as mirrors_registry
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
 
 _CORE = {"command": "/opt/kirocrew", "args": ["mcp-core"]}
 _CRON = {"command": "/opt/kirocrew", "args": ["mcp-cron"]}
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    A client start here materialises the agent spec (``ensure_agent_materialized``
+    -> ``rebuild_agent_config`` -> ``_write_derived_permissions``), which reads
+    ``installed_kiro_cli_version`` function-locally from ``kiro_crew.kiro_cli``:
+    one real ``kiro-cli --version`` spawn per binary identity, process-cached, so
+    whichever test in the worker starts first pays it against the HOST's install
+    with the checkout as the child's cwd. Pinned to the floor release, as
+    ``test_agent.py`` and the generated-writer suites pin it.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
 
 
 @pytest.fixture
@@ -55,11 +74,13 @@ def agents_dir(tmp_path, monkeypatch):
     return d
 
 
-def _write_spec(agents_dir: Path, *, servers: dict, tools: list | None) -> None:
-    spec: dict = {"name": "kirocrew", "mcpServers": servers}
+def _write_spec(
+    agents_dir: Path, *, servers: dict, tools: list | None, name: str = "kirocrew"
+) -> None:
+    spec: dict = {"name": name, "mcpServers": servers}
     if tools is not None:
         spec["tools"] = tools
-    (agents_dir / "kirocrew.json").write_text(json.dumps(spec), encoding="utf-8")
+    (agents_dir / f"{name}.json").write_text(json.dumps(spec), encoding="utf-8")
 
 
 def _write_project_spec(project_dir: Path, *, servers: dict, tools: list | None) -> None:
@@ -177,6 +198,15 @@ class TestElementShape:
 
 
 class TestMounting:
+    def test_dotted_template_keeps_its_mcp_allowlist(self, agents_dir):
+        _write_spec(
+            agents_dir,
+            name="reviewer.v2",
+            servers={"granted": {"command": "/bin/a"}, "ungranted": {"command": "/bin/b"}},
+            tools=["@granted"],
+        )
+        assert set(_by_name(session_mcp.session_mcp_servers("reviewer.v2"))) == {"granted"}
+
     def test_server_not_referenced_by_tools_is_withheld(self, agents_dir):
         _write_spec(
             agents_dir,

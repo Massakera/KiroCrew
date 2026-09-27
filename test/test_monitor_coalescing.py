@@ -51,7 +51,7 @@ def _state(**overrides) -> MonitorState:
         target="owner/repo/pull/1",
         objective="review_ready",
         created_ts=0.0,
-        budgets=MonitorBudgets(max_runtime_secs=10_000_000),
+        budgets=MonitorBudgets(max_runtime_secs=2_592_000),
     )
     base.update(overrides)
     return MonitorState(**base)

@@ -84,6 +84,7 @@ from kiro_crew.messaging.queue_receipt import (
     STEER_ACK_EMOJI,
     ReceiptQueue,
     ReceiptSurface,
+    receipt_address_key,
 )
 from kiro_crew.messaging.session_resume import refused_resume_is_restricted
 from kiro_crew.messaging.upload_gate import session_is_restricted
@@ -708,6 +709,11 @@ class TeamsDispatcher:
                 ctx_builder=self.ctx_builder,
             )
         finally:
+            # An approval window the driver never awaited -- the card went out and
+            # the turn then ended before the decider -- has no wait of its own to
+            # close it, so it would outlive this turn with its nonce still armed
+            # and authorizing a click.
+            decider.discard_reservations()
             # A Trust click is granted by the decider the moment it resolves, so
             # the rest of THIS turn stops prompting. Nothing to promote here.
             # A renderer that posted [OPTIONS:] chips must OUTLIVE its turn: the
@@ -942,6 +948,10 @@ class TeamsDispatcher:
 
         class _Surface:
             label = "teams"
+            # Both parts ``update_message`` addresses with: an activity id is one
+            # conversation's on one service endpoint, so the endpoint belongs in the key
+            # as much as the conversation does.
+            address_key = receipt_address_key("teams", service_url, conversation_id)
 
             async def send_receipt(self, body: str) -> Any | None:
                 try:
@@ -952,8 +962,8 @@ class TeamsDispatcher:
                     logger.debug("Teams: queue receipt send failed", exc_info=True)
                     return None
 
-            async def edit_receipt(self, msg_id: Any, body: str) -> None:
-                await client.update_message(conversation_id, str(msg_id), body, service_url)
+            async def edit_receipt(self, msg_id: Any, body: str) -> bool:
+                return await client.update_message(conversation_id, str(msg_id), body, service_url)
 
         return _Surface()
 
@@ -1154,6 +1164,11 @@ class TeamsDispatcher:
                     self._receipt_surface(replay),
                     [t or ATTACHMENT_PLACEHOLDER for t in texts],
                     own_deferred,
+                    # WHOSE messages this turn answers, through the same helper the
+                    # producer tagged them with: a group conversation shares one bubble
+                    # between members, so a drain answering one of them must leave the
+                    # other's lines -- and their entry -- alone.
+                    _entry_owner(replay),
                 )
             # Drained payloads are turn content, so command interpretation is off:
             # a queued "/new" must reach the model as text, not execute on drain.

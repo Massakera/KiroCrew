@@ -1104,22 +1104,6 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
     try:
         blocks: list[dict] = []
 
-        # ── Data Handling Reminder ──
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        ":warning: *Do not enter sensitive or confidential data"
-                        " into Kiro Crew.* Follow your organization's data handling"
-                        " policy when using this tool."
-                    ),
-                },
-            }
-        )
-        blocks.append({"type": "divider"})
-
         # ── Status ──
         yolo = is_yolo_mode()
         blocks.append(
@@ -1141,7 +1125,11 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
         # ── Capabilities ──
         blocks.append({"type": "header", "text": {"type": "plain_text", "text": "🔌 Capabilities"}})
         try:
-            servers = list_servers()
+            # Only servers a session can actually use: ``disabled`` is the
+            # aggregate of the launch predicate over every scope, so a server
+            # switched off in the shared config -- or muted by a non-boolean
+            # ``disabled`` -- is not advertised as a capability here.
+            servers = [s for s in list_servers() if not s.disabled]
             skills = await asyncio.to_thread(lambda: _get_skills_loader().list_skills())
 
             # Slack caps a single section's text at 3000 chars. MCP servers and

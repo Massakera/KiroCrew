@@ -858,6 +858,22 @@ export interface McpServer {
   /** True when the entry lives in KiroCrew's own mcp.json — the scope the
    *  Edit JSON action reads and writes (consent-disabled rows included). */
   kirocrewManaged?: boolean
+  /** Which config switched the row off, from the backend — never inferred from
+   *  `enabled` + `kirocrewManaged`. `kirocrew`: a disable in Kiro Crew's own
+   *  store, which the Kiro Crew scope badge + Apply lifts (the consent step).
+   *  `shared`: a disable in a config this panel does not write for enable (the
+   *  shared Kiro MCP config the IDE edits, or a provider global), so the row is
+   *  inert here; a row disabled in both reads `shared`. `null` when enabled. */
+  disabledIn?: 'shared' | 'kirocrew' | null
+  /** The file to edit to re-enable a `shared` row, home collapsed to `~`, when
+   *  the backend can name it; `null` when it cannot. */
+  disabledInFile?: string | null
+  /** WHY the row is off, when the switch is not the honest story: `invalid`
+   *  means the config's `disabled` is not a boolean (`"false"`, `1`, `null`) and
+   *  the backend read it fail-closed -- an invalid value never launches a
+   *  server -- so the fix is to repair the value where it sits, not to flip a
+   *  switch. `null` when enabled or when some config really says `true`. */
+  disabledReason?: 'invalid' | null
   /** Consecutive failed probes on record. Absent means none — a healthy server
    *  carries neither this nor `quarantined`. */
   probeFailures?: number
@@ -951,7 +967,17 @@ export interface McpSessionReport {
 export interface SessionLink {
   channel: string
   label: string
+  /** Redacted display tail of the conversation id — never the id, never a key. */
   target: string
+  /**
+   * Opaque identity of the whole binding (channel, full conversation id, thread),
+   * minted server-side. An unlink names it, and the server refuses a row whose
+   * binding has since been replaced — `target` alone cannot tell a Slack thread
+   * from its same-channel replacement. Optional for the same reason as `paused`:
+   * a cached `slots` payload from before this field shipped has none, and a
+   * row sent without it is refused as stale rather than unlinking anything.
+   */
+  binding?: string
   /**
    * `origin` — the conversation the session started on.
    * `out`    — dashboard replies are mirrored there (one-way, from `!link`).
@@ -964,6 +990,21 @@ export interface SessionLink {
    * `channel` alone does not identify a row; pair it with origin-ness.
    */
   direction: 'origin' | 'out' | 'both'
+  /**
+   * Messages sent in that conversation land in THIS session. The server's
+   * statement of inbound routing, per row, because it is not readable from the
+   * other fields: a Slack thread is `out` (Slack routes replies through its own
+   * thread index, not the mirror's inbound marker) yet a reply there resumes
+   * this session; a `both` mirror routes inbound by that marker; a one-way
+   * `out` mirror only receives replies; the conversation a session was born in
+   * is where its turns come from. What a sever destroys differs between a row
+   * that drives the session and one that does not, so the menu's sub-lines
+   * read this rather than inferring it from `direction` or the channel name —
+   * the inference is wrong for a paused Slack row. Optional for the same
+   * reason as `binding`: a cached `slots` payload from before this field
+   * shipped has none, and such a row reads as not driving until the next push.
+   */
+  drives_session?: boolean
   live: boolean
   /**
    * The user disconnected this channel: turn output stops flowing there, but the
@@ -1288,6 +1329,11 @@ export interface PullRequestSource {
 
 export interface ChatFolder {
   id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; icon?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  /** Epoch seconds the folder was created, written by every folder creator since
+   *  the sidebar's `created` sort existed. Absent on a row from before that; such
+   *  a row sorts as older than every stamped one. Read only through
+   *  `folderComparator('created')`, which mirrors the Python reader. */
+  created_at?: number
   /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
    *  this folder. Absent = no tags, mirroring the optional `color`. */
   tags?: string[]
@@ -1305,8 +1351,13 @@ export interface ChatFolder {
   channel?: string
 }
 
+export type AgentTagPolicy = 'none' | 'add-only' | 'add-remove'
+
 export interface ChatTag {
   id: string; name: string; color: string; order: number; status?: boolean
+  agent?: AgentTagPolicy
+  agent_provenanced?: boolean
+  agent_store_degraded?: boolean
 }
 
 export type TagColumnMode = 'any' | 'all' | 'none'
@@ -1333,7 +1384,7 @@ export interface ChatMessage {
   /** Structured metadata for role-specific data (e.g. tool_input for permission messages). */
   meta?: Record<string, unknown>
   /** Regenerated variants of an assistant message (most recent last). */
-  variants?: { content: string; ts?: string }[]
+  variants?: { content: string; ts?: string; blocked_links?: unknown; redactions?: unknown }[]
   /** Which variant index is currently active. */
   variant_idx?: number
   /** Counter for consecutive identical tool message deduplication. */

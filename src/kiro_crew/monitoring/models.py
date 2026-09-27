@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any, Protocol
 
+from kiro_crew.monitoring.limits import MAX_RUNTIME_CEILING_SECS
 from kiro_crew.monitoring.registry import PULL_REQUEST_MONITOR_KINDS
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ MAX_MONITOR_CHECK_IDENTITY_CHARS = 200
 MONITOR_STOP_INVALID_RECORD = "invalid_monitor_record"
 MIN_MONITOR_CADENCE_SECS = 15
 MAX_MONITOR_CADENCE_SECS = 86_400
-MAX_MONITOR_RUNTIME_SECS = 604_800
+MAX_MONITOR_RUNTIME_SECS = MAX_RUNTIME_CEILING_SECS
 MAX_MONITOR_AGENT_TURNS = 8
 MAX_MONITOR_TOKENS = 1_000_000
 MAX_MONITOR_PROVIDER_ERRORS = 20
@@ -39,8 +40,6 @@ MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS = 1_000
 MAX_MONITOR_STOP_REASON_CHARS = 500
 MAX_MONITOR_CHECK_NAMES = 8
 MAX_MONITOR_PROVIDER_CONCURRENCY = 4
-MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET = 100
-MAX_MONITOR_CHECK_IDENTITY_CHARS = 200
 # The normal turn ceiling is two hours. One extra minute lets the raw completion
 # callback win the timeout race while keeping missing evidence restart-durable
 # and bounded.
@@ -417,6 +416,8 @@ class MonitorBudgets:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.max_runtime_secs > MAX_MONITOR_RUNTIME_SECS:
+            raise ValueError(f"max_runtime_secs must be at most {MAX_MONITOR_RUNTIME_SECS}")
         if self.max_agent_turns > DEFAULT_MONITOR_AGENT_TURNS:
             raise ValueError(f"max_agent_turns must be at most {DEFAULT_MONITOR_AGENT_TURNS}")
 
@@ -1288,6 +1289,9 @@ def quarantine_monitor_state(raw: object) -> MonitorState:
         target=_identity("target"),
         objective=_identity("objective"),
         created_ts=created_ts,
+        # An inert quarantine must be constructible even below the ordinary
+        # default runtime. The original invalid budget remains in _raw_payload.
+        budgets=MonitorBudgets(max_runtime_secs=1),
         outcome=MonitorOutcome.BLOCKED,
         stopped_reason=MONITOR_STOP_INVALID_RECORD,
         _raw_payload=raw_payload,

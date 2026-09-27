@@ -19,6 +19,7 @@ import pytest
 from kiro_crew.cli_commands import _cron
 from kiro_crew.cli_doctor import _doctor
 from kiro_crew.cli_server import _update
+from kiro_crew.service.common import RestartReport
 
 
 def _add_job_kwargs(**overrides):
@@ -151,6 +152,25 @@ def _pin_default_config(monkeypatch) -> None:
 
     monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: _pristine()))
     monkeypatch.setattr(KiroCrewConfig, "load_credentials", lambda self: {})
+
+
+@pytest.fixture(autouse=True)
+def _doctor_reads_the_warm_probe_cache(monkeypatch):
+    """The doctor's blocking ``warm_backend()`` is a no-op here.
+
+    ``_doctor()`` calls ``sandbox.warm_backend()`` before its MCP probes so a fresh
+    CLI process has a settled backend verdict before anything spawns on the loop.
+    In this suite the rootdir conftest already keeps ``sandbox._backend`` warm for
+    every test (``pytest_runtest_setup``), yet the warm thread re-runs the real
+    probe unconditionally -- a fork plus a ``sys.executable`` spawn per doctor
+    test, 43 of them in this file, all against a verdict the conftest already
+    holds. The doctor then reads the cache the conftest filled, which is the same
+    thing a warmed boot gives it. Nothing in this file tests the warm itself
+    (``test_sandbox_backend_cache.py`` does).
+    """
+    import kiro_crew.cli_doctor as _doc
+
+    monkeypatch.setattr(_doc, "warm_backend", lambda timeout=None: None)
 
 
 class TestDoctor:
@@ -370,9 +390,24 @@ class TestDoctor:
         assert "composition failed" in out
         assert "KIROCREW_PROFILE=standalone" in out
 
-    def test_doctor_without_kiro(self, tmp_path):
+    def test_doctor_without_kiro(self, tmp_path, monkeypatch):
+        """A host with no kiro-cli: ``which`` finds nothing, and neither do the
+        trusted-directory resolvers the credentials, memory-pressure and
+        source-checkout sections spawn through. Left unpinned, those sections ran
+        the REAL ``aws configure list-profiles``, ``systemctl is-active`` and
+        ``git -C <this checkout>`` on the developer's host; ``None`` from each
+        resolver is the product's own "cannot ask" arm, so no binary is reached.
+        The one spawn that resolves through no seam -- the runtime section's
+        ``<venv>/bin/python3 --version`` -- is mocked like every sibling here."""
+        import kiro_crew.cli_doctor as _doc
+
+        monkeypatch.setattr(_doc.platform_compat, "trusted_aws_bin", lambda: None)
+        monkeypatch.setattr(_doc.platform_compat, "trusted_system_bin", lambda _name: None)
+        monkeypatch.setattr(_doc.platform_compat, "trusted_git_bin", lambda: None)
+        mock_run = MagicMock(returncode=0, stdout="Python 3.10.0", stderr="")
         with (
             patch("kiro_crew.cli_doctor.shutil.which", return_value=None),
+            patch("kiro_crew.cli_doctor.subprocess.run", return_value=mock_run),
             patch("urllib.request.urlopen", side_effect=urllib.error.URLError("no gateway")),
             patch("kiro_crew.cli_doctor.is_local_only", return_value=True),
             patch("kiro_crew.cli_doctor.config_dir", return_value=tmp_path),
@@ -2826,24 +2861,36 @@ class TestRestart:
         # unix-socket deployment: nothing listens on TCP, so nothing is
         # stopped, and the ORIGINAL gateway keeps running while the command
         # reads like a restart. The command must instead fail loudly and name
-        # the privileged command the operator has to run themselves.
+        # the privileged command the operator has to run themselves — the one
+        # for the scope that refused, carried in the restart report.
         from kiro_crew import cli_server
+        from kiro_crew.service.common import RESTART_REFUSED, RestartReport, ScopeRestart
 
         mock_sel = MagicMock()
+        refused = RestartReport(
+            (
+                ScopeRestart(
+                    "system",
+                    False,
+                    reason=(
+                        "the system manager refused the restart: "
+                        "Interactive authentication required"
+                    ),
+                    kind=RESTART_REFUSED,
+                    hint="sudo systemctl restart kirocrew",
+                ),
+            )
+        )
 
         with (
             patch("kiro_crew.cli_server.sel", return_value=mock_sel),
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=refused,
             ),
             patch(
                 "kiro_crew.cli_server.service_controller.is_service_active",
                 return_value=True,
-            ),
-            patch(
-                "kiro_crew.cli_server.service_controller.manual_restart_hint",
-                return_value="sudo systemctl restart kirocrew",
             ),
             patch("kiro_crew.cli_server.platform_compat.find_listening_pids") as mock_ports,
             patch("kiro_crew.cli_server._stop") as mock_stop,
@@ -2860,10 +2907,233 @@ class TestRestart:
         mock_spawn.assert_not_called()
         out = capsys.readouterr().out
         assert "NOT restarted" in out
-        assert "sudo systemctl restart kirocrew" in out
+        assert "system scope: the system manager refused the restart" in out
+        assert "Interactive authentication required" in out
+        assert "Run the restart yourself:  sudo systemctl restart kirocrew" in out
+        assert "journalctl" not in out
         audit = mock_sel.log_api_access.call_args.kwargs
         assert audit["outcome"] == "denied"
         assert "reason=service_restart_denied" in audit["resources"]
+
+    def test_user_unit_that_does_not_stay_up_names_its_state_not_a_sudo_hint(self, capsys):
+        # The SELinux remedy's per-user unit: `systemctl --user restart` exits 0
+        # (Type=simple forks and is done) and the gateway exits on start, so the
+        # unit sits in `activating (auto-restart)` — reachable to `is_active()`,
+        # so this branch is taken. The report says the unit did not stay up, and
+        # the command must print THAT and point at the user journal. It must not
+        # claim a privilege problem nor hint `sudo systemctl restart kirocrew`,
+        # which on this host answers "Unit kirocrew.service not found".
+        from kiro_crew import cli_server
+        from kiro_crew.service.common import RESTART_NOT_UP, RestartReport, ScopeRestart
+
+        mock_sel = MagicMock()
+        not_up = RestartReport(
+            (
+                ScopeRestart(
+                    "user",
+                    False,
+                    reason=(
+                        "kirocrew.service is activating (auto-restart) (last result: "
+                        "exit-code) after the restart — the gateway exits as soon as it starts"
+                    ),
+                    kind=RESTART_NOT_UP,
+                    hint="journalctl --user -u kirocrew.service -n 50 --no-pager",
+                ),
+            )
+        )
+
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=not_up,
+            ),
+            patch(
+                "kiro_crew.cli_server.service_controller.is_service_active",
+                return_value=True,
+            ),
+            patch("kiro_crew.cli_server.platform_compat.find_listening_pids") as mock_ports,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cli_server._restart(None)
+
+        assert exc.value.code == 1
+        mock_ports.assert_not_called()
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "NOT restarted" in out
+        assert "user scope: kirocrew.service is activating (auto-restart)" in out
+        assert "last result: exit-code" in out
+        assert "Read why it exits:  journalctl --user -u kirocrew.service" in out
+        assert "sudo" not in out
+        assert "privileges" not in out
+        audit = mock_sel.log_api_access.call_args.kwargs
+        assert audit["outcome"] == "denied"
+        assert "reason=service_restart_not_up" in audit["resources"]
+
+    def test_attempted_restart_that_left_the_unit_failed_never_spawns_a_foreground_gateway(
+        self, capsys
+    ):
+        # The restart WAS attempted and the unit landed `failed` (start limit
+        # hit): `is_service_active()` now reads False, but the unit is still an
+        # installed, enabled definition. Falling through would spawn an
+        # unmanaged gateway beside it; the attempted report must win over the
+        # live reach check.
+        from kiro_crew import cli_server
+        from kiro_crew.service.common import RESTART_NOT_UP, RestartReport, ScopeRestart
+
+        mock_sel = MagicMock()
+        failed = RestartReport(
+            (
+                ScopeRestart(
+                    "system",
+                    False,
+                    reason=(
+                        "kirocrew.service is failed (failed) (last result: "
+                        "start-limit-hit) after the restart — the gateway exits as soon as it starts"
+                    ),
+                    kind=RESTART_NOT_UP,
+                    hint="sudo journalctl -u kirocrew.service -n 50 --no-pager",
+                ),
+            )
+        )
+
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=failed,
+            ),
+            patch(
+                "kiro_crew.cli_server.service_controller.is_service_active",
+                return_value=False,
+            ) as mock_active,
+            patch("kiro_crew.cli_server.platform_compat.find_listening_pids") as mock_ports,
+            patch("kiro_crew.cli_server._stop") as mock_stop,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cli_server._restart(None)
+
+        assert exc.value.code == 1
+        mock_active.assert_not_called()
+        mock_ports.assert_not_called()
+        mock_stop.assert_not_called()
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "system scope: kirocrew.service is failed (failed)" in out
+        assert "start-limit-hit" in out
+        assert "Read why it exits:  sudo journalctl -u kirocrew.service" in out
+
+    def test_a_unit_in_both_scopes_is_reported_per_scope_never_as_not_restarted(self, capsys):
+        # A stale crash-looping system unit beside the working per-user one:
+        # `restart()` restarts the user unit (it stays up) and reports the
+        # system unit NOT UP. The command must say which scope restarted and
+        # which did not, with the failed scope's own remedy — never "the gateway
+        # was NOT restarted", which is false for the gateway the operator uses.
+        # Exit 1 all the same: a scope still needs a hand, the shape `service
+        # uninstall` gives a teardown that finished in one scope only.
+        from kiro_crew import cli_server
+        from kiro_crew.service.common import RESTART_NOT_UP, RestartReport, ScopeRestart
+
+        mock_sel = MagicMock()
+        mixed = RestartReport(
+            (
+                ScopeRestart(
+                    "system",
+                    False,
+                    reason=(
+                        "kirocrew.service is activating (auto-restart) (last result: "
+                        "exit-code) after the restart — the gateway exits as soon as it starts"
+                    ),
+                    kind=RESTART_NOT_UP,
+                    hint="sudo journalctl -u kirocrew.service -n 50 --no-pager",
+                ),
+                ScopeRestart("user", True),
+            )
+        )
+
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=mixed,
+            ),
+            patch(
+                "kiro_crew.cli_server.service_controller.is_service_active",
+                return_value=True,
+            ),
+            patch("kiro_crew.cli_server.platform_compat.find_listening_pids") as mock_ports,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cli_server._restart(None)
+
+        assert exc.value.code == 1
+        mock_ports.assert_not_called()
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "NOT restarted" not in out
+        assert out.startswith(
+            "⚠️ Restarted kirocrew service in the user scope; the restart did not "
+            "take in the system scope:\n"
+        )
+        assert "\n   user scope: restarted.\n" in out
+        assert "\n   ⚠️ system scope: kirocrew.service is activating (auto-restart)" in out
+        assert "Read why it exits:  sudo journalctl -u kirocrew.service" in out
+        audit = mock_sel.log_api_access.call_args.kwargs
+        assert audit["outcome"] == "partial"
+        assert "restarted=user" in audit["resources"]
+        assert "reason=service_restart_not_up" in audit["resources"]
+
+    def test_unconfirmed_restart_points_at_service_status(self, capsys):
+        # The manager stopped answering while the unit was re-read: its health is
+        # unknown, so neither "exits on start" nor a restart command is honest —
+        # the remedy is to look.
+        from kiro_crew import cli_server
+        from kiro_crew.service.common import RESTART_UNCONFIRMED, RestartReport, ScopeRestart
+
+        mock_sel = MagicMock()
+        unconfirmed = RestartReport(
+            (
+                ScopeRestart(
+                    "user",
+                    False,
+                    reason=(
+                        "the user manager stopped answering after the restart (Failed to "
+                        "connect to bus: No medium found); whether kirocrew.service is up "
+                        "could not be read"
+                    ),
+                    kind=RESTART_UNCONFIRMED,
+                    hint="kirocrew service status",
+                ),
+            )
+        )
+
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=unconfirmed,
+            ),
+            patch(
+                "kiro_crew.cli_server.service_controller.is_service_active",
+                return_value=False,
+            ),
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cli_server._restart(None)
+
+        assert exc.value.code == 1
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "stopped answering after the restart" in out
+        assert "Check its state:  kirocrew service status" in out
+        assert "exits" not in out.split("stopped answering")[1].split("\n")[0]
+        audit = mock_sel.log_api_access.call_args.kwargs
+        assert "reason=service_restart_unconfirmed" in audit["resources"]
 
     def test_inactive_service_still_falls_through_after_refused_restart(self):
         # ``restart_service()`` returning False because NO service is active
@@ -2875,7 +3145,7 @@ class TestRestart:
             self._mock_sel(),
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=RestartReport(),
             ),
             patch(
                 "kiro_crew.cli_server.service_controller.is_service_active",
@@ -2904,7 +3174,7 @@ class TestRestart:
         with (
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=RestartReport(),
             ),
             patch(
                 "kiro_crew.cli_server.platform_compat.find_listening_pids",
@@ -3017,7 +3287,7 @@ class TestRestart:
         with (
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=RestartReport(),
             ),
             patch(
                 "kiro_crew.cli_server.platform_compat.listening_pid_tool_available",
@@ -3170,7 +3440,7 @@ class TestRestart:
             self._mock_sel(),
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=RestartReport(),
             ),
             patch(
                 "kiro_crew.cli_server.platform_compat.find_listening_pids",
@@ -3196,7 +3466,7 @@ class TestRestart:
             self._mock_sel(),
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=RestartReport(),
             ),
             patch(
                 "kiro_crew.cli_server.platform_compat.find_listening_pids",
@@ -3234,7 +3504,7 @@ class TestRestart:
             self._mock_sel(),
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=RestartReport(),
             ),
             patch(
                 "kiro_crew.cli_server.platform_compat.find_listening_pids",
@@ -3275,7 +3545,7 @@ class TestRestart:
             self._mock_sel(),
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=RestartReport(),
             ),
             patch(
                 "kiro_crew.cli_server.platform_compat.find_listening_pids",
@@ -3310,7 +3580,7 @@ class TestRestart:
             self._mock_sel(),
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=RestartReport(),
             ),
             patch(
                 "kiro_crew.cli_server.platform_compat.find_listening_pids",
@@ -3351,7 +3621,7 @@ class TestRestart:
             self._mock_sel(),
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=RestartReport(),
             ),
             patch(
                 "kiro_crew.cli_server.platform_compat.find_listening_pids",
@@ -3406,7 +3676,10 @@ class TestRestart:
         monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
         with (
             patch("kiro_crew.cli_server.resolve_client_port", return_value=6776),
-            patch("kiro_crew.cli_server.service_controller.restart_service", return_value=False),
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=RestartReport(),
+            ),
             patch("kiro_crew.cli_server.platform_compat.find_listening_pids", return_value=[]),
             patch(
                 "kiro_crew.cli_server.platform_compat.listening_pid_tool_available",
@@ -3679,7 +3952,7 @@ class TestRestartReadinessVerdict:
             patch("kiro_crew.cli_server.sel", return_value=mock_sel),
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
-                return_value=False,
+                return_value=RestartReport(),
             ),
             # Keep the denied-service branch out of these verdict tests (and
             # keep them off the host's real systemctl/launchctl state).
@@ -4399,6 +4672,80 @@ class TestDoctorMcpTools:
         updated = json.loads(agent_path.read_text(encoding="utf-8"))
         assert updated["tools"] == ["@kirocrew-cron", "@kirocrew-core"]
         assert updated["allowedTools"] == ["@kirocrew-cron", "@kirocrew-core"]
+
+    def test_auto_fix_skips_write_when_shared_home_declined(self, tmp_path, capsys):
+        """An instance that must not own the shared agent home reports the
+        auto-fix as skipped and leaves the spec byte-identical."""
+        from kiro_crew.cli_doctor import _doctor_mcp_tools
+
+        agent_path = tmp_path / "kirocrew.json"
+        _write_agent_config(
+            agent_path,
+            tools=[],
+            allowed=[],
+            servers={
+                "kirocrew-core": {"command": "/bin/kirocrew", "args": ["mcp-core"]},
+                "kirocrew-cron": {"command": "/bin/kirocrew", "args": ["mcp-cron"]},
+            },
+        )
+        before = agent_path.read_bytes()
+        issues: list[str] = []
+        with (
+            patch("kiro_crew.agent._decline_shared_agent_home", return_value=agent_path),
+            self._mock_probe(
+                {
+                    "kirocrew-core": ("ok", [], ""),
+                    "kirocrew-cron": ("ok", [], ""),
+                }
+            ),
+        ):
+            _doctor_mcp_tools(agent_path, issues)
+        out = capsys.readouterr().out
+        assert "Auto-fix skipped: shared home" in out
+        assert "Auto-fixed agent config" not in out
+        assert agent_path.read_bytes() == before
+        assert "agent config (auto-fix skipped: shared home)" in issues
+
+    def test_declined_home_reports_a_forbidden_grant_without_writing(self, tmp_path, capsys):
+        """A declined home leaves a ceiling-forbidden grant on disk, logs no
+        SEL revoke, and reports the grant for the owning install to repair."""
+        from kiro_crew.cli_doctor import _doctor_mcp_tools
+
+        agent_path = tmp_path / "kirocrew.json"
+        refs = ["@kirocrew-core", "@kirocrew-cron"]
+        _write_agent_config(
+            agent_path,
+            tools=refs,
+            allowed=refs,
+            servers={
+                "kirocrew-core": {"command": "/bin/kirocrew", "args": ["mcp-core"]},
+                "kirocrew-cron": {"command": "/bin/kirocrew", "args": ["mcp-cron"]},
+            },
+        )
+        before = agent_path.read_bytes()
+        issues: list[str] = []
+        sel_mock = MagicMock()
+        with (
+            patch("kiro_crew.agent._decline_shared_agent_home", return_value=agent_path),
+            patch("kiro_crew.cli_doctor.may_skip_gate_now", return_value=False),
+            patch("kiro_crew.cli_doctor.sel", sel_mock),
+            self._mock_probe({}),
+        ):
+            _doctor_mcp_tools(agent_path, issues)
+        out = capsys.readouterr().out
+        assert agent_path.read_bytes() == before
+        sel_mock.return_value.log_api_access.assert_called_once_with(
+            caller="system",
+            operation="agent_home_write",
+            outcome="denied",
+            source="cli_doctor",
+            resources=str(agent_path),
+        )
+        assert "auto-approve withheld" not in out
+        assert issues == [
+            f"{ref} auto-approve forbidden by ceiling (repair from the owning install)"
+            for ref in ("@kirocrew-cron", "@kirocrew-core")
+        ] + ["agent config (auto-fix skipped: shared home)"]
 
     def test_auto_fix_never_blanket_allows_computer_use(self, tmp_path, capsys):
         """**Doctor must never add ``@kirocrew-computer`` to ``allowedTools``.**
@@ -6386,9 +6733,14 @@ class TestInstallPidfdChildWatcher:
     """Verify _install_child_watcher's platform behavior."""
 
     @staticmethod
-    def _install_then_spawn_in_child(expected_watcher: str) -> None:
+    def _install_then_spawn_in_child(expected_watcher: str, cwd: Path) -> None:
         """Run "_install_child_watcher() then asyncio.run(subprocess)" in a CLEAN
         child Python process, and assert it exits 0.
+
+        *cwd* is the caller's ``tmp_path``: the child imports ``kiro_crew`` off the
+        propagated ``PYTHONPATH``, never off its working directory, so the one
+        thing the process cwd could still do is let a ``-c`` child run inside the
+        developer's checkout.
 
         Why a subprocess instead of an in-process ``asyncio.run``: on CPython
         3.10 the child watcher is bound to the loop inside asyncio's
@@ -6434,6 +6786,7 @@ class TestInstallPidfdChildWatcher:
             text=True,
             timeout=60,
             env=env,
+            cwd=cwd,
         )
         assert result.returncode == 0, (
             f"install-before-run child failed (rc={result.returncode}):\n"
@@ -6563,7 +6916,7 @@ class TestInstallPidfdChildWatcher:
         )
 
     @pytest.mark.skipif(sys.platform != "linux", reason="pidfd watcher is Linux-only")
-    def test_real_subprocess_works_after_install_on_linux(self) -> None:
+    def test_real_subprocess_works_after_install_on_linux(self, tmp_path: Path) -> None:
         """End-to-end: after installing the watcher the way the gateway does
         (before asyncio.run, on the main thread), asyncio subprocess support must
         still work. This is the property the mocked test above cannot prove — it
@@ -6588,13 +6941,15 @@ class TestInstallPidfdChildWatcher:
             expected = "SafeChildWatcher"
         else:
             expected = "PidfdChildWatcher"
-        self._install_then_spawn_in_child(expected_watcher=expected)
+        self._install_then_spawn_in_child(expected_watcher=expected, cwd=tmp_path)
 
     @pytest.mark.skipif(
         sys.platform == "linux" or not hasattr(__import__("asyncio"), "SafeChildWatcher"),
         reason="exercises the real macOS SafeChildWatcher install (non-Linux Unix, 3.10-3.13)",
     )
-    def test_real_subprocess_works_after_safe_watcher_install_on_macos(self) -> None:
+    def test_real_subprocess_works_after_safe_watcher_install_on_macos(
+        self, tmp_path: Path
+    ) -> None:
         """End-to-end on macOS: after the REAL _install_child_watcher() installs
         SafeChildWatcher the way the gateway does (before asyncio.run, on the main
         thread), asyncio subprocess support must still work.
@@ -6610,7 +6965,7 @@ class TestInstallPidfdChildWatcher:
         is itself main-thread-only, so an in-process run under a non-main
         pytest-xdist worker thread would fail spuriously.
         """
-        self._install_then_spawn_in_child(expected_watcher="SafeChildWatcher")
+        self._install_then_spawn_in_child(expected_watcher="SafeChildWatcher", cwd=tmp_path)
 
 
 class TestChildWatcherApiRemoved:
@@ -7858,6 +8213,20 @@ class TestChatPermissionRequest:
         # Its own code: the gate did not reject this, we refused to ask.
         assert sels[0]["error"] == "unverified_shell"
         assert "could not be verified" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_an_unclassified_request_is_not_said_to_run_a_command(self, monkeypatch, capsys):
+        """A request nothing classified claimed no command, so the notice must not
+        say it did -- that sends the reader after the wrong defect."""
+        provider, sels, _ = await self._drive(
+            monkeypatch,
+            event=self._event(title="Sub-agent: my-research", tool_kind="", shell_classified=False),
+        )
+        assert provider.calls == [("reject", 7, False)]
+        assert sels[0]["error"] == "unverified_shell"
+        err = capsys.readouterr().err
+        assert "claims to run a command" not in err
+        assert "could not be identified" in err
 
     @pytest.mark.asyncio
     async def test_a_cosmetic_kind_variant_still_refuses(self, monkeypatch):

@@ -37,7 +37,7 @@ import ToolCallLine from './ToolCallLine'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
 import RecoveryCard, { injectOpensTurn, resolveInjectCard } from './RecoveryCard'
 import { SystemNoticeRow, isSystemNoticeRow } from './CompactionCard'
-import { ErrorCard, isAuthRequired, isModelUnentitled, isUsageLimit } from './ErrorCard'
+import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, isAuthRequired, isCapabilitiesChanged, isModelUnentitled, isSessionStartFailed, isUsageLimit, sessionStartFailureStreak } from './ErrorCard'
 import { FEATURE_REQUEST_FORM_URL, isFeatureRequestRow } from '../../prompts/featureRequest'
 import NoticeCard from './NoticeCard'
 import { resolveTransientNotice } from './transientNotice'
@@ -144,6 +144,9 @@ export interface TranscriptRendererOptions {
   /** Fix affordance for an `auth_required` row: deep-link to the Kiro sign-in
    *  card in Settings. Omitted on a surface with no settings route. */
   onOpenSignIn?: () => void
+  /** Fix affordance for a `materialization_changed` row: open the named crew
+   *  member's Capabilities pane. Omitted on a surface with no crew editor. */
+  onOpenCapabilities?: (member: string) => void
   /** Draw the assistant rows as a CREWMATE speaking: avatar + name + time on
    *  the first message of a run, one bordered bubble per message, grouped
    *  corners (components/chat/crewmateBubbles). Set by the Members page for a
@@ -222,6 +225,24 @@ export function featureRequestRefusalIsNewest(messages: readonly ChatMessage[]):
     if (row.role === 'assistant' || opensTurn(row)) return false
   }
   return isUsageLimit(messages[idx]) && isFeatureRequestRefusal(messages, idx)
+}
+
+/** True when the transcript's newest state is a session start that failed
+ *  `SESSION_START_REPEAT_REFUSAL_AT` times in a row: the newest error row is a
+ *  `session_start_failed` row, nothing after it opens a new turn, and the
+ *  streak scan reaches the threshold. The same predicate the error row uses
+ *  to withhold its Resume; ChatPage reads it to suppress the composer's Resume
+ *  and its "press Resume" hint beneath that card, because a composer urging
+ *  the press the card just withheld (and the server refuses with
+ *  `session_start_repeat`) would argue with it. Typing still works. */
+export function sessionStartRepeatIsNewest(messages: readonly ChatMessage[]): boolean {
+  const idx = lastErrorIndex(messages)
+  if (idx < 0) return false
+  for (let j = idx + 1; j < messages.length; j++) {
+    const row = messages[j]
+    if (row.role === 'assistant' || opensTurn(row)) return false
+  }
+  return isSessionStartFailed(messages[idx]) && sessionStartFailureStreak(messages) >= SESSION_START_REPEAT_REFUSAL_AT
 }
 
 /** Index of the last `error` row, so only that one offers Continue. Derived
@@ -480,6 +501,10 @@ export function createTranscriptRenderers(
         }
         const unentitled = isModelUnentitled(m)
         const authRequired = isAuthRequired(m)
+        const capabilitiesMember = isCapabilitiesChanged(m) ? String((m.meta as { member?: unknown } | undefined)?.member ?? '') : ''
+        const openCapabilities = isCapabilitiesChanged(m) && o.onOpenCapabilities
+          ? () => o.onOpenCapabilities!(capabilitiesMember)
+          : undefined
         // The form is offered on the seeded turn's own refusal and nowhere else:
         // a #4198 refused-send row in the same slot carries no kind (the send
         // never went out, so a retry CAN help); a usage limit under a user row
@@ -489,6 +514,16 @@ export function createTranscriptRenderers(
         // never read from the row: the stamp only selects it.
         const featureRequestFormUrl =
           isUsageLimit(m) && isFeatureRequestRefusal(ctx.messages, ctx.index) ? FEATURE_REQUEST_FORM_URL : undefined
+        const newest = ctx.index === lastErrorIndex(ctx.messages)
+        // The same session start failed twice in a row (Resume between them
+        // re-issued it): a third press would fail the same way, and the server
+        // refuses it (`session_start_repeat`). Only the NEWEST row decides --
+        // an older start-failure row is settled history and renders as plain
+        // prose like any other -- and the count mirrors the server's scan, so
+        // the card never hides a Resume the server would honour. One failure
+        // keeps today's card exactly: Resume, same words.
+        const sessionStartRepeat =
+          newest && isSessionStartFailed(m) && sessionStartFailureStreak(ctx.messages) >= SESSION_START_REPEAT_REFUSAL_AT
         return ctx.row(
           <ErrorCard
             content={transient ? transient.text : m.content}
@@ -496,18 +531,21 @@ export function createTranscriptRenderers(
             // A rejection the backend says no retry can fix never offers Continue,
             // even when this row is the newest and the turn was interrupted:
             // resuming would replay the identical rejection (or the same
-            // signed-out wall, or the same spent allowance).
+            // signed-out wall, or the same spent allowance, or the same start
+            // that already failed twice).
             onContinue={
-              !unentitled && !authRequired && !featureRequestFormUrl && o.onContinue && o.continuable && o.interrupted && ctx.index === lastErrorIndex(ctx.messages)
+              !unentitled && !authRequired && !featureRequestFormUrl && !sessionStartRepeat && !isCapabilitiesChanged(m) && o.onContinue && o.continuable && o.interrupted && newest
                 ? o.onContinue
                 : undefined
             }
+            sessionStartRepeat={sessionStartRepeat}
             continuing={o.continuing}
             onPickModel={unentitled ? o.onPickModel : undefined}
             onOpenDefaultModel={unentitled ? o.onOpenDefaultModel : undefined}
             onOpenSignIn={authRequired ? o.onOpenSignIn : undefined}
             unentitledElsewhere={unentitled}
             featureRequestFormUrl={featureRequestFormUrl}
+            onOpenCapabilities={openCapabilities}
           />,
         )
       },

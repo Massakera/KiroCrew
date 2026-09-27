@@ -47,11 +47,11 @@ from kiro_crew.constants import (
 # ``model_registry`` (stdlib-only), so no cycle back into validation.
 from kiro_crew.effort import EFFORT_VALUES
 from kiro_crew.lesson_validation import LESSON_APPLIES_VALUES
+from kiro_crew.monitoring.limits import MAX_RUNTIME_CEILING_SECS, validate_runtime_secs
 from kiro_crew.monitoring.models import (
     MAX_MONITOR_AGENT_TURNS,
     MAX_MONITOR_CADENCE_SECS,
     MAX_MONITOR_PROVIDER_ERRORS,
-    MAX_MONITOR_RUNTIME_SECS,
     MAX_MONITOR_STOP_REASON_CHARS,
     MAX_MONITOR_TOKENS,
     MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
@@ -191,8 +191,29 @@ ALLOWED_HOOK_EVENTS = frozenset(
     }
 )
 
-# Valid agent name pattern (alphanumeric, hyphens, underscores)
-_AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]$|^[a-zA-Z0-9]$")
+_AGENT_NAME_RE = re.compile(r"^(?:[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]|[a-zA-Z0-9])\Z")
+
+TEMPLATE_NAME_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,61}[A-Za-z0-9]|[A-Za-z0-9])\Z")
+
+#: The union of the two identifier grammars, as one pattern for ``FieldSpec``:
+#: a tool argument that names a registered agent SPEC (``spawn_run(agent=...)``,
+#: ``cron_add(agent=...)``) admits a published dotted template exactly as the
+#: read-side resolvers do. Crew MEMBERS are not named through these fields --
+#: ``crew`` / ``member_id`` carry them, unpatterned -- so this stays an
+#: identifier grammar. Keep in step with :func:`is_registered_agent_name`.
+REGISTERED_AGENT_NAME_RE = re.compile(
+    r"^(?:[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]"
+    r"|[A-Za-z0-9][A-Za-z0-9_.-]{0,61}[A-Za-z0-9]"
+    r"|[a-zA-Z0-9])\Z"
+)
+
+
+def is_registered_agent_name(value: object) -> bool:
+    """Return whether *value* can name a registered agent spec."""
+    return isinstance(value, str) and bool(
+        _AGENT_NAME_RE.fullmatch(value) or TEMPLATE_NAME_RE.fullmatch(value)
+    )
+
 
 # Artifact slug grammar — mirrors kiro_crew.artifacts._SLUG_RE (kept here so
 # consumers outside the store module share one public definition). Used to
@@ -1093,13 +1114,13 @@ SPAWN_RUN_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("task", str, max_len=MAX_MEDIUM_STRING),
         FieldSpec("tasks", list, item_type=str, item_max_len=MAX_MEDIUM_STRING),
-        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=REGISTERED_AGENT_NAME_RE),
         FieldSpec(
             "agents",
             list,
             item_type=str,
             item_max_len=MAX_SHORT_STRING,
-            item_pattern=_AGENT_NAME_RE,
+            item_pattern=REGISTERED_AGENT_NAME_RE,
         ),
         # 0 = "not set" → falls through to config default via `0 or config_value`.
         # Bounded by the same ceiling the config loader clamps
@@ -1171,7 +1192,7 @@ SPAWN_CONTINUE_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("conversation", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("task", str, required=True, max_len=MAX_MEDIUM_STRING),
-        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=REGISTERED_AGENT_NAME_RE),
         FieldSpec("max_turns", int, min_val=0, max_val=SUBAGENT_MAX_TURNS_CEILING),
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
     ],
@@ -1305,7 +1326,8 @@ SPAWN_STATUS_SCHEMA = ToolSchema(
     tool_name="spawn_status",
     fields=[
         FieldSpec("agent_id", str, required=True, max_len=64),
-        # Paged / filtered reads of the retained transcript (line-oriented).
+        # Paged / filtered reads of a running partial or retained full transcript
+        # (line-oriented in both states).
         FieldSpec("offset", int, min_val=0, max_val=100_000_000),
         FieldSpec("limit", int, min_val=0, max_val=2000),
         FieldSpec("grep", str, max_len=500),
@@ -1346,8 +1368,19 @@ AUTONUDGE_STOP_SCHEMA = ToolSchema(
     ],
 )
 
+
+def _validate_monitor_runtime(args: dict[str, Any]) -> None:
+    value = args.get("max_runtime_secs")
+    if value is not None:
+        try:
+            args["max_runtime_secs"] = validate_runtime_secs(value)
+        except ValueError as exc:
+            raise ValidationError("max_runtime_secs", str(exc)) from exc
+
+
 MONITOR_WATCH_SCHEMA = ToolSchema(
     tool_name="monitor_watch",
+    custom_validator=_validate_monitor_runtime,
     fields=[
         FieldSpec("kind", str, required=True, allowed=publicly_armable_kinds()),
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
@@ -1358,7 +1391,7 @@ MONITOR_WATCH_SCHEMA = ToolSchema(
             min_val=MIN_MONITOR_CADENCE_SECS,
             max_val=MAX_MONITOR_CADENCE_SECS,
         ),
-        FieldSpec("max_runtime_secs", int, min_val=1, max_val=MAX_MONITOR_RUNTIME_SECS),
+        FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
         FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
         FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
@@ -1378,16 +1411,16 @@ MONITOR_STOP_SCHEMA = ToolSchema(
 # monitor_start creates an AutoNudge loop bound to the calling session (the
 # agent-facing "babysit this PR" primitive). message caps match the REST
 # endpoint's 8000-char limit; interval bounds mirror autonudge's
-# _MIN_IDLE_SECS/_MAX_IDLE_SECS clamp. Both caps must be positive; the 7-day
-# runtime ceiling keeps a typo like 6e9 from arming an effectively unbounded
-# loop while still covering week-long babysits.
+# _MIN_IDLE_SECS/_MAX_IDLE_SECS clamp. The custom validator applies the
+# operator's finite runtime ceiling at call time.
 MONITOR_START_SCHEMA = ToolSchema(
     tool_name="monitor_start",
+    custom_validator=_validate_monitor_runtime,
     fields=[
         FieldSpec("message", str, required=True, max_len=8000),
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
         FieldSpec("max_cycles", int, min_val=1, max_val=1000),
-        FieldSpec("max_runtime_secs", int, min_val=1, max_val=604800),
+        FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
         # Opt-OUT of observation gating. Absent means gated, matching the tool's
         # default, so a caller written before this field existed keeps the
         # default behaviour rather than silently escaping it.
@@ -1507,11 +1540,12 @@ def validate_judge_spec(raw: object) -> dict[str, object]:
 # that monitor_start would have refused to create.
 MONITOR_UPDATE_SCHEMA = ToolSchema(
     tool_name="monitor_update",
+    custom_validator=_validate_monitor_runtime,
     fields=[
         FieldSpec("message", str, max_len=8000),
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
         FieldSpec("max_cycles", int, min_val=1, max_val=1000),
-        FieldSpec("max_runtime_secs", int, min_val=1, max_val=604800),
+        FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
         FieldSpec("target", str, max_len=MAX_SHORT_STRING),
         FieldSpec("objective", str, allowed=publicly_armable_objectives()),
         FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
@@ -1635,10 +1669,12 @@ KIRO_CLI_LOGS_SCHEMA = ToolSchema(
     ],
 )
 
-# Absolute filesystem path. Empty string is allowed (clears the project) —
-# the validator skips the pattern check on empty values, so the regex only
-# needs to cover the non-empty case.
-_ABSOLUTE_PATH_RE = re.compile(r"^/")
+# Absolute filesystem path: POSIX "/x" and the Windows drive root "C:\x" /
+# "C:/x". Root PREFIX only, so a POSIX body may carry ":" and drive-relative
+# "C:foo" is refused. Two-backslash roots stay out: "\\host\share" resolves by
+# contacting the named host, and "\\?\D:\" carries a prefix the sensitive-path
+# fence does not fold -- see the PR. An empty string (clear) skips this check.
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:[\\/])")
 
 # 4096 = Linux PATH_MAX. The gateway endpoint enforces realpath and
 # sensitive-path checks; this schema is the MCP-layer shape gate.
@@ -2371,6 +2407,17 @@ CHAT_TAG_ASSIGN_SCHEMA = ToolSchema(
     ],
 )
 
+CHAT_SESSION_PIN_SCHEMA = ToolSchema(
+    tool_name="chat_session_pin",
+    fields=[
+        # Same session-reference shape as ``chat_folder_move_session.session``.
+        FieldSpec("session", str, required=True, max_len=512),
+        # A real JSON boolean: the string "false" is truthy, so a coerced value
+        # would pin a session the caller asked to unpin.
+        FieldSpec("pinned", bool, required=True),
+    ],
+)
+
 ARTIFACT_MOVE_SCHEMA = ToolSchema(
     tool_name="artifact_move",
     fields=[
@@ -2771,7 +2818,7 @@ CRON_ADD_SCHEMA = ToolSchema(
         FieldSpec("at", (int, float), min_val=0, max_val=4102444800),  # up to 2100
         FieldSpec("delay", (int, float), min_val=1, max_val=86400 * 30),  # 1s to 30 days
         FieldSpec("at_time", str, max_len=100),
-        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=REGISTERED_AGENT_NAME_RE),
         FieldSpec("member_id", str, max_len=MAX_SHORT_STRING),
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
         FieldSpec("silent", bool),
@@ -3336,6 +3383,17 @@ SESSION_CREATE_SCHEMA = ToolSchema(
         # folder reference; the two readings share no charset, so only the
         # length is checked here.
         FieldSpec("folder", str, required=False, default="", max_len=_ARTIFACT_FOLDER_REF_MAX),
+        # Model the new session starts on, the same field ``spawn_run.model``
+        # takes and under the same charset: the id is persisted to the metadata
+        # line and later handed to the backend, so arbitrary strings stay out.
+        FieldSpec(
+            "model",
+            str,
+            required=False,
+            default="",
+            max_len=MAX_SHORT_STRING,
+            pattern=_MODEL_NAME_RE,
+        ),
     ],
 )
 
@@ -3507,7 +3565,7 @@ MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
             FieldSpec("message", str, max_len=MAX_CRON_MESSAGE),
             FieldSpec("cron_expr", str, max_len=100),
             FieldSpec("every", int, min_val=60, max_val=86400 * 30),
-            FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+            FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=REGISTERED_AGENT_NAME_RE),
             FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
             FieldSpec("channel", str, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
             FieldSpec("thread_ts", str, max_len=30, pattern=re.compile(r"^\d+\.\d+$")),
@@ -3658,6 +3716,7 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "chat_tag_create": CHAT_TAG_CREATE_SCHEMA,
     "chat_tag_update": CHAT_TAG_UPDATE_SCHEMA,
     "chat_tag_assign": CHAT_TAG_ASSIGN_SCHEMA,
+    "chat_session_pin": CHAT_SESSION_PIN_SCHEMA,
 }
 
 # ── Tool Schemas (MCP crew log — server ``kirocrew-crew-log``) ──

@@ -57,8 +57,8 @@ from kiro_crew.autonudge import (
     MONITOR_TERMINAL_REASON,
     is_channel_key,
 )
+from kiro_crew.autonudge_judge import screen_phrase
 from kiro_crew.messaging.link import is_channel_session_key
-from kiro_crew.probes.gh_pr import wake_set_phrase
 from kiro_crew.session_surface import has_dashboard_surface
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,8 @@ _ARMING_DIRECTIVES = frozenset({"monitor_start", "monitor_watch"})
 # just running the previous text -- so the two share the mechanism and not the
 # wording.
 _REVISION_DIRECTIVES = frozenset({"monitor_update"})
+_STOP_DIRECTIVES = frozenset({"monitor_stop", "autonudge_stop"})
+_WAKE_BOUND_MUTATIONS = _REVISION_DIRECTIVES | _STOP_DIRECTIVES
 
 # Transcript row prefix for a refused arm. Fixed text so the frontend and tests
 # can match on it; the authorizer's reason follows the colon.
@@ -239,12 +241,15 @@ async def apply_session_directive(
     producer_is_user_facing: bool = False,
     producer_is_self_wake: bool = False,
     producer_is_channel: bool = False,
+    producer_wake_loop_id: str = "",
 ) -> str:
     """Apply directive *kind* with *args* to *slot*/*session_key*; return a
     confirmation string for the model. Fail-soft: any error is returned as a
     readable message, never raised. Every path emits a SEL audit event.
     ``slot`` is ``None`` for a channel (TurnDriver) caller — see the module
-    docstring."""
+    docstring. ``producer_wake_loop_id`` names the loop whose delivered wake
+    this turn is (set with ``producer_is_self_wake`` by ``_fire_dashboard_nudge``);
+    the arming gate reads that row to tell a live wake from a stale one."""
     if kind in _DASHBOARD_ONLY_DIRECTIVES and (
         slot is None or not has_dashboard_surface(session_key)
     ):
@@ -296,12 +301,25 @@ async def apply_session_directive(
     # loop bound to this very slot (marked by ``_fire_dashboard_nudge``) -- a
     # member's loop firing on the member's slot is the member keeping itself
     # awake, so the re-arm or revision it issues from inside that cycle is its
-    # own act. Everything else -- a cron injection, an app-driven turn, a
+    # own act -- with one exception, ``_refuse_stale_wake_arm``: a delivered
+    # wake can outlive a person's Stop, and that stale turn must not create a
+    # replacement automation. Reviving a loop a person stopped needs a new user
+    # request; a wake may revive a loop its own cycle cap or runtime budget
+    # deactivated, by raising that bound (``_monitor_update``).
+    # Everything else -- a cron injection, an app-driven turn, a
     # sub-agent sharing the slot -- carries neither mark and is refused. This is
     # NOT the user-surface gate below: ``set_project`` / ``reset_conversation``
     # stay human-only, a wake must never retarget the slot's project.
     self_arm_ok = bool(producer_is_user_facing or producer_is_self_wake)
     try:
+        if producer_is_self_wake and kind in _ARMING_DIRECTIVES:
+            _refuse_stale_wake_arm(session_key, producer_wake_loop_id)
+        elif producer_is_self_wake and producer_wake_loop_id and kind in _WAKE_BOUND_MUTATIONS:
+            _refuse_stale_wake_arm(
+                session_key,
+                producer_wake_loop_id,
+                require_current=True,
+            )
         if kind == "monitor_start":
             result = await _monitor_start(
                 state,
@@ -327,6 +345,7 @@ async def apply_session_directive(
                 args,
                 self_arm_ok=self_arm_ok,
                 producer_is_channel=producer_is_channel,
+                allow_rearm=not producer_is_self_wake,
             )
         elif kind == "monitor_stop":
             result = await _monitor_stop(slot, session_key, args)
@@ -390,6 +409,67 @@ def _structured_binding(session_key: str) -> str | None:
     from kiro_crew.autonudge import structured_monitor_binding_key_for
 
     return structured_monitor_binding_key_for(session_key)
+
+
+def _refuse_stale_wake_arm(
+    session_key: str,
+    wake_loop_id: str,
+    *,
+    require_current: bool = False,
+) -> None:
+    """Refuse stale-wake arms and mutations.
+
+    A delivered wake turn can outlive the Stop that ended its loop: a
+    prompt-loop Stop REMOVES the row, and a structured stop retains it as a
+    ``USER_STOP`` record. The wake carries its loop id
+    (``_fire_dashboard_nudge`` passes it with the self-wake mark), so the row
+    that fired this turn is read back here:
+
+    * row gone -> the loop was removed under the turn (a Stop, a session close):
+      refused, nothing may be created in its place;
+    * row present but stopped by a person -- a manual pause, a user stop, an
+      empty reason, anything ``_stopped_row_is_replaceable`` fails closed on
+      -> refused, the retained record is evidence;
+    * row present and active, or deactivated by its own cycle cap, runtime
+      budget, terminal subject, dropped sentinel or over-policy stored budget
+      -> admitted. The arm then meets the create-only and ``replace_stopped``
+      rules unchanged, so an active row still answers 409 and only a
+      system-imposed stop is displaced.
+
+    A wake that names no loop id (a caller outside the fire path) falls back to
+    the session's bound row, which answers the same three ways.
+    """
+    from kiro_crew.autonudge import _stopped_row_is_replaceable, get_instance
+
+    svc = get_instance()
+    if svc is None:
+        # The applier refuses a disabled host on its own, with its own wording.
+        return
+    if wake_loop_id:
+        row = svc.get_by_id(wake_loop_id)
+    else:
+        binding = _binding(session_key)
+        row = svc.get_by_slot(binding) if binding else None
+    if require_current:
+        binding = _binding(session_key)
+        current = svc.get_by_slot(binding) if binding else None
+        if current is None or getattr(current, "id", "") != wake_loop_id:
+            raise _DirectiveDenied(
+                "Monitor NOT changed: the loop that delivered this wake is no longer "
+                "this session's monitor; a new user request is required."
+            )
+    if row is None:
+        raise _DirectiveDenied(
+            "Monitor NOT armed: the loop that delivered this wake was stopped or "
+            "removed, so this turn may not start a replacement. A new user request "
+            "is required."
+        )
+    if not getattr(row, "active", False) and not _stopped_row_is_replaceable(row):
+        raise _DirectiveDenied(
+            "Monitor NOT armed: the loop that delivered this wake was stopped by a "
+            "person and is retained, so this turn may not start a replacement. A new "
+            "user request is required."
+        )
 
 
 async def _monitor_start(
@@ -479,9 +559,8 @@ async def _monitor_start(
     if armed_monitor is not None and getattr(loop, "gate", False):
         cadence = (
             f"observing {armed_monitor.target} every {idle_secs}s and re-injecting the "
-            "message only on a wake from it -- "
-            f"{wake_set_phrase()} -- so a lane finishing while others still "
-            "run costs no turn, and a raised wake lands up to about one "
+            "message only when the tick needs you -- "
+            f"{screen_phrase()}, and a raised wake lands up to about one "
             "interval after the tick that saw it"
         )
     else:
@@ -591,6 +670,7 @@ async def _monitor_update(
     args: dict[str, Any],
     *,
     self_arm_ok: bool = False,
+    allow_rearm: bool = True,
     producer_is_channel: bool = False,
 ) -> str:
     from kiro_crew.autonudge import get_instance, is_structured_monitor_loop
@@ -611,6 +691,30 @@ async def _monitor_update(
     loop = svc.get_by_slot(binding)
     if not loop:
         raise _DirectiveDenied("No active monitor loop on this session to update.")
+    if not allow_rearm and not loop.active:
+        # SELF-WAKE REVIVAL: a delivered wake can outlive a Stop, so a stopped
+        # loop is NOT a wake's to revive -- with one exception the bound-revival
+        # rule below already owns. A legacy loop that deactivated on its OWN
+        # cycle cap or runtime budget (the ``_timer`` stamps exactly these two
+        # persisted reasons) was never stopped by a person, and a member's
+        # final-cycle wake raising that bound is the loop managing its own
+        # patrol lifecycle unattended. Everything else fails closed:
+        # a manual pause, a user stop, a structured record (terminal by
+        # contract, re-armed only by an explicit new watch), and an EMPTY
+        # reason (a pre-field pause or a torn write, which the cycle-count
+        # heuristic below may still read as a cap stop for a HUMAN turn but
+        # which a wake must not trust). The revival itself still runs through
+        # the bound-revival decision below, so a wake that does not raise the
+        # stopping bound is refused there like any other patch.
+        reason = str(getattr(loop, "stopped_reason", "") or "")
+        self_wake_revivable = not is_structured_monitor_loop(loop) and reason in {
+            "cycle_cap",
+            "runtime_budget",
+        }
+        if not self_wake_revivable:
+            raise _DirectiveDenied(
+                "Monitor NOT rearmed: this loop stopped; a new user request is required."
+            )
     # Read HERE, not at the write: ``get_by_slot`` hands back the LIVE row, so a token read
     # at the call site would already carry a concurrent rotation and never fail the compare.
     baseline_token = str(getattr(loop, "goal_token", "") or "")
@@ -962,10 +1066,11 @@ async def _stop_resolved_loop(
     through ``authorize_and_stop_monitor``, which RETAINS a terminal record for
     later inspection. A legacy loop has no such record: a research-owned slot is
     deactivated with a tombstone reason a Research Lab consumer reads, and every
-    other legacy loop is REMOVED, leaving nothing behind. So a stop of a legacy
-    loop cannot be inspected afterward -- there is no stopped-loop record to
-    read, and ``monitor_inspect`` reports it as not armed. Callers that need a
-    retained terminal record must be watching a structured monitor.
+    other legacy loop is REMOVED, leaving no row behind. So a stop of a legacy
+    loop cannot be inspected afterward -- ``monitor_inspect`` reports it as not
+    armed; only the WARNING stop line in ``gateway.log`` says why it went (the
+    agent's own explanation rides along on the removal path only). Callers that
+    need a retained terminal record must be watching a structured monitor.
     """
     from kiro_crew.autonudge import is_structured_monitor_loop
 
@@ -1002,7 +1107,9 @@ async def _stop_resolved_loop(
     if is_owned_research_slot(binding, str(getattr(slot, "_app", "") or "")):
         await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
     else:
-        await svc.remove(loop_id)
+        # The removal leaves no row, so the agent's own reason travels in the WARNING
+        # stop line instead (autonudge_stop_log); without it a self-stop is "removed".
+        await svc.remove(loop_id, stop_reason=AUTONUDGE_STOP_REASON, stop_detail=reason)
     return (
         f"Auto-nudge loop {loop_id} stopped on this session"
         + (f" (reason: {reason})" if reason else "")
@@ -1055,7 +1162,7 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
 async def _set_project(state: Any, slot: Any, args: dict[str, Any]) -> str:
     from kiro_crew.dashboard.chat_utils import effective_session_key
     from kiro_crew.sandbox import voice_runtime_workspace_conflict
-    from kiro_crew.security import is_sensitive_path
+    from kiro_crew.security import is_unverifiable_path_refusal, sensitive_path_refusal
 
     clear = bool(args.get("clear"))
     project = str(args.get("project") or "").strip()
@@ -1068,27 +1175,29 @@ async def _set_project(state: Any, slot: Any, args: dict[str, Any]) -> str:
         return "Project cleared. The next message cold-starts with no project scope."
     expanded = os.path.expanduser(project)
 
-    def _validate() -> tuple[str, bool, bool]:
+    def _validate() -> tuple[str, str | None, bool]:
         """Resolve + classify the path on a worker thread.
 
         `realpath`/`isdir` touch the filesystem, so a network-mounted project
         path would stall chat, heartbeat and liveness if resolved on the event
         loop (no-blocking-call-on-event-loop). Returns
-        (realpath, sensitive, is_dir); the sensitive check runs on BOTH the
+        (realpath, refusal, is_dir); the sensitive check runs on BOTH the
         pre-resolution and resolved forms — the pre-check keeps a sensitive
         path from being probed at all, the post-check catches symlink/".."
         evasion.
         """
-        if is_sensitive_path(expanded):
-            return "", True, False
+        if reason := sensitive_path_refusal(expanded):
+            return "", reason, False
         rp_ = os.path.realpath(expanded)
-        if is_sensitive_path(rp_):
-            return rp_, True, False
-        return rp_, False, os.path.isdir(rp_)
+        if reason := sensitive_path_refusal(rp_):
+            return rp_, reason, False
+        return rp_, None, os.path.isdir(rp_)
 
-    rp, sensitive, is_dir = await asyncio.to_thread(_validate)
-    if sensitive:
+    rp, refusal, is_dir = await asyncio.to_thread(_validate)
+    if refusal:
         # Permission decision — raise so the wrapper audits it as denied.
+        if is_unverifiable_path_refusal(refusal):
+            raise _DirectiveDenied(f"Error: {refusal}")
         raise _DirectiveDenied("Error: access denied (sensitive path).")
     if not is_dir:
         return f"Error: not a directory: {rp}"
@@ -1368,8 +1477,9 @@ async def _apply_chat_tag(state: Any, slot: Any, session_key: str, args: dict[st
                     # treating it as a plain label would leave two exclusive
                     # states on the session. The vocabulary bit is agent-writable
                     # and grants nothing here — it is only ever a reason to
-                    # REFUSE. Recovery is one authenticated PATCH with an
-                    # explicit ``status``.
+                    # REFUSE. Recovery is owner adoption
+                    # (``POST /api/chat/tags/{id}/adopt``); a status PATCH on a
+                    # rowless tag answers ``tag_id_not_grantable``.
                     _sel_self_tag("denied", et["id"])
                     return _store_refusal("status_identity_unprotected", str(et["id"]))
                 if et_is_status and et["id"] != state_id:

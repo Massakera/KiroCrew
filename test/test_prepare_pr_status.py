@@ -2052,7 +2052,9 @@ def test_stampless_advisory_lane_comment_does_not_block_discovery_mode() -> None
     module = _load_script()
     comments = json.dumps(
         [
-            _bot_comment("⏭️ skipped: no UI changes in this revision", key="ux-review"),
+            _bot_comment(
+                f"⏭️ skipped for `{_HEAD}`: no UI changes in this revision", key="ux-review"
+            ),
             _bot_comment(f"No findings.\n[GPT-REVIEWED] {_HEAD}"),
         ]
     )
@@ -2062,6 +2064,76 @@ def test_stampless_advisory_lane_comment_does_not_block_discovery_mode() -> None
     assert module.main(["pr_status.py", "42"]) == 0
     # Pinned: UX is explicitly required -> its stampless state blocks.
     assert module.main(["pr_status.py", "42", "--reviewers", "GPT,UX"]) == 20
+
+
+def test_a_stampless_notice_for_an_earlier_head_exempts_nothing() -> None:
+    """The exemption is scoped to the revision the notice names.
+
+    A lane rewrites its slot to a stampless notice naming the head it declined.
+    That notice then sits there. If it excused any later head, a lane that DID
+    review the current head and whose verdict upsert failed would read as
+    deliberately silent, and the required status would pass with no verdict for
+    the revision -- the fail-open the pin exists to prevent.
+
+    Negative control: the same notice naming the CURRENT head is exempt, so the
+    check distinguishes rather than exempting nobody.
+    """
+    module = _load_script()
+    bindings = dict(module.DEFAULT_MARKER_BINDINGS)
+    older = "0" * 40
+
+    def notice(sha: str) -> dict:
+        return {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": "<!-- ux-review -->\nNo verdict for `" + sha + "`.\n",
+        }
+
+    stale_notice = module.evaluate_reviewer_markers(
+        [notice(older)], _HEAD, bindings, only=["UX"]
+    )
+    assert stale_notice["stale"] == ["UX"], stale_notice
+    assert stale_notice["stampless"] == [], stale_notice
+
+    current = module.evaluate_reviewer_markers([notice(_HEAD)], _HEAD, bindings, only=["UX"])
+    assert current["stale"] == ["UX"], current
+    assert current["stampless"] == ["UX"], current
+
+
+def test_a_bound_slot_with_no_stamp_of_its_own_is_reported_stampless() -> None:
+    """The enrolment exemption above, published so a PINNED caller can reuse it.
+
+    Under a pin, absence must read as stale -- otherwise a lane that published
+    nothing scores as reviewed. But then the stampless notice reads as stale too,
+    and the two cannot be told apart from ``stale`` alone: one is a lane that
+    said it did not review this head, which a re-run reproduces rather than
+    fills. ``stampless`` is that distinction, from the function that already
+    makes it, so a caller applies the exemption instead of respelling it.
+    """
+    module = _load_script()
+    bindings = dict(module.DEFAULT_MARKER_BINDINGS)
+    notice = {
+        "user": {"type": "Bot", "login": "github-actions[bot]"},
+        "body": "<!-- ux-review -->\nNo verdict for `" + _HEAD + "`.\n",
+    }
+    stamped = {
+        "user": {"type": "Bot", "login": "github-actions[bot]"},
+        "body": ("<!-- design-review -->\nDesign-Verdict: PASS\n\n[DESIGN-REVIEWED] " + _HEAD),
+    }
+
+    # Independent of the pin: it describes the comment set, not what was asked.
+    discovered = module.evaluate_reviewer_markers([notice, stamped], _HEAD, bindings)
+    assert discovered["stampless"] == ["UX"], discovered
+
+    pinned = module.evaluate_reviewer_markers(
+        [notice, stamped], _HEAD, bindings, only=["DESIGN", "UX", "FIRST-PRINCIPLES"]
+    )
+    assert pinned["stale"] == ["FIRST-PRINCIPLES", "UX"], pinned
+    assert pinned["stampless"] == ["UX"], pinned
+
+    # Fail-closed reads carry the key too, so a caller deciding what to exempt
+    # never trips over its absence.
+    unreadable = module.evaluate_reviewer_markers(None, _HEAD, bindings)
+    assert unreadable["ok"] is False and unreadable["stampless"] == [], unreadable
 
 
 def test_checks_blind_token_degrades_softly_instead_of_aborting(capsys) -> None:
@@ -2575,6 +2647,67 @@ def test_disposition_gate_reports_unreadable_comments_as_not_ok(capsys) -> None:
     assert report["violations"] == []
 
 
+def test_disposition_gate_reads_the_comment_pages_once(capsys) -> None:
+    """The records and the marker comments come from ONE paginated read.
+
+    This mode runs on every full readiness evaluation, and each page is a
+    request on the hourly GITHUB_TOKEN pool every workflow shares. A second
+    walk of the same pages bought nothing: both selectors filter the same
+    list. Two full pages plus a short one pin that pagination still reaches
+    the last page, and that each page is requested exactly once.
+    """
+    module = _load_script()
+    span = module.span_hash("src/x.py", "gpt/FINDING")
+    ruling = {
+        "id": 903,
+        "user": {"type": "User", "login": "alice"},
+        "body": (
+            "<!-- ai-review-disposition target=gpt head=" + _GATE_HEAD + " -->\n"
+            + f"- **rebutted** span={span}\n> reason"
+        ),
+    }
+    filler = [{"id": i, "user": {"type": "User", "login": "bob"}, "body": "hi"} for i in range(100)]
+    pages = {1: filler, 2: filler, 3: [_gate_bot_comment(), ruling]}
+    requested: list[str] = []
+
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        if args[:2] == ["gh", "api"] and "/collaborators/" in args[2]:
+            return 0, json.dumps({"permission": "write"}), ""
+        if args[:2] == ["gh", "api"] and "/issues/42/comments" in args[2]:
+            requested.append(args[2])
+            page = int(args[2].rsplit("page=", 1)[1])
+            return 0, json.dumps(pages[page]), ""
+        raise AssertionError("unexpected command: {}".format(args))
+
+    module.run = fake_run
+
+    assert module.main(_gate_argv()) == 0
+
+    report = json.loads(capsys.readouterr().out.strip())
+    assert report["ok"] is True, report
+    assert report["records"] == 1
+    assert report["violations"] == []
+    assert [url.rsplit("page=", 1)[1] for url in requested] == ["1", "2", "3"]
+
+
+def test_the_shared_comment_read_keeps_only_what_a_selector_wants() -> None:
+    """Filtering page by page: a comment neither selector wants is dropped as
+    its page is read, so a PR with thousands of ordinary comments does not
+    hold them all in memory."""
+    module = _load_script()
+    ordinary = {"id": 1, "user": {"type": "User", "login": "bob"}, "body": "x" * 1000}
+    marker = _gate_bot_comment()
+
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        return 0, json.dumps([ordinary, marker]), ""
+
+    module.run = fake_run
+    kept = module.fetch_issue_comments(
+        "example/repo", 42, keep=lambda c: module.is_trusted_bot_comment(c, ("github-actions[bot]",))
+    )
+    assert kept == [marker]
+
+
 def test_disposition_gate_requires_repo_pr_and_head(capsys) -> None:
     module = _load_script()
 
@@ -2589,8 +2722,7 @@ def test_disposition_gate_flattens_newlines_out_of_each_violation(capsys) -> Non
     """The workflow reads one violation per line, so a newline inside one would
     forge an extra blocker line. Flattening is what makes that unrepresentable."""
     module = _load_script()
-    module.fetch_disposition_comments = lambda *_a: []
-    module.fetch_bot_comments = lambda *_a: []
+    module.fetch_issue_comments = lambda *_a, **_k: []
     module.writer_disposition_records = lambda *_a: []
     module.disposition_violations = lambda *_a: ["first\nsecond   third"]
 
@@ -2968,9 +3100,15 @@ def test_the_concerns_stop_never_reaches_the_server_side_gate(capsys) -> None:
     """--disposition-gate JSON is byte-identical whether or not the body
     carries a whole-design CONCERNS. The required status must keep treating
     CONCERNS as advisory -- turning it into a red for every writer is a policy
-    change this local loop does not get to make."""
+    change this local loop does not get to make.
+
+    Both arms carry the design slot and differ ONLY in its verdict word. The
+    slot's presence is a second variable the gate answers on purpose -- a lane
+    that published nothing owes this head a verdict -- so varying it here would
+    test that instead of the CONCERNS stop.
+    """
     reports = []
-    for extra in ([], [_design_comment()]):
+    for verdict in ("PASS", "CONCERNS"):
         module = _load_script()
         span = module.span_hash("src/x.py", "gpt/FINDING")
         ruling = {
@@ -2984,7 +3122,9 @@ def test_the_concerns_stop_never_reaches_the_server_side_gate(capsys) -> None:
         _install_fake_gh(
             module,
             _pr_payload(_GREEN_CHECKS),
-            comments=json.dumps([_gate_bot_comment(), ruling] + extra),
+            comments=json.dumps(
+                [_gate_bot_comment(), ruling, _design_comment(verdict=verdict)]
+            ),
             permissions={"alice": "write"},
         )
         assert module.main(_gate_argv()) == 0

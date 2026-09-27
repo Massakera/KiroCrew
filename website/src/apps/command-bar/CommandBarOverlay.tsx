@@ -49,6 +49,7 @@ import {
 import { createArtifactsProvider } from '../../components/commandPalette/providers/artifactsProvider'
 import type { ArtifactsResponse } from '../../components/commandPalette/providers/artifactsProvider'
 import { createFoldersProvider, FOLDERS_STALE_MS } from './foldersProvider'
+import { useFolderSortRead, type FolderSortConfigBody } from '../../hooks/useFolderSortMode'
 import { useSessionsProvider } from '../../components/commandPalette/providers/sessionsProvider'
 import type { Result } from '../../components/commandPalette/types'
 import { resolveCopyTarget, type CopyableRow } from '../../components/commandPalette/copyTarget'
@@ -160,12 +161,25 @@ function groupLabel(group: RootGroup): string {
  * section exists — and a "Session" kind was considered for this surface once
  * before and dropped.
  */
-function kindLabel(row: { kind: RootRowKind; group: RootGroup; appLabel?: string }): string | null {
+function kindLabel(
+  row: { kind: RootRowKind; group: RootGroup; appLabel?: string },
+  queryActive = false,
+): string | null {
+  // An attention row's column carries its LIVE STATE, which is both more useful than
+  // a kind word and the reason that section exists. It is never empty: a row reaches
+  // this group only because its status is a pill, so the renderer always has one to
+  // show and never falls through to this label.
   if (row.group === 'attention') return null
   // A recent row is named by its own group header and its session glyph, and its
   // right-hand column belongs to whatever the session is DOING. Labelling it
   // "Command" would be both wrong and the widest thing on the row.
-  if (row.group === 'recent') return null
+  //
+  // Under a QUERY there is no header (the list is one ranked block, so it carries
+  // none), and an idle session has no live state either — which left the row as a
+  // glyph and a title while every row beside it still showed its word. So the group's
+  // own name stands in, in the column that is empty anyway. The idle page is
+  // unchanged: the header above the row says this there.
+  if (row.group === 'recent') return queryActive ? groupLabel('recent') : null
   if (row.kind === 'view') return i18nT('apps.commandBar.kind.view')
   if (row.group === 'apps') return i18nT('apps.commandBar.kind.app')
   if (row.group === 'settings') return i18nT('apps.commandBar.kind.setting')
@@ -377,9 +391,18 @@ function actionLabel(slot: Slot): string {
  * them by (the recents listing separates live sessions from history). The synthetic
  * slots — fallback, recovery, retry — head on nothing: they are one-offs at the
  * bottom of the list, and a header over a single row is noise.
+ *
+ * `queryActive` turns the root's headers OFF, because under a query the root is one
+ * list ranked by match, not blocks filed by group — so a group can appear, be left,
+ * and appear again, and a header per transition would print "Commands" twice with an
+ * app between them and describe nothing. Each row still names its own kind in its
+ * right-hand column, which is where a ranked list carries that fact. View slots keep
+ * their headers either way: an engine's grouping is a fact about its results, not a
+ * filing order the query just replaced.
  */
-function headerOf(slot: Slot, prev?: Slot): string | null {
+function headerOf(slot: Slot, prev?: Slot, queryActive = false): string | null {
   if (slot.tag === 'root') {
+    if (queryActive) return null
     if (prev?.tag === 'root' && prev.row.group === slot.row.group) return null
     return groupLabel(slot.row.group)
   }
@@ -611,6 +634,23 @@ export default function CommandBarOverlay({
   chatFoldersRef.current = chatFolders
   const queryClient = useQueryClient()
 
+  // The person's folder sort mode (`dashboard.folder_sort`), read the same way as the
+  // two entries above — a SUBSCRIBER to the shared `['kirocrewConfig']` key, never a
+  // fetch: the shell's own read of that key holds the entry from boot and the
+  // WebSocket invalidates it on a config change, so fetching here would be the
+  // request-on-open this surface exists to avoid, for a value that is already in the
+  // cache. Read through the sidebar hook's own derivation, so the Folders view
+  // below lists in the order the sidebar draws — and says the same failed read the
+  // sidebar says, above its list, when there is no body to draw from (there is no
+  // sidebar on this surface to say it). A body on hand is drawn and acted on,
+  // whatever the shell's last refetch did.
+  const kirocrewConfigQuery = useQuery<FolderSortConfigBody>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+    enabled: false,
+  })
+  const { mode: folderSortMode, error: folderSortError } = useFolderSortRead(kirocrewConfigQuery)
+
   /**
    * The artifacts view's engine.
    *
@@ -685,8 +725,13 @@ export default function CommandBarOverlay({
           dispatch(requestFolderReveal(folderId))
           navigate('/chat')
         },
+        // The sidebar's own mode, so the listing is the sidebar's order and not a
+        // second one. A dep of the memo: a mode switch rebuilds the engine, and the
+        // scope query below keys on the mode too, so the switch is never served from
+        // a 15-second-stale list in the old order.
+        mode: folderSortMode,
       }),
-    [dispatch, navigate, queryClient],
+    [dispatch, navigate, queryClient, folderSortMode],
   )
 
   useEffect(() => {
@@ -1112,7 +1157,10 @@ export default function CommandBarOverlay({
     error: foldersSearchError,
     refetch: refetchFolders,
   } = useQuery({
-    queryKey: ['command-bar', 'folders', folderQuery],
+    // The mode is part of the identity: the same query in a different mode is a
+    // different list, and without it a switch made in the sidebar would be served
+    // from the previous order for the rest of the stale window.
+    queryKey: ['command-bar', 'folders', folderSortMode, folderQuery],
     queryFn: () => Promise.resolve(folders.search(folderQuery)) as Promise<Result[]>,
     enabled: scope === 'folders',
     staleTime: 15_000,
@@ -1809,7 +1857,9 @@ export default function CommandBarOverlay({
               {row.status ? (
                 statusAccessory(row.status)
               ) : (
-                <span className="shrink-0 text-[11px] text-muted">{kindLabel(row)}</span>
+                <span className="shrink-0 text-[11px] text-muted">
+                  {kindLabel(row, query.trim().length > 0)}
+                </span>
               )}
             </>
           ),
@@ -2183,6 +2233,35 @@ export default function CommandBarOverlay({
           </div>
         )}
 
+        {/* FOLDERS: the shared settings read the order comes from has FAILED with no
+            body to draw from, so the list below is the stored order whatever mode
+            the person chose — said here the way the sidebar says it over its own
+            tree (there is no sidebar on this surface), because a list drawn silently
+            in the wrong order is the dead end, not the failure. The raw server
+            string is the message so the notice's journal lookup still finds the
+            endpoint and status -- under the title, smaller, because "config store"
+            and "gateway" are the detail, not the lead; the plain line under it says
+            what the list is showing (a picker: "listed", not the sidebar's
+            "arrangement"), that nothing is asked of the reader (the shell's read
+            retries on its own), and where the hand-off lives, since this notice has
+            none: the query typed into the bar is unsaved and the navigation would
+            take it along. */}
+        {scope === 'folders' && folderSortError && (
+          <div className="px-3 py-2 border-b border-border">
+            <ErrorNotice
+              variant="inline"
+              className="flex-wrap"
+              title={i18nT('pages.chatSidebar.folder_order_unavailable')}
+              message={folderSortError}
+              messagePlacement="below"
+              testId="command-bar-folder-order-unavailable"
+            />
+            <p className="mt-0.5 text-[11px] text-muted" data-testid="command-bar-folder-order-unavailable-detail">
+              {i18nT('pages.chatSidebar.folder_order_unavailable_detail_picker_ask')}
+            </p>
+          </div>
+        )}
+
         <div className="overflow-y-auto py-1" id={listId} role="listbox" aria-label={i18nT('apps.commandBar.title')}>
           {rowCount === 0 ? (
             scopeLoading ? (
@@ -2299,7 +2378,7 @@ export default function CommandBarOverlay({
             )
           ) : (
             slots.map((slot, i) => {
-              const header = headerOf(slot, slots[i - 1])
+              const header = headerOf(slot, slots[i - 1], query.trim().length > 0)
               return (
                 <div key={slot.key}>
                   {header && (

@@ -28,7 +28,7 @@ import {
 import { api } from '../api/client'
 import { store as globalStore } from '../store'
 import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard, sseAutomation, resolveByApprovalId } from '../store/chatSlice'
-import { sseSlots } from '../store/dashboardSlice'
+import { sseSlots, addSlotOptimistic, armConfirmedCloseHold, removeSlotOptimistic } from '../store/dashboardSlice'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import type { ChatSlot } from '../types'
 import { recentErrors } from '../utils/errorReport'
@@ -324,6 +324,69 @@ describe('useWebSocket frame router', () => {
     // A slot-less TODO delta is dropped rather than dispatched.
     act(() => { ws.simulateMessage({ type: 'todo_update', data: { todo: null } }) })
     expect(dash().slots[0].todo).toEqual(todo)
+  })
+
+  it('refreshes slots once when a slot patch names an absent row', async () => {
+    globalStore.dispatch(sseSlots([slotFixture(ACTIVE)]))
+    try {
+      const { ws } = mount()
+      await act(async () => { await Promise.resolve(); await Promise.resolve() })
+      vi.mocked(api.chatSlots).mockClear()
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'slot_patch',
+          data: { slots: [{ key: BACKGROUND, title: 'New session' }] },
+        })
+      })
+
+      expect(api.chatSlots).toHaveBeenCalledTimes(1)
+    } finally {
+      globalStore.dispatch(sseSlots([]))
+    }
+  })
+
+  it('does not refresh slots when a slot patch names a present row', async () => {
+    globalStore.dispatch(sseSlots([slotFixture(ACTIVE)]))
+    try {
+      const { ws } = mount()
+      await act(async () => { await Promise.resolve(); await Promise.resolve() })
+      vi.mocked(api.chatSlots).mockClear()
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'slot_patch',
+          data: { slots: [{ key: ACTIVE, title: 'Renamed session' }] },
+        })
+      })
+
+      expect(api.chatSlots).not.toHaveBeenCalled()
+    } finally {
+      globalStore.dispatch(sseSlots([]))
+    }
+  })
+
+  it('does not refresh slots when an absent patched row is closing', async () => {
+    globalStore.dispatch(sseSlots([slotFixture(ACTIVE), slotFixture(BACKGROUND)]))
+    globalStore.dispatch(armConfirmedCloseHold(BACKGROUND))
+    globalStore.dispatch(removeSlotOptimistic(BACKGROUND))
+    try {
+      const { ws } = mount()
+      await act(async () => { await Promise.resolve(); await Promise.resolve() })
+      vi.mocked(api.chatSlots).mockClear()
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'slot_patch',
+          data: { slots: [{ key: BACKGROUND, title: 'Closing session' }] },
+        })
+      })
+
+      expect(api.chatSlots).not.toHaveBeenCalled()
+    } finally {
+      globalStore.dispatch(addSlotOptimistic(slotFixture(BACKGROUND)))
+      globalStore.dispatch(sseSlots([]))
+    }
   })
 
   it('refreshes the pending-skill queues when a candidate is staged', () => {
@@ -1412,7 +1475,7 @@ describe('useWebSocket frame router', () => {
     expect(stored[0].tool_call_id).toBe('tc-app')
   })
 
-  it('marks a live question card fresh and clears it on resolution', () => {
+  it('stores a live question card under its server identity and clears it on resolution', () => {
     const { ws } = mount()
     act(() => {
       ws.simulateMessage({
@@ -1421,7 +1484,6 @@ describe('useWebSocket frame router', () => {
       })
     })
     expect(chat().pendingQuestions[ACTIVE]?.ask_id).toBe('ask-live')
-    expect(chat().pendingQuestions[ACTIVE]?.cardId).toBeTruthy()
 
     act(() => { ws.simulateMessage({ type: 'question_card_resolved', data: { ask_id: 'ask-live' } }) })
     expect(chat().pendingQuestions[ACTIVE]).toBeUndefined()
@@ -2262,7 +2324,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-gone',
       questions: [{ question: 'Stale', options: [{ label: 'x' }] }],
-      fresh: true,
     })
     ;(api.pendingQuestions as ReturnType<typeof vi.fn>).mockResolvedValueOnce([])
     act(() => {
@@ -2279,7 +2340,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-old',
       questions: [{ question: 'Old', options: [{ label: 'x' }] }],
-      fresh: true,
     })
     ;(api.pendingQuestions as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
       { card_id: 'card-new', slot: ACTIVE, questions: [{ question: 'New', options: [{ label: 'y' }] }] },
@@ -2302,7 +2362,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-live',
       questions: [{ question: 'Still asking', options: [{ label: 'x' }] }],
-      fresh: true,
     })
     ;(api.pendingQuestions as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
       { card_id: 'card-live', slot: ACTIVE, questions: [{ question: 'Still asking', options: [{ label: 'x' }] }] },
@@ -2311,14 +2370,13 @@ describe('useWebSocket frame router', () => {
       globalStore.dispatch(held)
       testStore.dispatch(held as never)
     })
-    const deliveryId = chat().pendingQuestions[ACTIVE]?.cardId
-    expect(deliveryId).toBeTruthy()
+    const entry = chat().pendingQuestions[ACTIVE]
+    expect(entry?.serverCardId).toBe('card-live')
     mount()
     await act(async () => { await Promise.resolve() })
-    expect(chat().pendingQuestions[ACTIVE]?.serverCardId).toBe('card-live')
-    // The SAME entry, not a drop-and-re-add: a fresh per-delivery id would mean
-    // the component remounted, discarding a half-typed answer on every reconnect.
-    expect(chat().pendingQuestions[ACTIVE]?.cardId).toBe(deliveryId)
+    // The SAME entry, not a drop-and-re-add: a replaced entry would reset the
+    // draft protection and let a reconnect discard a half-typed answer.
+    expect(chat().pendingQuestions[ACTIVE]).toBe(entry)
   })
 
   it('restores a stateless card when a queued answer is cancelled', async () => {
@@ -2365,7 +2423,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-new',
       questions: [{ question: 'Live', options: [{ label: 'y' }] }],
-      fresh: true,
     })
     mount()
     // Both stores: the hook reads the module store for its snapshots (like the

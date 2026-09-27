@@ -31,11 +31,12 @@ from kiro_crew.config.loader import (
     _workspace_dir_file,
     config_path,
     env_path,
+    normalize_workspace_path,
     unsandboxed_exec_declared,
     unsandboxed_exec_platform_default,
     update_config_locked,
 )
-from kiro_crew.constants import DATA_WARNING, MIN_NODE_MAJOR
+from kiro_crew.constants import MIN_NODE_MAJOR
 from kiro_crew.dashboard.urls import _resolve_hostname_bounded
 from kiro_crew.sandbox import unavailable_kind
 from kiro_crew.secrets.migrate import _env_lock_path
@@ -366,7 +367,6 @@ def _setup_impl(
         return
 
     print("Kiro Crew Setup 👻\n")
-    print(f"  {DATA_WARNING.replace(chr(10), chr(10) + '  ')}\n")
 
     # Report on optional prerequisites.
     _ensure_prerequisites()
@@ -535,7 +535,7 @@ def _setup_workspace_dir() -> None:
     if _workspace_dir_file().is_file():
         configured = _workspace_dir_file().read_text(encoding="utf-8").strip()
         if configured:
-            default = Path(configured)
+            default = normalize_workspace_path(configured)
             label = "Configured"
     print("── Workspace Directory ──\n")
     print("  LLM sessions and task output are stored in a workspace directory.")
@@ -544,8 +544,10 @@ def _setup_workspace_dir() -> None:
     # traceback out of the wizard — this step runs FIRST, so a bare input() here
     # made `kirocrew setup < /dev/null` fail before any later guard could help.
     answer = _input_or_skip(f"  Workspace path [{default}]: ") or ""
-    chosen = default if answer.lower() in ("", "y", "yes") else Path(answer).expanduser()
+    chosen = default if answer.lower() in ("", "y", "yes") else normalize_workspace_path(answer)
     try:
+        if not chosen.is_absolute():
+            raise OSError("not an absolute path")
         chosen.mkdir(parents=True, exist_ok=True)
         _workspace_dir_file().parent.mkdir(parents=True, exist_ok=True)
         _workspace_dir_file().write_text(str(chosen) + "\n", encoding="utf-8")

@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 
-import { ErrorCard, isAuthRequired, isModelUnentitled, isUsageLimit, retryProse } from '../pages/chat/ErrorCard'
+import { ErrorCard, isAuthRequired, isCapabilitiesChanged, isModelUnentitled, isSessionStartFailed, isUsageLimit, retryProse, sessionStartFailureStreak } from '../pages/chat/ErrorCard'
+import type { ChatMessage } from '../types'
 import { FEATURE_REQUEST_FORM_URL } from '../prompts/featureRequest'
 import { i18nT } from '../i18n/t'
 
@@ -197,6 +198,33 @@ describe('ErrorCard — model entitlement rejection', () => {
  * A signed-out agent process is the other error whose fix is not a retry. Its
  * row swaps Continue for a deep link to the Kiro sign-in card in Settings.
  */
+describe('ErrorCard — member agent file changed', () => {
+  const content = 'materialization_changed: This crew member\'s agent file changed outside the Capabilities page.'
+  const meta = { code: 'materialization_changed', member: 'reviewer' }
+
+  it('offers Open Capabilities and NO Resume, with plain copy instead of the code', () => {
+    const onOpenCapabilities = vi.fn()
+    render(<ErrorCard content={content} meta={meta} onContinue={() => {}} onOpenCapabilities={onOpenCapabilities} />)
+    expect(screen.queryByTestId('error-card-continue')).toBeNull()
+    expect(screen.getByTestId('error-card')).toHaveTextContent(i18nT('pages.chat.errorCard.capabilities_changed'))
+    expect(screen.getByTestId('error-card')).not.toHaveTextContent('materialization_changed')
+    fireEvent.click(screen.getByTestId('error-card-open-capabilities'))
+    expect(onOpenCapabilities).toHaveBeenCalledTimes(1)
+  })
+
+  it('hides the code on a surface with no crew editor', () => {
+    render(<ErrorCard content={content} meta={meta} />)
+    expect(screen.getByTestId('error-card')).not.toHaveTextContent('materialization_changed:')
+    expect(screen.queryByTestId('error-card-open-capabilities')).toBeNull()
+  })
+
+  it('recognises the row only by its structural code', () => {
+    expect(isCapabilitiesChanged({ meta })).toBe(true)
+    expect(isCapabilitiesChanged({ meta: undefined })).toBe(false)
+    expect(isCapabilitiesChanged({ meta: { code: 'memory_unavailable' } })).toBe(false)
+  })
+})
+
 describe('ErrorCard — agent not signed in', () => {
   it('offers Sign in to Kiro and NO Continue, even when resumable', () => {
     const onContinue = vi.fn()
@@ -264,6 +292,24 @@ describe('ErrorCard — feature request refused for a usage limit', () => {
     cleanup()
   })
 
+  it('lets the action wrap inside the card instead of running past its edge: the label is long by design (destination and cost; 62 chars in de), so the control may shrink and balance its lines', () => {
+    render(<ErrorCard content={prose} onContinue={() => undefined} featureRequestFormUrl={FEATURE_REQUEST_FORM_URL} />)
+    const link = screen.getByTestId('error-card-feature-request-form')
+    const classes = link.className.split(/\s+/)
+    // `shrink-0` on a flex item in the wrapping action row pins it at its full
+    // one-line width, so a card narrower than the label is overflowed, not
+    // wrapped. Without it the control shrinks to its longest word and the
+    // label breaks into lines.
+    expect(classes).not.toContain('shrink-0')
+    expect(classes).not.toContain('truncate')
+    expect(classes).not.toContain('whitespace-nowrap')
+    // Balanced lines: two similar halves, not one long line and one word.
+    expect(classes).toContain('text-balance')
+    // The icon beside the label keeps its size when the control shrinks.
+    expect(link.querySelector('svg')?.getAttribute('class') ?? '').toMatch(/\bshrink-0\b/)
+    cleanup()
+  })
+
   it('points at the repo\'s feature_request issue template, not a blank issue', () => {
     const url = new URL(FEATURE_REQUEST_FORM_URL)
     expect(url.origin + url.pathname).toBe('https://github.com/kirodotdev/KiroCrew/issues/new')
@@ -285,5 +331,82 @@ describe('ErrorCard — feature request refused for a usage limit', () => {
     expect(screen.queryByTestId('error-card-feature-request-form')).toBeNull()
     expect(screen.getByTestId('error-card')).not.toHaveAttribute('data-usage-limit-fallback')
     expect(screen.getByTestId('error-card-continue')).toBeInTheDocument()
+  })
+})
+
+describe('ErrorCard — a session start that failed twice in a row', () => {
+  const prose = 'Request session/new timed out after 90s (4/4 session-injected MCP server(s) reported)'
+
+  it('shows the restart remedy, naming the command, and NO Resume', () => {
+    render(<ErrorCard content={prose} meta={{ kind: 'session_start_failed' }} sessionStartRepeat />)
+    const card = screen.getByTestId('error-card')
+    // The backend's own sentence stays first -- it carries the diagnostic.
+    expect(card).toHaveTextContent(prose)
+    const hint = screen.getByTestId('error-card-session-start-repeat-hint')
+    expect(hint).toHaveTextContent(i18nT('pages.chat.errorCard.session_start_repeat_hint', { command: 'kirocrew restart' }))
+    // The command is the one thing to copy, so it is a code chip at body weight,
+    // not a muted footnote (the only remaining next step must not be the least
+    // visible thing on the card).
+    expect(screen.getByTestId('error-card-restart-command')).toHaveTextContent('kirocrew restart')
+    expect(screen.getByTestId('error-card-restart-command').tagName).toBe('CODE')
+    expect(hint.className).not.toMatch(/text-muted/)
+    expect(screen.queryByTestId('error-card-continue')).toBeNull()
+    expect(card).not.toHaveAttribute('data-continuable')
+  })
+
+  it('keeps the first failure as today: Resume, no hint', () => {
+    render(<ErrorCard content={prose} meta={{ kind: 'session_start_failed' }} onContinue={() => undefined} />)
+    expect(screen.getByTestId('error-card-continue')).toBeInTheDocument()
+    expect(screen.queryByTestId('error-card-session-start-repeat-hint')).toBeNull()
+  })
+})
+
+describe('sessionStartFailureStreak mirrors the server scan', () => {
+  const row = (role: string, over: Partial<ChatMessage> = {}): ChatMessage =>
+    ({ role, content: '', ts: 0, ...over }) as ChatMessage
+  const failed = () => row('error', { content: 'Request session/new timed out after 90s', meta: { kind: 'session_start_failed' } })
+  const resumed = () => row('inject', { content: '[Continue — requested by the user] …', meta: { injectKind: 'recovery' } })
+
+  it('counts consecutive tagged failures across Resume rows', () => {
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed()])).toBe(1)
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed(), resumed(), failed()])).toBe(2)
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed(), resumed(), failed(), resumed(), failed()])).toBe(3)
+  })
+
+  it('a typed message or an assistant reply starts the count over', () => {
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed(), resumed(), failed(), row('user', { content: 'again' }), failed()])).toBe(1)
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed(), row('assistant', { content: 'ok' })])).toBe(0)
+  })
+
+  it('a row that opens a turn of its own ends the streak; the Resume row does not', () => {
+    const cron = row('inject', { content: '[Cron notification from "job"] …', meta: { injectKind: 'cron' } })
+    const synthesis = row('inject', { content: 'synthesis', meta: { injectKind: 'synthesis' } })
+    const nudge = row('nudge', { content: '[auto-nudge cycle 2]' })
+    const sub = row('subagent', { content: '[Subagent completion event] …' })
+    for (const opener of [cron, synthesis, nudge, sub]) {
+      expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed(), opener, failed()])).toBe(1)
+    }
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed(), resumed(), failed()])).toBe(2)
+  })
+
+  it('an error of another kind, or a Stop card, ends the streak', () => {
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed(), row('error', { content: '⟳ Connection lost — please retry.' })])).toBe(0)
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed(), row('error', { content: 'x' }), failed()])).toBe(1)
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed(), row('system', { kind: 'stop_event' }), failed()])).toBe(1)
+  })
+
+  it('walks past a system notice and reads both kind carriers', () => {
+    const notice = row('assistant', { content: 'Auto-compacted.', meta: { kind: 'compaction' } })
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), failed(), notice, failed()])).toBe(2)
+    const rebuilt = row('error', { content: 'timed out', kind: 'session_start_failed' })
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), rebuilt, resumed(), rebuilt])).toBe(2)
+    expect(isSessionStartFailed(rebuilt)).toBe(true)
+    expect(isSessionStartFailed(failed())).toBe(true)
+    expect(isSessionStartFailed(row('error', { content: 'timed out' }))).toBe(false)
+  })
+
+  it('never counts an untagged timeout -- the kind decides, not the prose', () => {
+    const untagged = () => row('error', { content: 'Request session/new timed out after 90s' })
+    expect(sessionStartFailureStreak([row('user', { content: 'hi' }), untagged(), resumed(), untagged()])).toBe(0)
   })
 })

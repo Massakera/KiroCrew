@@ -1120,6 +1120,35 @@ the file lock first, and `_record_run` and `_record_skip` no longer wrap it in
 callers' outer hold was the only thing serialising it, and `(process, sequence)`
 is the identity the compare-and-set inside `mutate` reads, so a shared sequence
 would let a stale baseline pass a check it must fail.
+
+The in-lock failure handoff runs INSIDE that lock rather than after it. When a
+run's state update fails at ANY step taken after the sidecar lock is acquired --
+the read, the pending merge, `mutate`, or `write_state` -- `_record_run_locked`
+holds the completed upload's record in process memory (see below) via
+`_remember_unpersisted`. The upload happens BEFORE `_record_run` is called, so that
+completed-upload record exists whichever step raises, a read failure included:
+publishing over an unread document strands the run just as a failed write does.
+`_locked_state_update` releases the sidecar lock the instant any of those steps
+raises, so if that handoff ran from the outer except -- after the block released --
+a second run-record writer could take the sidecar lock in the gap, `_merge_pending`
+in nothing (the first run is not held yet), and persist only its own record; the
+first upload would then live in memory alone and be forgotten on restart, reopening
+the unattended re-upload. `_locked_state_update` takes an `on_in_lock_failure`
+callback and invokes it while the sidecar lock is still held, then re-raises, so the
+record is held before any other writer can read the state it is missing from -- no
+second lock, no serialization of the happy path (two same-kind runs still contend on
+the file lock and resolve by `(process, sequence)` supersession, and the status read
+stays non-blocking). The callback takes only `_unpersisted_lock`, a leaf below the
+two locks the block holds, so the acquisition order stands. It fires on any such
+failure and never on success. A failure to ACQUIRE the sidecar lock itself cannot
+run an in-lock callback. The outer handler still holds that record in process
+memory, preventing another upload while this process lives, but it cannot promise
+immediate disk convergence: a peer may already hold the sidecar lock and commit
+state that does not include this run, and no callback can execute under a lock this
+caller never acquired. A restart may therefore re-upload that archive, which is
+the fallback for an unavailable state lock. Only the UNCONDITIONAL run
+write passes the callback: the conditional (`expected`) path re-uploads a full copy
+on failure and remembers nothing.
 The sidecar lock is taken with a ceiling derived from that hold rather than
 `file_lock`'s 300s default, which is sized for a sub-second read plus a rename.
 A shorter ceiling would refuse a contender that is only waiting, and that refusal
@@ -1149,8 +1178,13 @@ different risk decisions and enabling one must not enable the other.
 A run's `at` is the observed UTC wall time, not a unique identifier or a
 monotonic clock. `process` (a random process token plus PID) and `sequence`
 distinguish and order this process's completed run records even when wall time
-ties or moves backwards. Recording and state updates share an in-process lock;
-the existing sidecar lock still serializes disk writes across processes.
+ties or moves backwards. The in-lock failure handoff -- when a completed upload's
+state update fails at any step after the sidecar lock is acquired (read, merge,
+`mutate`, or `write_state`), `_record_run_locked` holds the run in process memory
+via `_remember_unpersisted` -- runs INSIDE the sidecar lock (`_locked_state_update`'s
+`on_in_lock_failure` callback), so a second same-process record writer cannot read
+state in the window after a failed update releases the lock and before the run is
+held; the sidecar lock still serializes disk writes across processes.
 A newly recorded run unconditionally replaces its kind's prior state under the
 sidecar lock, including prior-process or legacy records with equal or later wall
 times. Only best-effort overlay/recovery comparisons use local sequence or the
@@ -1353,10 +1387,13 @@ corrupt or absent stamp, a stamp in the future from a backwards clock step. That
 the rule `_a_day_since_last_run` already states for an unparseable success stamp,
 and a failure record is a new place for the same silence to appear.
 
-Any success clears the count, atomically inside `_record_run_locked`'s mutate
-rather than as a second write beside it, so no wake can land between the run record
-and the clear. Only the SCHEDULED path records a failure, while a success from
-anywhere clears one: an owner pressing the button is present and has just
+A success by a CURRENT run clears the count, atomically inside `_record_run_locked`'s
+mutate rather than as a second write beside it, so no wake can land between the run
+record and the clear. A run whose own record is refused as stale leaves the count
+standing: the clear shares the run write's condition, because a record this document
+has already superseded is not evidence that a later failure is over. Only the
+SCHEDULED path records a failure, while a success from anywhere clears one: an owner
+pressing the button is present and has just
 demonstrated the fault is gone, which is the line `_unattended_sessions_redaction_gap`
 already draws. The status read serves the record as `nightlyFailures` so an operator
 can see the count and the day it started; no console renderer ships with it.
@@ -1399,11 +1436,15 @@ one-step skew on the next genuine failure. The row is why the guard ships -- mak
 state readable is half of what this change is for -- and a review lane that priced the
 guard against the withheld-attempt claim was right to reject that claim.
 
-A run record reaches the document by TWO paths, so the clear sits on both. The second is
-`_merge_pending`, which carries a run whose own state write raised and was held in memory;
-before it also cleared, a stale count outlived the success that should have ended it, and
-after a restart withheld one nightly for up to the ceiling on an account that had already
-backed up. It is gated on `_run_is_newer` for the same reason the run write is.
+A run record reaches the document by TWO paths, so the clear sits on both, and on both it
+carries the same condition as the run write beside it. `_record_run_locked` gates it on
+`not superseded`, the same-process comparison; `_merge_pending` gates it on
+`_run_is_newer`, the best-effort recovery comparison that also weighs wall time. The two
+spellings are one question -- whether this record is the current one -- and a record that
+loses it is too stale to write a key and so too stale to retire a count a later failure
+accumulated. `_merge_pending` carries a run whose own state write raised and was held in
+memory; a stale count that outlives the success which should have ended it withholds one
+nightly, after a restart, for up to the ceiling on an account that had already backed up.
 
 `run_witness` is a required keyword with no default, so a call site added later cannot
 opt out of the protocol silently -- which is the shape of the bug it closes. Each hooks
@@ -1808,7 +1849,7 @@ bind a forwarded conversation id to, and a binding written against an absent
 identity would fail open. What it does instead is refuse to serve customer turns at
 all unless the deployment has declared `SMC_SINGLE_PRINCIPAL`, which is the RFC's
 one-owner invariant made explicit and enforced at startup rather than assumed. The
-refusal is at startup for the reason `require_api_key` refuses at startup: a
+refusal is at startup for the reason `require_model_identity` refuses at startup: a
 container that answers its port while mixing two callers' conversations looks
 healthy and is not.
 
@@ -1840,7 +1881,7 @@ each wrong once in a way that produced no error:
   kind added later is dropped rather than relayed.
 - **Readiness proves less than it looks like.** A backend with no model credential
   answers its port and then returns `503 kiro_prerequisite_required` on every turn,
-  so a present `KIRO_API_KEY` is not a working one and only a real turn establishes
+  so a usable stored identity is not a working one and only a real turn establishes
   that it is.
 
 A restored transcript is bounded by SIZE as well as by shape. The bytes come from the
@@ -1883,9 +1924,10 @@ does not have, because that reads as coverage while doing nothing.
 (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` and its peers) and the front's
 `SMC_CONTROL_SECRET` are removed: the backend spawns the model subprocess with this
 environment, that subprocess auto-approves every tool, and a turn could otherwise
-read the task role from its own environment and act as it. `KIRO_API_KEY` cannot be
-removed, because kiro-cli re-injects it into the worker and it is the whole
-model-auth mechanism.
+read the task role from its own environment and act as it. The model credential is
+removed on the same grounds, in both of its shapes: the identity reaches the engine
+from the crew's vault through the host auth callback, so the worker needs none in its
+environment.
 
 **A reinstall replaces the bundle's own files and prunes nothing else.**
 `install_bundle` runs at every boot and the data home may be a persistent volume, so
@@ -2007,34 +2049,55 @@ looking for. The container's own writes into the data home already refuse a link
 the destination (`bundle._write_nofollow`); this is the same guard for a file
 another process writes.
 
-### Sandboxed-only, and why there is no opt-in
+### Sandboxed-only, and why removing the credential does not change that
 
 kiro-cli runs the model subprocess inside an unprivileged user namespace, and
-without one `wrap_argv` fails closed. This container runs SANDBOXED-ONLY: there is
-deliberately no config key or environment variable that opts into unsandboxed
-execution, and the supervisor refuses to start on a host that cannot provide the
-sandbox rather than running the worker exposed.
+without one `wrap_argv` fails closed. This container is sandboxed-only: the
+supervisor refuses to start on a host that cannot provide one, loudly, rather than
+answering its port and failing every turn.
 
-The refusal is positive. The probe returns an available verdict, a denied verdict,
-or an `undetermined: <why>` verdict, and only the first proceeds: undetermined
-refuses and names what could not be determined, and so does any verdict the guard
-does not recognise. Reading "could not determine" as "probably fine" fails open as
-new hosts appear, which is the same defect as reading the environment through a
-denylist.
+The credential is nevertheless kept out of the worker's environment, because that is
+worth doing on every host. `build_backend_env` withholds both shapes. The delivered
+identity arrives in the SUPERVISOR's environment as `KIRO_IDENTITY`, is written into
+the crew's encrypted vault by `seed_model_identity`, and is then popped along with
+`KIRO_API_KEY`, which nothing delivers. `acp_backend` is forced to `kas` for the same
+reason: the harness strips the key from the relay's environment and the relay asks the
+host for a token over `_kiro/auth/getAccessToken`, answered by
+`acp/kas_host_auth.answer_get_access_token` inside the backend process.
 
-Why no opt-in, and why the task boundary is not a substitute for one: the model
-subprocess auto-approves every tool and its environment carries `KIRO_API_KEY`, so
-an unsandboxed worker would run an auto-approved shell, driven by untrusted prompt
-content, with a live credential readable in its own environment. The ECS task
-boundary (one owner, one data home, no public endpoint, reached only by an
-authorised call in the owner's own account) does not close that path, because the
-attacker there is the caller's own prompt content, already inside the boundary.
-Offering an unsandboxed posture safely requires brokering the model credential out
-of the worker's environment, which is tracked separately; until then the worker is
-sandboxed or the container does not start. Unprivileged user namespaces are not
-available on Fargate today
+**That is defence in depth, not a licence to drop the sandbox.** What decides whether
+an auto-approved worker is safe is whether it can REACH a credential, not whether one
+is resident in its own environment, and the vault is a route the container cannot
+close. The backend answers the token request from the vault, so the backend's uid must
+be able to decrypt it, and the worker is a child of the backend under that same uid. A
+uid-1000 process reads and decrypts that vault directly. So
+`sandbox_allow_unsandboxed_exec` stays false, and the startup refusal has no
+credential-shaped escape hatch: a clean environment cannot be traded for it.
+
+`verify_sandbox` therefore does two separate things, and the split matters. It ASSERTS
+that the environment handed to the backend carries no credential, refusing on any
+verdict, because that withholding is an invariant this code maintains rather than a
+property of the host — and a value there means it was removed or defeated. It then
+DECIDES on the host's sandbox verdict alone. Taking the posture decision from the
+environment it was handed would be the builder confirming itself: the code that fills
+that dictionary is the code that empties it, so the check could never fail.
+
+The probe returns an available verdict, a denied verdict, or an `undetermined: <why>`
+verdict, and only the first proceeds. Undetermined refuses and names what could not be
+determined, and so does any verdict the guard does not recognise. Reading "could not
+determine" as "probably fine" fails open as new hosts appear, which is the same defect
+as reading the environment through a denylist.
+
+Consequence for Fargate: unprivileged user namespaces are not available there
 ([aws/containers-roadmap#2102](https://github.com/aws/containers-roadmap/issues/2102)),
-so the supported target is a host that permits them.
+Fargate offers no `privileged` flag and no custom seccomp profile, and
+`linuxParameters` admits only `CAP_SYS_PTRACE` — so no task-definition field can
+supply one. The crew container does not run on Fargate today. Closing the remaining
+route is not something this module can do: it needs a user namespace, a worker under a
+different uid from the BACKEND (the gateway's own spawn path, not this container's), or
+a credential not worth stealing — short-lived and narrowly scoped, issued to the task
+rather than to a process. Tracked in
+[#9355](https://github.com/kirodotdev/KiroCrew/issues/9355).
 
 ### Shutdown
 

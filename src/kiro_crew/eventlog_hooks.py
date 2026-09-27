@@ -464,7 +464,9 @@ def _slot_is_still_open_at(slot_key: str, values: dict, observed: dict) -> bool:
 def reconcile_members_at_startup(cfg, state, autonudge_svc) -> int:
     """Reconcile every crew member's log against live state at gateway boot.
 
-    For each global crew member:
+    For each dispatchable global crew member whose resolved slug has exactly
+    one configured claimant and whose existing log header is not owned by
+    another member:
 
     * ``ensure`` its log exists;
     * config-reconcile it (see :func:`reconcile_member_config`), so a config
@@ -483,9 +485,20 @@ def reconcile_members_at_startup(cfg, state, autonudge_svc) -> int:
     closers = 0
     try:
         from kiro_crew import members as members_mod
+        from kiro_crew.crew_log.errors import CrewLogError
         from kiro_crew.eventlog import types
-        from kiro_crew.eventlog.service import get_service
-        from kiro_crew.validation import _AGENT_NAME_RE
+        from kiro_crew.eventlog.service import CloserTailContention, get_service
+
+        # The two ways a closer comes back unplaced against a member another process
+        # is writing: it lost the tail on every attempt, or it was refused write
+        # ownership. Named once and caught as one, because they carry the same three
+        # facts -- the closer is unplaced, nothing is known about whether it applied,
+        # and the closers below it are unaffected -- so a site that handled only one
+        # of them would starve the same siblings through the other door. Retrying is
+        # safe for both: a ``CrewLogError`` is a refusal the store defines as having
+        # written nothing, and ``IndeterminateAppend``, the case that may have
+        # written, is deliberately not one of them and still propagates.
+        closer_unplaced = (CloserTailContention, CrewLogError)
 
         svc = get_service()
         agents = getattr(cfg, "agents", {}) or {}
@@ -503,38 +516,52 @@ def reconcile_members_at_startup(cfg, state, autonudge_svc) -> int:
 
             return _still_open
 
-        for name, agent_cfg in agents.items():
-            if not _AGENT_NAME_RE.match(name):
-                continue
-            try:
-                # member_slug, not slug_for_name: a member with an explicit
-                # member_id keeps that identity, so reconciling by the folded
-                # name would read a different log and leave the real one stale.
-                slug = members_mod.member_slug(name, cfg)
-            except Exception:
-                continue
-            try:
-                svc.ensure(slug, name)
-                snap = svc.snapshot(slug)
-                values = snap.get("values", {}) if isinstance(snap, dict) else {}
-                reconcile_member_config(slug, name, agent_cfg, values.get(types.PROJ_ROSTER, {}))
-                # Patrol closer.
-                wake = values.get(types.PROJ_WAKE, {}) or {}
-                if wake.get("patrol") == "armed":
-                    wake_slot = wake.get("slot_key")
-                    has_loop = False
-                    if autonudge_svc is not None and wake_slot:
-                        try:
-                            get_by_slot = getattr(autonudge_svc, "get_by_slot", None)
-                            has_loop = (
-                                bool(get_by_slot(wake_slot)) if callable(get_by_slot) else False
-                            )
-                        except Exception:
-                            has_loop = False
-                    if not has_loop:
-                        # Re-asked under the write lock: this decision came from a
-                        # snapshot, and the gateway is going live concurrently, so a
-                        # patrol re-armed in between must not be closed by it.
+        def _sweep_member(name: str, agent_cfg, slug: str) -> None:
+            """Reconcile one member, counting each closer into *closers* as it lands.
+
+            Every step is decided from a fresh snapshot and guarded by its own
+            predicate, so running it twice writes nothing twice -- which is what lets
+            the retry pass below simply call it again.
+
+            The count is incremented here rather than returned, because a later closer
+            can raise ``CloserTailContention`` after an earlier one has already landed:
+            a returned total would be discarded with the exception, and the retry pass
+            cannot recover it -- the landed closer has changed the very projection its
+            predicate reads, so the retry correctly declines it. The events are on disk
+            either way; only the report would have been wrong.
+
+            Each closer's contention is caught where it happens and re-raised only
+            after the others have been attempted. Letting it propagate at once would
+            make ONE unlucky closer suppress every later closer for this member: the
+            patrol closer is attempted first, so a patrol that keeps losing the tail
+            would leave the interrupted slots below it untouched in both passes, and
+            those slots would read open until the next boot. Before the tail bound
+            existed each closer's ``None`` decline was already independent of its
+            siblings, so containing the raise keeps that property rather than adding
+            a new one.
+            """
+            nonlocal closers
+            first_unplaced: Exception | None = None
+            svc.ensure(slug, name)
+            snap = svc.snapshot(slug)
+            values = snap.get("values", {}) if isinstance(snap, dict) else {}
+            reconcile_member_config(slug, name, agent_cfg, values.get(types.PROJ_ROSTER, {}))
+            # Patrol closer.
+            wake = values.get(types.PROJ_WAKE, {}) or {}
+            if wake.get("patrol") == "armed":
+                wake_slot = wake.get("slot_key")
+                has_loop = False
+                if autonudge_svc is not None and wake_slot:
+                    try:
+                        get_by_slot = getattr(autonudge_svc, "get_by_slot", None)
+                        has_loop = bool(get_by_slot(wake_slot)) if callable(get_by_slot) else False
+                    except Exception:
+                        has_loop = False
+                if not has_loop:
+                    # Re-asked under the write lock: this decision came from a
+                    # snapshot, and the gateway is going live concurrently, so a
+                    # patrol re-armed in between must not be closed by it.
+                    try:
                         if svc.append_closer_if_still_applies(
                             slug,
                             types.PATROL_STOPPED,
@@ -543,12 +570,15 @@ def reconcile_members_at_startup(cfg, state, autonudge_svc) -> int:
                             observed=values,
                         ):
                             closers += 1
-                # Slot closers.
-                driving = values.get(types.PROJ_DRIVING, {}) or {}
-                for slot_key in driving.get("open", []) or []:
-                    if slot_key not in live_slots:
-                        # Same window as the patrol closer above: a slot reopened
-                        # between the snapshot and this write must survive it.
+                    except closer_unplaced as exc:
+                        first_unplaced = first_unplaced or exc
+            # Slot closers.
+            driving = values.get(types.PROJ_DRIVING, {}) or {}
+            for slot_key in driving.get("open", []) or []:
+                if slot_key not in live_slots:
+                    # Same window as the patrol closer above: a slot reopened
+                    # between the snapshot and this write must survive it.
+                    try:
                         if svc.append_closer_if_still_applies(
                             slug,
                             types.SLOT_CLOSED,
@@ -557,10 +587,95 @@ def reconcile_members_at_startup(cfg, state, autonudge_svc) -> int:
                             observed=values,
                         ):
                             closers += 1
+                    except closer_unplaced as exc:
+                        first_unplaced = first_unplaced or exc
+            if first_unplaced is not None:
+                # Re-raised only now, so the caller's retry pass still sees this
+                # member as contended. Unchanged, so it keeps naming the closer
+                # that actually went unplaced.
+                raise first_unplaced
+
+        contended: list[tuple[str, object, str]] = []
+        members_by_slug: dict[str, list[tuple[str, object]]] = {}
+        claimant_count_by_slug: dict[str, int] = {}
+        non_dispatchable_name_count = 0
+        unresolved_slug_count = 0
+        for name, agent_cfg in agents.items():
+            try:
+                slug = members_mod.member_slug(name, cfg)
             except Exception:
-                logger.debug("startup reconcile failed for slug=%r", slug, exc_info=True)
+                unresolved_slug_count += 1
+                continue
+            claimant_count_by_slug[slug] = claimant_count_by_slug.get(slug, 0) + 1
+            if not members_mod.is_dispatchable_member_name(name):
+                non_dispatchable_name_count += 1
+                continue
+            members_by_slug.setdefault(slug, []).append((name, agent_cfg))
+
+        if non_dispatchable_name_count or unresolved_slug_count:
+            logger.warning(
+                "member event-log startup reconcile skipped %d non-dispatchable name(s) and %d unresolved slug(s)",
+                non_dispatchable_name_count,
+                unresolved_slug_count,
+            )
+
+        for slug, resolved_members in members_by_slug.items():
+            claimant_count = claimant_count_by_slug[slug]
+            if claimant_count != 1:
+                logger.warning(
+                    "member event-log startup reconcile skipped ambiguous slug=%r (%d members)",
+                    slug,
+                    claimant_count,
+                )
+                continue
+            name, agent_cfg = resolved_members[0]
+            try:
+                logged_name = svc.logged_name(slug)
+                if logged_name is not None and logged_name != name:
+                    # Only the EXACT name proves ownership. A header equal to the
+                    # slug is the nameless-writer placeholder, and it is ambiguous
+                    # rather than harmless: a retired member with no ``member_id``
+                    # whose name folded onto itself leaves nothing reserving the
+                    # slug once its row is pruned, so a recreated display-name
+                    # member is handed the identical identity and ``member_slug``
+                    # resolves it here. Writing this member's configuration and
+                    # closers into that log is append-only and unrecoverable, so
+                    # both shapes skip; the diagnostic names the slug only.
+                    kind = "placeholder" if logged_name == slug else "foreign"
+                    logger.warning(
+                        "member event-log startup reconcile skipped slug=%r with %s header",
+                        slug,
+                        kind,
+                    )
+                    continue
+                _sweep_member(name, agent_cfg, slug)
+            except closer_unplaced:
+                contended.append((name, agent_cfg, slug))
+            except Exception:
+                # Slug only, no exception text: a header value or a store error
+                # can carry a stored display name, which this log must not.
+                logger.warning("member event-log startup reconcile failed for slug=%r", slug)
+
+        # This sweep runs ONCE per boot, so a closer that never got a clean window is
+        # not re-decided until the next restart -- the interrupted slot reads open and
+        # the interrupted patrol reads armed until then. What took the window is
+        # another process's burst of appends to that one member, which a pass moments
+        # later is past, so one more attempt is what turns a permanent loss into a
+        # delay. Normally this list is empty and the pass costs nothing.
+        for name, agent_cfg, slug in contended:
+            try:
+                _sweep_member(name, agent_cfg, slug)
+            except closer_unplaced:
+                logger.warning(
+                    "startup reconcile could not place closers for slug=%r: the member's "
+                    "log stayed under foreign writes across a retry pass, so its "
+                    "interrupted state reads open until the next boot re-decides",
+                    slug,
+                )
+            except Exception:
+                logger.warning("member event-log startup reconcile retry failed for slug=%r", slug)
     except Exception:
-        logger.debug("reconcile_members_at_startup failed", exc_info=True)
+        logger.warning("member event-log startup reconcile failed before processing members")
     logger.info("member event-log startup reconcile wrote %d closer event(s)", closers)
     return closers
 

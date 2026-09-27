@@ -450,10 +450,11 @@
       "sensitive": false,
       "tags": [],
       "label": "Sandbox",
-      "help": "Sandbox mode for ACP provider. Default 'auto' engages OS-level isolation (namespace on Linux, sandbox-exec on macOS) and automatically defers to kiro-cli's internal sandbox on macOS when it is enabled (kiro-cli >= 2.13; nested seatbelt causes EPERM). Set to 'off' to skip Kiro Crew's own OS-level sandbox — delegation to kiro-cli's internal sandbox still fires on macOS if it is enabled, and a SECURITY warning is logged when neither layer is active.",
+      "help": "Sandbox mode for ACP provider. Default 'auto' engages OS-level isolation (namespace on Linux, sandbox-exec on macOS) at the standard tier and automatically defers to kiro-cli's internal sandbox on macOS when it is enabled (kiro-cli >= 2.13; nested seatbelt causes EPERM). The standard tier deliberately leaves ~/.aws, ~/.ssh and ~/.kube visible to the agent's shell so the aws CLI, boto3 credential_process, git-over-SSH and kubectl keep working; the file tools still refuse those paths. Set to 'strict' to also hide ~/.aws (including ~/.aws/sso/cache, kiro-cli's grant store for OAuth-connected remote MCP servers), ~/.ssh (except known_hosts), ~/.kube and ~/.config/gh, plus the credential files ~/.npmrc, ~/.pypirc, ~/.netrc and ~/.git-credentials, from every agent subprocess -- opt-in, and inside the agent it breaks the aws CLI, boto3, git-over-SSH, gh, kubectl, npm/pip registry auth, .netrc HTTPS auth, the git credential store and remote-MCP OAuth for the same reason. Like every value of this key, a change applies to sessions started after it; a session already running keeps the tier it was spawned with until it ends. 'strict' changes nothing where Kiro Crew applies no sandbox of its own: Windows has no OS backend, and a macOS spawn delegated to kiro-cli's internal sandbox is confined by that profile instead. Set to 'off' to skip Kiro Crew's own OS-level sandbox -- delegation to kiro-cli's internal sandbox still fires on macOS if it is enabled, and a SECURITY warning is logged when neither layer is active.",
       "hasChildren": false,
       "enumValues": [
         "auto",
+        "strict",
         "off"
       ],
       "defaultValue": "auto"
@@ -1951,6 +1952,7 @@
         "persistence_enabled": true,
         "inject_memory": true,
         "inject_lessons": true,
+        "inject_activity": true,
         "migrated": false
       }
     },
@@ -2347,6 +2349,20 @@
       "tags": [],
       "label": "Inject Lessons Context",
       "help": "Inject the learned-corrections and user-profile blocks into new-session context.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
+      "path": "memory.inject_activity",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Inject Memory Activity",
+      "help": "Inject the recent activity block (active projects, daily history (14 full days, then decayed summaries and counts to day 180), task facts and relevant past episodes) into new-session context as a budgeted background block. Off: only preferences and the activity index ship at session start and older material is read through memory_recall. Requires inject_memory.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
@@ -2997,7 +3013,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Assistant Excerpt Size",
-      "help": "Characters kept from each end of an assistant message when building the summarization input (>=80). User messages are always included in full -- they carry intent and are small -- while assistant output is excerpted because it holds the progress detail but dominates the transcript.",
+      "help": "Characters kept from each end of an assistant message when building the summarization input (>=80). User messages are included in full unless the whole input exceeds the fixed 40,000-character summary input limit -- they carry intent and are small -- while assistant output is excerpted because it holds the progress detail but dominates the transcript. Past that limit, middle turns are dropped and any turn is cut to about 5,000 characters per end, so larger values stop helping.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 400
@@ -3942,7 +3958,7 @@
       "enumValues": null,
       "defaultValue": {
         "extra_path_dirs": [],
-        "honour_auto_approve": false
+        "honour_auto_approve": true
       }
     },
     {
@@ -3983,10 +3999,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Honour MCP autoApprove",
-      "help": "Keep an ``autoApprove`` list no server spec declares -- one hand-added to ``mcp.json`` -- in the agent config Kiro Crew writes. Off by default, and off DROPS those verbs: such a tool is approved locally with no permission request, so no approval card is ever shown for it. A ceiling strips the key whatever this says; a verb a spec declares is kept either way. Applies at restart, when the spec is rebuilt, so turning it off does not retract a grant already in the file.",
+      "help": "Keep an ``autoApprove`` list you wrote yourself -- one hand-added to ``mcp.json`` or to an agent file -- in the agent config Kiro Crew writes. On by default: an ``autoApprove`` is a deliberate choice about your own tools and is respected, so those verbs run without an approval card. Know what it costs before writing one: the agent runtime approves such a call locally and emits no permission request, so Kiro Crew's own tool gate never runs for it. Turn this OFF to drop every verb no server spec declares, which puts those tools back through the gate. A governance ceiling strips the key whatever this says, and a verb a spec declares is kept either way. Applies at restart, when the spec is rebuilt, so a change does not retract or restore a grant already in the file.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": false,
+      "defaultValue": true,
       "requiresRestart": true
     },
     {
@@ -4186,8 +4202,23 @@
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {
+        "max_runtime_secs": 604800,
         "prefer_structured_arming": false
       }
+    },
+    {
+      "path": "monitoring.max_runtime_secs",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Maximum monitoring runtime (seconds)",
+      "help": "Finite wall-clock ceiling for new and updated monitors. Accepts up to 2592000 seconds (30 days). Raising this limit never extends an existing deadline.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 604800
     },
     {
       "path": "monitoring.prefer_structured_arming",
@@ -5866,7 +5897,7 @@
         "whatsapp"
       ],
       "label": "Allowed WhatsApp IDs",
-      "help": "Phone numbers (digits only, country code, no '+') additionally permitted to DM the agent when dm_policy='allowlist'. Empty adds nobody beyond the linked account.",
+      "help": "Phone numbers (digits only, country code, no '+') permitted to address the agent besides the linked account: in direct chats when dm_policy='allowlist', and in every configured group regardless of dm_policy (a group member not listed here is dropped silently, even when they @-mention the agent or the group is in 'rules' mode). Empty adds nobody beyond the linked account.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": []
@@ -5896,7 +5927,7 @@
         "whatsapp"
       ],
       "label": "Group Rules",
-      "help": "Per-group participation rules. Each entry: {'jid': group JID (…@g.us), 'name': display label, 'mode': 'mention' (reply only when @-mentioned or quoted, the default) | 'rules' (also speak unprompted when the entry's rules say the agent can genuinely help) | 'off', 'rules': free-text guidance for when to speak, 'cooldown_s': minimum seconds between unprompted replies (default 120)}. Groups not listed are ignored entirely.",
+      "help": "Per-group participation rules. Each entry: {'jid': group JID (…@g.us), 'name': display label, 'mode': 'mention' (reply only when @-mentioned or quoted, the default) | 'rules' (also speak unprompted when the entry's rules say the agent can genuinely help) | 'off', 'rules': free-text guidance for when to speak, 'cooldown_s': minimum seconds between unprompted replies (default 120)}. Groups not listed are ignored entirely. Listing a group lets the agent speak there; it does not admit its members: only you and the numbers in allowed_wa_ids can make the agent reply.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": []
@@ -7034,6 +7065,7 @@
         "theme_color": "",
         "language": "",
         "recent_tint_count": 0,
+        "folder_sort": "custom",
         "update_nudge": {},
         "onboarded": false,
         "import_onboarded": false,
@@ -7836,6 +7868,24 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0
+    },
+    {
+      "path": "dashboard.folder_sort",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Sidebar Folder Order",
+      "help": "How the chat sidebar orders session folders: 'custom' keeps the stored positions (set by dragging a folder or by chat_folder_move), 'name' is an ASCII-case-insensitive natural order (01. < 02. < 10.; A-Z fold to a-z, other letters compare as written), 'created' is newest first. A view preference only -- choosing a mode never rewrites the stored positions, so switching back to 'custom' restores them exactly. Read by the sidebar and by chat_folder_tree, which lists folders in the order the sidebar draws them.",
+      "hasChildren": false,
+      "enumValues": [
+        "custom",
+        "name",
+        "created"
+      ],
+      "defaultValue": "custom"
     },
     {
       "path": "dashboard.update_nudge",

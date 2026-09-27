@@ -15,6 +15,7 @@ build is driven by [`packaging/build-desktop.sh`](../../packaging/build-desktop.
 ```bash
 make desktop               # macOS: universal DMG + update ZIP · Linux: AppImage + deb + rpm
 UNIVERSAL=0 make desktop   # macOS: faster host-arch-only DMG + ZIP (local iteration)
+UNIVERSAL=0 TARGET_ARCH=x86_64 make desktop   # macOS: single-arch DMG for a NAMED arch (arm64 | x86_64)
 ```
 
 Output lands in **`website/electron/dist/`**:
@@ -23,6 +24,7 @@ Output lands in **`website/electron/dist/`**:
 |---------|----------|----------|
 | `make desktop` | macOS | `KiroCrew-<version>-universal.dmg` plus `KiroCrew-<version>-universal-mac.zip` |
 | `UNIVERSAL=0 make desktop` | macOS | Host-arch DMG plus the matching `*-mac.zip` update archive |
+| `UNIVERSAL=0 TARGET_ARCH=<arch> make desktop` | macOS | `KiroCrew-<version>-arm64.dmg` / `KiroCrew-<version>-x64.dmg` plus `KiroCrew-<version>-<arch>-mac.zip` — the arch is always spelled, x64 included |
 | `make desktop` | Linux | `KiroCrew-*.AppImage`, `*.deb`, `*.rpm` (host arch) |
 
 The electron-builder configuration lives in
@@ -79,6 +81,105 @@ It needs only
 an Apple-Silicon host with Rosetta 2; the script fails fast with instructions
 otherwise, and `UNIVERSAL=0` is the opt-out.)
 
+### Bundled kiro-cli — the app carries its own agent runtime
+
+By default (`BUNDLE_KIRO_CLI=1`), the build stages a pinned, sha256-verified
+kiro-cli into the app's resources at `backend-dist/kiro-cli/`. On macOS and
+Linux, the staged payload is the single `kiro-cli-chat` binary, not upstream's
+layout: the `kiro-cli` launcher resolves `kiro-cli-chat` through `$HOME/.local/bin` and
+`PATH` and never through its own directory, so a bundle entered through the
+launcher would silently run whatever copy the user has installed (or fail on a
+clean machine) while still answering `--version` and `whoami` itself.
+`kiro-cli-chat` is the process every session is anyway and carries every
+subcommand the app uses. The Windows build administratively extracts the
+upstream MSI without installing it or writing PATH/registry state, then stages
+its one self-contained `kiro-cli.exe`; `kiro_cli.bundled_kiro_cli_entry` owns
+the platform split. The release is pinned in two files that travel together:
+`packaging/kiro-cli-version`
+names the version and `packaging/kiro-cli-sha256` holds the sha256 of each
+artifact the build stages (the universal macOS DMG, the two Linux gnu zips, and
+the Windows x64 MSI) in
+`sha256sum` format keyed by the artifact's release path, `<version>/<file>`.
+Upstream hosts every release under that prefix but publishes a manifest — the
+only document naming sha256s — for `latest` alone, so a pinned build fetches the
+pinned version's own artifact URL and verifies it against the committed sha: it
+never reads the mutable manifest, a hotfix rebuild of an older tag keeps working
+after upstream releases, and a version bump without matching sha lines fails
+closed with the bump procedure in the error. `build-desktop.yml` passes the pin
+explicitly so the lane log names the release it bundled; `KIRO_CLI_VERSION=latest`
+resolves the manifest instead and takes the version and sha it names, for a local
+build that wants the newest release (still sha256-verified). Bumping both files,
+after testing the app against the new release, is the whole procedure for
+shipping a newer kiro-cli ([release](release.md), step 1). On macOS the binary is
+extracted from the universal `Kiro CLI.dmg` (one Mach-O serves both arches; the
+DMG download is ~360 MB for kiro-cli 2.24); Linux uses the matching per-arch zip
+(~160 MB); Windows uses the x64 MSI (~190 MB). Downloads are cached per user
+under `~/.cache/kirocrew-build/kiro-cli`,
+so a rebuild against the same pin fetches nothing. A `BUNDLED-VERSION` file
+beside the payload records provenance; a clean-room smoke — empty `HOME`, minimal
+`PATH`, so no install on the build host can answer for the staged binary — runs
+`--version` and then one ACP `initialize` round trip over stdio, the call every
+Kiro Crew session opens with, so the lane log on each platform proves the lone
+binary is self-contained there before it is sealed into the app; and a layout
+gate refuses a payload that carries a nested `.app`/`.framework` under
+`Resources/`, which the signing manifest cannot seal per file.
+
+At runtime the Electron shell (`gateway-env.js`, `bundledKiroCliEnvironment`)
+exports the directory as `KIROCREW_BUNDLED_KIRO_DIR` when it spawns the
+gateway, and only when the directory shipped; the backend resolver
+(`kiro_cli.known_kiro_cli_dirs`) ranks it **above** any system install (the app
+was built against that exact version) but **below** the `KIROCREW_KIRO_BIN`
+operator override. That override is the escape when the pinned release must be
+swapped without waiting for an app update, and a Finder- or Dock-launched app
+does not read the user's shell profile, so it is set the way
+[macos-troubleshooting](../guides/macos-troubleshooting.md) sets `PATH` for the
+app: `launchctl setenv KIROCREW_KIRO_BIN /absolute/path/to/kiro-cli`, then
+relaunch the app (the Electron shell spawns the gateway with its own
+environment, `main.js`, so a launchd-session variable reaches the resolver); on
+Linux the equivalent is `systemctl --user set-environment` for a
+desktop-session launcher. The same ranking feeds the pinned off-`PATH` spawns
+(`pin_kiro_cli`), so the version check, the readiness probe and every ACP
+session all run the bundled copy. The shell hands the directory over only after
+the staged entry has answered `--version` on the user's machine (one bounded
+`spawnSync` in `gateway-env.js`): a copy that is present but does not run there
+-- a glibc below the binary's floor, a quarantine flag, a truncated payload --
+is logged and NOT exported, so discovery falls through to the user's own
+kiro-cli exactly as an unbundled build does instead of every session failing
+on a binary the user never chose. Beside the directory, the shell sets
+`KIRO_NO_AUTO_UPDATE=1` once for the whole gateway process tree, so every child
+that runs the bundled copy — ACP sessions, the model listing, `whoami`, the
+usage scrape, `kirocrew doctor`, the readiness probes — inherits kiro-cli's
+documented switch for its startup update check by construction, rather than
+each spawn site remembering to merge it. Upstream compiles that check for
+Windows (the upstream chat-cli crate's `cli/mod.rs` at v2.24.0 gates the
+whole block on `target_os = "windows"`; upstream's auto-update guide documents
+the variable), so it stops the bundled Windows copy from self-updating. It also
+guards upstream's stated "FUTURE: re-enable for all platforms", which would
+otherwise write into the signed, sealed bundle. Accepted side effect: a system
+kiro-cli an operator forces through `KIROCREW_KIRO_BIN` also skips the check
+while running as a child of the app (its own terminal use is unaffected), and
+the user's `app.disableAutoupdates` setting is never written. The setup gate
+serves the copy's quoted absolute path as the click-to-copy sign-in command (it
+is not on the user's shell `PATH`) with a one-line hint that the path is the
+app's built-in kiro-cli (`bundled_cli` in the status payload). On Windows that
+command also sets `KIRO_NO_AUTO_UPDATE` for itself (`Set-Item Env:…` inside the
+`powershell.exe -Command` string, which an interactive PowerShell would
+interpolate away if it were `$env:`): the user's terminal is outside the
+gateway tree, and it is the Windows copy that compiles the self-update. The
+gate refuses the
+in-place **Update** (and the gateway auto-update's `kiro-cli update`
+step, and `kirocrew update`'s) because the copy is replaced by the next app
+update. `kiro-cli login` is still the user's own step — bundling covers the
+binary, never the credential. The Windows install smoke (`scripts/smoke-windows-install.ps1`) then checks the INSTALLED tree: the staged `kiro-cli.exe` runs from where the installer put it and reports the pinned version, and the installed `kirocrew doctor` resolves that copy when `KIROCREW_BUNDLED_KIRO_DIR` names its directory. The macOS install smoke (`scripts/smoke-macos-install.sh`, job `smoke-install-macos` in `build-desktop.yml`) mounts the unsigned DMG, copies the app out, runs the installed launcher and the installed `kiro-cli-chat`, then launches the REAL app and reads the gateway child's environment back: `KIROCREW_BUNDLED_KIRO_DIR` and `KIRO_NO_AUTO_UPDATE=1` present, no probe fall-through line in `gateway-launch.log`, and the installed doctor resolving the bundled copy. That launch is the only place the shell's hand-off runs against a shipped bundle.
+
+The payload adds one Mach-O of a few hundred MB to the macOS signing zip (about
+1 GB in total), which is what `packaging/signing/sign.sh`'s poll window is sized
+for.
+
+`BUNDLE_KIRO_CLI=0 make desktop` opts a build out (the payload is large);
+the app then detects a system kiro-cli exactly as before. The Windows installer
+grows by about 190 MB before outer installer compression.
+
 ### macOS opt-out and Linux — host-arch-only builds
 
 `UNIVERSAL=0 make desktop` (and every Linux build) produces an installer for
@@ -92,9 +193,24 @@ an Intel Mac where the universal build cannot run. Per-arch targets:
 | Target | Build host | Produces |
 |--------|-----------|----------|
 | macOS arm64 (Apple Silicon) | Apple Silicon Mac (`UNIVERSAL=0`) | arm64 `.dmg` + matching `*-mac.zip` |
-| macOS x86_64 (Intel) | Intel Mac | x86_64 `.dmg` + matching `*-mac.zip` |
+| macOS x86_64 (Intel) | Intel Mac, **or** an Apple Silicon Mac with Rosetta 2 (`UNIVERSAL=0 TARGET_ARCH=x86_64`) | x86_64 `.dmg` + matching `*-mac.zip` |
 | Linux x86_64 | x86_64 Linux | x86_64 `.AppImage`, `.deb`, `.rpm` |
 | Linux aarch64 (Graviton/ARM) | aarch64 Linux | aarch64 `.AppImage`, `.deb`, `.rpm` |
+
+**Naming an arch instead of taking the host's.** `TARGET_ARCH=arm64|x86_64`
+(macOS, `UNIVERSAL=0` only) makes a single-arch build *for* that arch: the
+script provisions that arch's python-build-standalone interpreter (x86_64
+runs under Rosetta 2 on Apple Silicon, exactly as the universal build's
+x86_64 half does), arch-gates the bundled backend with `file`, passes
+`--arm64` / `--x64` to electron-builder, and post-gates the shell binary with
+`lipo -archs` so a host-arch shell can never land in an x86_64-labelled DMG.
+The artifact always spells its arch (`-arm64` / `-x64`), including for x64,
+where electron-builder's default pattern would otherwise drop it; the ZIP
+keeps electron-builder's `-mac.zip` suffix. `scripts/emit-symbols-manifest.mjs`
+reads the same variable so the symbols pin records the arch actually built.
+`TARGET_ARCH=arm64` needs an Apple Silicon host (an Intel Mac cannot run the
+arm64 backend it would have to gate); any other value, any use outside
+macOS, or setting it while `UNIVERSAL=1` is in effect, is refused.
 
 **Both Linux architectures ship.** `build-desktop.yml` builds them on
 `ubuntu-22.04` and `ubuntu-22.04-arm`, and `publish-linux.yml` runs once per
@@ -127,6 +243,9 @@ Two properties are load-bearing and worth knowing before you touch that lane:
   than assuming it equals the runner's glibc. The AppImage links against
   it, which is why both Linux legs stay on 22.04 (glibc 2.35) rather than moving
   to 24.04 (2.39) — the newer floor would exclude AL2023, Debian 12 and RHEL 9.
+  The bundled kiro-cli 2.24.0 stays inside that floor: `kiro-cli-chat` requires
+  `GLIBC_2.34` on x86_64 and `GLIBC_2.30` on aarch64, so it does not narrow the
+  supported distro set. Re-measure both pinned zips when updating the CLI pin.
 
 **Building your own package locally.** `make desktop` needs no arch flags: it
 detects the host and emits an AppImage for it, so running it on an ARM box
@@ -138,6 +257,22 @@ it builds the full matrix and uploads artifacts, with no publish lane attached.
 
 Anything you **distribute** for macOS should be the universal DMG — the
 host-arch build is a local-machine artifact.
+
+**Single-arch macOS DMGs in CI (opt-in, build-only).** `build-desktop.yml` has
+a second macOS job, `build-desktop-mac-single-arch`, behind the boolean input
+`mac_single_arch` (default `false`; `nightly.yml` passes `true`, `release.yml`
+keeps the default). When on, it runs the script twice on `macos-15` —
+`UNIVERSAL=0 TARGET_ARCH=arm64` and
+`UNIVERSAL=0 TARGET_ARCH=x86_64` — and uploads `unsigned-build-darwin-arm64`
+and `unsigned-build-darwin-x64` beside `unsigned-build-darwin-universal`.
+Nothing downstream consumes them: `sign-and-notarize.yml` excludes those two
+artifact names when it flattens the run's artifacts, so its "first `*-mac.zip`"
+pick and exactly-one-DMG assertion still see only the universal build, and the
+feed still has one `latest-mac.yml`. The job is `continue-on-error`, because
+build-only artifacts must never hold the universal signing or the Linux
+publishers. Per-arch signing and feeds are a separate, future lane. To get the
+two DMGs from any ref, dispatch `build-desktop.yml` manually with the box
+ticked, or pick them up from the nightly run.
 
 Prerequisite: **Rosetta 2** on the build machine
 (`softwareupdate --install-rosetta --agree-to-license`) — the x86_64 PBS
@@ -313,6 +448,7 @@ The script honors these environment flags:
 | Flag | Effect |
 |------|--------|
 | `UNIVERSAL=0` | macOS: opt out of the universal default — host-arch-only build (faster local iteration; the only option on an Intel Mac). Universal (`UNIVERSAL=1`) is the macOS default; Linux is always host-arch |
+| `TARGET_ARCH=arm64` / `TARGET_ARCH=x86_64` | macOS, with `UNIVERSAL=0`: build the single-arch app for the NAMED arch rather than the host's (x86_64 on Apple Silicon runs under Rosetta 2). Arch-gates the backend and the shell; the artifact always carries `-arm64` / `-x64`. Refused outside macOS or with any other value |
 | `SKIP_FRONTEND=1` | Reuse an already-built `website/dist` |
 | `SKIP_ELECTRON=1` | Stop after the bundled backend (no electron-builder) |
 
@@ -402,9 +538,24 @@ interpreter then dies on `from urllib.parse import …` reached through
 check probes stdlib packages spread across the alphabet — via each one's
 `__init__.py`, since an extractor creates a directory before filling it and a
 top-level `.py` file lands with the early batch — and, when any are missing,
-reports "still being installed" through the normal gateway-failure dialog, whose
-**Retry** succeeds once extraction completes. It stays silent for the legacy
-flat layout, which carries no interpreter tree to verify.
+reports "still being installed" through the normal gateway-failure dialog. It
+stays silent for the legacy flat layout, which carries no interpreter tree to
+verify.
+
+That dialog does not wait for a click. While it is open it re-runs the same
+refusal predicate (`launchBlockingBundleParts`, shared with the launcher so the
+probe can never be laxer than the refusal) every five seconds, repaints the
+remaining-component count in place, and — once every part is on disk — shows
+"Installation finished", lingers briefly, and fires its own **Retry**. That is
+the very action the button fires, resolved through the same window-closed
+handshake, so it re-enters `startGateway()` exactly once by the ordinary path
+and introduces no second respawn owner beside `recoverWedgedGateway` or the
+liveness monitor. A click always wins over the probe, and the probe stands down
+when an update install is dispatched (the updater stops the gateway on purpose)
+or the app is quitting. Only the pre-spawn refusal arms it; the reclassified
+crash below keeps the manual **Retry**, because there the probe cannot see what
+is missing and a permanently truncated bundle would otherwise respawn and crash
+on every tick.
 
 That pre-spawn check cannot be complete, and does not pretend to be: extraction
 order *within* a package is not the app's to control, so `import zoneinfo` can
@@ -468,8 +619,10 @@ so a `node`-less build environment still produces a bundle (unvalidated).
 The gateway-hosted dashboard then checks both prerequisites needed by the ACP
 provider:
 
-1. It discovers `kiro-cli` in the inherited `PATH`, `~/.local/bin`,
-   `~/.cargo/bin`, Homebrew locations, or the macOS `Kiro CLI.app` bundle.
+1. It discovers the app's own bundled copy — `kiro-cli-chat` in
+   `KIROCREW_BUNDLED_KIRO_DIR`, when built with one — then `kiro-cli` on the inherited
+   `PATH`, `~/.local/bin`, `~/.cargo/bin`, Homebrew locations, or the macOS
+   `Kiro CLI.app` bundle.
 2. It verifies the first candidate selected by the shared ACP resolver with
    `kiro-cli --version`. A broken or untrusted higher-priority candidate blocks
    readiness instead of approving a later binary that ACP would not launch.
@@ -739,7 +892,7 @@ after right-click → Open or `xattr -dr com.apple.quarantine KiroCrew.app`.)
 
 The build is already wired for this — `website/electron/package.json` enables
 `hardenedRuntime` with `build/entitlements.mac.plist`, and the
-`scripts/notarize.js` afterSign hook notarizes when credentials are present and
+`website/electron/scripts/notarize.js` afterSign hook notarizes when credentials are present and
 silently skips when they aren't. You only supply the secrets at build time via
 env vars (nothing is committed):
 

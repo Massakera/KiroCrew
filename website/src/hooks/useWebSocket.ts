@@ -1,13 +1,52 @@
 import { useEffect, useRef, useCallback } from 'react'
+import { purgeDocumentBodiesForRedactionChange } from './usePanelTabs'
+
+/** After a reconnect, re-read the owner's credential-redaction switch and purge
+ *  this document's file bodies when that could matter (the
+ *  `credential_redaction_changed` push has no replay):
+ *   - the document had read the switch and its position CHANGED while the
+ *     socket was down; or
+ *   - the document had NOT read the switch (never visited Settings) and it is
+ *     now ON -- a file opened raw while OFF may be on screen, and nothing else
+ *     would ever re-read it.
+ *  Unmoved, or unknown-and-still-OFF, costs nothing: a transient drop must not
+ *  close every diff tab and empty every clean file body. A non-owner's 403 is
+ *  swallowed: the card handles that; the socket has nothing to purge for. */
+let redactionSwitchUnreadable = false
+/** Test seam: forget a latched refusal. */
+export function __resetRedactionHealForTests(): void { redactionSwitchUnreadable = false }
+
+export async function healRedactionSwitchAfterReconnect(qc: QueryClient): Promise<void> {
+  // A document the owner gate refused once (a Slack allow-listed non-owner's
+  // `!dashboard`) is refused on every reconnect too, and each ask writes an
+  // audited refusal for a subject that took no action: ask once, then stop.
+  if (redactionSwitchUnreadable) return
+  const before = qc.getQueryData<{ enabled: boolean }>(['credential-redaction'])
+  let after: { enabled: boolean; changed_at?: string } | undefined
+  try {
+    after = await qc.fetchQuery({ queryKey: ['credential-redaction'], queryFn: () => api.credentialRedaction(), staleTime: 0 })
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 403 || e.status === 401)) redactionSwitchUnreadable = true
+    return
+  }
+  if (!after) return
+  const moved = before !== undefined && after.enabled !== before.enabled
+  // Unknown position and ON: purge only if the switch has EVER been flipped
+  // (`changed_at` set). In the shipped default -- ON, never flipped, Settings
+  // never opened -- no raw body can exist, and a transient drop must not close
+  // every diff tab and empty every clean file body for nothing.
+  const unknownAndNowOn = before === undefined && after.enabled && !!after.changed_at
+  if (moved || unknownAndNowOn) purgeDocumentBodiesForRedactionChange(qc)
+}
 import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { isArtifactEditing } from '../utils/artifactEditGuard'
 import { isReconcileNote } from '../lib/noteContract'
 import { approvalNotificationBody } from '../lib/approvalNotificationBody'
 import { useAppDispatch, useAppSelector } from '../store'
 import { store } from '../store'
-import { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, sseMcpReportUpdate, setChannelTrusted, sseSlotTitle, triggerRefresh, fetchSlots, markSlotUnread, remoteSlotRead, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail } from '../store/dashboardSlice'
+import { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, sseMcpReportUpdate, setChannelTrusted, sseSlotTitle, sseSlotPatch, triggerRefresh, fetchSlots, markSlotUnread, remoteSlotRead, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail, type SlotPatchFrame } from '../store/dashboardSlice'
 import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, clearAllNotifications, fetchNotifications, markBootNotificationsFetched } from '../store/notificationsSlice'
-import { dispatchMcNotification, dispatchLiveNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone } from './notificationEvent'
+import { dispatchMcNotification, dispatchLiveNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone, shouldChimeOnPermissionRow } from './notificationEvent'
 import { shouldNotifyOnChatComplete } from './chatCompleteNotify'
 import { postNativeNotification } from '../lib/nativeNotify'
 import { isChatPath } from './notificationBanner'
@@ -26,10 +65,14 @@ import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
 import { TAB_ID } from '../api/tabId'
 import { api } from '../api/client'
+// From the leaf module, not `api/client`: the many tests that mock the client
+// do not export ApiError, and an `instanceof` against a missing mock export
+// throws inside the reconnect heal's own catch.
+import { ApiError } from '../api/apiError'
 import { AUTONUDGE_LOOPS_QUERY_KEY } from '../components/autoNudgeLoop'
 import { forgetUnobservedMemberThreads } from '../api/membersQuery'
 import { observedPaneSlots } from '../api/slotMessagesQuery'
-import { MEMBERS_ROSTER_QUERY_KEY } from '../api/membersQuery'
+import { MEMBERS_ROSTER_QUERY_KEY, MEMBER_PROJECTIONS_QUERY_PREFIX } from '../api/membersQuery'
 import { memberProjectionStore } from '../state/memberProjectionStore'
 import { threadLiveStore, type ThreadReplyFrame } from '../state/threadLiveStore'
 import { threadQueryKey, threadsQueryKey } from '../api/threads'
@@ -88,6 +131,15 @@ const isSlotOnScreen = (slot: string): boolean =>
 const isSlotRenderedVisibly = (slot: string): boolean =>
   isChatSurfaceVisible() || slot === getViewedThreadSlot()
 const WORKFLOW_HEAL_MS = 15000
+/** A socket that has delivered nothing for this long while the page is visible
+ *  is treated as dead, even when its `readyState` still reads OPEN. The gateway
+ *  pushes a `dashboard` status frame on every socket every 5s
+ *  (`_WS_STATUS_INTERVAL` in `dashboard/ws.py`), so this is four missed ticks. */
+export const WS_SILENCE_MS = 20_000
+/** How often the silence check runs: the status frame's own cadence. */
+export const WS_SILENCE_CHECK_MS = 5_000
+/** Ceiling for the silence window after repeated silent reconnects. */
+export const WS_SILENCE_MAX_MS = 300_000
 const LEGACY_AUTOMATION_SEED_QUERY_KEY = ['automation-seed', 'legacy'] as const
 const STRUCTURED_AUTOMATION_SEED_QUERY_KEY = ['automation-seed', 'structured'] as const
 
@@ -366,6 +418,16 @@ export function useWebSocket() {
   const logCbRef = useRef<LogCallback>(null)
   const subagentSubRef = useRef(false)
   const reconnectRef = useRef(1000)
+  // Silence watchdog state (see WS_SILENCE_MS), kept in visible time: when the
+  // current socket last delivered a frame, when its silence clock started (at
+  // open), when the page was hidden (0 while visible), until when a socket
+  // thawed by a return is spared, and how many silent sockets in a row the
+  // watchdog has replaced.
+  const lastFrameAtRef = useRef(0)
+  const silenceClockStartedAtRef = useRef(0)
+  const hiddenAtRef = useRef(0)
+  const graceUntilRef = useRef(0)
+  const silentReconnectsRef = useRef(0)
   const wasConnectedRef = useRef(false)
   const reconnectingRef = useRef(false)  // suppress markSlotUnread during reconnect catch-up
   const lastVersionRef = useRef<string | null>(null)
@@ -454,6 +516,15 @@ export function useWebSocket() {
     voicePlayingRef.current = false
     dispatch(setVoicePlaying(false))
   }, [dispatch])
+
+  const releaseVoiceOnSocketLoss = useCallback(() => {
+    if (!voiceRequestsRef.current.size && !voicePlayingRef.current && !store.getState().chat.voicePlaying) return
+    reportVoiceFailure({
+      slot: store.getState().chat.activeSlot, code: 'voice_playback_failed',
+    })
+    // Audio frames have no reconnect replay, so release the incomplete stream.
+    stopVoice()
+  }, [stopVoice])
 
   const getPcmPlayer = useCallback(() => {
     pcmPlayerRef.current ??= new VoicePcmPlayer(
@@ -896,6 +967,7 @@ export function useWebSocket() {
           slot: q.slot as string,
           ask_id: q.ask_id,
           card_id: q.card_id,
+          native: q.native,
           questions: q.questions as Parameters<typeof setQuestionCard>[0]['questions'],
         }))
       }
@@ -1174,11 +1246,18 @@ export function useWebSocket() {
     if (closingRef.current) return  // component unmounted, don't reconnect
     // closingRef invariant: reset by useEffect before calling connect()
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${proto}//${location.host}/api/ws`)
+    // `caps=slot_patch`: this bundle applies one-row `slot_patch` frames, so
+    // the gateway sends those instead of the full slot list after a pin,
+    // rename, folder move or close. A gateway that predates the frame ignores
+    // the parameter and keeps sending full lists, which this handler still
+    // applies.
+    const ws = new WebSocket(`${proto}//${location.host}/api/ws?caps=slot_patch`)
     wsRef.current = ws
 
     ws.onopen = () => {
       reconnectRef.current = 1000
+      silenceClockStartedAtRef.current = Date.now()
+      lastFrameAtRef.current = silenceClockStartedAtRef.current
       // Forget the last-seen allowlist generation: it is process-local to the
       // gateway, so after a restart an equal number can mean a different
       // allowlist. Clearing it makes the next generation frame refetch.
@@ -1261,6 +1340,16 @@ export function useWebSocket() {
         // comes back with its folders missing.
         queryClient.invalidateQueries({ queryKey: ['artifacts'] })
         queryClient.invalidateQueries({ queryKey: ['artifact-folders'] })
+        // `credential_redaction_changed` is pushed to CONNECTED owner sockets
+        // with no replay, so a flip made from another window while this socket
+        // was down never reached this document. Re-read the switch and, ONLY if
+        // its position differs from the one this document last held, drop every
+        // file body (react-query and open tabs) exactly as the frame would have.
+        // Not unconditionally: a transient drop (sleep/wake, Wi-Fi change,
+        // gateway restart) must not close every diff tab and empty every clean
+        // file body when the switch never moved. A document that never read the
+        // switch has nothing to compare and nothing raw to drop.
+        void healRedactionSwitchAfterReconnect(queryClient).catch(() => { /* a heal that cannot run leaves the document as it was */ })
         // Same one-shot problem for a reply thread on a crewmate chat message:
         // the terminal `chat.thread_reply` frame of a reply that finished while
         // the socket was down was never delivered, so the live store would show
@@ -1335,9 +1424,11 @@ export function useWebSocket() {
         // socket died — for good, until a remount. The observed hydrate queries
         // are the registry of on-screen panes (api/slotMessagesQuery.ts): warm
         // each once through the same sanctioned path, which reconciles the rows
-        // to the server's canonical transcript, idles the run indicator only
-        // when the server says the turn ended, and raises the chunk replay
-        // floor when it is still live. The active slot is skipped here and
+        // to the server's canonical transcript, settles the run indicator to
+        // the server's answer (idle when the turn ended, streaming when one
+        // started during the outage) unless a live frame ordered after the
+        // warm already wrote it, and raises the chunk replay floor when the
+        // turn is still live. The active slot is skipped here and
         // again inside the thunk.
         for (const slot of observedPaneSlots(queryClient)) {
           if (slot === active || warmed.has(slot)) continue
@@ -1406,6 +1497,7 @@ export function useWebSocket() {
     }
 
     ws.onmessage = (e) => {
+      if (wsRef.current === ws) lastFrameAtRef.current = Date.now()
       try {
         const msg = JSON.parse(e.data)
         const { type, data } = msg
@@ -1436,6 +1528,8 @@ export function useWebSocket() {
             if (raw === lastSlotsRawRef.current
                 && store.getState().dashboard.slots === lastSlotsArrayRef.current) break
             lastSlotsRawRef.current = raw
+            // Query keys this frame has made stale; flushed once at the end.
+            const staleKeys = new Set<'chat-folders' | 'dashboardConfig'>()
             dispatch(sseSlots(data as ChatSlot[]))
             lastSlotsArrayRef.current = store.getState().dashboard.slots
             if (msg.yolo !== undefined) {
@@ -1483,7 +1577,7 @@ export function useWebSocket() {
                 queryClient.setQueryData<ChatFolder[]>(['chat-folders'], msg.folders as ChatFolder[])
                 // Backfill history_count (omitted from the WS payload) — the seed
                 // marked the query fresh, so nudge the real GET to run.
-                queryClient.invalidateQueries({ queryKey: ['chat-folders'] })
+                staleKeys.add('chat-folders')
               }
             }
             // Refetch the folder tree when the STORE changed, for every source of
@@ -1509,7 +1603,7 @@ export function useWebSocket() {
               const prevFoldersGen = lastFoldersGenRef.current
               lastFoldersGenRef.current = msg.foldersGeneration
               if (prevFoldersGen === null || prevFoldersGen !== msg.foldersGeneration) {
-                queryClient.invalidateQueries({ queryKey: ['chat-folders'] })
+                staleKeys.add('chat-folders')
               }
             }
             // Refresh the cached GitLab-hosts allowlist when it may have changed.
@@ -1522,7 +1616,7 @@ export function useWebSocket() {
               const prevGen = lastGitlabHostsGenRef.current
               lastGitlabHostsGenRef.current = msg.gitlabHostsGeneration
               if (prevGen === null || prevGen !== msg.gitlabHostsGeneration) {
-                queryClient.invalidateQueries({ queryKey: ['dashboardConfig'] })
+                staleKeys.add('dashboardConfig')
               }
             }
             // Same contract for the governance ceiling: a centrally pushed policy
@@ -1534,9 +1628,35 @@ export function useWebSocket() {
               const prevGovGen = lastGovernanceGenRef.current
               lastGovernanceGenRef.current = msg.governanceGeneration
               if (prevGovGen === null || prevGovGen !== msg.governanceGeneration) {
-                queryClient.invalidateQueries({ queryKey: ['dashboardConfig'] })
+                staleKeys.add('dashboardConfig')
               }
             }
+            // One invalidation per key per frame. Several arms above can each
+            // ask for the same key on one frame (the first frame of a connection
+            // trips both generation arms, and the folder seed plus its generation),
+            // and every invalidate cancels the refetch the previous one started
+            // and issues another, so separate calls put two identical GETs on the
+            // wire where one answers them all.
+            for (const key of staleKeys) queryClient.invalidateQueries({ queryKey: [key] })
+            break
+          }
+          case 'credential_redaction_changed': {
+            // The owner flipped the credential-redaction switch, possibly in
+            // ANOTHER browser tab: this document must drop every file body it
+            // holds too (a file read while the switch was off is raw in the
+            // react-query caches and in open side-panel tabs) and re-read the
+            // switch, so no dashboard document keeps showing raw credentials
+            // after redaction is back on. Owner sockets only receive this frame.
+            // Seed the switch entry from the frame's own payload FIRST, so a
+            // document that never mounted the Settings card still knows the
+            // position it now runs under (the reconnect heal compares against
+            // it); the invalidate then re-reads the authoritative record.
+            const d = msg.data as { enabled?: unknown; changed_at?: unknown } | undefined
+            if (d && typeof d.enabled === 'boolean') {
+              queryClient.setQueryData(['credential-redaction'], { enabled: d.enabled, changed_at: typeof d.changed_at === 'string' ? d.changed_at : '' })
+            }
+            queryClient.invalidateQueries({ queryKey: ['credential-redaction'] })
+            purgeDocumentBodiesForRedactionChange(queryClient)
             break
           }
           case 'skills.pending_changed': {
@@ -1565,6 +1685,21 @@ export function useWebSocket() {
           case 'slot_title':
             dispatch(sseSlotTitle(data as { key: string; title: string }))
             break
+          case 'slot_patch': {
+            const frame = data as SlotPatchFrame
+            const dashboard = store.getState().dashboard
+            const removed = new Set(frame.removed ?? [])
+            const hasUnknownRow = (frame.slots ?? []).some(row =>
+              typeof row?.key === 'string'
+              && !removed.has(row.key)
+              && !Object.prototype.hasOwnProperty.call(dashboard.closingSlots ?? {}, row.key)
+              && !dashboard.slots.some(slot => slot.key === row.key))
+            // A stale list can remove a newly created row; its later patch cannot
+            // restore that row, so the authoritative list repairs the omission.
+            if (hasUnknownRow) dispatch(fetchSlots())
+            dispatch(sseSlotPatch(frame))
+            break
+          }
           case 'session_summary': {
             // A turn finished and the backend regenerated this session's intent
             // summary. Invalidate so the panel picks it up immediately.
@@ -1819,10 +1954,36 @@ export function useWebSocket() {
                 // recorded something that did not happen, and removing it leaves the
                 // card with no value where the truth is whatever the server holds at
                 // its own seq. The store is a cache and cannot produce that, so the
-                // roster is refetched -- its rows carry each slug's baseline, and
-                // seeding is higher-seq-wins, so this restores the authoritative
-                // value without overwriting anything newer that arrives meanwhile.
-                queryClient.invalidateQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
+                // reads that own those values are refetched -- seeding is
+                // higher-seq-wins, so this restores the authoritative value without
+                // overwriting anything newer that arrives meanwhile.
+                //
+                // BOTH reads, because the truncation drops every key a slug holds
+                // while each read owns only some of them: a roster row carries the
+                // `roster` view, and the open member's activity, wake and driving
+                // views come from its own per-member projections read. Invalidating
+                // the roster alone would leave the drawer blank until something else
+                // happened to refetch it.
+                //
+                // RESET, not invalidate, for BOTH reads. Invalidating a query with
+                // no enabled observer only marks it stale: its pre-rollback block
+                // stays in cache, and the next mount runs `select` over that block
+                // before any refetch lands, seeding the store at the sequence the
+                // server just rolled back. Higher-seq-wins then REJECTS the
+                // authoritative lower-seq baseline the refetch returns, so the
+                // rolled-back values repaint as live with no self-correcting path.
+                // Resetting drops the cached block, so there is nothing stale to
+                // seed from, and an active query still refetches.
+                //
+                // Neither read is exempt. The per-member one is disabled while no
+                // member is open. The roster's own observer outside the members page
+                // is the crewmates gate, which holds it `enabled: eligible`, so the
+                // roster query has no enabled observer either once that page
+                // unmounts. The cost is a fetch where a fresh cache would have
+                // served, and only on a torn tail -- a gateway restart -- against a
+                // wrong value that would otherwise win permanently.
+                queryClient.resetQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
+                queryClient.resetQueries({ queryKey: MEMBER_PROJECTIONS_QUERY_PREFIX })
               }
             }
             break
@@ -1830,6 +1991,20 @@ export function useWebSocket() {
           case 'chat_message':
             flushChunks()
             dispatch(sseChatMessage(data))
+            // Approval-blocked chime for an INTERACTIVE chat. The chat runner
+            // parks its turn on this `permission` row and emits no `approval`
+            // frame for it (that frame is the coordinator registry's, and chimes
+            // on its own), so this row is where the sound is synthesized — the
+            // `chat_done` / `question_card` layering: client-side, sound only,
+            // no feed row, no toast. The row is delivered once, so one frame is
+            // one sound; a row carrying `resolved` — the batch-rejection
+            // re-append, or a turn with no budget left to wait, decided before
+            // the append — and a reconnect replay stay silent. A Slack post
+            // that fails after the row went out retires it via
+            // `approval_resolved`; that arrival chime is the accepted residual.
+            if (data.role === 'permission' && shouldChimeOnPermissionRow({ meta: data.meta, reconnecting: reconnectingRef.current })) {
+              dispatchMcNotification(APPROVAL_KIND)
+            }
             // Re-rank the sidebar the instant a session sees a message, instead of waiting
             // for the next full slots push. `last_ts` moves for agent output too (it feeds
             // "last message" reads); the ORDERING key moves only for an inbound prompt —
@@ -2093,9 +2268,10 @@ export function useWebSocket() {
             break
           case 'question_card': {
             const previous = store.getState().chat.pendingQuestions?.[data.slot]
-            // `fresh` marks a live delivery and preserves the card's existing
-            // identity/rehydration contract. Audio deduplicates by server id.
-            dispatch(setQuestionCard({ ...(data as Parameters<typeof setQuestionCard>[0]), fresh: true }))
+            // Every card carries its server identity (`ask_id` or `card_id`);
+            // the reducer coalesces a re-delivery of the same id. Audio
+            // deduplicates by that id too.
+            dispatch(setQuestionCard(data as Parameters<typeof setQuestionCard>[0]))
             const current = store.getState().chat.pendingQuestions?.[data.slot]
             const id = data.ask_id || data.card_id
             if (current?.slot === data.slot && !reconnectingRef.current
@@ -2194,7 +2370,9 @@ export function useWebSocket() {
             dispatch(sseSubagentSpawn(data as { slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; total_tokens?: number; cost_usd?: number }))
             break
           case 'subagent_queued':
-            dispatch(sseSubagentQueued(data as { slot: string; queued: number }))
+            // The count plus the gate's optional `reason` label (absent from an
+            // older gateway); the reducer parses the label.
+            dispatch(sseSubagentQueued(data as { slot: string; queued: number; reason?: string; available_gb?: number; required_gb?: number }))
             break
           case 'subagent_chunk': {
             // Buffer and flush per-frame, mirroring chat_chunk.
@@ -2715,21 +2893,14 @@ export function useWebSocket() {
       wsRef.current = null
 
       if (closingRef.current) return
-      if (voiceRequestsRef.current.size || voicePlayingRef.current || store.getState().chat.voicePlaying) {
-        reportVoiceFailure({
-          slot: store.getState().chat.activeSlot, code: 'voice_playback_failed',
-        })
-        // Audio frames have no reconnect replay. Retrying the connection cannot
-        // recover the missing samples, so release the pending stream explicitly.
-        stopVoice()
-      }
+      releaseVoiceOnSocketLoss()
       const delay = reconnectRef.current
       reconnectRef.current = Math.min(delay * 2, 10000)
       reconnectTimerRef.current = setTimeout(connect, delay)
     }
 
     ws.onerror = () => { /* onclose will fire */ }
-  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, flushVoiceTail, queryClient, stopVoice, getPcmPlayer, syncPendingApprovals, syncPendingQuestions, syncWorkflowRuns, seedAutomations, recordRetiredId, retireApproval])
+  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, flushVoiceTail, queryClient, stopVoice, releaseVoiceOnSocketLoss, getPcmPlayer, syncPendingApprovals, syncPendingQuestions, syncWorkflowRuns, seedAutomations, recordRetiredId, retireApproval])
 
   /**
    * Force an immediate reconnect: cancels any pending backoff timer, closes
@@ -2746,6 +2917,7 @@ export function useWebSocket() {
     reconnectRef.current = 1000  // reset backoff window
     const ws = wsRef.current
     if (ws && ws.readyState !== WebSocket.CLOSED) {
+      releaseVoiceOnSocketLoss()
       // Detach handlers BEFORE close() so the onclose handler doesn't fire
       // asynchronously and schedule a redundant reconnect on top of our 0ms
       // timer below — that race would briefly create two parallel WebSocket
@@ -2760,7 +2932,78 @@ export function useWebSocket() {
     }
     wsRef.current = null
     reconnectTimerRef.current = setTimeout(connect, 0)
-  }, [connect])
+  }, [connect, releaseVoiceOnSocketLoss])
+
+  /** Replace a socket that is OPEN but has stopped delivering.
+   *
+   *  A browser can keep a WebSocket whose transport is gone -- a phone that
+   *  changed networks, or a tab resumed after the OS froze it -- without ever
+   *  firing `onclose`. Nothing else notices: the reconnect catch-up only runs on
+   *  close, and the health probe only polls while `connected` is false. Every
+   *  one-shot frame is then lost until a manual reload; an agent-armed
+   *  `autonudge_state` is the visible case, since no local mutation writes that
+   *  record. The gateway's 5s `dashboard` frame is the liveness signal: while the
+   *  page is visible, a socket silent for WS_SILENCE_MS is torn down through
+   *  `forceReconnect`, whose catch-up re-reads every frame family.
+   *
+   *  Silence is measured in visible time only. Hidden pages are skipped (timers
+   *  are throttled there, and a suspended tab processed nothing); on the return
+   *  every stamp moves past the hidden interval, so silence adds up across tab
+   *  switches while a frame that arrived in the background counts as arriving
+   *  at the return. A thawed socket then gets two checks to deliver its next
+   *  status frame before it can be replaced -- unless its visible silence had
+   *  already passed the window when the page came back, in which case the
+   *  first check replaces it, so a dead socket cannot outlive a run of glances
+   *  each shorter than that grace. Each consecutive silent replacement doubles
+   *  the window up to WS_SILENCE_MAX_MS, so a gateway that stopped sending
+   *  status on a live socket costs one reconnect per window rather than one
+   *  every 20s; a socket observed live for a whole window of visible time since
+   *  it opened resets the count. */
+  useEffect(() => {
+    const silenceWindowMs = () => Math.min(
+      WS_SILENCE_MS * 2 ** silentReconnectsRef.current,
+      WS_SILENCE_MAX_MS,
+    )
+    const check = () => {
+      if (document.hidden) return
+      const ws = wsRef.current
+      if (!ws || ws.readyState !== WebSocket.OPEN) return
+      const now = Date.now()
+      const silenceMs = silenceWindowMs()
+      if (now - lastFrameAtRef.current <= silenceMs) {
+        if (now - silenceClockStartedAtRef.current > silenceMs) silentReconnectsRef.current = 0
+        return
+      }
+      if (now < graceUntilRef.current) return
+      silentReconnectsRef.current += 1
+      forceReconnect()
+    }
+    const onVisibility = () => {
+      const now = Date.now()
+      if (document.hidden) {
+        hiddenAtRef.current = now
+        return
+      }
+      // Move each stamp past only the hidden time after it, and never past
+      // now: a stamp from before the hide keeps its visible age, and a frame
+      // that arrived while hidden counts as arriving at the return.
+      const skipHidden = (stamp: number) => stamp + now - Math.max(hiddenAtRef.current, stamp)
+      lastFrameAtRef.current = skipHidden(lastFrameAtRef.current)
+      silenceClockStartedAtRef.current = skipHidden(silenceClockStartedAtRef.current)
+      hiddenAtRef.current = 0
+      // Two checks of grace for a thawed socket, none for one whose visible
+      // silence had already passed the window before it was hidden.
+      graceUntilRef.current = now - lastFrameAtRef.current > silenceWindowMs()
+        ? 0
+        : now + WS_SILENCE_CHECK_MS * 2
+    }
+    const timer = setInterval(check, WS_SILENCE_CHECK_MS)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [forceReconnect])
 
   useEffect(() => {
     closingRef.current = false  // reset for StrictMode re-mount

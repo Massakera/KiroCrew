@@ -94,7 +94,7 @@ from kiro_crew.messaging.queue_drain import (
     register_drain,
     tag_entry,
 )
-from kiro_crew.messaging.queue_receipt import ReceiptQueue, ReceiptSurface
+from kiro_crew.messaging.queue_receipt import ReceiptQueue, ReceiptSurface, receipt_address_key
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
 from kiro_crew.sel import sel
 from kiro_crew.webex import cards
@@ -310,6 +310,18 @@ _APPROVALS = PendingApprovals("webex")
 #: Webex room id is an opaque base64 blob with no colon, so this prefix is what
 #: tells the two route kinds apart everywhere one is read.
 _SPACE_ROUTE_PREFIX = "space:"
+
+#: The thread component of a receipt address when the bubble sits in the room
+#: ROOT rather than under a thread -- either because ``reply_in_thread`` is off,
+#: or because the message it receipts arrived outside any thread.
+#:
+#: A stand-in is required rather than an empty component:
+#: :func:`~kiro_crew.messaging.queue_receipt.receipt_address_key` reads an empty
+#: part as UNKNOWN and returns no address at all, which opens no bubble. A room
+#: root IS a nameable conversation, so it gets a name. The colon keeps it out of
+#: the value space it shares: a Webex message id is an opaque base64 blob with no
+#: colon, so no real thread root can collide with this.
+_ROOT_THREAD = "root:none"
 
 
 def _route_of(inbound: "WebexInbound") -> str:
@@ -1232,6 +1244,16 @@ class WebexDispatcher:
 
         class _Surface:
             label = "webex"
+            # The room AND the thread this receipt's own send threads under. A group
+            # space routes as ``space:{room_id}``, so two threads in one room share one
+            # session key and therefore one queue entry -- and an entry's bubble may
+            # only show what arrived where the bubble lives. A room-only key would
+            # answer "same conversation" for a message in a sibling thread and render
+            # its text into the bubble sitting in this one.
+            #
+            # Every member of one thread still produces the SAME key, which is what
+            # lets a second member's mid-turn message update the one shared bubble.
+            address_key = receipt_address_key("webex", room_id, parent_id or _ROOT_THREAD)
 
             async def send_receipt(self, body: str) -> Any | None:
                 # A receipt quotes the message it queued, so it carries user text
@@ -1240,8 +1262,8 @@ class WebexDispatcher:
                     room_id, webex_display_safe(body), parent_id=parent_id
                 )
 
-            async def edit_receipt(self, msg_id: Any, body: str) -> None:
-                await client.edit_message(str(msg_id), room_id, webex_display_safe(body))
+            async def edit_receipt(self, msg_id: Any, body: str) -> bool:
+                return await client.edit_message(str(msg_id), room_id, webex_display_safe(body))
 
         return _Surface()
 
@@ -1448,11 +1470,19 @@ class WebexDispatcher:
                     # and ``edit_receipt`` carries the room id, so editing it under the
                     # opener's address reaches a different room where that message id
                     # does not exist.
+                    envelope = _reply_envelope(inbound, place)
                     await self._queue.flip_answering_locked(
                         session_key,
-                        self._receipt_surface(_reply_envelope(inbound, place)),
+                        self._receipt_surface(envelope),
                         texts,
                         own_deferred,
+                        # WHOSE messages this turn answers, read through the same helper
+                        # the producer tagged them with, so "which of the bubble's lines
+                        # were answered" cannot be spelled differently here than where
+                        # they were recorded. A space shares one bubble between members,
+                        # so without this the flip retires it over lines that are still
+                        # queued and the second member's acknowledgement disappears.
+                        _entry_owner(envelope),
                     )
             if not texts or place is None:
                 return

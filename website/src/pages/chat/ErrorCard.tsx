@@ -1,10 +1,23 @@
-import { memo } from 'react'
-import { ExternalLink, KeyRound, Loader2, RotateCw, Settings, SlidersHorizontal } from 'lucide-react'
+import { memo, type ReactNode } from 'react'
+import { ExternalLink, KeyRound, Loader2, RotateCw, Settings, ShieldCheck, SlidersHorizontal } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import { chatErrorDisplayText } from '../../lib/chatErrorRecovery'
+import { isStopEvent } from '../../lib/stopEvent'
+import { isSystemNoticeKind } from '../../lib/systemNotice'
 import type { ChatMessage } from '../../types'
+import { withOriginLink } from '../../components/withOriginLink'
+import { injectOpensTurn } from './RecoveryCard'
+
+/** Error code the backend stamps (`meta.code`) when a crew member's private
+ *  agent file no longer matches what was last reviewed in Capabilities
+ *  (`agent_capabilities.prepare_member_capabilities`). A retry re-runs the same
+ *  check, so the row links to the member's Capabilities pane instead. */
+const MATERIALIZATION_CHANGED = 'materialization_changed'
+
+export const isCapabilitiesChanged = (m: Pick<ChatMessage, 'meta'>): boolean =>
+  (m.meta as { code?: string } | undefined)?.code === MATERIALIZATION_CHANGED
 
 /** Row kind the backend stamps on a terminal model-entitlement rejection
  *  (`chat_utils.MODEL_UNENTITLED_KIND`). Both carriers are load-bearing for the
@@ -32,6 +45,62 @@ const USAGE_LIMIT_KIND = 'usage_limit'
 
 export const isUsageLimit = (m: Pick<ChatMessage, 'kind' | 'meta'>): boolean =>
   m.kind === USAGE_LIMIT_KIND || (m.meta as { kind?: string } | undefined)?.kind === USAGE_LIMIT_KIND
+
+/** Row kind the backend stamps on the terminal error a SESSION START that never
+ *  answered produces (`chat_utils.SESSION_START_FAILED_KIND`): `session/new`
+ *  timed out, so the turn has no agent session at all. Decided from the
+ *  exception's tag on the backend, never from the prose here -- the timeout
+ *  message carries a diagnostic suffix that changes, and a translation moves
+ *  the words. Same two carriers as above. */
+const SESSION_START_FAILED_KIND = 'session_start_failed'
+
+export const isSessionStartFailed = (m: Pick<ChatMessage, 'kind' | 'meta'>): boolean =>
+  m.kind === SESSION_START_FAILED_KIND || (m.meta as { kind?: string } | undefined)?.kind === SESSION_START_FAILED_KIND
+
+/** Consecutive tagged session-start failures at which the card stops offering
+ *  Resume and the server refuses the re-run (`session_start_repeat`). Two, not
+ *  one: a single timed-out start is host weather and the first Resume is the
+ *  retry it deserves; the second identical failure is the signal that nothing
+ *  a retry can change is wrong. Mirrors `_SESSION_START_REPEAT_REFUSAL_AT` in
+ *  `src/kiro_crew/dashboard/chat_handlers.py`. */
+export const SESSION_START_REPEAT_REFUSAL_AT = 2
+
+/**
+ * How many session starts in a row failed at the tail of the transcript.
+ *
+ * Mirrors `session_start_failure_streak` in
+ * `src/kiro_crew/dashboard/chat_handlers.py` -- the two must agree, or the card
+ * hides a Resume the server would honour (or offers one it refuses). Walks back
+ * from the newest row counting `error` rows of the `session_start_failed` kind.
+ * Rows that are not the conversation's floor are walked past -- tool rows,
+ * notices, and the `recovery` inject a Resume press lands as, which resumes the
+ * SAME turn and is what makes two Resume-separated failures consecutive. The
+ * walk stops at the first row that IS new information: a user or assistant row
+ * with content (a typed retry is a new attempt and starts the count over), a
+ * Stop card, an error row of any OTHER kind (a connection-lost row is a
+ * different failure, not a third start), or a row that OPENS a turn of its own
+ * -- a nudge, a sub-agent completion, or an `inject` that `injectOpensTurn`
+ * classifies as new work -- since a failure before such a row belongs to a
+ * different turn and must not cost this turn its first Resume.
+ */
+export function sessionStartFailureStreak(messages: readonly ChatMessage[]): number {
+  let streak = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role === 'error') {
+      if (isSessionStartFailed(m)) { streak++; continue }
+      break
+    }
+    if (isStopEvent(m)) break
+    if (m.role === 'nudge' || m.role === 'subagent') break
+    if (injectOpensTurn(m as { role: string; meta?: Record<string, unknown> | null })) break
+    if ((m.role === 'user' || m.role === 'assistant') && m.content) {
+      if (m.role === 'assistant' && isSystemNoticeKind(m.kind ?? (m.meta as { kind?: string } | undefined)?.kind)) continue
+      break
+    }
+  }
+  return streak
+}
 
 /**
  * WIRE SHAPES, never rendered — the gateway's own English error prose, matched
@@ -120,6 +189,18 @@ export interface ErrorCardProps {
    */
   onOpenSignIn?: () => void
   /**
+   * True on the newest `session_start_failed` row when the same session start
+   * has already failed `SESSION_START_REPEAT_REFUSAL_AT` times in a row with
+   * nothing but Resume presses between the attempts. The host withholds
+   * `onContinue` for that row (the server refuses the re-run too, with
+   * `session_start_repeat`), and this flag makes the card say WHY there is no
+   * Resume and what does end it: restarting the gateway. Without it the row
+   * would be a bare red line where the button used to be, and the loop from
+   * the field report -- Resume, same 90 s wall, Resume -- would simply become
+   * a dead end with no next step on it.
+   */
+  sessionStartRepeat?: boolean
+  /**
    * The non-inference exit for a `usage_limit` row in a slot the header's
    * "Request a Feature" action created (#13342): the repo's feature-request
    * issue form. That action is an agent turn by design, so a spent allowance
@@ -130,10 +211,50 @@ export interface ErrorCardProps {
    * an ordinary chat has no form to offer and keeps today's card.
    */
   featureRequestFormUrl?: string
+  /**
+   * The fix affordance for a `materialization_changed` row: open this crew
+   * member's Capabilities pane, where the changed agent file is reviewed and
+   * saved. Offered INSTEAD of Continue: a retry repeats the same check.
+   * Omitted on a surface with no crew editor route (embed, popout).
+   */
+  onOpenCapabilities?: () => void
 }
 
+// No `shrink-0` and no `truncate`: every action sits in a flex row, and a
+// label longer than the card (the feature-request form's, which names its
+// destination and its cost, runs 44 chars in English and 62 in German) must
+// break into lines inside the card rather than run past its edge. The control
+// shrinks to its longest word and `text-balance` splits the label into two
+// even lines instead of a long line and a stray word. The icon beside the
+// label keeps its own `shrink-0`, so only the text gives.
 const ACTION_BTN =
-  'shrink-0 inline-flex items-center gap-2 text-[12px] leading-5 font-medium px-3 py-1 rounded-md border-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
+  'inline-flex items-center gap-2 text-[12px] leading-5 font-medium text-balance px-3 py-1 rounded-md border-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed transition-colors'
+
+/** The restart hint with its command as a `<code>` chip. The command is
+ *  interpolated verbatim (never translated) inside the `i18nT` call, and the
+ *  chip's position is found by rendering the same key once more with a
+ *  sentinel in the placeholder's place, so the chip lands wherever the
+ *  translation put `{{command}}`; a catalog that dropped the placeholder
+ *  renders the sentence unchanged rather than nothing. The two `i18nT` calls
+ *  are the only place the command text lives in this module. */
+function restartHint(): ReactNode {
+  const text = i18nT('pages.chat.errorCard.session_start_repeat_hint', { command: 'kirocrew restart' })
+  const marked = i18nT('pages.chat.errorCard.session_start_repeat_hint', { command: '\u0000' })
+  const at = marked.indexOf('\u0000')
+  if (at < 0) return text
+  const tail = marked.length - at - 1
+  const command = text.slice(at, text.length - tail)
+  if (!command) return text
+  return (
+    <>
+      {text.slice(0, at)}
+      <code className="font-mono text-[12px] px-1 py-0.5 rounded bg-bg-elevated ring-1 ring-inset ring-border" data-testid="error-card-restart-command">
+        {command}
+      </code>
+      {text.slice(text.length - tail)}
+    </>
+  )
+}
 /**
  * The error row in a chat transcript.
  *
@@ -161,6 +282,8 @@ export const ErrorCard = memo(function ErrorCard({
   onOpenSignIn,
   unentitledElsewhere,
   featureRequestFormUrl,
+  sessionStartRepeat,
+  onOpenCapabilities,
 }: ErrorCardProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Swap the gateway's "please retry" wording ONLY on a row that renders the
@@ -203,6 +326,30 @@ export const ErrorCard = memo(function ErrorCard({
       </div>
     )
   }
+  if (onOpenCapabilities) {
+    return (
+      <div
+        className="bg-danger-subtle ring-1 ring-inset forced-colors:border ring-danger/20 rounded-md self-center w-full max-w-full min-w-0 px-3 py-2 flex flex-col gap-2 animate-scale-in"
+        data-testid="error-card"
+        data-capabilities-changed="true"
+      >
+        <div className="text-danger text-[13px] leading-5 min-w-0" style={{ overflowWrap: 'anywhere' }}>
+          {i18nT('pages.chat.errorCard.capabilities_changed')}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={onOpenCapabilities}
+            className={`${ACTION_BTN} bg-accent text-accent-fg hover:bg-accent-hover`}
+            data-testid="error-card-open-capabilities"
+          >
+            <ShieldCheck size={12} className="lucide-inline shrink-0" aria-hidden="true" />
+            {i18nT('pages.chat.errorCard.open_capabilities')}
+          </button>
+        </div>
+      </div>
+    )
+  }
   if (onOpenSignIn) {
     // A signed-out agent process: the one action that ends it is signing in
     // again from Settings. The prose (the backend's own wording, which may
@@ -215,7 +362,7 @@ export const ErrorCard = memo(function ErrorCard({
         data-auth-required="true"
       >
         <div className="text-danger text-[13px] leading-5 min-w-0" style={{ overflowWrap: 'anywhere' }}>
-          {content}
+          {withOriginLink(content)}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -252,7 +399,7 @@ export const ErrorCard = memo(function ErrorCard({
         data-testid="error-card"
       >
         <div className="text-danger text-[13px] leading-5 min-w-0" style={{ overflowWrap: 'anywhere' }}>
-          {displayText}
+          {withOriginLink(displayText)}
         </div>
         {onPickModel && onOpenDefaultModel && (
           // Both actions are needed, and a primary/secondary pair reads as
@@ -307,10 +454,21 @@ export const ErrorCard = memo(function ErrorCard({
         data-testid="error-card"
         style={{ overflowWrap: 'anywhere' }}
       >
-        {displayText}
+        {withOriginLink(displayText)}
         {elsewhere && (
           <div className="text-[12px] leading-5 text-muted mt-1" data-testid="error-card-elsewhere-hint">
             {i18nT(elsewhereKey!)}
+          </div>
+        )}
+        {sessionStartRepeat && (
+          // The same start failed twice; a third Resume would only fail the
+          // same way, so the button is gone and this line is the card's ONLY
+          // remaining next step. It therefore renders at body weight in the
+          // card's own colour, not as a muted footnote, and the command is a
+          // code chip so it reads as a thing to copy. The dashboard has no
+          // restart control on this surface, so the terminal is the next step.
+          <div className="text-[13px] leading-5 mt-1" data-testid="error-card-session-start-repeat-hint">
+            {restartHint()}
           </div>
         )}
       </div>
@@ -323,7 +481,7 @@ export const ErrorCard = memo(function ErrorCard({
       data-continuable="true"
     >
       <div className="text-danger text-[13px] leading-5 flex-1 min-w-0" style={{ overflowWrap: 'anywhere' }}>
-        {displayText}
+        {withOriginLink(displayText)}
       </div>
       <button
         type="button"

@@ -2265,31 +2265,35 @@ class TestSessionsArchiveLayerBGate:
         assert set(backup.uploaded_objects(ACCOUNT)) == {"key-low", "key-high"}
         assert backup.uploaded_versions(ACCOUNT)["key-low"] == "v-low"
 
-    def test_a_superseded_run_still_clears_the_nightly_backoff(self, tmp_path, monkeypatch):
-        """A run that loses the slot still ends the retry backoff. Pins what the code does.
+    def test_a_superseded_run_keeps_the_nightly_backoff(self, tmp_path, monkeypatch):
+        """A run that loses the slot must not end the retry backoff.
 
-        ``_record_run_locked``'s mutate does two things: it writes the run record into
-        the ``runs`` slot under the supersession guard, and it calls
-        ``_clear_nightly_failure`` OUTSIDE that guard. Gating the clear or leaving it
-        ungated produces identical state everywhere but one window, which is why no
-        other case in the suite tells the two apart: the winner clears the backoff in
-        its own mutate, so a failure has to land BETWEEN the winner's commit and the
-        loser's for the loser's clear to be the one that removes it.
+        ``_record_run_locked``'s mutate writes the run record into the ``runs`` slot
+        under the supersession guard and clears the failure count under that same
+        guard, because the two answer one question: a record this document has already
+        superseded is not evidence of anything, so it must not retire a count a later
+        failure legitimately accumulated. :func:`_merge_pending` states that reason at
+        the other place a run record and this clear travel together.
+
+        Gating the clear or leaving it ungated produces identical state everywhere but
+        one window, which is why no other case in the suite tells the two apart: the
+        winner clears the backoff in its own mutate, so a failure has to land BETWEEN
+        the winner's commit and the loser's for the loser to be the one that meets it.
 
         Reaching that window takes the witness as well. ``record_nightly_failure``
         compares the run slot against the witness read before its attempt, so a failure
         whose witness predates the winner's commit is refused and writes nothing. The
         witness here is therefore read AFTER the winner commits, and the row is asserted
-        PRESENT before the loser is released -- without that the loser's clear would have
-        nothing to remove and this would pass under either placement.
+        PRESENT before the loser is released -- without that the assertion below would
+        hold for the trivial reason that no row ever existed.
 
         The inversion is produced rather than simulated, the same way the clobber test
         above builds it: the low-sequence writer bumps first, parks in ``file_lock``, and
-        is released only once the high-sequence writer has committed.
+        is released only once the high-sequence writer has committed. That is what shows
+        the window is reachable by two real runs rather than by an edited document.
 
-        This PINS the behaviour and does not endorse it. Which placement is right is an
-        open question for the backoff's owner; what an unpinned answer allows is a
-        refactor flipping it with no test objecting.
+        MUTATION: move the ``_clear_nightly_failure`` call in ``_record_run_locked`` back
+        out of the ``if not superseded:`` branch and this reddens on the final assertion.
         """
         monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
         real_file_lock = backup.file_lock
@@ -2338,9 +2342,9 @@ class TestSessionsArchiveLayerBGate:
                 )
                 assert recorded, "the compare-and-set refused a witness read after the commit"
                 assert backup.nightly_failures(ACCOUNT).get(backup.KIND_SESSIONS), (
-                    "the window was never entered: with no failure row on the account,"
-                    " the superseded run's clear has nothing to remove and this case"
-                    " cannot tell the two placements apart"
+                    "the window was never entered: with no failure row on the account"
+                    " there is nothing for the loser to preserve, and this case cannot"
+                    " tell the two placements apart"
                 )
                 release_low.set()
                 thread.join(timeout=15)
@@ -2350,15 +2354,18 @@ class TestSessionsArchiveLayerBGate:
             assert not thread.is_alive(), "the low-seq writer never completed"
 
         assert "error" not in low, low
-        # The supersession really happened, so the clear under test is the LOSER's: the
+        # The supersession really happened, so the run under test is the LOSER's: the
         # slot still holds the winner's record and the loser's write was refused.
         assert backup.last_runs(ACCOUNT)[backup.KIND_SESSIONS]["key"] == "key-high"
-        assert backup.nightly_failures(ACCOUNT) == {}, (
-            "a superseded run kept the nightly retry backoff, so the clear is gated on"
-            " the supersession guard. That is a deliberate semantic change for the"
-            " backoff's owner to make, not a side effect of a refactor -- update this"
-            " pin together with the decision that changes it"
+        surviving = backup.nightly_failures(ACCOUNT).get(backup.KIND_SESSIONS)
+        assert surviving, (
+            "a run whose own record was refused as stale retired the failure count"
+            " anyway. That count was accumulated by a failure recorded AFTER the"
+            " winning run committed, so nothing about it is over -- and the next"
+            " nightly wake reads the account as due on the strength of a run that was"
+            " too stale to write a key"
         )
+        assert surviving["consecutive"] == 1, surviving
 
     def test_the_authorization_runs_inside_the_lock_it_will_upload_under(
         self, tmp_path, monkeypatch
@@ -4286,15 +4293,45 @@ class TestALostRunWriteDoesNotReUploadForever:
         assert not backup._run_is_newer({**earlier, "at": later["at"]}, later)
 
     def test_run_identity_concurrent_failure_then_recovery(self, monkeypatch):
+        """Two runs in flight, the first one's state write lost, and the second
+        write carries it.
+
+        The last assertion reads :func:`_merge_pending`'s recovery, and that can only
+        carry a run the in-memory hold ALREADY holds. Registration now runs inside
+        the sidecar lock (``_locked_state_update``'s ``on_in_lock_failure``), so no
+        contender can publish before the hold exists; before that it ran in
+        ``_record_run_locked``'s ``except OSError``, after the lock was released,
+        and this assertion then depended on scheduling.
+
+        ``held`` is the handshake that positions the second write after that
+        registration, which is the ordering this test's final assertion depends on.
+        Gating instead on the second thread's own start states only that the thread
+        is running, which leaves the ordering to the machine. With the hand-off
+        inside the lock the handshake is redundant, and it is kept so this test
+        does not depend on where the hold is taken. The window a released lock used
+        to leave is
+        :meth:`test_a_contender_cannot_publish_between_a_failed_write_and_its_hold`'s
+        subject; here it is excluded.
+
+        The two runs are still genuinely concurrent -- the contender is submitted
+        while the failed writer is parked, and both take their sequence from
+        ``_run_lock`` -- but nothing here asserts anything about the two contending
+        for the file lock, which is why gating the second one costs no coverage. That
+        contention is
+        :meth:`TestSessionsArchiveLayerBGate.test_a_long_holder_does_not_refuse_a_waiting_contender`'s
+        subject, and single-threaded recovery ordering is
+        :meth:`test_a_later_successful_write_takes_over_from_memory`'s.
+        """
         from concurrent.futures import ThreadPoolExecutor
         from threading import Event
 
-        entered, release, contender = Event(), Event(), Event()
+        entered, release, held = Event(), Event(), Event()
         now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)
         clock = mock.Mock(wraps=dt.datetime)
         clock.now.return_value = now
         monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
         real_write = backup.write_state
+        real_remember = backup._remember_unpersisted
 
         def writer(state):
             if not entered.is_set():
@@ -4303,11 +4340,19 @@ class TestALostRunWriteDoesNotReUploadForever:
                 raise OSError(errno.EIO, "injected")
             real_write(state)
 
+        def remember(account, kind, record):
+            # Delegates first, so the event states the hold EXISTS rather than that
+            # the handler is entered -- the contender's `_merge_pending` reads the
+            # map, not the call.
+            real_remember(account, kind, record)
+            held.set()
+
         def second_run():
-            contender.set()
+            assert held.wait(10), "the failed run was never held in memory"
             return backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "second.tar.gz", 2, "b")
 
         monkeypatch.setattr(backup, "write_state", writer)
+        monkeypatch.setattr(backup, "_remember_unpersisted", remember)
         with ThreadPoolExecutor(max_workers=2) as pool:
             first_future = pool.submit(
                 backup._record_run, ACCOUNT, backup.KIND_SNAPSHOT, "first.tar.gz", 1, "a"
@@ -4315,7 +4360,6 @@ class TestALostRunWriteDoesNotReUploadForever:
             try:
                 assert entered.wait(10)
                 second_future = pool.submit(second_run)
-                assert contender.wait(10)
             finally:
                 release.set()
             first = first_future.result(timeout=10)
@@ -4327,6 +4371,236 @@ class TestALostRunWriteDoesNotReUploadForever:
             "first.tar.gz": "a",
             "second.tar.gz": "b",
         }
+
+    @pytest.mark.parametrize("failure_stage", ["read", "write"])
+    def test_run_identity_failed_state_update_hand_off_runs_inside_the_state_lock(
+        self, monkeypatch, failure_stage
+    ):
+        # A run whose state update fails must hand its record to `_remember_unpersisted`
+        # BEFORE the sidecar lock is released -- i.e. before any second run-record
+        # writer can read and persist state. If the hand-off ran AFTER the lock
+        # released (as the original code did, from the outer except handler), a second
+        # writer taking the lock in that gap would `_merge_pending` in nothing (the
+        # first run is not held yet) and persist only its own record, stranding the
+        # first upload in memory alone -- forgotten on restart, reopening the
+        # unattended re-upload. The fix runs the hand-off inside `_locked_state_update`
+        # while the sidecar lock is STILL HELD, so no reader between a failed step and
+        # the hand-off can miss the first run.
+        #
+        # Parameterized by which step raises, because the gap is the SAME for every
+        # step taken after the lock is acquired -- not the write alone. The upload
+        # happens BEFORE `_record_run` is called, so a completed-upload record exists
+        # whichever step fails; the READ case is the sibling defect a write-only
+        # handoff left open. `_read_state_for_update` runs inside the lock, so its
+        # `_StateUnreadable` must fire the in-lock handoff exactly as a failed write
+        # does. This is the case the write-only callback missed: it wrapped only
+        # `write_state`, so a read failure fell through to the outer except and handed
+        # off with the lock already released.
+        #
+        # This proves the property DIRECTLY, on the calling thread, with no second
+        # thread, no sleep, and no elapsed-time assumption -- so it cannot pass
+        # vacuously on a contended runner where a worker was simply never scheduled.
+        # `_state_lock` is wrapped in a tracker that records whether its body is
+        # active, and the patched `_remember_unpersisted` reads that flag at the
+        # moment the hand-off fires:
+        #
+        #   * Fixed production calls the hand-off from inside `_locked_state_update`'s
+        #     `with _state_lock():` block, so the flag is True. The patched remember
+        #     records the run first, and only AFTER the first `_record_run` has
+        #     returned (lock released) does the test drive the second run in. The
+        #     second's `_merge_pending` reads the held first run, so both uploads land.
+        #
+        #   * Old production (write-only handoff, or no handoff at all) calls remember
+        #     from the outer except handler, after `_locked_state_update` has already
+        #     released the lock, so the flag is False. To reproduce the exact loss
+        #     deterministically, the patched remember then runs the second
+        #     `_record_run` to completion BEFORE handing the first run to real remember
+        #     -- exactly the interleaving the released lock permits. The second
+        #     persists a document the first run is absent from, and the final on-disk
+        #     assertion (both uploads present) fails at pytest call phase.
+        now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
+        real_state_lock = backup._state_lock
+        real_write = backup.write_state
+        real_read = backup._read_state_for_update
+        real_remember = backup._remember_unpersisted
+
+        state_lock_depth = 0
+
+        @contextlib.contextmanager
+        def tracking_state_lock():
+            nonlocal state_lock_depth
+            with real_state_lock():
+                state_lock_depth += 1
+                try:
+                    yield
+                finally:
+                    state_lock_depth -= 1
+
+        first_failed = False
+
+        def reader():
+            # The FIRST read fails (the losing run); every later read -- the second
+            # run's -- returns the real document. Only patched for failure_stage="read".
+            nonlocal first_failed
+            if not first_failed:
+                first_failed = True
+                raise backup._StateUnreadable(errno.EIO, "injected")
+            return real_read()
+
+        def writer(state):
+            # The FIRST write fails (the losing run); every later write -- the second
+            # run's -- goes to disk for real. Only patched for failure_stage="write".
+            nonlocal first_failed
+            if not first_failed:
+                first_failed = True
+                raise OSError(errno.EIO, "injected")
+            return real_write(state)
+
+        second_done = False
+        handed_off_inside_lock = None
+
+        def remembering(account, kind, record):
+            # Fires once, for the first (failed) run's hand-off. Snapshot whether the
+            # sidecar lock body is active at this instant -- the property under test.
+            nonlocal second_done, handed_off_inside_lock
+            if handed_off_inside_lock is None:
+                handed_off_inside_lock = state_lock_depth > 0
+                if not handed_off_inside_lock:
+                    # OLD production interleaving: the lock is already released, so a
+                    # second writer can read and persist state before this run is held.
+                    # Drive it to completion FIRST, then hold the first run -- the loss.
+                    second_done = True
+                    backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "second.tar.gz", 2, "b")
+            return real_remember(account, kind, record)
+
+        monkeypatch.setattr(backup, "_state_lock", tracking_state_lock)
+        if failure_stage == "read":
+            monkeypatch.setattr(backup, "_read_state_for_update", reader)
+        else:
+            monkeypatch.setattr(backup, "write_state", writer)
+        monkeypatch.setattr(backup, "_remember_unpersisted", remembering)
+
+        first = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "first.tar.gz", 1, "a")
+        # The hand-off fired, and it fired while the sidecar lock body was still
+        # active. This is the direct proof, independent of the on-disk outcome, and it
+        # holds for BOTH stages: `_read_state_for_update` runs inside the lock, so its
+        # failure must reach the in-lock handoff just as `write_state`'s does.
+        assert handed_off_inside_lock is True, (
+            "the failed state-update hand-off ran outside the state lock; a concurrent "
+            "writer could read and persist state in that window without the first run "
+            "held"
+        )
+        # FIXED production reached remember inside the lock, so it did NOT drive the
+        # second run from within; run it now, after the first has released the lock.
+        if not second_done:
+            second = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "second.tar.gz", 2, "b")
+        else:  # pragma: no cover - only the old-production interleaving reaches here
+            second = backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT]
+
+        assert first["at"] == second["at"]
+        assert first["sequence"] < second["sequence"]
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+        # Both uploads persist: the first was held before the second could read state,
+        # so the second's `_merge_pending` carried it into the committed document.
+        assert self._on_disk()["accounts"][ACCOUNT]["uploads"] == {
+            "first.tar.gz": "a",
+            "second.tar.gz": "b",
+        }
+
+    def test_a_contender_cannot_publish_between_a_failed_write_and_its_hold(self, monkeypatch):
+        """A contender parked on the sidecar lock while a run's write fails cannot
+        publish a document that run is missing from.
+
+        The lost-run hold is taken inside the sidecar lock, so the contender's
+        ``_merge_pending`` always carries the failed run and BOTH uploads are on
+        disk as soon as the contender returns. No later update is needed, which is
+        what makes this restart-safe: if the gateway restarts right after the
+        contender, the in-memory hold is gone and only the disk remains.
+
+        When the hold was taken after the lock was released, the contender could
+        publish first; the archive then lived in memory alone until the NEXT
+        successful update, and a restart in between re-uploaded it. The patched
+        ``_remember_unpersisted`` pins that losing order whenever it runs outside
+        the lock (it waits for the contender to publish), so this test fails
+        deterministically against that code. Inside the lock it does not wait:
+        the contender cannot reach ``write_state`` until the lock is released, so
+        waiting there would only time out. The lock depth is tracked per thread,
+        so a contender that holds the lock cannot be mistaken for the failed
+        writer holding it.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event, local
+
+        entered, release, published = Event(), Event(), Event()
+        now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
+        real_state_lock = backup._state_lock
+        real_write = backup.write_state
+        real_remember = backup._remember_unpersisted
+        holder = local()
+
+        @contextlib.contextmanager
+        def tracking_state_lock():
+            with real_state_lock():
+                holder.depth = getattr(holder, "depth", 0) + 1
+                try:
+                    yield
+                finally:
+                    holder.depth -= 1
+
+        def writer(state):
+            if not entered.is_set():
+                entered.set()
+                assert release.wait(10), "test did not release the failed writer"
+                raise OSError(errno.EIO, "injected")
+            real_write(state)
+            published.set()
+
+        handed_off_inside_lock = []
+
+        def remember(account, kind, record):
+            inside = getattr(holder, "depth", 0) > 0
+            handed_off_inside_lock.append(inside)
+            if not inside:
+                # The lock is already released, so pin the order it permits: the
+                # contender publishes before this run is held.
+                assert published.wait(10), "the contender never published"
+            real_remember(account, kind, record)
+
+        monkeypatch.setattr(backup, "_state_lock", tracking_state_lock)
+        monkeypatch.setattr(backup, "write_state", writer)
+        monkeypatch.setattr(backup, "_remember_unpersisted", remember)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                backup._record_run, ACCOUNT, backup.KIND_SNAPSHOT, "first.tar.gz", 1, "a"
+            )
+            try:
+                assert entered.wait(10)
+                second_future = pool.submit(
+                    backup._record_run, ACCOUNT, backup.KIND_SNAPSHOT, "second.tar.gz", 2, "b"
+                )
+            finally:
+                release.set()
+            first = first_future.result(timeout=10)
+            second = second_future.result(timeout=10)
+
+        # The contender's own document already carries the failed run.
+        assert self._on_disk()["accounts"][ACCOUNT]["uploads"] == {
+            "first.tar.gz": "a",
+            "second.tar.gz": "b",
+        }
+        assert handed_off_inside_lock == [True]
+        assert first["sequence"] < second["sequence"]
+        # A restart drops the in-memory hold. The disk alone still knows both
+        # archives, so the nightly loop does not upload the first one again.
+        backup._unpersisted_runs.clear()
+        assert backup.uploaded_keys(ACCOUNT) == {"first.tar.gz", "second.tar.gz"}
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
 
 
 @pytest.mark.parametrize("basename", ["backup.tar.gz", "备份.tar.gz", "x" * 255])
@@ -4443,6 +4717,21 @@ class TestNightlyRetryBackoff:
 
         backup._locked_state_update(mutate)
 
+    def _raise_stored_sequence(self, kind: str = backup.KIND_SNAPSHOT, by: int = 50) -> None:
+        """Raise the stored run's sequence so this process's next run loses the slot.
+
+        ``superseded`` in :func:`_record_run_locked` compares the stored record's
+        ``process`` and ``sequence`` against the incoming run's, so raising the stored
+        sequence is the whole precondition -- no second writer is needed, and the
+        document stays one the writer itself produced apart from that field.
+        """
+
+        def mutate(state):
+            stored = backup._account_state(state, ACCOUNT)["runs"][kind]
+            stored["sequence"] = stored["sequence"] + by
+
+        backup._locked_state_update(mutate)
+
     # -- the schedule itself ------------------------------------------------
 
     def test_the_schedule_backs_off_and_then_holds_at_its_ceiling(self):
@@ -4520,6 +4809,93 @@ class TestNightlyRetryBackoff:
         # The key itself is gone, not left as an empty map or a stored zero, so
         # "nothing is failing" has exactly one spelling in the document.
         assert backup.NIGHTLY_FAILURE_STATE_KEY not in backup._account_view(ACCOUNT)
+
+    @pytest.mark.parametrize("backoff_set", [True, False], ids=["backoff-set", "no-backoff"])
+    @pytest.mark.parametrize("superseded", [True, False], ids=["superseded", "current"])
+    def test_only_a_current_run_retires_the_backoff(self, superseded, backoff_set):
+        """The four combinations of losing the slot and carrying a standing backoff.
+
+        A success clears the count, and a run whose own record is refused as stale is
+        not a success this document can act on: too stale to write a key is too stale
+        to retire a count a later failure accumulated. So the clear shares the run
+        write's condition, which is what :func:`_merge_pending` says at the other place
+        the two travel together.
+
+        Supersession is produced by raising the stored run's ``sequence``, because
+        ``superseded`` is the same-process half of ``_run_is_newer`` -- it compares the
+        stored record's ``process`` and ``sequence`` against the incoming run's, so a
+        raised sequence makes this process's next run the loser.
+        ``test_a_superseded_run_keeps_the_nightly_backoff`` is what shows two real runs
+        reach that state; this one is what enumerates every combination cheaply.
+
+        MUTATION: move the ``_clear_nightly_failure`` call in ``_record_run_locked`` out
+        of the ``if not superseded:`` branch and the superseded/backoff-set case reddens.
+        """
+        backup._unpersisted_runs.clear()
+        try:
+            backup.set_nightly(ACCOUNT, True)
+            backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/i/first.tar.gz", 7)
+            if superseded:
+                self._raise_stored_sequence()
+            if backoff_set:
+                assert _fail(ACCOUNT, backup.KIND_SNAPSHOT, "eio"), "the CAS refused the setup"
+                assert backup.nightly_failures(ACCOUNT).get(backup.KIND_SNAPSHOT)
+            else:
+                assert backup.nightly_failures(ACCOUNT) == {}, "the case starts with no row"
+
+            backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/i/second.tar.gz", 7)
+
+            stored = backup._account_view(ACCOUNT).get("runs", {}).get(backup.KIND_SNAPSHOT)
+            assert stored, "no run record survived at all"
+            # Whether the second run won the slot is the case's own precondition, so it
+            # is asserted rather than assumed: a bump that stopped working would
+            # otherwise turn the superseded rows into duplicates of the current ones.
+            if superseded:
+                assert stored["key"] == "snapshots/i/first.tar.gz", "the run was not superseded"
+            else:
+                assert stored["key"] == "snapshots/i/second.tar.gz", "the run lost the slot"
+
+            after = backup.nightly_failures(ACCOUNT).get(backup.KIND_SNAPSHOT)
+            if superseded and backoff_set:
+                assert (
+                    after and after["consecutive"] == 1
+                ), "a run refused as stale retired a count a later failure accumulated"
+            else:
+                assert after is None, (
+                    "a current run left the backoff standing"
+                    if backoff_set
+                    else "a row appeared where the case wrote none"
+                )
+            if not backoff_set:
+                # The absence has ONE spelling: the map goes with its last kind, so an
+                # empty map left behind would be a second way to say nothing is failing.
+                assert backup.NIGHTLY_FAILURE_STATE_KEY not in backup._account_view(ACCOUNT)
+        finally:
+            backup._unpersisted_runs.clear()
+
+    def test_a_failure_before_the_winning_run_commits_is_retired_by_that_run(self):
+        """The ordering half: WHEN the failure is written decides who meets it.
+
+        A failure recorded before the winning run commits is retired by that run's own
+        mutate, so it is gone whichever condition the clear carries -- the two
+        placements agree here, and this is the ordering that a reader assumes is the
+        only one. The divergent ordering is a failure recorded AFTER the winner commits,
+        which ``test_a_superseded_run_keeps_the_nightly_backoff`` builds with two real
+        writers: there the only run left to meet the row is one whose record was
+        refused.
+
+        Kept separate from the matrix above because the matrix varies WHO the run is
+        while holding the order fixed; this varies the order.
+        """
+        backup.set_nightly(ACCOUNT, True)
+        for _ in range(3):
+            _fail(ACCOUNT, backup.KIND_SNAPSHOT, "eio")
+        assert backup.nightly_failures(ACCOUNT)[backup.KIND_SNAPSHOT]["consecutive"] == 3
+        # The winner commits after the row exists, and clears it in its own mutate.
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/i/winner.tar.gz", 7)
+        assert (
+            backup.nightly_failures(ACCOUNT) == {}
+        ), "the run that WON the slot did not retire a count written before it"
 
     def test_an_unchanged_skip_also_clears_the_count(self):
         # `uploaded=False` is a successful comparison against an archive that is

@@ -17,7 +17,6 @@ import re
 
 from aiohttp import web
 
-from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.handlers.mcp import (
     _find_server_spec_anywhere,
     _get_mcp_lock,
@@ -25,6 +24,8 @@ from kiro_crew.dashboard.handlers.mcp import (
     _offload_config_write,
     _set_kirocrew_entry,
 )
+from kiro_crew.external_text import redact_external_text as _redact_external
+from kiro_crew.mcp_cleanup import mcp_entry_is_muted
 from kiro_crew.mcp_providers.base import ProviderRegistry, ProviderUnavailableError
 from kiro_crew.mcp_providers.capability import CapabilityProvider
 from kiro_crew.mcp_providers.official import OfficialRegistryProvider
@@ -372,8 +373,9 @@ async def _install_from_official(request: web.Request, server_id: str) -> web.Re
             # Identical spec already present — a reinstall is a pure no-op:
             # the user's env values AND enabled/disabled state survive.
             # (Re-enabling here would reopen the one-click path around the
-            # configure-then-enable consent step.)
-            enable_now = not existing.get("disabled", False)
+            # configure-then-enable consent step.) Reported through the launch
+            # predicate, so a non-boolean ``disabled`` reads as off here too.
+            enable_now = not mcp_entry_is_muted(existing)
 
     # Rebuild the rendered agent configs so the new server loads on the next
     # session, mirroring api_mcp_apply. Best-effort: the config write above

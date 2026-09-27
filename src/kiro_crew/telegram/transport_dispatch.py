@@ -69,7 +69,11 @@ from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     delivery_is_muted,
     driver_turn_landed,
+    open_turn_crew_log,
+    predecessor_sid,
     rearm_reinjection,
+    requested_model_sid,
+    slot_workspace,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
@@ -131,8 +135,9 @@ from kiro_crew.telegram.commands import (
     parse_dashboard_argument,
     parse_mid_turn_override,
 )
+from kiro_crew.telegram.renderer import TelegramApprovalDecider
+from kiro_crew.telegram.renderer import TelegramApprovalDecider as _APPROVAL_REGISTRY
 from kiro_crew.telegram.renderer import (
-    TelegramApprovalDecider,
     TelegramRenderer,
     md_to_telegram_html_safe,
 )
@@ -163,6 +168,7 @@ from kiro_crew.messaging.queue_receipt import STEER_ACK_EMOJI as _STEER_ACK_EMOJ
 from kiro_crew.messaging.queue_receipt import (
     ReceiptQueue,
     ReceiptSurface,
+    receipt_address_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -1163,6 +1169,38 @@ class TelegramDispatcher:
                 model=(None if resumed_key is not None else self._model_pref.get(route) or None),
             )
             _acquired = True
+            if resumed_key is None or channel_namespace_of(session_key):
+                # The session's crew log, opened the moment the allocation lands
+                # and before ANY further await: the work ledger appends every write
+                # to the acting session's log and rolls back one it cannot record,
+                # so a DM admitted as a conductor needs its log to exist before its
+                # first ledger call -- and a turn that bails between the allocation
+                # and a later opener (a failed attachment fetch, a renderer error)
+                # would leave a live session whose log is first created on the NEXT
+                # turn, by then a warm reuse, so the previous edge would never be
+                # written. The predecessor is the allocation boundary's own capture,
+                # taken inside its critical section and consumed here after the
+                # claim -- no read of the mapping around the call, which a
+                # concurrent turn's allocate-and-recycle could stale while this turn
+                # waited inside the allocation. Every CHANNEL session this dispatcher
+                # runs is opened here, including a same-DM native history picked
+                # through ``/sessions`` (``resumed_key`` naming a channel key): no
+                # dashboard runner ever handles its turns, so this is its only
+                # opener. Only a resumed DASHBOARD session is left alone -- its
+                # opener is the dashboard's, which alone holds its lineage. The
+                # workspace is read off the dashboard slot this conversation is
+                # surfaced under, the source a tab on it states the same fact from,
+                # so the two writers of this log agree. Never raises, never suspends.
+                open_turn_crew_log(
+                    provider,
+                    session_key=session_key,
+                    agent=agent,
+                    resumed=resumed,
+                    ctx_builder=self.ctx_builder,
+                    previous_sid=predecessor_sid(self.sessions, session_key),
+                    model_requested=requested_model_sid(self.sessions, session_key),
+                    workspace=slot_workspace(self.dashboard_state, session_key),
+                )
             # Extraction's approved root is the provider's OWN resolved cwd, so a
             # path lexically outside it is refused before any metadata probe.
             # Read defensively: an absent cwd must mean "no uploads", never a dead
@@ -1522,6 +1560,19 @@ class TelegramDispatcher:
                 await self.sessions.record_failure(session_key)
                 Stats().inc_message_failed()
         finally:
+            # An approval window the driver never awaited -- the prompt went out
+            # and the turn then ended before the decider -- has no wait of its own
+            # to close it, so it would outlive this turn with its nonce still
+            # armed and authorizing a press.
+            #
+            # ``_APPROVAL_REGISTRY`` is ``TelegramApprovalDecider`` under a second
+            # name. Reservations are class state, so the sweep has to reach the
+            # class holding them, and the construction name above is a seam
+            # callers and tests substitute to observe the decider a turn builds.
+            # Sweeping through that name aims at the substitute: it raises on a
+            # plain function, and on a stand-in class it clears an empty registry
+            # and leaves the real window armed past the end of its turn.
+            _APPROVAL_REGISTRY.discard_session(session_key)
             # A turn that consumed the post-compaction flag but never landed
             # discarded the prompt carrying the re-injected context; put the
             # flag back so the next turn re-injects it.
@@ -1853,7 +1904,11 @@ class TelegramDispatcher:
                     )
                 if texts and origin is not None:
                     await self._receipt_flip_locked(
-                        session_key, int(origin.chat_id), texts, own_deferred
+                        session_key,
+                        int(origin.chat_id),
+                        texts,
+                        own_deferred,
+                        owner=_entry_owner(origin),
                     )
             if not texts or origin is None:
                 return
@@ -1919,12 +1974,18 @@ class TelegramDispatcher:
 
         class _Surface:
             label = "telegram"
+            # ``chat_id`` alone, deliberately: a forum route's ``comp`` is
+            # ``"{chat_id}:{thread}"``, so ``_session_key`` already gives each Topic its
+            # own entry and no two Topics ever share a bubble for this key to keep
+            # apart. ``thread`` routes a send, which the bubble's own retained surface
+            # already carries.
+            address_key = receipt_address_key("telegram", chat_id)
 
             async def send_receipt(self, body: str) -> Any | None:
                 return await reply(chat_id, body, thread=thread)
 
-            async def edit_receipt(self, msg_id: Any, body: str) -> None:
-                await client.edit_message(chat_id, msg_id, body)
+            async def edit_receipt(self, msg_id: Any, body: str) -> bool:
+                return await client.edit_message(chat_id, msg_id, body)
 
         return _Surface()
 
@@ -1978,7 +2039,13 @@ class TelegramDispatcher:
             return True
 
     async def _receipt_flip_locked(
-        self, session_key: str, chat_id: int, answered: list[str], deferred: int = 0
+        self,
+        session_key: str,
+        chat_id: int,
+        answered: list[str],
+        deferred: int = 0,
+        *,
+        owner: str,
     ) -> None:
         """Flip the receipt to a durable "▶️ Now answering" record and drop the
         live entry so the next mid-turn burst opens a fresh receipt. Caller MUST
@@ -1989,6 +2056,15 @@ class TelegramDispatcher:
         so a >cap burst doesn't overstate what this turn answers. ``deferred``
         (>0 only past the cap) is noted so the remainder isn't silently implied.
 
+        ``owner`` is WHOSE messages those are, which the flip needs because one bubble
+        can list several principals': a GROUP chat gives every member one chat address
+        and one session key, so a drain answering one member must leave the others'
+        lines -- and the entry that is their only handle -- alone. REQUIRED and
+        keyword-only, unlike the registry transition it forwards to, which keeps a
+        default for a caller that genuinely cannot name a principal: this wrapper has
+        exactly one caller and that caller always can, so an omission is a type error
+        rather than a silent return to retiring the whole bubble.
+
         ``chat_id`` is the chat the receipt BUBBLE lives in, which the drain takes
         from the queued entry's own origin rather than from the turn that opened the
         queue -- ``create_or_grow_locked`` posted that bubble into the chat of
@@ -1998,7 +2074,7 @@ class TelegramDispatcher:
         """
         assert self.client is not None
         await self._queue.flip_answering_locked(
-            session_key, self._receipt_surface(chat_id, None), answered, deferred
+            session_key, self._receipt_surface(chat_id, None), answered, deferred, owner
         )
 
     async def _handle_dashboard(
@@ -3245,12 +3321,14 @@ class TelegramDispatcher:
         (``True``/``False``), or ``None`` to tell the gate "not surfaced here,
         fall through to Slack/dashboard" — for a key this dispatcher cannot turn
         back into a chat (``unified`` dm_scope drops the peer, a non-``telegram``
-        key, an unparseable one) or when the client is not up. The operator's
-        ``channels`` governance ceiling is read TWICE for one prompt, and both
-        reads belong to the seam: before it invokes any hook, so a denied channel
-        is never prompted at all, and again through ``unpressed_wait_answer`` when
-        a wait elapses unpressed, because a deny can land inside that wait. This
-        method owns neither reading; it asks for the second one.
+        key, an unparseable one), when the client is not up, when the
+        destination's authorization has since been withdrawn, or when the post
+        fails. The operator's ``channels`` governance ceiling is read TWICE for
+        one prompt, and both reads belong to the seam: before it invokes any hook,
+        so a denied channel is never prompted at all, and again through
+        ``unpressed_wait_answer`` when a wait elapses unpressed, because a deny
+        can land inside that wait. This method owns neither reading; it asks for
+        the second one.
 
         The wait is the SAME deny-by-default one a tool prompt uses
         (:class:`TelegramApprovalDecider`, ``APPROVAL_TIMEOUT_S``): the press
@@ -3290,7 +3368,12 @@ class TelegramDispatcher:
         rid = str(request_id)
         nonce = new_approval_nonce()
         key = TelegramApprovalDecider.key(session_key, rid)
-        TelegramApprovalDecider.arm(key, nonce)
+        # The wait below runs in this gate's OWN task, not in the turn that asked
+        # for the spawn: that turn returns as soon as the spawn is admitted, so its
+        # end-of-turn sweep can land while this coroutine is still in the send.
+        # Claiming the window here keeps the sweep off a prompt the operator is
+        # looking at; every exit path below releases the claim.
+        TelegramApprovalDecider.arm(key, nonce, detached=True)
         keyboard = {
             "inline_keyboard": [
                 [
@@ -3322,13 +3405,19 @@ class TelegramDispatcher:
             )
             return None
         try:
-            await client.send_message(
+            posted = await client.send_message(
                 chat_id,
                 body,
                 parse_mode="HTML",
                 reply_markup=keyboard,
                 message_thread_id=thread_id,
             )
+        except asyncio.CancelledError:
+            # The only suspension point between the arm and the wait, so a cancel
+            # here is the one exit that would otherwise leave the window claimed
+            # with no wait coming to release it. Close it, then let the cancel run.
+            TelegramApprovalDecider.retire(key)
+            raise
         except Exception:
             # Could not surface it: retire the armed nonce and fall through so the
             # spawn can still be answered on Slack/dashboard rather than deny by a
@@ -3336,6 +3425,20 @@ class TelegramDispatcher:
             TelegramApprovalDecider.retire(key)
             logger.warning(
                 "Telegram: failed to post spawn-approval prompt for %s", rid, exc_info=True
+            )
+            return None
+        if not posted:
+            # This client reports a failed send by RETURNING no message id rather
+            # than by raising (a revoked token, a deleted forum Topic, a chat it
+            # cannot write to, a 5xx past its own retries), so the ``except`` above
+            # does not cover it. Same conclusion: nothing is on screen, so fall
+            # through instead of waiting out the whole decision window on a prompt
+            # nobody can press and handing that silence back as a denial.
+            TelegramApprovalDecider.retire(key)
+            logger.warning(
+                "Telegram: the spawn-approval prompt for %s was not accepted by the "
+                "chat; falling through",
+                rid,
             )
             return None
 

@@ -10,6 +10,7 @@ import math
 import os
 import random
 import re
+import socket
 import string
 import struct
 import sys
@@ -50,6 +51,12 @@ _AWS_EXAMPLE_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 _ALT_SLASH_KEY = "Kx3Q51tPusV/D0URlGfMmNbVc7Z8yJhLpQrStUwZ"
 #: The same shape without separators, which the ceiling cannot reach.
 _NO_SLASH_KEY = "Kx3Q51tPusVkD0URlGfMmNbVc7Z8yJhLpQrStUwZ"
+
+
+def _jose_header(min_len: int) -> str:
+    """A base64url JOSE header segment at least *min_len* characters long."""
+    raw = json.dumps({"alg": "HS256", "pad": "A" * min_len}).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
 class TestRedactCredentials:
@@ -334,11 +341,11 @@ class TestRedactCredentials:
         to be missed. This ratchet makes that omission fail here instead of
         silently degrading a user-facing warning.
         """
-        from kiro_crew import security
+        from kiro_crew.security import redaction
 
         declared = {
             name: value
-            for name, value in vars(security).items()
+            for name, value in vars(redaction).items()
             if name.startswith("_REDACTED_") and name.endswith("_TAG")
             if isinstance(value, str)
         }
@@ -347,7 +354,7 @@ class TestRedactCredentials:
         unregistered = {
             name: value
             for name, value in declared.items()
-            if value not in security.CREDENTIAL_REDACTION_TAGS
+            if value not in redaction.CREDENTIAL_REDACTION_TAGS
         }
         assert not unregistered, (
             "redaction tag(s) not in CREDENTIAL_REDACTION_TAGS: "
@@ -623,6 +630,60 @@ class TestRedactCredentials:
         result, warnings = redact_credentials(text)
         assert result == text
         assert warnings == []
+
+    def test_hostname_containing_eyj_not_redacted(self) -> None:
+        """A dotted name with `eyJ` inside has JWT shape but no JSON-object header."""
+        from kiro_crew.security import _contains_fixed_credential, _decode_b64_safe
+
+        for text in ("ssh honeyJar.example.com", "https://api.honeyJar.co.uk/v1/x"):
+            assert redact_credentials(text) == (text, []), text
+            assert not _contains_fixed_credential(text), text
+            assert _decode_b64_safe(base64.b64encode(text.encode()).decode()) == "", text
+
+    def test_jose_validated_jwt_redacted_on_every_batch_path(self) -> None:
+        from kiro_crew.security import (
+            _contains_fixed_credential,
+            _decode_b64_chunk,
+            _decode_b64_safe,
+        )
+
+        for token in (self._JWT, self._JWE, self._JWE_DIR):
+            text = f"host honeyJar.example.com token {token}"
+            result, warnings = redact_credentials(text)
+            assert result == "host honeyJar.example.com token [REDACTED: credential]"
+            assert len(warnings) == 1
+            assert _contains_fixed_credential(token)
+            encoded = base64.b64encode(token.encode()).decode()
+            assert _decode_b64_chunk(encoded) == token
+            assert _decode_b64_safe(encoded) == token
+
+    def test_credential_inside_rejected_jwt_shape_still_redacted(self) -> None:
+        """A rejected JWT-shaped span is rescanned, so nothing inside it leaks."""
+        result, _ = redact_credentials("eyJx.AKIAIOSFODNN7EXAMPLE.y")
+        assert "AKIAIOSFODNN7EXAMPLE" not in result
+        result, _ = redact_credentials(f"eyJfoo.{self._JWT}")
+        assert result == "eyJfoo.[REDACTED: credential]"
+        # a link token matched by the same start: the other branches are retried there
+        link = "eyJ" + "e" * 100 + "." + "S" * 43
+        assert redact_credentials(f"{link}.json")[0] == "[REDACTED: credential].json"
+
+    def test_non_jose_json_header_still_redacted(self) -> None:
+        """itsdangerous / Flask-session tokens carry a JSON header with no `alg`/`enc`."""
+        typ_only = base64.urlsafe_b64encode(b'{"typ":"JWT"}').decode().rstrip("=")
+        payload = base64.urlsafe_b64encode(b'{"user_id":7}').decode().rstrip("=")
+        for token in (f"{typ_only}.payload.sig", f"{payload}.ZsT9kA.sig-x_Y"):
+            assert redact_credentials(f"cookie {token} end")[0] == (
+                "cookie [REDACTED: credential] end"
+            ), token
+
+    def test_dense_eyj_header_fails_closed(self) -> None:
+        """A header holding a second `eyJ` is redacted whole instead of rescanned per `eyJ`."""
+        from kiro_crew.security import _partial_jwt_tail
+
+        dense = "eyJ" * 30000 + ".x.y"
+        assert redact_credentials(dense)[0] == "[REDACTED: credential]"
+        assert redact_credentials(f"monkeyJ{self._JWT}")[0] == "monk[REDACTED: credential]"
+        assert _partial_jwt_tail(dense).start() == 0
 
     # ── Two-segment dashboard link token ──
     # `dashboard.token_auth.generate_token` emits `base64url(payload).base64url(
@@ -2497,6 +2558,54 @@ class TestKiroCliBundledDeniedCommands:
         assert not self._is_denied("kill 12345 | tee /tmp/kirocrew.log")
 
 
+#: The peers the ssh-to-self floor's own-host seed UDP-``connect``s to learn this
+#: machine's primary outbound address per family: RFC 5737 TEST-NET-2 and the
+#: RFC 3849 documentation prefix, which no router forwards, so a datagram
+#: ``connect`` to them sends no packet. This is what the seed MUST keep pointing
+#: at; the stub below records what it pointed at instead of asking the routing
+#: table.
+_OWN_HOST_PROBE_PEERS = frozenset({("198.51.100.1", 53), ("2001:db8::1", 53)})
+#: What the stubbed probe answers as this machine's outbound address, per family:
+#: documentation addresses too, distinct from the peers, so a test can tell the
+#: seed read the STUB (these turn up in the own-name set) from a real interface.
+_STUB_OWN_ADDRESS: dict[int, str] = {
+    socket.AF_INET: "203.0.113.7",
+    socket.AF_INET6: "2001:db8::7",
+}
+
+
+class _InertDatagramSocket:
+    """A datagram socket that connects nothing.
+
+    ``connect`` records the peer instead of asking the routing table for a
+    source address; ``getsockname`` answers the documentation address for the
+    family; ``fileno`` refuses so the per-interface ioctl sweep, which needs a
+    real descriptor, contributes nothing (its own ``except`` swallows this).
+    """
+
+    def __init__(self, family: int, recorded: list[tuple[int, object]]) -> None:
+        self._family = family
+        self._recorded = recorded
+
+    def __enter__(self) -> _InertDatagramSocket:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def connect(self, peer: object) -> None:
+        self._recorded.append((self._family, peer))
+
+    def getsockname(self) -> tuple[str, int]:
+        return (_STUB_OWN_ADDRESS.get(self._family, ""), 0)
+
+    def fileno(self) -> int:
+        raise OSError("inert datagram socket has no descriptor")
+
+    def close(self) -> None:
+        return None
+
+
 class TestBuiltinDenyPatterns:
     """Tests for is_denied() from security.py BUILTIN_DENY_PATTERNS.
 
@@ -2507,21 +2616,58 @@ class TestBuiltinDenyPatterns:
     """
 
     @pytest.fixture(autouse=True)
-    def _own_host_seed_stays_local(self, monkeypatch) -> None:
+    def _own_host_seed_connects_nothing(self, monkeypatch) -> list[tuple[int, object]]:
         """The ``ssh`` cases here are the first own-host lookup in the process.
 
         ``is_denied("ssh ...")`` seeds the ssh-to-self floor's own-host set on
         first use and, once the backoff allows, starts a DNS enrichment thread.
         The seed learns this machine's outbound address with a UDP ``connect``
-        to a documentation peer -- packet-less, but a real off-loopback connect
-        the routing table has to answer -- and the worker resolves real names.
-        These tests are about the deny patterns, not about this host's identity,
-        so the seed is pinned to the hostname alone and the worker never starts.
+        to a documentation peer -- packet-less, but a real socket the routing
+        table has to answer -- and the worker resolves real names. These tests
+        are about the deny patterns, not about this host's identity, so the
+        datagram socket is stubbed at the seam production reads -- the module's
+        ``socket`` binding, datagram construction only; every other socket kind
+        passes through -- and the enrichment backoff is pushed past the test.
+        The seed still RUNS, through the stub, so the peers it names are
+        observable (``_OWN_HOST_PROBE_PEERS``) and the address it reads back is
+        the stub's. The enumeration's other layers -- the per-interface ioctl
+        sweep (its ``fileno`` is refused), ``/proc/net/if_inet6`` and the
+        Windows / macOS adapter tables -- are local reads that may still yield
+        this host's real addresses, so the enumeration's result is filtered to
+        the stub's addresses before it enters the own-name set: what the deny
+        patterns see is host-independent, and the filter admitting the stub's
+        addresses is what proves the seed read the stub.
+
+        The own-host cache is reset for the test and restored after it, so the
+        stub's addresses never become another test's idea of this machine.
         """
         from kiro_crew.security import argv_floor
 
-        monkeypatch.setattr(argv_floor, "_own_interface_addresses", set)
+        recorded: list[tuple[int, object]] = []
+        real_socket = argv_floor.socket
+        real_interface_addresses = argv_floor._own_interface_addresses
+        stub_addresses = set(_STUB_OWN_ADDRESS.values())
+
+        def _stub_addresses_only() -> set[str]:
+            return real_interface_addresses() & stub_addresses
+
+        class _SocketModule:
+            """``socket`` with datagram construction routed to the inert stub."""
+
+            def __getattr__(self, name: str):
+                return getattr(real_socket, name)
+
+            def socket(self, family: int = -1, type: int = -1, proto: int = -1, fileno=None):
+                if type == real_socket.SOCK_DGRAM:
+                    return _InertDatagramSocket(family, recorded)
+                return real_socket.socket(family, type, proto, fileno)
+
+        monkeypatch.setattr(argv_floor, "socket", _SocketModule())
+        monkeypatch.setattr(argv_floor, "_own_interface_addresses", _stub_addresses_only)
+        monkeypatch.setattr(argv_floor, "_OWN_HOST_NAMES_CACHE", None)
+        monkeypatch.setattr(argv_floor, "_OWN_HOST_RESOLVE_DONE", False)
         monkeypatch.setattr(argv_floor, "_OWN_HOST_RESOLVE_NEXT_TRY", float("inf"))
+        return recorded
 
     def test_allows_command_with_credential_in_path(self) -> None:
         """Commands in dirs like CredentialValidatorServiceCDK must not be blocked."""
@@ -2964,17 +3110,31 @@ class TestBuiltinDenyPatterns:
         # ``git remote`` referencing a remote literally named "push".
         assert is_denied("git remote show push") is None
 
-    def test_allows_ssh_remote_command_without_publish(self) -> None:
+    def test_allows_ssh_remote_command_without_publish(
+        self, _own_host_seed_connects_nothing: list[tuple[int, object]]
+    ) -> None:
         """A plain ``ssh host '<cmd>'`` whose remote command contains the word
         ``push`` (but is not a real ``git push``) must be ALLOWED.
 
         Covers the ssh symptom from the same thread: remote
         interactions starting with ``ssh xxxx`` were aborting.
+
+        The first ``ssh`` verdict in a process also seeds the own-host set. That
+        seed runs here through the inert datagram stub: the peers it names are
+        the documentation addresses (the seam kept pointing where it must), and
+        the own addresses that reached the own-name set are the STUB's: they
+        got there only because the real enumeration read them back from the
+        stubbed socket, and the fixture's filter admits nothing else.
         """
-        from kiro_crew.security import is_denied
+        from kiro_crew.security import argv_floor, is_denied
 
         assert is_denied("ssh dev-dsk 'cd /workplace && git status'") is None
         assert is_denied("ssh dev-dsk 'git commit -m \"address push-back from review\"'") is None
+        recorded = _own_host_seed_connects_nothing
+        assert {peer for _family, peer in recorded} == _OWN_HOST_PROBE_PEERS, recorded
+        assert {family for family, _peer in recorded} == {socket.AF_INET, socket.AF_INET6}
+        assert argv_floor._OWN_HOST_NAMES_CACHE is not None
+        assert set(_STUB_OWN_ADDRESS.values()) <= argv_floor._OWN_HOST_NAMES_CACHE
 
     def test_blocks_ssh_remote_real_git_push(self) -> None:
         """A real ``git push`` inside an ``ssh`` remote command stays BLOCKED."""
@@ -4296,6 +4456,7 @@ class TestOperatorOAuthEndpointExtension:
         self, ext_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from kiro_crew import security
+        from kiro_crew.security import exfil
 
         logged: list = []
 
@@ -4303,7 +4464,7 @@ class TestOperatorOAuthEndpointExtension:
             def log(self, event: object) -> None:
                 logged.append(event)
 
-        monkeypatch.setattr(security, "SecurityEventLog", lambda: _RecorderLog())
+        monkeypatch.setattr(exfil, "SecurityEventLog", lambda: _RecorderLog())
         security._emit_oauth_extension_used_event(self.HOST, self.PATH)
         security._emit_oauth_extension_used_event(self.HOST, self.PATH)
         assert len(logged) == 1
@@ -4320,13 +4481,13 @@ class TestOperatorOAuthEndpointExtension:
     def test_audit_failure_does_not_break_the_approval(
         self, ext_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from kiro_crew import security
+        from kiro_crew.security import exfil
 
         class _BrokenLog:
             def log(self, event: object) -> None:
                 raise RuntimeError("SEL unavailable")
 
-        monkeypatch.setattr(security, "SecurityEventLog", lambda: _BrokenLog())
+        monkeypatch.setattr(exfil, "SecurityEventLog", lambda: _BrokenLog())
         self._write_extension(ext_home, [{"host": self.HOST, "path": self.PATH}])
         assert oauth_url_contains_credential(self.CONSENT_URL) is False
 
@@ -6175,18 +6336,20 @@ class TestAdaptiveHomeTargetsExpiry:
             gate._KEYSTONE_ARTIFACT_PARENTS,
         )
         adapter_roots = dict(roots.adapter_roots)
-        real = gate._realpath_or_none
+        real = gate._realpaths_or_none
         override_anchored_seen = 0
 
         for tier in tiers:
             self._clear()
             asked: list[str] = []
 
-            def recording(path: str, _sink=asked) -> str | None:
-                _sink.append(path)
-                return real(path)
+            # The build resolves its anchors as ONE batched child request, so the
+            # recorder sits on the batch seam; the population it asks for is the same.
+            def recording(paths: list[str], _sink=asked) -> list[str | None]:
+                _sink.extend(paths)
+                return real(paths)
 
-            monkeypatch.setattr(gate, "_realpath_or_none", recording)
+            monkeypatch.setattr(gate, "_realpaths_or_none", recording)
             gate._home_dir_targets_uncached(tier, roots)
 
             expected = {roots.home}
@@ -7644,7 +7807,7 @@ class TestStreamRedactor:
         """
         from kiro_crew.security import _STREAM_HOLDBACK_MAX, StreamRedactor
 
-        payload = "eyJ" + "A" * (_STREAM_HOLDBACK_MAX + 800)
+        payload = _jose_header(_STREAM_HOLDBACK_MAX + 800)
         jwt = f"{payload}.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6"
         assert len(jwt) > _STREAM_HOLDBACK_MAX
         r = StreamRedactor()
@@ -7663,7 +7826,7 @@ class TestStreamRedactor:
         """
         from kiro_crew.security import _STREAM_HOLDBACK_MAX, StreamRedactor
 
-        seg = "eyJ" + "A" * (_STREAM_HOLDBACK_MAX + 400)
+        seg = _jose_header(_STREAM_HOLDBACK_MAX + 400)
         jwe = f"{seg}.QW5rZXk.aXY.Y2lwaGVydGV4dA.dGFn"  # 5 compact JWE segments
         assert len(jwe) > _STREAM_HOLDBACK_MAX
         r = StreamRedactor()
@@ -7671,6 +7834,31 @@ class TestStreamRedactor:
         assert jwe not in emitted
         assert "eyJ" not in emitted  # no raw head leaked ahead of the flush
         assert "[REDACTED: credential]" in emitted
+
+    def test_jose_validated_jwt_split_across_chunks(self) -> None:
+        from kiro_crew.security import StreamRedactor
+
+        jws = TestRedactCredentials._JWT
+        jwe = TestRedactCredentials._JWE_DIR
+        text = f"host honeyJar.example.com then {jws} and {jwe} done"
+        for size in (1, 5, 13):
+            r = StreamRedactor()
+            chunks = [text[i : i + size] for i in range(0, len(text), size)]
+            emitted = "".join(r.feed(c) for c in chunks) + r.flush()
+            assert emitted == (
+                "host honeyJar.example.com then [REDACTED: credential]"
+                " and [REDACTED: credential] done"
+            ), size
+
+    def test_holdback_anchor_needs_a_json_header(self) -> None:
+        from kiro_crew.security import _partial_jwt_tail
+
+        assert _partial_jwt_tail("see honeyJar.example.com") is None
+        assert _partial_jwt_tail("eyJ0.honeyJar.example") is None
+        jws = TestRedactCredentials._JWT
+        assert _partial_jwt_tail(f"x {jws[:40]}") is not None
+        assert _partial_jwt_tail("x eyJhbGciOi") is not None  # header still arriving
+        assert _partial_jwt_tail(f"eyJfoo.{jws[:40]}").start() == 7
 
     def test_terminal_long_opaque_bearer_not_bisected(self) -> None:
         """A >512-char opaque (non-JWT) Bearer token stays fully redacted.
@@ -7823,7 +8011,7 @@ class TestStreamRedactor:
         """
         from kiro_crew.security import _STREAM_HOLDBACK_JWT_MAX, StreamRedactor
 
-        jwt = "eyJ" + "A" * (_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
+        jwt = _jose_header(_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
         r = StreamRedactor()
         emitted = r.feed("prefix ") + r.feed(jwt)
         emitted += r.flush()
@@ -7880,7 +8068,7 @@ class TestStreamRedactor:
         )
 
         redactor = StreamRedactor()
-        jwt = "eyJ" + "A" * (_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
+        jwt = _jose_header(_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
         assert redactor.feed(jwt) == REDACTED_CREDENTIAL_TAG
         assert redactor._discarding
         assert redactor.feed("!Important") + redactor.flush() == "!Important"
@@ -7919,7 +8107,7 @@ class TestStreamRedactor:
         )
 
         redactor = StreamRedactor()
-        jwt = "eyJ" + "A" * (_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
+        jwt = _jose_header(_STREAM_HOLDBACK_JWT_MAX + 500) + ".eyJz.SflK"
         assert redactor.feed(jwt) == REDACTED_CREDENTIAL_TAG
         assert redactor._discarding
         assert redactor.feed("More.JWT_- done") + redactor.flush() == " done"

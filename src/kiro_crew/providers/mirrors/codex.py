@@ -67,8 +67,10 @@ import re
 from collections.abc import Collection
 from typing import Any, Mapping
 
+from kiro_crew.acp import session_mcp
 from kiro_crew.acp.session_mcp import CONTROL_PLANE_SERVERS, session_mcp_projection
 from kiro_crew.acp_backends import ACP_BACKEND_CODEX
+from kiro_crew.members import MEMBER_DISPATCH_SERVER
 from kiro_crew.providers.mirrors.base import (
     AgentConfigMirror,
     Concern,
@@ -264,11 +266,11 @@ def codex_elements(
     command, args and env the spec chose, so handing it this session's credential
     would let a hand-edited line drive the session it was mounted into.
 
-    Crew's own identity-bound servers therefore do not appear at all rather than
+    Other identity-bound servers therefore do not appear at all rather than
     appearing unusable -- :func:`codex_withheld_servers` drops them upstream of
-    this function. A codex session has a working control plane and no session-bound
-    work ledger, the same line ``ACP_BACKENDS_MEMBER_DISPATCH`` already draws for
-    session control.
+    this function. The projection additionally reconstructs an explicitly granted
+    dashboard entry before attaching identity; its broker stub may carry verified
+    per-call identity instead. The work ledger remains withheld.
 
     A folded name is still claimed only once, first writer keeping it: two spec
     entries CAN legitimately fold together (``"my server"`` and ``"my_server"``),
@@ -362,6 +364,16 @@ def codex_projection(
     kept: list[dict[str, Any]] = []
     for element in projection.servers:
         name = element.get("name")
+        if name == MEMBER_DISPATCH_SERVER:
+            # The grant and restrictions come from the same parsed spec as the
+            # rest of this array. Only the gateway's managed launch gets identity.
+            if name in projection.restricted or name in projection.disabled_servers:
+                continue
+            managed = session_mcp.managed_mcp_spec_entry(name, include_opt_in=True)
+            owned = session_mcp.acp_server_element(name, managed) if managed else None
+            if owned is not None:
+                kept.append(_with_env(owned, _identity_env(session_key, channel_id, session_token)))
+            continue
         if name in withheld:
             logger.warning(
                 "codex session MCP: withholding server %r -- this transport cannot deliver "
@@ -379,7 +391,13 @@ def codex_projection(
         if not isinstance(stub, Mapping):
             continue
         name = stub.get("name")
-        if name in withheld:
+        # A dashboard stub is produced by the gateway rewriter, which rebuilds
+        # managed launches and verifies each caller. Keep the spec restrictions.
+        if name in withheld and not (
+            name == MEMBER_DISPATCH_SERVER
+            and name not in projection.restricted
+            and name not in projection.disabled_servers
+        ):
             logger.warning(
                 "codex session MCP: withholding pooled stub %r -- the projection withheld "
                 "the server it wraps, and a stub re-adds it unrestricted",

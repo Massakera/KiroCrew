@@ -50,8 +50,8 @@ interface SettingsSubNavProps<K extends string> {
    *  because hosts historically used a shorter word for the back action
    *  ("Channels") than for the list's accessible name ("Chat channels"). */
   backLabel?: string
-  /** Content pinned to this SubNav in EVERY mode (e.g. Security's
-   *  data-classification notice). A slot rather than a host-rendered sibling
+  /** Content pinned to this SubNav in EVERY mode (e.g. Chat's save-error and
+   *  config-load-failure notices). A slot rather than a host-rendered sibling
    *  because its position depends on the responsive mode: above the list at
    *  rest, but BELOW the back bar when narrow mode has drilled in — a sibling
    *  above the component would sit above the back bar and displace the
@@ -280,7 +280,9 @@ export function SettingsSubNav<K extends string>({
   }
 
   const list = (
-    <nav className={twoPane ? 'shrink-0' : 'w-full'} style={twoPane ? { width: railWidth } : undefined}>
+    // -ml-2.5 cancels the item px-2.5 so icons sit on the page title's left
+    // edge and the highlight pill bleeds into the gutter.
+    <nav className={twoPane ? 'shrink-0 -ml-2.5' : 'w-full'} style={twoPane ? { width: railWidth } : undefined}>
       <div className="flex flex-col gap-0.5" role={twoPane ? 'listbox' : 'list'} aria-label={listLabel}>
         {grouped.map(({ group, items: groupItems }, gi) =>
           group ? (

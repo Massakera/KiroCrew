@@ -1743,13 +1743,15 @@ def _deferred(module_name: str, handler_name: str) -> Callable:
     for a feature-flagged subsystem the import precedes its own gate. Route
     registration at boot is fine -- only the import moves to first request.
 
-    Both current callers wanted exactly this and differed only in which module they
+    Both original callers wanted exactly this and differed only in which module they
     named, so the module is a parameter rather than a second copy of the closure:
 
     * ``session_control`` -- feature-flagged (``agent.session_control``), with the
       enabled check inside the handler.
     * ``agent_panel`` -- the crew webview store, whose MCP server ships gated off
       (``opt_in``) and which most installs never publish to.
+    * ``mcp_apps`` -- feature-flagged (``mcp_gateway.apps_enabled``); its module
+      scope imports the gateway backend, which must never load on dashboard boot.
 
     ``module_name`` is a submodule of ``kiro_crew.dashboard.handlers``, not a
     dotted path, so this cannot be pointed at an arbitrary module.
@@ -1790,7 +1792,8 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/spawn/lost", handlers.api_spawn_lost)
     app.router.add_post("/api/spawn/mark-collected", handlers.api_spawn_mark_collected)
     # MCP Apps (SEP-1865): embedded app iframe -> gateway tool callback.
-    app.router.add_post("/api/mcp-apps/call", handlers.api_mcp_apps_call)
+    app.router.add_post("/api/mcp-apps/call", _deferred("mcp_apps", "api_mcp_apps_call"))
+    app.router.add_post("/api/mcp-apps/message", _deferred("mcp_apps", "api_mcp_apps_message"))
     app.router.add_get("/api/spawn", handlers.api_spawn_list)
     app.router.add_post("/api/spawn/stop-all", handlers.api_spawn_stop_all)
     # Fairness: the resume-hold, lanes and adaptive routes
@@ -5811,8 +5814,10 @@ async def start_dashboard(
         while True:
             t0 = time.monotonic()
             await asyncio.sleep(interval)
-            _loop_watchdog.beat()
             lag = time.monotonic() - t0 - interval
+            # Claimed before beat(): check() holds its own capture flag until a beat.
+            capture_lag = _loop_watchdog.claim_lag_enrichment(lag)
+            _loop_watchdog.beat()
             # Resource-pressure notifications ride the heartbeat cadence
             # rather than owning a task: the notifier self-gates to its own
             # sample interval, never raises, and off-loads its synchronous
@@ -5833,6 +5838,16 @@ async def start_dashboard(
                 # stays silent unless it actually wedges (the tripwire), and we
                 # don't emit ~8.6k INFO lines/day when DEBUG is enabled.
                 logger.debug("event-loop heartbeat ok (lag %.2fs)", lag)
+            if capture_lag:
+                # Bounded like the probes above so a busy executor cannot starve
+                # beat(); shielded so the capture still clears its in-flight flag.
+                try:
+                    capture = asyncio.get_running_loop().run_in_executor(
+                        None, _loop_watchdog.log_lag_enrichment, lag
+                    )
+                    await asyncio.wait_for(asyncio.shield(capture), 2.0)
+                except Exception:
+                    logger.debug("heartbeat lag capture not awaited", exc_info=True)
 
     def _heartbeat_done(task: "asyncio.Task") -> None:  # type: ignore[type-arg]
         if task.cancelled():

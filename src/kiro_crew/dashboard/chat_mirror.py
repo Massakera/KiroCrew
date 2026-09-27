@@ -38,9 +38,12 @@ from kiro_crew.dashboard.chat_runner import (
     _resolve_channel_target,
     _resolve_mirror_target,
 )
-from kiro_crew.dashboard.chat_slack import list_slack_channels
+from kiro_crew.dashboard.chat_slack import api_chat_slot_slack_unlink, list_slack_channels
 from kiro_crew.dashboard.chat_utils import effective_session_key
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.state import (
+    DashboardState,
+    _expected_binding,
+)
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
@@ -48,7 +51,7 @@ from kiro_crew.messaging.link import (
     ChannelLink,
     is_channel_session_key,
 )
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.split import bounded_for_delivery, split_markdown_safe
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform.governance_profiles import vet_and_audit
 from kiro_crew.sel import sel
@@ -533,6 +536,14 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "failed to create channel link", "code": "channel_link_failed"}, status=502
         )
+    # Persist before publishing, like the pause and unlink routes: from here on
+    # the notice in the channel, the transcript that follows it, the slots push
+    # and the `{ok, ...}` answer all report a link the user acts on. The claim
+    # above ran off the loop, where a batch writes the file inline on the way
+    # out, so this await normally finds nothing owed -- it is here so the four
+    # publish sites share one visible contract that does not hinge on which
+    # thread the claim happened to run on.
+    await state.sessions.aflush()
 
     try:
         # Recheck at the actual send boundary as well: target resolution can
@@ -585,7 +596,25 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         text, _ = redact_for_display(
             strip_control_comments(backfill_content(row)), redact_via_context
         )
-        return split_markdown_safe(f"{speaker}: {text}", max_chars)
+        units = split_markdown_safe(f"{speaker}: {text}", max_chars, redactor=redact_via_context)
+        # Re-bound: the splitter declines to cut when no budget is clean, and a
+        # transport that caps what it accepts truncates the rest after every
+        # scan has run.
+        return bounded_for_delivery(units, max_chars, redact_via_context)
+
+    def _compose_units() -> tuple[list[list[str]], list[str]]:
+        """Every selected row's units, composed off the loop thread.
+
+        Offloaded for the same reason the selection above is, and it matters more
+        here: splitting redacts and re-scans each candidate boundary, an imported
+        history row carries no size cap, and on the loop thread one large row
+        holds the loop long enough for the liveness watchdog to exit the process.
+        The Slack twin offloads its own split for this reason.
+        """
+        return (
+            [[unit for row in turn for unit in _units_for(row)] for turn in selection.recent],
+            [unit for row in selection.first_turn for unit in _units_for(row)],
+        )
 
     # Bound the INLINE delivery. Unlike the Slack drain this cannot be
     # backgrounded -- the per-unit governance re-check below has to be able to
@@ -599,12 +628,7 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
     # cannot afford is folded into the gap marker's count. Trimming composed
     # units instead would cut a reply mid-sentence and could drop the marker
     # itself -- the one line telling the reader history is missing.
-    recent_turn_units = [
-        [unit for row in turn for unit in _units_for(row)] for turn in selection.recent
-    ]
-    head_units: list[str] = []
-    for row in selection.first_turn:
-        head_units.extend(_units_for(row))
+    recent_turn_units, head_units = await asyncio.to_thread(_compose_units)
 
     total_turns = len(recent_turn_units)
 
@@ -760,6 +784,12 @@ async def api_chat_slot_mirror_pause(request: web.Request) -> web.Response:
     # offloading picks ``_save``'s inline-write branch and holds ``_MAP_LOCK``
     # across the write, which is what stalls the loop rather than what avoids it.
     was_paused = bool(state.sessions.set_mirror_paused(session_key, paused, origin=origin))
+    # Persist before publishing: the flag's write is debounced, and everything
+    # below -- the note in the channel, the slots push, the `{ok, paused}` answer
+    # -- reports a pause (or resume) the user just acted on. A gateway exit before
+    # the deferred write would revert it on restart without a word: a channel the
+    # user muted starts delivering again. (Same point as the unlink routes.)
+    await state.sessions.aflush()
 
     # Same courtesy note as the Slack thread, for the same reason and under the
     # same governance: a conversation that simply goes quiet cannot be told from a
@@ -820,18 +850,90 @@ async def api_chat_slot_mirror_unlink(request: web.Request) -> web.Response:
     with no mirror returns ``{ok, was_linked: false}``. Unlike Slack links, a
     mirror link is set on the slot's own session key — the channel key for a
     conversation that started on a channel, ``dashboard:<slot>`` otherwise — and
-    is never copied onto a second spelling, so a single clear on that key
-    suffices. Legacy bindings written under the pre-unification derived key are
-    reached by ``SessionMap``'s own compat fallback.
+    a single clear on that key suffices: ``SessionMap.clear_mirror_link`` drops
+    the canonical binding and, in the same save, any pre-unification derived-key
+    row it superseded. Dropping the winner alone would hand the map's read
+    fallback to that older row, and the session this request just reported
+    unlinked would redraw as mirrored to its previous target.
+
+    Body (optional): ``{channel_type, binding}`` — the binding the caller believes
+    it is severing, spelled as the slots projection spells its link row: the
+    channel and the row's opaque ``binding`` token, a digest of the whole binding
+    (thread id included). The session menu sends it, because the row it renders
+    can be stale: a tab that missed a slots push (a reconnecting socket) still
+    shows the Discord row after another tab has rebound the slot to Telegram,
+    and a key-only clear would then delete the Telegram binding the clicker
+    never saw. When the body names one, the compare and the clear are ONE step
+    in the map (``SessionMap.clear_mirror_link_if``: the current mirror must
+    match on both, under the map's lock, and only then is it cleared -- a rebind
+    landing between a route-level read and its clear would otherwise be cleared
+    by the stale unlink that matched the binding before it); a mismatch is 409
+    ``mirror_changed`` and nothing is cleared — and
+    nothing is pushed either, so it is the menu's own slots refetch on that
+    answer that corrects the stale row. An empty
+    body keeps the unconditional clear for callers that have no row in hand.
+
+    A body naming a ``slack`` binding is the slot's Slack THREAD, and this
+    handler hands it to ``slack-unlink``'s, which owns that teardown (both key
+    spellings, the slot's own fields, the thread's reverse index, the courtesy
+    note). The menu therefore posts every row's Unlink here and carries no
+    transport assumption of its own; the assumption lives beside the code that
+    enforces it: ``mirror-link`` refuses Slack on channel type
+    (``use_slack_link``), so no slack-typed mirror binding is creatable, and
+    ``SessionMap.get_mirror_link`` already reads the thread as the session's
+    mirror. The delegate re-reads the body; aiohttp serves it from the cache
+    the first read filled.
     """
     state: DashboardState = request.app["state"]
+    expected = await _expected_binding(request)
+    if expected is not None and expected[0] == SLACK_NAMESPACE:
+        return await api_chat_slot_slack_unlink(request)
     name = request.match_info.get("name") or request.match_info.get("slot", "")
     slot = state.get_slot(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
 
     session_key = effective_session_key(slot)
-    cleared = state.sessions.clear_mirror_link(session_key, reason=UNBIND_REASON_DASHBOARD_UNLINK)
+    if expected is not None:
+        # Compare and clear are ONE guarded step in the map: a rebind landing
+        # between a route-level read and its clear (another thread's `!sessions`
+        # pick, a rival claim, the dispatcher re-asserting an origin mirror)
+        # would be cleared by the stale unlink that matched the binding before
+        # it. False is a mismatch and nothing was touched.
+        channel_type, token = expected
+        if not state.sessions.clear_mirror_link_if(
+            session_key, channel_type, token, reason=UNBIND_REASON_DASHBOARD_UNLINK
+        ):
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.mirror_unlink",
+                outcome="denied",
+                source="dashboard",
+                resources=f"{slot.key} reason=mirror_changed",
+            )
+            logger.info("mirror-unlink: %s refused, the binding changed under the menu", slot.key)
+            return web.json_response(
+                {
+                    "error": "the session's linked channel changed; nothing was unlinked",
+                    "code": "mirror_changed",
+                },
+                status=409,
+            )
+        cleared = True
+    else:
+        cleared = state.sessions.clear_mirror_link(
+            session_key, reason=UNBIND_REASON_DASHBOARD_UNLINK
+        )
+    # Persist before publishing. The map's writer is debounced, so without this
+    # the slots push and the `{ok, was_linked: true}` below would report a
+    # sever that a gateway exit before the flush undoes: the binding reloads on
+    # restart and the channel keeps driving a session the user was told it no
+    # longer does. Awaited here rather than made the map's default because the
+    # writers that are not answering a user (inbound turns, the dispatcher's
+    # origin rebind) tolerate the debounce; every dashboard route that publishes
+    # a state the user just acted on -- link, pause, unlink, on both the mirror
+    # and the Slack side -- flushes first.
+    await state.sessions.aflush()
     state.push_slots_update()
     sel().log_api_access(
         caller="dashboard",

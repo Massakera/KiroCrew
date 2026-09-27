@@ -13,7 +13,7 @@ anything that survived a gateway crash. No single mechanism is a single point of
 |-----------|--------|-------|--------------------|-----------------------|---------------------------|
 | `asyncio.wait_for` on `_run_inner` | `subagent.py` | Subagent tasks | 3 h (`agent.subagent_timeout_secs`, `_TIMEOUT_SECS` fallback) | No (see reaper below) | Raises `TimeoutError`, marks subagent failed, resets session |
 | Periodic reaper loop | `subagent.py` | Subagent tasks | 60s sweep (`_REAPER_INTERVAL`), kills at the same deadline | Yes, runs independently of the spawning session | `_force_reap`: reset, SIGKILL fallback, mark done, SEL audit, announce |
-| Startup watchdog | `subagent.py` | Pre-first-turn subagents | 120s with no runtime (`_STARTUP_TIMEOUT_SECS`) | Yes | Reaps a subagent that never got a runtime |
+| Startup watchdog | `subagent.py` | Pre-first-turn subagents | Session-start budget plus the late-start collector wait plus a 30s margin, at least 120s, with no runtime (`SubagentManager._startup_deadline`) | Yes | Reaps a subagent that never got a runtime |
 | Reset timeout in `_run` finally | `subagent.py` | Subagent cleanup | 30s (`_RESET_TIMEOUT`) | No | SIGKILL fallback plus SEL audit if `reset()` hangs |
 | Turn limit | `subagent.py` | Subagent tool calls | 1000 turns (`_TURN_LIMIT`, configurable) | No | Stops execution, returns partial output |
 | Stall surfacing | `subagent.py` | Running subagents | 120s with no stream activity (`_STALL_IDLE_SECS`) | Yes | Surfaces the subagent as "stalled" in the UI |
@@ -75,7 +75,7 @@ Five profiles:
 | Profile | Used by | Effect |
 |---------|---------|--------|
 | `tool` (default) | Every ordinary agent-influenced spawn | The full rlimit ceiling plus `oom_score_adj=1000` |
-| `extractor` | The PDF text-extraction child (`pdf_extract.py` -> `python -m kiro_crew.pdf_extract_child`), fed untrusted document bytes on stdin by file-grep and knowledge ingest | A FIXED ceiling independent of `resource_limits`: `RLIMIT_AS` 1 GiB, `RLIMIT_CPU` 60 s, `RLIMIT_NOFILE` 1024, plus the OOM bias. `pdfplumber` allocates a page's whole character list before any caller can measure it, so the memory bound has to be on by default and one process down; a pure-CPython child measures ~270 MB virtual on a one-page document, which is why a virtual cap is safe here where `tool` leaves it opt-in. On Windows (no rlimits) `pdf_extract.py` spawns the child `CREATE_SUSPENDED`, attaches a Job object with `JobMemoryLimit` at the same byte count via `platform_compat.apply_job_limits`, and FAILS CLOSED -- kills the unrun child and reports `unbounded` -- when the job cannot be attached. macOS accepts `RLIMIT_AS` without enforcing it, so the child additionally polices its own peak RSS (`getrusage` `ru_maxrss`, sampled every 20 ms) against the same 1 GiB and ends itself with the `memory` report: the ceiling there, a second layer on Linux |
+| `extractor` | The PDF text-extraction child (`pdf_extract.py` -> `python -m kiro_crew.pdf_extract_child`), fed untrusted document bytes on stdin by file-grep and knowledge ingest | A FIXED ceiling independent of `resource_limits`: `RLIMIT_AS` 1 GiB, `RLIMIT_CPU` 60 s, `RLIMIT_NOFILE` 1024, plus the OOM bias. `pdfplumber` allocates a page's whole character list before any caller can measure it, so the memory bound has to be on by default and one process down; a pure-CPython child measures ~270 MB virtual on a one-page document, which is why a virtual cap is safe here where `tool` leaves it opt-in. On Windows (no rlimits) `pdf_extract.py` spawns the child `CREATE_SUSPENDED`, attaches a Job object with `JobMemoryLimit` at the same byte count via `platform_compat.apply_job_limits`, and FAILS CLOSED -- kills the unrun child and reports `unbounded` -- when the job cannot be attached. macOS accepts `RLIMIT_AS` without enforcing it, so the child additionally polices its own peak RSS (sampled every 20 ms) against the same 1 GiB and ends itself with the `memory` report: the ceiling there, a second layer on Linux. The sample is the CHILD's own high-water mark: `getrusage` `ru_maxrss` on macOS, but `/proc/self/status` `VmHWM` on Linux, because there `execve` folds the pre-exec image's peak into `ru_maxrss` and a child of a gateway already past 1 GiB would read its parent's peak on the first tick and lose every document unparsed |
 | `session_host` | The trusted ACP session-host spawns (`acp/client.py`, `acp/runtime.py`) | RAISES NOFILE to the inherited hard limit and does nothing else. A session host multiplexes many MCP pipe pairs, and the 1024 cap caused EMFILE crashes. No OOM bias: a trusted session host must not be the preferred kill target |
 | `build` | The dev-fleet build spawns (`apps/builtins/dev_fleet/runtime.py`) | Vite and npm need thousands of descriptors; keeps the OOM bias |
 | `none` | The user's own interactive terminal | No rlimits and no OOM bias, so the shim is skipped entirely unless the spawn also asks for a controlling terminal (`ctty_fd=`), which the terminal does |
@@ -226,6 +226,24 @@ memory-ballooning command is killed *before* `memory.max` takes out the entire a
 It is requested explicitly (`--oom-bias`) by the `tool`, `build` and `extractor` profiles
 only (`_PROFILE_OOM_BIAS`).
 
+### Scope unit names
+
+`systemd-run` names a scope after the invocation (`run-u<N>.scope`) unless it is
+given a `--unit`, so a scope in a kernel OOM report or a `systemctl` listing
+identifies nothing about what it held. `AcpRuntime._spawn` passes
+`--unit kirocrew-rt-<spawn instance>.scope` (`sandbox.scope_unit_name` builds the
+name, `sandbox.name_scope_unit` inserts it) and logs that unit name beside the
+runtime's pid at initialization, so an operator reading a kill can join the scope
+back to the runtime it held, and from that pid to the sessions it served — those
+are logged against the same pid as they are created.
+
+Every other wrap keeps the default anonymous name: `AcpClient._spawn`, cron,
+app-backend, hook, git and tool spawns. For `AcpClient._spawn` that is deliberate
+here — its spawn instance exists only in memory and is never written to the
+child's environment, so a name alone would not outlive the kill it is meant to
+explain. Giving that path a durable token is harness-parity work, not part of this
+naming pass.
+
 ### The aggregate slice ceiling (`memory.high` on `kirocrew-agents.slice`)
 
 `MemoryMax` is a **per-scope** cap, and scopes are created per spawn — so several
@@ -309,6 +327,35 @@ thread) logs new `oom_kill` events with the victim scopes (each scope's own
 `memory.events.local`), the slice's `memory.current` versus `memory.max`, and whether the
 slice's own ceiling engaged (`memory.events.local max` on the slice) — the discriminator
 between an aggregate breach and a single scope hitting its own per-tree limit.
+
+A **task** breach has no comparable kernel event to observe: past `pids.max` the kernel
+fails `fork()` with `EAGAIN` in whichever scope asks next, logs nothing, and every agent
+under that slice hits the same wall at once — the whole agent population of this user's
+gateways, since the slice lives in the per-UID user manager, not the machine's other users.
+What makes it observable is the count on the way up, so
+`resource_status.probe()` reads the slice's `pids.current` against its `pids.max` and carries
+three figures on its snapshot — the slice total, the ceiling, and this instance's own
+child-slice share, read separately so an install is never credited with a co-resident
+gateway's tasks. The reading reaches the `resource_status` pull tool and the diagnostics
+bundle's posture block; past
+`_SLICE_TASKS_TIGHT_RATIO` (90%) of the ceiling it also rides the injected `[RESOURCES]`
+line, and raises that line by itself when memory is not the constraint — the case the memory
+figure cannot express at all. Note the asymmetry with memory, which is deliberate: the task
+figure is **reported, never gated**. `posture` stays a single memory scalar, so
+`admission_check` and `prewarm_allowance` behave identically at any task count, and a
+refusal keeps naming the GB reading an operator can act on. The dashboard's `/api/system`
+payload deliberately does NOT carry these figures: nothing renders them yet, and the key
+lands in the same change as its consumer rather than ahead of it.
+
+Where there is no cgroup task ceiling to approach (macOS, Windows, no delegation) all three
+figures read `-1`. The RENDERED surfaces then print nothing rather than an unknown —
+`summary_lines()` drops its line and the `[RESOURCES]` advisory cannot be raised by a task
+count at all — while the diagnostics bundle carries the `-1` sentinel through, because a
+reader parsing fields needs the key present to tell "not measurable here" from a field this
+gateway version does not serve. An absent ceiling and an unreadable one stay distinct:
+`pids.max` holding the kernel's `max` sentinel reports `0` and prints "no ceiling set", while
+a read that fails — a slice released between the directory check and the read — reports `-1`
+and prints "ceiling unreadable", so a teardown is never published as an absent limit.
 
 ### Availability and fallback
 

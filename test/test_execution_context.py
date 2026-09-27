@@ -72,6 +72,48 @@ def test_explicit_target_selects_existing_member_without_broadening_privacy(memb
         execution.derive_execution(parent, target_member="missing", config=members)
 
 
+def test_template_selection_keeps_the_store_and_flips_only_the_namespace(members):
+    """`with_template` is the one rewrite for running a store under a template.
+
+    A member with a persisted id can carry "this member, under that template":
+    the store and id stay, the selection namespace becomes the template's. A
+    member with NO persisted id is named by its selection alone, so the same
+    rewrite leaves a record attributed to no member -- the plain template run the
+    spawn gate mints for that caller; the `session_create` arm, which keeps such
+    a member's selection, does not call this. A template record renames its
+    selection.
+    """
+    alice = execution.resolve_member_execution(members, "alice", memory_mode="incognito")
+    delegate = alice.with_template("worker-template", "kirocrew-worker")
+    assert delegate.selection_kind == "template"
+    assert delegate.selection_name == "kirocrew-worker"
+    assert delegate.template_id == "worker-template"
+    assert (delegate.member_id, delegate.store, delegate.memory_mode) == (
+        alice.member_id,
+        alice.store,
+        "incognito",
+    )
+
+    legacy = execution.ExecutionContext(
+        None, execution.MemoryStoreRef("legacy-v1"), "member", "shared-template", "incognito"
+    )
+    legacy = replace(legacy, selection_name="scribe")
+    flipped = legacy.with_template("worker-template", "kirocrew-worker")
+    assert flipped == replace(
+        legacy,
+        selection_kind="template",
+        template_id="worker-template",
+        selection_name="kirocrew-worker",
+    )
+    assert (flipped.store, flipped.memory_mode) == (legacy.store, "incognito")
+
+    plain = execution.ExecutionContext(None, execution.MemoryStoreRef("default"), "template", "")
+    renamed = plain.with_template("worker-template", "kirocrew-worker")
+    assert renamed == replace(
+        plain, template_id="worker-template", selection_name="kirocrew-worker"
+    )
+
+
 def test_corrupt_member_never_becomes_global(members, tmp_path):
     admitted = execution.resolve_member_execution(members, "alice")
     (tmp_path / "memory_stores" / "member-alice" / "memory.db").unlink()
@@ -126,6 +168,68 @@ def test_restricted_session_record_stays_live_and_monotonic(members, tmp_path):
     from kiro_crew.history import ConversationLog
 
     assert not ConversationLog()._path("dashboard_private").exists()
+
+
+@pytest.mark.parametrize("line_mode", ["incognito", "Incognito"])
+def test_persistent_bind_honors_restricted_record_without_execution_context(members, line_mode):
+    from kiro_crew.history import ConversationLog
+
+    key = "dashboard_restricted_recreate"
+    log = ConversationLog()
+    log.update_metadata(key, {"memory_mode": line_mode})
+    persistent = execution.resolve_member_execution(members, "alice")
+
+    execution.bind_session_execution(key, persistent)
+
+    metadata = log.get_metadata(key)
+    assert metadata["memory_mode"] == "incognito"
+    assert "memory_store" not in metadata
+    assert execution.EXECUTION_CONTEXT_KEY not in metadata
+    live = execution.read_live_session_execution(key)
+    assert live is not None
+    assert live.memory_mode == "incognito"
+    assert execution.read_session_execution(key) == live
+
+
+@pytest.mark.parametrize("line_mode", ["incognito", "Incognito"])
+def test_durable_record_reads_no_looser_than_its_tightened_line(members, line_mode):
+    """A persistent record beside a restricted line answers with the line's mode.
+
+    A member chat binds a persistent DURABLE record into its line. The line's own
+    ``memory_mode`` can then be tightened without the record following it -- a
+    hand-edited ``Incognito`` header, or a save that ratcheted the line as a
+    restricted original's rows landed under it. Every carrier-first reader goes
+    through ``read_session_execution``, so it folds the line in: the identity is
+    the record's, the mode is the stricter of the two. The next binding then takes
+    the restricted branch and heals the record itself, so the file stops
+    disagreeing with itself.
+    """
+    from kiro_crew.history import ConversationLog
+
+    key = "dashboard_member_line_tightened"
+    log = ConversationLog()
+    persistent = execution.resolve_member_execution(members, "alice")
+    execution.bind_session_execution(key, persistent)
+    before = log.get_metadata(key)
+    assert before[execution.EXECUTION_CONTEXT_KEY]["memory_mode"] == "persistent"
+    assert execution.read_session_execution(key) == persistent
+
+    log.update_metadata(key, {"memory_mode": line_mode})
+
+    read = execution.read_session_execution(key)
+    assert read is not None
+    assert read.memory_mode == "incognito", "the record's looser mode won over the line"
+    assert replace(read, memory_mode="persistent") == persistent, "the identity moved"
+
+    execution.bind_session_execution(key, persistent)
+
+    metadata = log.get_metadata(key)
+    assert metadata["memory_mode"] == "incognito"
+    assert metadata[execution.EXECUTION_CONTEXT_KEY]["memory_mode"] == "incognito"
+    assert metadata[execution.EXECUTION_CONTEXT_KEY]["member_id"] == persistent.member_id
+    live = execution.read_live_session_execution(key)
+    assert live is not None
+    assert live.memory_mode == "incognito"
 
 
 def test_session_publication_compares_captured_record(members):

@@ -196,7 +196,7 @@ describe('automation transport normalizer', () => {
 
   it.each([
     { cadence_secs: 86_401 },
-    { budgets: { max_runtime_secs: 604_801, max_agent_turns: 8, max_tokens: 250_000, max_provider_errors: 3 } },
+    { budgets: { max_runtime_secs: 2_592_001, max_agent_turns: 8, max_tokens: 250_000, max_provider_errors: 3 } },
     { budgets: { max_runtime_secs: 14_400, max_agent_turns: 9, max_tokens: 250_000, max_provider_errors: 3 } },
     { budgets: { max_runtime_secs: 14_400, max_agent_turns: 8, max_tokens: 1_000_001, max_provider_errors: 3 } },
     { budgets: { max_runtime_secs: 14_400, max_agent_turns: 8, max_tokens: 250_000, max_provider_errors: 21 } },

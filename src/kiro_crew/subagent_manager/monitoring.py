@@ -444,13 +444,20 @@ class OrphanStallMonitor(ManagerComponent):
                         # started (folder creation time) to avoid false negatives under load
                         pid_recorded_at = state.get("pid_recorded_at", state.get("started", 0))
                         if self._manager._is_orphan_process(pid, pid_recorded_at):
-                            self._manager._kill_orphan_pid(pid)
+                            # Awaited: the Windows arm is a taskkill spawn that
+                            # waits on the target, kept off the loop.
+                            kill_failed = await self._manager._kill_orphan_pid(pid)
                             try:
                                 sel().log_tool_invocation(
                                     session_key=f"subagent:{agent_id}",
                                     source="subagent",
                                     tool_name="orphan_reconcile_kill",
-                                    outcome="killed",
+                                    # Never ``killed`` for a process the kill
+                                    # left standing: the folder is reconciled
+                                    # below either way, so this row is the only
+                                    # place the process's fate is recorded.
+                                    outcome="killed" if kill_failed is None else "failed",
+                                    error=kill_failed or "",
                                     metadata={"subagent_id": agent_id, "pid": pid},
                                 )
                             except Exception:
@@ -941,11 +948,17 @@ class OrphanStallMonitor(ManagerComponent):
                 # "failed to start" error instead of burning the full deadline
                 # and surfacing a misleading 30-minute turn-0 timeout.
                 if self._manager._is_startup_stalled(info, now):
+                    # The in-startup population is diagnostic only: the
+                    # deadline is the fixed ``_startup_deadline`` whatever the
+                    # crowd, measured from gate exit (``_gate_exit_reset``).
                     logger.warning(
                         "Reaper: subagent %s failed to start within %ds "
-                        "(turn 0, no runtime launched), force-killing",
+                        "(turn 0, no runtime launched; %d other agent(s) in startup; "
+                        "%d co-tenant frame(s) received), force-killing",
                         agent_id,
-                        self._manager._startup_deadline,
+                        self._stamped_startup_deadline(info),
+                        self._manager._startup_population(exclude=info),
+                        info._startup_cotenant_frames,
                     )
                     try:
                         await self._manager._force_reap(
@@ -994,24 +1007,52 @@ class OrphanStallMonitor(ManagerComponent):
         """True if a subagent is wedged in startup and should be reaped early.
 
         A subagent qualifies only once it has actually entered execution
-        (``_exec_started`` set by ``_run_inner``) yet has not begun its first
-        provider stream, launched no runtime (``_pid is None``), and produced
-        no turn (``turns == 0``) within ``_startup_deadline`` seconds. A
-        provider can create its child lazily from ``stream()``, so a missing PID
-        alone is not evidence that startup has not progressed. Keying on
+        (``_exec_started`` set by ``_run_inner``) yet has launched no runtime
+        (``_pid is None``), had no answer on its own session
+        (``_first_stream_started``, see ``_leave_startup``) and produced no turn
+        (``turns == 0``) within ``_startup_deadline`` seconds. A provider can
+        create its child lazily from ``stream()``, so a missing PID alone is not
+        evidence that startup has not progressed; an opened stream is not
+        evidence that it has. Keying on
         ``_exec_started`` — not the registration timestamp ``started`` — means
         an agent merely awaiting spawn approval (never entered ``_run_inner``)
         is never caught here.
+
+        The deadline is the fixed ``_startup_deadline`` however many other
+        agents are in startup, and the clock it is measured on does not run
+        while the run is queued for a ``SessionStartGate`` permit: the clock
+        freezes at gate entry (``_gate_wait_mark`` stamps
+        ``_gate_wait_started``, which stands in for *now* here) and restarts at
+        acquisition (``_gate_exit_reset``). So the clock measures time spent
+        STARTING -- before the gate, and from gate exit until the start's exit
+        (a runtime PID, or its first answer) -- never time queued
+        behind other starts, on both start paths, and the in-startup population
+        is bounded separately by ``_startup_cap`` at admission. The deadline does not grow with the
+        population: a term sampled at sweep time against a clock spanning the
+        whole crowded period would not be monotonic -- it would shrink as the
+        crowd drained and could reap at one sweep an agent the sweep before had
+        left inside its window.
         """
         exec_started = info._exec_started
         if exec_started is None:
             return False
+        # Queued for a permit: the clock reads as it stood when the wait began.
+        clock_now = info._gate_wait_started if info._gate_wait_started is not None else now
         return (
             info.turns == 0
             and info._pid is None
             and info._first_stream_started is None
-            and (now - exec_started) > self._manager._startup_deadline
+            and (clock_now - exec_started) > self._stamped_startup_deadline(info)
         )
+
+    def _stamped_startup_deadline(self, info: SubagentInfo) -> int:
+        """*info*'s startup deadline, fixed per start clock so a config write
+        moves only the windows of starts that begin after it."""
+        stamp = info._startup_deadline_stamp
+        if stamp is None or stamp[0] != info._exec_started:
+            stamp = (info._exec_started or 0.0, self._manager._startup_deadline)
+            info._startup_deadline_stamp = stamp
+        return stamp[1]
 
     async def _stall_verdict_impl(self, info: SubagentInfo) -> tuple[str, str]:
         """Liveness verdict for an idle subagent: working, wedged, or unknown.

@@ -55,6 +55,7 @@ from kiro_crew.instances.constants import (
 )
 from kiro_crew.instances.constants import WARM_SET_CAP_AUTO as _WARM_SET_CAP_AUTO
 from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX
+from kiro_crew.monitoring.limits import DEFAULT_RUNTIME_CEILING_SECS, MAX_RUNTIME_CEILING_SECS
 from kiro_crew.stt.limits import DEFAULT_IDLE_EVICT_SECS as _STT_DEFAULT_IDLE_EVICT_SECS
 from kiro_crew.stt.limits import DEFAULT_PARTIAL_INTERVAL_MS as _STT_DEFAULT_PARTIAL_INTERVAL_MS
 from kiro_crew.stt.limits import DEFAULT_SILENCE_MS as _STT_DEFAULT_SILENCE_MS
@@ -1136,14 +1137,30 @@ class AgentConfig:
         metadata=_meta(
             "Sandbox",
             "Sandbox mode for ACP provider. Default 'auto' engages OS-level "
-            "isolation (namespace on Linux, sandbox-exec on macOS) and "
-            "automatically defers to kiro-cli's internal sandbox on macOS when "
-            "it is enabled (kiro-cli >= 2.13; nested seatbelt causes EPERM). "
-            "Set to 'off' to skip Kiro Crew's own OS-level sandbox — delegation "
-            "to kiro-cli's internal sandbox still fires on macOS if it is "
-            "enabled, and a SECURITY warning is logged when neither layer is "
-            "active.",
-            enum=["auto", "off"],
+            "isolation (namespace on Linux, sandbox-exec on macOS) at the "
+            "standard tier and automatically defers to kiro-cli's internal "
+            "sandbox on macOS when it is enabled (kiro-cli >= 2.13; nested "
+            "seatbelt causes EPERM). The standard tier deliberately leaves "
+            "~/.aws, ~/.ssh and ~/.kube visible to the agent's shell so the aws "
+            "CLI, boto3 credential_process, git-over-SSH and kubectl keep "
+            "working; the file tools still refuse those paths. Set to 'strict' "
+            "to also hide ~/.aws (including ~/.aws/sso/cache, kiro-cli's grant "
+            "store for OAuth-connected remote MCP servers), ~/.ssh (except "
+            "known_hosts), ~/.kube and ~/.config/gh, plus the credential files "
+            "~/.npmrc, ~/.pypirc, ~/.netrc and ~/.git-credentials, from every "
+            "agent subprocess -- opt-in, and inside the agent it breaks the aws "
+            "CLI, boto3, git-over-SSH, gh, kubectl, npm/pip registry auth, "
+            ".netrc HTTPS auth, the git credential store and remote-MCP OAuth "
+            "for the same reason. Like every value of this key, a change applies "
+            "to sessions started after it; a session already running keeps the "
+            "tier it was spawned with until it ends. 'strict' changes "
+            "nothing where Kiro Crew applies no sandbox of its own: Windows has "
+            "no OS backend, and a macOS spawn delegated to kiro-cli's internal "
+            "sandbox is confined by that profile instead. Set to 'off' to skip "
+            "Kiro Crew's own OS-level sandbox -- delegation to kiro-cli's "
+            "internal sandbox still fires on macOS if it is enabled, and a "
+            "SECURITY warning is logged when neither layer is active.",
+            enum=["auto", "strict", "off"],
         ),
     )
     sandbox_allow_no_isolation: bool = field(
@@ -2396,6 +2413,18 @@ class MemoryConfig:
         metadata=_meta(
             "Inject Lessons Context",
             "Inject the learned-corrections and user-profile blocks into " "new-session context.",
+        ),
+    )
+    inject_activity: bool = field(
+        default=True,
+        metadata=_meta(
+            "Inject Memory Activity",
+            "Inject the recent activity block (active projects, daily history (14 full "
+            "days, then decayed summaries and counts to day 180), task facts and "
+            "relevant past episodes) into new-session context as a "
+            "budgeted background block. Off: only preferences and the activity index "
+            "ship at session start and older material is read through memory_recall. "
+            "Requires inject_memory.",
         ),
     )
     migrated: bool = field(
@@ -3692,6 +3721,26 @@ class DashboardConfig:
             "graded accent stripe (0-10; 0 = off).",
         ),
     )
+    # Literal enum rather than FOLDER_SORT_MODES: that constant is defined below
+    # this class (with the other write/load bounds) and a class body is evaluated
+    # top to bottom. test_config_patch.py::TestFolderSortRoundTrip::
+    # test_the_allowlist_enum_is_the_loader_list_spelled_once pins the two
+    # spellings equal.
+    folder_sort: str = field(
+        default="custom",
+        metadata=_meta(
+            "Sidebar Folder Order",
+            "How the chat sidebar orders session folders: 'custom' keeps the stored "
+            "positions (set by dragging a folder or by chat_folder_move), 'name' is an "
+            "ASCII-case-insensitive natural order (01. < 02. < 10.; A-Z fold to a-z, "
+            "other letters compare as written), 'created' is newest "
+            "first. A view preference only -- choosing a mode never rewrites the "
+            "stored positions, so switching back to 'custom' restores them exactly. "
+            "Read by the sidebar and by chat_folder_tree, which lists folders in the "
+            "order the sidebar draws them.",
+            enum=["custom", "name", "created"],
+        ),
+    )
     update_nudge: dict = field(
         default_factory=dict,
         metadata=_meta(
@@ -4394,10 +4443,12 @@ class SessionSummaryConfig:
         metadata=_meta(
             "Assistant Excerpt Size",
             "Characters kept from each end of an assistant message when building "
-            "the summarization input (>=80). User messages are always included in "
-            "full -- they carry intent and are small -- while assistant output is "
+            "the summarization input (>=80). User messages are included in full "
+            "unless the whole input exceeds the fixed 40,000-character summary input "
+            "limit -- they carry intent and are small -- while assistant output is "
             "excerpted because it holds the progress detail but dominates the "
-            "transcript.",
+            "transcript. Past that limit, middle turns are dropped and any turn is "
+            "cut to about 5,000 characters per end, so larger values stop helping.",
         ),
     )
 
@@ -4690,6 +4741,14 @@ MCP_PROBE_TIMEOUT_MIN = 5
 MCP_PROBE_TIMEOUT_MAX = 120
 RECENT_TINT_COUNT_MIN = 0
 RECENT_TINT_COUNT_MAX = 10
+# The sidebar's folder sort modes, spelled once for the same reason as the bounds
+# above: the loader normalizes to this set, the PATCH allowlist accepts exactly
+# it, and the ``kirocrew-dashboard`` MCP server reads the stored value back
+# through it. ``custom`` is the stored ``order`` positions (today's behaviour and
+# the default), ``name`` an ASCII-case-insensitive natural order, ``created`` newest
+# first. The frontend's ``readFolderSortMode`` mirrors this list.
+FOLDER_SORT_MODES: tuple[str, ...] = ("custom", "name", "created")
+FOLDER_SORT_DEFAULT = "custom"
 SESSION_TIMEOUT_MIN = 0
 SESSION_TIMEOUT_MAX = 86400
 POOL_TTL_SECS_MIN = 0
@@ -5810,16 +5869,21 @@ class McpConfig:
         ),
     )
     honour_auto_approve: bool = field(
-        default=False,
+        default=True,
         metadata=_meta(
             "Honour MCP autoApprove",
-            "Keep an ``autoApprove`` list no server spec declares -- one hand-added "
-            "to ``mcp.json`` -- in the agent config Kiro Crew writes. Off by default, "
-            "and off DROPS those verbs: such a tool is approved locally with no "
-            "permission request, so no approval card is ever shown for it. A ceiling "
-            "strips the key whatever this says; a verb a spec declares is kept either "
-            "way. Applies at restart, when the spec is rebuilt, so turning it off "
-            "does not retract a grant already in the file.",
+            "Keep an ``autoApprove`` list you wrote yourself -- one hand-added to "
+            "``mcp.json`` or to an agent file -- in the agent config Kiro Crew "
+            "writes. On by default: an ``autoApprove`` is a deliberate choice about "
+            "your own tools and is respected, so those verbs run without an approval "
+            "card. Know what it costs before writing one: the agent runtime approves "
+            "such a call locally and emits no permission request, so Kiro Crew's "
+            "own tool gate never runs for it. Turn this OFF to drop every verb no "
+            "server spec declares, which puts those tools back through the gate. A "
+            "governance ceiling strips the key whatever this says, and a verb a spec "
+            "declares is kept either way. Applies at restart, when the spec is "
+            "rebuilt, so a change does not retract or restore a grant already in the "
+            "file.",
             restart=True,
         ),
     )
@@ -6421,22 +6485,23 @@ class DecisionsConfig:
 
 @dataclass
 class MonitoringConfig:
-    """Which side justifies itself when a session picks a monitoring path.
+    """Monitor arming preference and finite wall-clock policy.
 
-    Two paths can watch the same pull request today and NEITHER is gated. The
-    probe-gated structured monitor (``monitor_watch``) and the per-interval
-    prompt loop (``monitor_start``) are both armable on a stock install, and
-    ``GET /api/monitors`` answers ``enabled`` from whether the service object
-    exists rather than from any key, so there has never been a switch that
-    turns the structured engine on or off.
-
-    What is genuinely unsettable is which of the two an arming takes, and the
-    reason is that no code chooses: the choice is made by the model reading the
-    two tool descriptions. So this section is read exactly where those
-    descriptions are built -- ``mcp_tools/control.py::schemas()`` -- and
-    nowhere else. That is the honest extent of it, and the help text below says
-    so rather than implying an enforcement this key does not have.
+    The preference changes tool guidance, not eligibility. The runtime ceiling
+    is enforced across tools, API mutations and persistence; raising it never
+    extends an existing loop's stored budget or creation time.
     """
+
+    max_runtime_secs: int = field(
+        default=DEFAULT_RUNTIME_CEILING_SECS,
+        metadata=_meta(
+            "Maximum monitoring runtime (seconds)",
+            "Finite wall-clock ceiling for new and updated monitors. Accepts up to "
+            "2592000 seconds (30 days). Raising this limit never extends an existing deadline.",
+            min=1,
+            max=MAX_RUNTIME_CEILING_SECS,
+        ),
+    )
 
     prefer_structured_arming: bool = field(
         default=False,
@@ -7684,9 +7749,12 @@ class WhatsAppConfig:
         default_factory=list,
         metadata=_meta(
             "Allowed WhatsApp IDs",
-            "Phone numbers (digits only, country code, no '+') additionally "
-            "permitted to DM the agent when dm_policy='allowlist'. Empty adds "
-            "nobody beyond the linked account.",
+            "Phone numbers (digits only, country code, no '+') permitted to "
+            "address the agent besides the linked account: in direct chats when "
+            "dm_policy='allowlist', and in every configured group regardless of "
+            "dm_policy (a group member not listed here is dropped silently, even "
+            "when they @-mention the agent or the group is in 'rules' mode). Empty "
+            "adds nobody beyond the linked account.",
             tags=["whatsapp"],
         ),
     )
@@ -7700,7 +7768,9 @@ class WhatsAppConfig:
             "unprompted when the entry's rules say the agent can genuinely "
             "help) | 'off', 'rules': free-text guidance for when to speak, "
             "'cooldown_s': minimum seconds between unprompted replies "
-            "(default 120)}. Groups not listed are ignored entirely.",
+            "(default 120)}. Groups not listed are ignored entirely. Listing a "
+            "group lets the agent speak there; it does not admit its members: "
+            "only you and the numbers in allowed_wa_ids can make the agent reply.",
             tags=["whatsapp"],
         ),
     )

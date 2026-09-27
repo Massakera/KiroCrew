@@ -199,6 +199,138 @@ class TestPiAcpResolutionLadder:
         assert "pi-coding-agent" in PI_INSTALL_COMMAND
 
 
+def _npm_install(prefix: Path, package: str, version: str, entry: str) -> Path:
+    """An npm global install of *package*: the package dir and the ``pi`` bin link to it."""
+    package_dir = prefix / "lib" / "node_modules" / Path(*package.split("/"))
+    script = package_dir / Path(*entry.split("/"))
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    (package_dir / "package.json").write_text(
+        json.dumps({"name": package, "version": version, "bin": {"pi": entry}}),
+        encoding="utf-8",
+    )
+    return script
+
+
+class TestATooOldPiIsRefusedByName:
+    """pi-acp cannot drive an old pi, and without this check the chat just spins.
+
+    Measured, not assumed: pi-acp 0.0.34 fails ``session/new`` on pi 0.80.x and
+    waits forever on 0.73.1 (the last release under the old npm name), and pi-acp
+    0.0.33 never ends a turn on 0.80.3. The gate read-back passes on every one of
+    them, so nothing else names the cause.
+    """
+
+    def _linked_bin(self, tmp_path, package, version, entry="dist/cli.js"):
+        """The ``pi`` bin the way a global npm install lays it out on THIS platform.
+
+        POSIX: a symlink in ``bin`` into the package. Windows: a ``pi.cmd`` shim in
+        the prefix, with the package under the prefix's ``node_modules``.
+        """
+        if acp_client.platform_compat.IS_WINDOWS:
+            package_dir = tmp_path / "node_modules" / Path(*package.split("/"))
+            package_dir.mkdir(parents=True)
+            (package_dir / "package.json").write_text(
+                json.dumps({"name": package, "version": version}), encoding="utf-8"
+            )
+            shim = tmp_path / "pi.cmd"
+            shim.write_text("@echo off\r\n", encoding="utf-8")
+            return str(shim)
+        script = _npm_install(tmp_path, package, version, entry)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        link = bin_dir / "pi"
+        link.symlink_to(script)
+        return str(link)
+
+    def test_the_version_is_read_through_the_npm_bin_link(self, tmp_path):
+        pi_bin = self._linked_bin(tmp_path, acp_client.PI_NPM_PKG, "0.87.1", "dist/bundle/cli.js")
+        assert acp_client._pi_installed_version(pi_bin) == ((0, 87, 1), acp_client.PI_NPM_PKG)
+
+    def test_the_windows_shim_finds_the_package_under_its_node_modules(self, tmp_path):
+        package_dir = tmp_path / "node_modules" / "@earendil-works" / "pi-coding-agent"
+        package_dir.mkdir(parents=True)
+        (package_dir / "package.json").write_text(
+            json.dumps({"name": acp_client.PI_NPM_PKG, "version": "0.80.5"}), encoding="utf-8"
+        )
+        shim = tmp_path / "pi.cmd"
+        shim.write_text("@echo off\r\n", encoding="utf-8")
+        assert acp_client._pi_installed_version(str(shim)) == ((0, 80, 5), acp_client.PI_NPM_PKG)
+
+    def test_a_project_local_windows_shim_finds_the_package_beside_bin(self, tmp_path):
+        """``node_modules/.bin/pi.cmd``: the package is a sibling of ``.bin``, not below it."""
+        modules = tmp_path / "project" / "node_modules"
+        (modules / "@mariozechner" / "pi-coding-agent").mkdir(parents=True)
+        (modules / "@mariozechner" / "pi-coding-agent" / "package.json").write_text(
+            json.dumps({"name": "@mariozechner/pi-coding-agent", "version": "0.73.1"}),
+            encoding="utf-8",
+        )
+        (modules / ".bin").mkdir()
+        (modules / ".bin" / "pi.cmd").write_text("@echo off\r\n", encoding="utf-8")
+        assert "0.73.1" in acp_client._pi_version_issue(str(modules / ".bin" / "pi.cmd"))
+
+    def test_a_manifest_of_another_package_is_not_read_as_pis(self, tmp_path):
+        pi_bin = self._linked_bin(tmp_path, "some-other-cli", "0.1.0")
+        assert acp_client._pi_installed_version(pi_bin) is None
+        assert acp_client._pi_version_issue(pi_bin) == ""
+
+    def test_an_unknown_install_is_let_through(self, tmp_path):
+        wrapper = tmp_path / "pi"
+        wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+        assert acp_client._pi_installed_version(str(wrapper)) is None
+        assert acp_client._pi_version_issue(str(wrapper)) == ""
+
+    def test_the_floor_itself_passes(self, tmp_path):
+        floor = ".".join(str(part) for part in acp_client.PI_MIN_VERSION)
+        pi_bin = self._linked_bin(tmp_path, acp_client.PI_NPM_PKG, floor)
+        assert acp_client._pi_version_issue(pi_bin) == ""
+
+    def test_a_release_below_the_floor_names_the_upgrade(self, tmp_path):
+        pi_bin = self._linked_bin(tmp_path, acp_client.PI_NPM_PKG, "0.80.5")
+        issue = acp_client._pi_version_issue(pi_bin)
+        assert "0.80.5" in issue and "0.81.0" in issue
+        assert f"npm i -g {acp_client.PI_NPM_PKG}" in issue
+        assert "npm rm" not in issue
+
+    def test_the_old_package_name_is_removed_first(self, tmp_path):
+        """Both names install a ``pi`` bin, so npm refuses the new one until the old one goes."""
+        pi_bin = self._linked_bin(tmp_path, "@mariozechner/pi-coding-agent", "0.73.1")
+        issue = acp_client._pi_version_issue(pi_bin)
+        assert "0.73.1" in issue
+        assert issue.index("npm rm -g @mariozechner/pi-coding-agent") < issue.index(
+            f"npm i -g {acp_client.PI_NPM_PKG}"
+        )
+
+    def test_the_spawn_refuses_before_any_child_starts(self, tmp_path, monkeypatch):
+        pi_bin = self._linked_bin(tmp_path, acp_client.PI_NPM_PKG, "0.80.5")
+        monkeypatch.setattr(acp_client, "_pi_acp_argv_cache", (["node", "pi-acp.js"], ""))
+        monkeypatch.setattr(acp_client, "_pi_bin_cache", (pi_bin, ""))
+
+        async def no_child(*_a, **_kw):
+            raise AssertionError("a child was prepared for a pi the adapter cannot drive")
+
+        monkeypatch.setattr(acp_client, "_run_preflight_bounded", no_child)
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_PI)
+        with pytest.raises(acp_client.AcpError, match="too old"):
+            asyncio.run(client._spawn())
+
+    def test_a_current_pi_reaches_the_rest_of_the_spawn(self, tmp_path, monkeypatch):
+        pi_bin = self._linked_bin(tmp_path, acp_client.PI_NPM_PKG, "0.87.1")
+        monkeypatch.setattr(acp_client, "_pi_acp_argv_cache", (["node", "pi-acp.js"], ""))
+        monkeypatch.setattr(acp_client, "_pi_bin_cache", (pi_bin, ""))
+
+        class Reached(Exception):
+            pass
+
+        async def reached(*_a, **_kw):
+            raise Reached
+
+        monkeypatch.setattr(acp_client, "_run_preflight_bounded", reached)
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_PI)
+        with pytest.raises(Reached):
+            asyncio.run(client._spawn())
+
+
 def test_the_handshake_is_the_spec_dialect():
     """Integer ``1``, from the per-harness table the shared handshake reads."""
     assert PROTOCOL_VERSION_PI == 1
@@ -2330,3 +2462,66 @@ class TestThePushNeverNeedsARefusal:
         assert "EFFORT_LEVELS[: start + 1]" in body
         assert "_is_config_value_rejection(exc, effort_option)" in body
         assert "effort_config_option_value(self._client.backend, level)" in body
+
+
+# What pi-acp 0.0.34 answered, driving pi 0.87.1, when ``session/set_config_option``
+# asked for a ``provider/model`` id absent from pi's ``models.json``. Verbatim off a
+# live session but for the model id: pi-acp wraps pi's own ``set_model`` failure in a
+# bare -32603, so neither the code nor the option name says the VALUE was refused.
+_PI_MODEL_NOT_FOUND = (
+    "JSON-RPC error: {'code': -32603, 'message': 'Internal error', 'data': "
+    "{'details': 'pi set_model failed: Model not found: ollama/gone-model'}}"
+)
+
+
+class TestAModelPiCannotSelectLeavesTheSessionOnItsDefault:
+    """A stale model pin must not kill every pi session at startup.
+
+    The pin can be one pi advertised earlier -- its list follows the operator's
+    ``models.json`` and which provider keys are set -- so it goes stale on an edit
+    Crew never sees. Every other harness on the config-option channel reads such a
+    refusal as a refused VALUE and stays on its default; pi's refusal arrived in a
+    shape the shared reader did not know, so it was re-raised as a protocol fault and
+    the session never started.
+    """
+
+    def _client(self, tmp_path, monkeypatch, backend=ACP_BACKEND_PI):
+        client = acp_client.AcpClient(work_dir=tmp_path, acp_backend=backend)
+        client._session_id = "pi-sess"
+        sent: list[tuple[str, str]] = []
+
+        async def refuse(config_id: str, value: str) -> None:
+            sent.append((config_id, value))
+            raise acp_client.AcpError(_PI_MODEL_NOT_FOUND, code=-32603)
+
+        monkeypatch.setattr(client, "set_config_option", refuse)
+        return client, sent
+
+    def test_an_inherited_pin_falls_back_to_the_default(self, tmp_path, monkeypatch):
+        client, sent = self._client(tmp_path, monkeypatch)
+
+        applied = asyncio.run(client._push_model_config_option("ollama/gone-model", strict=False))
+
+        assert applied == ""
+        assert sent and sent[0] == ("model", "ollama/gone-model")
+
+    def test_an_explicit_pick_names_the_model(self, tmp_path, monkeypatch):
+        client, _sent = self._client(tmp_path, monkeypatch)
+
+        with pytest.raises(acp_client.AcpModelUnavailable):
+            asyncio.run(client._push_model_config_option("ollama/gone-model", strict=True))
+
+    def test_the_phrase_is_read_only_for_pi(self, tmp_path, monkeypatch):
+        """Another harness's -32603 stays a protocol fault, whatever its text says."""
+        client, _sent = self._client(tmp_path, monkeypatch, backend=ACP_BACKEND_OPENCODE)
+
+        with pytest.raises(acp_client.AcpError) as raised:
+            asyncio.run(client._push_model_config_option("ollama/gone-model", strict=False))
+        assert not isinstance(raised.value, acp_client.AcpModelUnavailable)
+
+    def test_the_phrase_is_read_only_for_the_model_option(self):
+        exc = acp_client.AcpError(_PI_MODEL_NOT_FOUND, code=-32603)
+
+        assert acp_client._is_config_value_rejection(exc, "model", ACP_BACKEND_PI)
+        assert not acp_client._is_config_value_rejection(exc, "thought_level", ACP_BACKEND_PI)
+        assert not acp_client._is_config_value_rejection(exc, "model")

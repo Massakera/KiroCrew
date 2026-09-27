@@ -355,6 +355,10 @@ class CodexHarness(MembershipHarness):
 
         loader_mod.strip_kiro_cli_api_key(env)
         seed_api_key_auth_request(env)
+        # codex-acp otherwise drops session entries whose names occur in global
+        # config. That keeps an unbound global dashboard server in place of the
+        # gateway's verified mount, on both session/new and session/load.
+        env["DISABLE_MCP_CONFIG_FILTERING"] = "true"
 
     @property
     def verifies_agent_activation(self) -> bool:

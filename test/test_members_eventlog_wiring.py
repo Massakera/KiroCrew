@@ -13,6 +13,7 @@ neighbouring ``test_members_dm_thread.py``.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from chat_test_helpers import _make_state
 
 from kiro_crew import eventlog_hooks, members
 from kiro_crew.config.loader import KiroCrewAgentConfig
+from kiro_crew.dashboard.handlers import members as handlers_members
 from kiro_crew.eventlog import types
 from kiro_crew.eventlog.service import get_service, set_service
 
@@ -85,24 +87,27 @@ class TestApiMembersProjections:
         state = _make_state(tmp_path)
         app = _members_app(state)
 
+        # The roster is a pure READ, so a member with no log has nothing to serve.
+        # This test is about what an EXISTING log projects onto a row.
+        svc = get_service()
+        slug = members.slug_for_name(CREW)
+        svc.ensure(slug, CREW)
+
         async with TestClient(TestServer(app)) as client:
             data = await (await client.get("/api/members")).json()
         row = data["members"][0]
         proj = row["projections"]
-        assert set(proj["values"]) == {
-            types.PROJ_ROSTER,
-            types.PROJ_ACTIVITY,
-            types.PROJ_WAKE,
-            types.PROJ_DRIVING,
-        }
+        assert set(proj["values"]) == {types.PROJ_ROSTER}, (
+            "a list ROW paints the roster line only, so the three drawer views must "
+            f"not ride along on every row: {sorted(proj['values'])}"
+        )
         assert isinstance(proj["asOfSeq"], int)
 
         # First call's reconcile appended exactly one member/config (the log had
-        # never seen one). A SECOND call must append nothing: the roster view
+        # never seen one). A SECOND pass must append nothing: the roster view
         # now matches the live config, so the reconcile is a no-op.
-        svc = get_service()
-        slug = members.slug_for_name(CREW)
         seq_after_first = svc.last_seq(slug)
+        assert seq_after_first >= 0, "the first read never established a config baseline"
         async with TestClient(TestServer(app)) as client:
             await client.get("/api/members")
         assert svc.last_seq(slug) == seq_after_first, "config reconcile is not idempotent"
@@ -212,12 +217,37 @@ class TestApiMembersProjections:
             data = await (await client.get("/api/members")).json()
         proj = data["members"][0]["projections"]
         assert proj["asOfSeq"] >= 0, f"own projection withheld on a placeholder header: {proj}"
-        assert set(proj["values"]) == {
-            types.PROJ_ROSTER,
-            types.PROJ_ACTIVITY,
-            types.PROJ_WAKE,
-            types.PROJ_DRIVING,
-        }
+        assert set(proj["values"]) == {types.PROJ_ROSTER}
+
+    @pytest.mark.asyncio
+    async def test_a_placeholder_header_is_served_but_never_written_through(
+        self, tmp_path, monkeypatch
+    ):
+        """Serving a placeholder log's projection is a read; reconciling the row's
+        config INTO it is a write into a log whose owner cannot be told apart
+        from a retired member handed the same slug. The row still renders, but
+        the roster read appends nothing to that log."""
+        named = "Code_Reviewer"
+        slug = members.slug_for_name(named)
+        empty = _fake_config({})
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: empty
+        )
+        svc = get_service()
+        svc.ensure(slug, slug)
+        svc.append(slug, types.SLOT_OPENED, {"slot_key": "member-code-reviewer"})
+        assert svc.logged_name(slug) == slug
+        before = svc.last_seq(slug)
+
+        cfg = _fake_config({named: _agent(model="claude-x")}, default=named)
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_members_app(state))) as client:
+            data = await (await client.get("/api/members")).json()
+        proj = data["members"][0]["projections"]
+        assert proj["asOfSeq"] >= 0
+        assert svc.last_seq(slug) == before, "the roster read wrote into a placeholder log"
+        assert "model" not in proj["values"].get(types.PROJ_ROSTER, {})
 
     @pytest.mark.asyncio
     async def test_a_fresh_log_resolves_a_placeholder_name_from_the_roster(
@@ -244,23 +274,19 @@ class TestApiMembersProjections:
     @pytest.mark.asyncio
     async def test_projection_values_are_redacted_before_egress(self, tmp_path, monkeypatch):
         """The roster list embeds ``svc.snapshot()`` per member, and snapshot
-        returns raw values. An activity record's ``project`` is operator-supplied
-        and can embed a credential or presigned URL, so the list route must scrub
-        it before the response crosses the network boundary -- the same chain the
-        ``/activity`` read runs over the text it surfaces."""
+        returns raw values. ``avatar`` is an agent-writable config field folded into
+        the roster view verbatim, so it can embed a credential or presigned URL, and
+        the list route must scrub it before the response crosses the network
+        boundary -- the same chain the ``/activity`` read runs over the text it
+        surfaces."""
         import json
 
-        cfg = _fake_config({CREW: _agent()})
+        secret_url = "https://evil.example/x?token=AKIAIOSFODNN7EXAMPLE"
+        cfg = _fake_config({CREW: _agent(avatar=secret_url)})
         monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
         slug = members.slug_for_name(CREW)
         svc = get_service()
         svc.ensure(slug, CREW)
-        secret_url = "https://evil.example/x?token=AKIAIOSFODNN7EXAMPLE"
-        svc.append(
-            slug,
-            types.ACTIVITY_RECORD,
-            {"ts": 1.0, "member": CREW, "project": secret_url, "via": "chat"},
-        )
 
         state = _make_state(tmp_path)
         async with TestClient(TestServer(_members_app(state))) as client:
@@ -269,35 +295,591 @@ class TestApiMembersProjections:
         assert secret_url not in blob
         assert "AKIAIOSFODNN7EXAMPLE" not in blob
         # The projection block is still present (redacted), not dropped.
-        assert data["members"][0]["projections"]["values"].get(types.PROJ_ACTIVITY) is not None
+        roster = data["members"][0]["projections"]["values"].get(types.PROJ_ROSTER)
+        assert roster is not None, "the roster view was dropped rather than redacted"
+        assert roster.get("avatar") != secret_url
 
     @pytest.mark.asyncio
     async def test_editing_model_appends_one_member_config_changed_model(
         self, tmp_path, monkeypatch
     ):
+        """A config edited outside the dashboard reaches the log on the next read.
+
+        The reconcile compares the folded roster against the config THIS request
+        loaded, so the case that matters is the one that bypasses the dashboard's
+        own save: an operator editing the file with the gateway up. Nothing is
+        remembered between requests, so the next read is the one that corrects it.
+        """
         cfg = _fake_config({CREW: _agent(model="claude-x")})
         monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
         state = _make_state(tmp_path)
         app = _members_app(state)
         slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
 
         async with TestClient(TestServer(app)) as client:
             await client.get("/api/members")
-        svc = get_service()
         seq_before = svc.last_seq(slug)
+        assert seq_before >= 0, "the first read never established a config baseline"
 
-        # Hand-edit the config's model, then hit the roster again: the reconcile
-        # sees the drift and appends exactly one member/config with the single
-        # changed field.
+        # The edit: the loader answers the new model from here on.
         cfg.agents[CREW].model = "gpt-y"
         async with TestClient(TestServer(app)) as client:
             await client.get("/api/members")
 
-        assert svc.last_seq(slug) == seq_before + 1
+        assert svc.last_seq(slug) == seq_before + 1, (
+            "the edited config never reached the log: the roster read did not "
+            "reconcile the fold against the config it loaded"
+        )
         newest = svc.history(slug, before=None, limit=1)[0]
         assert newest["type"] == types.MEMBER_CONFIG
         assert newest["data"]["changed"] == ["model"]
         assert newest["data"]["model"] == "gpt-y"
+
+
+# ---------------------------------------------------------------------------
+# 2. The roster is a READ: no creates, one view per row, the rest per member
+# ---------------------------------------------------------------------------
+def _projections_app(state) -> web.Application:
+    """The per-member projections route, mounted the way the roster app above is."""
+    from kiro_crew.dashboard.handlers.members import api_member_projections
+
+    @web.middleware
+    async def _auth(request, handler):
+        request["app"] = request.headers.get("X-Test-App", "")
+        request["user"] = request.headers.get("X-Test-User", "local-app")
+        return await handler(request)
+
+    app = web.Application(middlewares=[_auth])
+    app["state"] = state
+    app.router.add_get("/api/members/{slug}/projections", api_member_projections)
+    return app
+
+
+SECRET_URL = "https://evil.example/x?token=AKIAIOSFODNN7EXAMPLE"
+
+
+def _member_log_root():
+    """The directory a member log is actually written into.
+
+    Not ``members_root()``: a member's event log lives under the crew-log root for
+    the member kind, which is where the service itself is rooted. Counting files
+    anywhere else answers about a directory the write path never touches, so an
+    unchanged count there proves nothing about whether a log was created.
+
+    Resolved through ``data_home``, which the rootdir conftest pins per test via
+    ``KIROCREW_HOME`` -- that, not any per-fixture patch, is what keeps this count
+    scoped to the test's own isolated home.
+    """
+    from kiro_crew.crew_log.store import crew_log_root
+    from kiro_crew.eventlog.service import KIND_MEMBER
+
+    return crew_log_root(KIND_MEMBER)
+
+
+def _log_files() -> list[str]:
+    root = _member_log_root()
+    if not root.exists():
+        return []
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+
+class TestRosterIsAPureRead:
+    @pytest.mark.asyncio
+    async def test_a_get_creates_no_log_for_a_member_that_has_none(self, tmp_path, monkeypatch):
+        """Opening the page is not an event in any member's life.
+
+        A read of the roster must not bring a member's log into being -- a
+        directory, a header write and an fsync each, for members who have done
+        nothing. A member with no log has no recorded state that could be stale, so
+        there is nothing for the read to correct and nothing for it to create.
+        """
+        cfg = _fake_config({CREW: _agent(model="claude-x")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        state = _make_state(tmp_path)
+
+        before = _log_files()
+
+        async with TestClient(TestServer(_members_app(state))) as client:
+            data = await (await client.get("/api/members")).json()
+
+        after = _log_files()
+        assert after == before, (
+            "the roster read created files under the member log root for a member "
+            f"with no log: {sorted(set(after) - set(before))}"
+        )
+        assert members.slug_for_name(CREW) not in set(
+            get_service().slugs()
+        ), "the read brought a member's log into existence"
+        # The row is still served -- from live config, with an empty BASELINE. The
+        # sequence is what makes it a baseline instead of a refusal: the client
+        # mutes a slug's live frames when the roster sends a negative one, and this
+        # member is about to receive its first frame the moment anything is
+        # recorded about it.
+        row = data["members"][0]
+        assert row["projections"] == {"asOfSeq": 0, "values": {}}
+        assert row["projections"]["asOfSeq"] >= 0, (
+            "a member with no log was served the unattributable sentinel, which "
+            "mutes the live frames that follow"
+        )
+        assert row["name"] == CREW, "the row itself must still be served"
+
+    @pytest.mark.asyncio
+    async def test_a_log_the_store_will_not_prove_is_refused_not_called_empty(
+        self, tmp_path, monkeypatch
+    ):
+        """A log that exists but cannot be proved is a REFUSAL, never a fresh baseline.
+
+        ``unit_ids`` skips a unit whose header it cannot read, parse, or fold back to
+        the directory holding it, so the enumeration this read trusts omits a log that
+        is right there on disk. Serving that omission as an empty baseline is the
+        dangerous half of the pair: the client keeps every cached row ABOVE the
+        sequence it is seeded at, so a stale roster row and stale drawer views stay on
+        display as though they were current, and live frames keep landing on them. The
+        refusal sentinel clears the slug instead, which is the honest answer when the
+        log cannot be read.
+        """
+        cfg = _fake_config({CREW: _agent(model="claude-x")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        state = _make_state(tmp_path)
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        svc.append(slug, types.MEMBER_RULES, {"text": "a recorded event"})
+        assert slug in set(svc.slugs()), "the log must be enumerable before it is broken"
+
+        # Break only the HEADER, leaving the directory and the file in place: this is
+        # the exact state the enumeration drops and a filesystem check still sees.
+        log_file = (
+            _member_log_root()
+            / sorted(p.name for p in _member_log_root().iterdir() if p.is_dir())[0]
+        )
+        segment = sorted(log_file.glob("*.jsonl"))[0]
+        rest = segment.read_text(encoding="utf-8").splitlines()[1:]
+        segment.write_text("\n".join(["not-a-json-header", *rest]) + "\n", encoding="utf-8")
+        set_service(None)
+        assert slug not in set(
+            get_service().slugs()
+        ), "the corrupted header must make the enumeration omit this slug"
+
+        async with TestClient(TestServer(_members_app(state))) as client:
+            data = await (await client.get("/api/members")).json()
+        row = data["members"][0]
+        assert row["projections"]["asOfSeq"] < 0, (
+            "a log the store would not prove was served as an empty baseline "
+            f"({row['projections']['asOfSeq']}), which preserves the stale rows the "
+            "client already holds instead of clearing them"
+        )
+        assert row["name"] == CREW, "the row itself must still be served"
+
+    @pytest.mark.asyncio
+    async def test_the_drawer_route_errors_on_a_log_it_cannot_prove(self, tmp_path, monkeypatch):
+        """The drawer gets an ERROR for an unprovable log, never an empty answer.
+
+        The roster can blank one row among many, but the drawer's whole request is
+        that one member. An empty answer there renders the affirmative "nothing
+        scheduled" over a patrol state the read could not see, so the unprovable case
+        takes the route's failure path and the error notice the page already has.
+        """
+        cfg = _fake_config({CREW: _agent(model="claude-x")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        state = _make_state(tmp_path)
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        svc.append(slug, types.MEMBER_RULES, {"text": "a recorded event"})
+
+        unit_dir = sorted(p for p in _member_log_root().iterdir() if p.is_dir())[0]
+        segment = sorted(unit_dir.glob("*.jsonl"))[0]
+        rest = segment.read_text(encoding="utf-8").splitlines()[1:]
+        segment.write_text("\n".join(["not-a-json-header", *rest]) + "\n", encoding="utf-8")
+        set_service(None)
+
+        async with TestClient(TestServer(_projections_app(state))) as client:
+            resp = await client.get(f"/api/members/{slug}/projections?member={CREW}")
+            status = resp.status
+            payload = await resp.json()
+        assert status == 500, (
+            f"an unprovable log answered {status} rather than the route's error "
+            "path, so the drawer renders it as read state"
+        )
+        assert payload["code"] == "member_projections_failed"
+
+    @pytest.mark.asyncio
+    async def test_a_log_created_after_the_listing_is_read_not_refused(self, tmp_path, monkeypatch):
+        """A member's FIRST event must not cost that member its projections.
+
+        The listing is taken once, and two thread hops run before a row is projected,
+        so a member whose first event lands in that window has a log the listing never
+        saw. That is the ordinary beginning of every member's record, not a fault, and
+        the frame announcing it is already on its way -- so refusing the slug would
+        clear the row and drop that very frame. A directory the listing did not
+        account for is therefore re-asked rather than guessed at, and a log the store
+        proves reads like any other.
+        """
+        cfg = _fake_config({CREW: _agent(model="claude-x")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        state = _make_state(tmp_path)
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        svc.append(slug, types.MEMBER_RULES, {"text": "the member's first event"})
+        real_seq = svc.last_seq(slug)
+        assert real_seq >= 1, "the log must hold a real event for this to mean anything"
+
+        # The race, reproduced exactly: the listing this read was given predates the
+        # log, while the log itself is complete and provable by the time the row is
+        # projected. One stale answer, so a fresh listing sees the log.
+        stale = {"count": 0}
+        real_logged_slugs = handlers_members._logged_slugs
+
+        def _stale_once(service):
+            stale["count"] += 1
+            return set() if stale["count"] == 1 else real_logged_slugs(service)
+
+        monkeypatch.setattr(handlers_members, "_logged_slugs", _stale_once)
+
+        async with TestClient(TestServer(_members_app(state))) as client:
+            data = await (await client.get("/api/members")).json()
+        assert stale["count"] >= 2, (
+            "the stale listing was never re-asked, so this test did not exercise the "
+            "path it is pinning"
+        )
+        row = data["members"][0]
+        assert row["projections"]["asOfSeq"] >= real_seq, (
+            "a log created after the listing was served "
+            f"{row['projections']['asOfSeq']} instead of a real position at or above "
+            f"{real_seq}; the refusal sentinel would clear the row and drop the frame "
+            "announcing that very first event"
+        )
+        assert "roster" in row["projections"]["values"], "the read must serve the log it found"
+
+    @pytest.mark.asyncio
+    async def test_the_drawer_route_reads_a_log_created_after_its_listing(
+        self, tmp_path, monkeypatch
+    ):
+        """The drawer must not 500 on a member whose log has only just appeared."""
+        cfg = _fake_config({CREW: _agent(model="claude-x")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        state = _make_state(tmp_path)
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        svc.append(slug, types.MEMBER_RULES, {"text": "the member's first event"})
+        real_seq = svc.last_seq(slug)
+
+        stale = {"count": 0}
+        real_logged_slugs = handlers_members._logged_slugs
+
+        def _stale_once(service):
+            stale["count"] += 1
+            return set() if stale["count"] == 1 else real_logged_slugs(service)
+
+        monkeypatch.setattr(handlers_members, "_logged_slugs", _stale_once)
+
+        async with TestClient(TestServer(_projections_app(state))) as client:
+            resp = await client.get(f"/api/members/{slug}/projections?member={CREW}")
+            status = resp.status
+            payload = await resp.json()
+        assert status == 200, (
+            f"a log created after the listing answered {status}; the drawer would "
+            "render an error for a member whose record has just begun"
+        )
+        assert payload["asOfSeq"] >= real_seq
+        assert "roster" in payload["values"], "the route must serve the log it found"
+
+    @pytest.mark.asyncio
+    async def test_the_drawer_route_appends_nothing_even_when_config_has_drifted(
+        self, tmp_path, monkeypatch
+    ):
+        """The per-member read is a READ: it never writes, not even a correction.
+
+        The config reconcile compares a config THIS request loaded against the folded
+        roster and appends what differs, so a save landing between the load and the
+        snapshot is undone by an append carrying the older values. The roster read is
+        where that comparison belongs: it runs for every logged member on every poll,
+        and its correcting append raises the log's sequence, so the corrected value
+        outranks an uncorrected one under higher-seq-wins. A second writer on a
+        per-member read path buys one member's correction and opens that window again.
+        """
+        cfg = _fake_config({CREW: _agent(model="claude-x")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        state = _make_state(tmp_path)
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        svc.append(slug, types.MEMBER_RULES, {"text": "a recorded event"})
+
+        # Drift the config so a reconcile WOULD have something to append.
+        cfg.agents[CREW].model = "gpt-y"
+        seq_before = svc.last_seq(slug)
+
+        async with TestClient(TestServer(_projections_app(state))) as client:
+            resp = await client.get(f"/api/members/{slug}/projections?member={CREW}")
+            status = resp.status
+            payload = await resp.json()
+        assert status == 200
+        assert svc.last_seq(slug) == seq_before, (
+            "the per-member read appended to the log: it is a read path, and an append "
+            "here can carry a config older than a save that landed since the load"
+        )
+        assert "roster" in payload["values"], "the route must still serve what it read"
+
+    @pytest.mark.asyncio
+    async def test_the_open_member_gets_all_four_views_from_its_own_route(
+        self, tmp_path, monkeypatch
+    ):
+        """What the drawer mounts on: the list row's three missing views.
+
+        The list row paints the roster line; the drawer paints the activity
+        timeline, the patrol state and the driven-slot list. A narrow list is
+        only correct if the drawer has its own way to get them, so this asserts the
+        whole set arrives for the member that is open.
+        """
+        cfg = _fake_config({CREW: _agent(model="claude-x")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        svc.append(slug, types.ACTIVITY_RECORD, {"ts": 1.0, "member": CREW, "via": "chat"})
+        svc.append(slug, types.PATROL_STARTED, {"slot_key": "member-code-reviewer"})
+        svc.append(slug, types.SLOT_OPENED, {"slot_key": "worker-1"})
+
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_projections_app(state))) as client:
+            resp = await client.get(f"/api/members/{slug}/projections?member={CREW}")
+            assert resp.status == 200, await resp.text()
+            block = await resp.json()
+
+        assert set(block["values"]) == {
+            types.PROJ_ROSTER,
+            types.PROJ_ACTIVITY,
+            types.PROJ_WAKE,
+            types.PROJ_DRIVING,
+        }, f"the drawer's own route withheld a view it paints: {sorted(block['values'])}"
+        assert isinstance(block["asOfSeq"], int) and block["asOfSeq"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_the_per_member_route_creates_no_log_either(self, tmp_path, monkeypatch):
+        """Opening a drawer is not an event either, and the baseline must match.
+
+        A member with no log answers the same empty block the roster sends for that
+        member, so the client seeds one shape from either source -- including its
+        sequence, which is what decides whether later frames are applied or muted.
+        """
+        cfg = _fake_config({CREW: _agent(model="claude-x")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        slug = members.slug_for_name(CREW)
+        state = _make_state(tmp_path)
+        before = _log_files()
+
+        async with TestClient(TestServer(_projections_app(state))) as client:
+            block = await (
+                await client.get(f"/api/members/{slug}/projections?member={CREW}")
+            ).json()
+
+        after = _log_files()
+        assert after == before, f"the drawer read created {sorted(set(after) - set(before))}"
+        assert block == {"asOfSeq": 0, "values": {}}
+
+    @pytest.mark.asyncio
+    async def test_both_routes_redact_the_same_planted_payload(self, tmp_path, monkeypatch):
+        """One credential, both reads, neither ships it.
+
+        The list and the drawer read the same folded views through different
+        handlers, so the projection redaction chain has to run on both. A payload
+        scrubbed on the list and shipped by the drawer is the same leak with a
+        different URL.
+        """
+        import json
+
+        cfg = _fake_config({CREW: _agent(avatar=SECRET_URL)})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        # Planted in BOTH an activity record (drawer-only) and the config-derived
+        # avatar (carried by the roster view, so it reaches the list as well).
+        svc.append(
+            slug,
+            types.ACTIVITY_RECORD,
+            {"ts": 1.0, "member": CREW, "project": SECRET_URL, "via": "chat"},
+        )
+        state = _make_state(tmp_path)
+
+        async with TestClient(TestServer(_members_app(state))) as client:
+            listing = await (await client.get("/api/members")).json()
+        async with TestClient(TestServer(_projections_app(state))) as client:
+            block = await (
+                await client.get(f"/api/members/{slug}/projections?member={CREW}")
+            ).json()
+
+        for label, payload in (("list", listing), ("per-member", block)):
+            blob = json.dumps(payload)
+            assert SECRET_URL not in blob, f"the {label} route shipped the planted URL"
+            assert "AKIAIOSFODNN7EXAMPLE" not in blob, f"the {label} route shipped the credential"
+
+        # Both carry the roster view, and both carry the SAME redacted avatar --
+        # identical scrubbing, not merely both non-empty.
+        listed = listing["members"][0]["projections"]["values"][types.PROJ_ROSTER]
+        drawn = block["values"][types.PROJ_ROSTER]
+        assert listed.get("avatar") == drawn.get("avatar"), (
+            "the two routes redact the same field differently, so which handler "
+            "served a value decides what the browser is shown"
+        )
+        # The drawer's activity view is present and scrubbed, not dropped.
+        assert block["values"].get(types.PROJ_ACTIVITY) is not None
+
+    @pytest.mark.asyncio
+    async def test_a_row_carries_the_roster_view_only(self, tmp_path, monkeypatch):
+        """The payload contract, asserted on a log that holds all four views.
+
+        A member with activity, a patrol and an open slot still ships one view on
+        its list row: the three the drawer paints are read per member, so a roster
+        of any size costs one fold each rather than four.
+        """
+        cfg = _fake_config({CREW: _agent(model="claude-x")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        svc.append(slug, types.ACTIVITY_RECORD, {"ts": 1.0, "member": CREW, "via": "chat"})
+        svc.append(slug, types.PATROL_STARTED, {"slot_key": "member-code-reviewer"})
+        svc.append(slug, types.SLOT_OPENED, {"slot_key": "worker-1"})
+        state = _make_state(tmp_path)
+
+        async with TestClient(TestServer(_members_app(state))) as client:
+            data = await (await client.get("/api/members")).json()
+
+        values = data["members"][0]["projections"]["values"]
+        assert set(values) == {types.PROJ_ROSTER}, (
+            "a list row carries a view nothing on it paints: " f"{sorted(values)}"
+        )
+        # asOfSeq is a property of the LOG, not of the subset, so the client's
+        # higher-seq-wins rule still measures against the real sequence.
+        assert data["members"][0]["projections"]["asOfSeq"] == svc.last_seq(slug)
+
+    @pytest.mark.asyncio
+    async def test_the_drawer_route_refuses_a_member_that_does_not_own_the_slug(
+        self, tmp_path, monkeypatch
+    ):
+        """``?member=`` may not name one member while the path names another's log.
+
+        The header check answers which member a log RECORDS, and a log whose header
+        holds the slug placeholder records nobody, so it admits any name. That alone
+        would let a read of one member's log be told to reconcile a second member's
+        config into it -- the wrong member's fields appended, and the pass recorded
+        as done so no later read corrects it. Ownership is a question about the
+        CONFIG and is asked there.
+        """
+        other = "other-crew"
+        cfg = _fake_config({CREW: _agent(model="claude-x"), other: _agent(model="claude-y")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        # Header holds the SLUG, the placeholder a writer with no name in hand
+        # leaves: the case that passes the header check for every member.
+        svc.ensure(slug, slug)
+        svc.append(slug, types.ACTIVITY_RECORD, {"ts": 1.0, "member": CREW, "via": "chat"})
+        seq_before = svc.last_seq(slug)
+        state = _make_state(tmp_path)
+
+        async with TestClient(TestServer(_projections_app(state))) as client:
+            resp = await client.get(f"/api/members/{slug}/projections?member={other}")
+
+        assert (
+            resp.status == 400
+        ), f"a member that does not derive this slug was served its log: {resp.status}"
+        assert (
+            svc.last_seq(slug) == seq_before
+        ), "another member's config was appended to this member's log"
+
+    @pytest.mark.asyncio
+    async def test_one_roster_read_enumerates_the_member_store_once(self, tmp_path, monkeypatch):
+        """The whole-roster enumeration is paid once per request, not per closure.
+
+        ``slugs()`` is uncached -- it walks the member-kind root and reads a header
+        per member -- and two separate reads of it answer the same question, since
+        which members have a log cannot change inside one request. Asking twice
+        makes the read cost twice what the enumeration is for, against the very
+        claim that one pass beats a probe per row.
+        """
+        from kiro_crew.eventlog.service import get_service as _get
+
+        cfg = _fake_config({CREW: _agent(model="claude-x")})
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", lambda: cfg)
+        slug = members.slug_for_name(CREW)
+        svc = _get()
+        svc.ensure(slug, CREW)
+        state = _make_state(tmp_path)
+
+        calls = {"n": 0}
+        real_slugs = type(svc).slugs
+
+        def _counting(self):
+            calls["n"] += 1
+            return real_slugs(self)
+
+        monkeypatch.setattr(type(svc), "slugs", _counting)
+
+        async with TestClient(TestServer(_members_app(state))) as client:
+            data = await (await client.get("/api/members")).json()
+
+        assert calls["n"] == 1, (
+            f"one roster read enumerated the member store {calls['n']} times; the "
+            "enumeration walks the root and reads a header per member, so each "
+            "extra pass is the whole roster again for an answer already held"
+        )
+        assert data["members"][0]["projections"]["values"], (
+            "the row lost its projection, so the single enumeration is not reaching "
+            "both closures"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_nameless_writer_still_gets_the_real_name_into_the_header(
+        self, tmp_path, monkeypatch
+    ):
+        """A nameless writer's own create resolves the placeholder, not the read.
+
+        The roster read creates nothing, so the FIRST WRITER creates a member's log
+        -- and a writer with no name in hand passes the slug, which names nobody and
+        would scope that member's own activity records out of their own projection.
+
+        That resolution does not depend on the roster read at all: ``ensure``
+        resolves a placeholder against live config on the fresh-create path, which
+        is exactly the path a nameless writer takes. Pinned with a name that DIFFERS
+        from its slug, because a member legitimately named after its own slug cannot
+        tell a resolved header from an unresolved one.
+        """
+        import json
+
+        name = "Review_Agent"
+        slug = members.slug_for_name(name)
+        assert slug != name, "this pin needs a name that differs from its slug"
+
+        conf = tmp_path / "config.json"
+        conf.write_text(
+            json.dumps({"agents": {name: {"kiro_agent": "reviewer"}}}), encoding="utf-8"
+        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: conf)
+        monkeypatch.setattr(
+            "kiro_crew.config.loader.config_local_path", lambda: tmp_path / "config.local.json"
+        )
+        monkeypatch.setattr(members, "data_home", lambda: tmp_path)
+
+        svc = get_service()
+        assert slug not in set(svc.slugs()), "the log must not exist before the writer runs"
+
+        # What `eventlog_hooks.emit` does for a writer holding no name: it passes
+        # `name or slug`, so the slug arrives as the name, and no config is handed in.
+        svc.ensure(slug, slug)
+
+        assert svc.logged_name(slug) == name, (
+            "a nameless writer locked the slug placeholder into the header, so this "
+            f"member's own activity records scope out of their projection: "
+            f"{svc.logged_name(slug)!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +922,449 @@ class TestStartupReconcile:
         assert eventlog_hooks.reconcile_members_at_startup(cfg, state, autonudge) == 0
         assert svc.last_seq(slug) == seq_after
 
+    def test_a_contended_patrol_closer_does_not_starve_the_slot_closers(self, monkeypatch):
+        """One closer losing its tail must not cost the same member's other closers.
+
+        The patrol closer is attempted before the slot closers, so an exhaustion that
+        propagated straight out of the member's sweep would skip every slot below it
+        -- in BOTH passes, because the retry re-enters at the same first closer. The
+        slot would then read open until the next boot even though nothing was
+        contending for it. Only the patrol closer is starved here; the slot's own
+        append is left alone, so a green run is the slot closer having been reached.
+        """
+        from kiro_crew.eventlog import service as svc_mod
+
+        cfg = _fake_config({CREW: _agent()})
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        eventlog_hooks.reconcile_member_config(
+            slug, CREW, cfg.agents[CREW], svc.snapshot(slug)["values"].get(types.PROJ_ROSTER, {})
+        )
+        svc.append(slug, types.PATROL_STARTED, {"slot_key": "member-code-reviewer"})
+        svc.append(slug, types.SLOT_OPENED, {"slot_key": "worker-1"})
+
+        real_closer = svc.append_closer_if_still_applies
+        attempted = []
+
+        def _patrol_always_loses_its_tail(target, type, data, **kwargs):
+            attempted.append(type)
+            if type == types.PATROL_STOPPED:
+                raise svc_mod.CloserTailContention(target, type)
+            return real_closer(target, type, data, **kwargs)
+
+        monkeypatch.setattr(svc, "append_closer_if_still_applies", _patrol_always_loses_its_tail)
+
+        wrote = eventlog_hooks.reconcile_members_at_startup(
+            cfg, SimpleNamespace(_slots={}), SimpleNamespace(get_by_slot=lambda key: None)
+        )
+
+        monkeypatch.setattr(svc, "append_closer_if_still_applies", real_closer)
+        assert types.PATROL_STOPPED in attempted, "the patrol closer was never attempted"
+        assert types.SLOT_CLOSED in attempted, (
+            "the slot closer was never attempted: the patrol closer's contention "
+            "propagated out of the member's sweep and skipped it"
+        )
+        events = svc.history(slug, before=None, limit=None)
+        assert (types.SLOT_CLOSED, "interrupted") in {
+            (e["type"], e["data"].get("reason")) for e in events
+        }, "the interrupted slot was left open by a closer that never ran"
+        driving = svc.snapshot(slug)["values"].get(types.PROJ_DRIVING, {}) or {}
+        assert "worker-1" not in (
+            driving.get("open", []) or []
+        ), "the slot still reads open after the sweep"
+        assert wrote == 1, f"the sweep reported {wrote} closer(s), not the one that landed"
+
+    def test_a_closer_refused_the_write_lease_also_leaves_its_siblings_alone(self, monkeypatch):
+        """Losing the lease is the closer's other contention, and costs the same.
+
+        A closer has two ways to come back empty-handed against a busy member: it
+        loses the tail on every attempt, or it never gets write ownership and the
+        store refuses it. Both are one member being written to by another process,
+        both leave the closer unplaced, and neither says anything about the closers
+        below it -- so containing only the first would starve the same slots through
+        the second door. A refusal is also the store's own guarantee that nothing was
+        written, which is what makes one more attempt safe.
+        """
+        from kiro_crew.crew_log.errors import CODE_ALREADY_OWNED, CrewLogError
+
+        cfg = _fake_config({CREW: _agent()})
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        eventlog_hooks.reconcile_member_config(
+            slug, CREW, cfg.agents[CREW], svc.snapshot(slug)["values"].get(types.PROJ_ROSTER, {})
+        )
+        svc.append(slug, types.PATROL_STARTED, {"slot_key": "member-code-reviewer"})
+        svc.append(slug, types.SLOT_OPENED, {"slot_key": "worker-1"})
+
+        real_closer = svc.append_closer_if_still_applies
+        attempted = []
+
+        def _patrol_never_gets_the_lease(target, type, data, **kwargs):
+            attempted.append(type)
+            if type == types.PATROL_STOPPED:
+                raise CrewLogError(
+                    f"another process owns the log for {target!r}", code=CODE_ALREADY_OWNED
+                )
+            return real_closer(target, type, data, **kwargs)
+
+        monkeypatch.setattr(svc, "append_closer_if_still_applies", _patrol_never_gets_the_lease)
+
+        wrote = eventlog_hooks.reconcile_members_at_startup(
+            cfg, SimpleNamespace(_slots={}), SimpleNamespace(get_by_slot=lambda key: None)
+        )
+
+        monkeypatch.setattr(svc, "append_closer_if_still_applies", real_closer)
+        assert types.PATROL_STOPPED in attempted, "the patrol closer was never attempted"
+        assert types.SLOT_CLOSED in attempted, (
+            "the slot closer was never attempted: the patrol closer's refused lease "
+            "propagated out of the member's sweep and skipped it"
+        )
+        driving = svc.snapshot(slug)["values"].get(types.PROJ_DRIVING, {}) or {}
+        assert "worker-1" not in (
+            driving.get("open", []) or []
+        ), "the slot still reads open after the sweep"
+        assert attempted.count(types.PATROL_STOPPED) == 2, (
+            f"the patrol closer was attempted {attempted.count(types.PATROL_STOPPED)} time(s): "
+            "a member whose closer was refused the lease must still reach the retry pass"
+        )
+        assert wrote == 1, f"the sweep reported {wrote} closer(s), not the one that landed"
+
+    def test_a_contended_member_is_recovered_by_the_retry_pass(self, monkeypatch):
+        """The sweep runs once per boot, so a lost closer must not be lost for good.
+
+        Another process bursts appends into one member's log across the whole first
+        attempt, so every closer for it exhausts its tail retries. The burst then
+        stops, and the sweep's own second pass places the closers -- without which the
+        interrupted slot reads open and the patrol reads armed until the next restart.
+        """
+        from kiro_crew.eventlog import log as log_mod
+        from kiro_crew.eventlog import service as svc_mod
+
+        cfg = _fake_config({CREW: _agent()})
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        eventlog_hooks.reconcile_member_config(
+            slug, CREW, cfg.agents[CREW], svc.snapshot(slug)["values"].get(types.PROJ_ROSTER, {})
+        )
+        svc.append(slug, types.PATROL_STARTED, {"slot_key": "member-code-reviewer"})
+        svc.append(slug, types.SLOT_OPENED, {"slot_key": "worker-1"})
+
+        autonudge = SimpleNamespace(get_by_slot=lambda key: None)
+        state = SimpleNamespace(_slots={})
+
+        # Enough foreign commits to exhaust the first pass's attempts, then silence,
+        # so the retry pass runs unobstructed.
+        budget = [svc_mod._CLOSER_TAIL_ATTEMPTS]
+        real_fold = svc._fold_gap_locked
+        bursts = []
+
+        def _fold_then_a_foreign_commit(target, log, *, below=None):
+            real_fold(target, log, below=below)
+            if target == slug and below is None and budget[0] > 0:
+                budget[0] -= 1
+                bursts.append(True)
+                log_mod.MemberLog(slug).append(
+                    types.SLOT_OPENED, {"slot_key": f"foreign-{len(bursts)}"}
+                )
+
+        monkeypatch.setattr(svc, "_fold_gap_locked", _fold_then_a_foreign_commit)
+
+        wrote = eventlog_hooks.reconcile_members_at_startup(cfg, state, autonudge)
+
+        monkeypatch.setattr(svc, "_fold_gap_locked", real_fold)
+        assert bursts, "the foreign burst never landed; this test proved nothing"
+        assert budget[0] == 0, f"the burst was not consumed ({budget[0]} left), so no exhaustion"
+        events = svc.history(slug, before=None, limit=None)
+        closer_kinds = {(e["type"], e["data"].get("reason")) for e in events}
+        assert (
+            types.PATROL_STOPPED,
+            "interrupted",
+        ) in closer_kinds, "the patrol closer was abandoned by the first pass and never retried"
+        assert (
+            types.SLOT_CLOSED,
+            "interrupted",
+        ) in closer_kinds, "the slot closer was abandoned by the first pass and never retried"
+        # The report must match what is on disk. A closer that landed before a later
+        # one lost the tail is still a closer this sweep wrote, and the retry pass
+        # cannot recount it -- the landed event changed the projection its predicate
+        # reads, so the retry declines it correctly.
+        on_disk = len(
+            [
+                e
+                for e in events
+                if e["type"] in (types.PATROL_STOPPED, types.SLOT_CLOSED)
+                and e["data"].get("reason") == "interrupted"
+            ]
+        )
+        assert wrote == on_disk, (
+            f"the sweep reported {wrote} closer(s) but {on_disk} are on disk: a closer "
+            "that landed before a later one lost the tail was not counted"
+        )
+
+    def test_a_closer_that_landed_before_a_later_one_lost_the_tail_is_counted(self, monkeypatch):
+        """The reported count must match the closers on disk.
+
+        A later closer can exhaust its tail retries after an earlier one has already
+        landed. A total RETURNED from the per-member step is discarded along with that
+        exception, and the retry pass cannot recount it: the landed closer changed the
+        very projection its predicate reads, so the retry declines it correctly. The
+        events are on disk either way; only the report would be wrong.
+        """
+        from kiro_crew.eventlog import service as svc_mod
+
+        cfg = _fake_config({CREW: _agent()})
+        slug = members.slug_for_name(CREW)
+        svc = get_service()
+        svc.ensure(slug, CREW)
+        eventlog_hooks.reconcile_member_config(
+            slug, CREW, cfg.agents[CREW], svc.snapshot(slug)["values"].get(types.PROJ_ROSTER, {})
+        )
+        svc.append(slug, types.PATROL_STARTED, {"slot_key": "member-code-reviewer"})
+        svc.append(slug, types.SLOT_OPENED, {"slot_key": "worker-1"})
+
+        autonudge = SimpleNamespace(get_by_slot=lambda key: None)
+        state = SimpleNamespace(_slots={})
+
+        # First closer lands; every later one reports exhaustion. No sleeping, no
+        # foreign writer: the point is purely what the count does when the step
+        # raises after a write.
+        real_closer = svc.append_closer_if_still_applies
+        calls = []
+
+        def _first_lands_then_contention(target, type, data, **kw):
+            calls.append(type)
+            if len(calls) == 1:
+                return real_closer(target, type, data, **kw)
+            raise svc_mod.CloserTailContention(target, type)
+
+        monkeypatch.setattr(svc, "append_closer_if_still_applies", _first_lands_then_contention)
+
+        wrote = eventlog_hooks.reconcile_members_at_startup(cfg, state, autonudge)
+
+        monkeypatch.setattr(svc, "append_closer_if_still_applies", real_closer)
+        assert len(calls) >= 2, f"only {len(calls)} closer call(s); the fixture proved nothing"
+        on_disk = len(
+            [
+                e
+                for e in svc.history(slug, before=None, limit=None)
+                if e["type"] in (types.PATROL_STOPPED, types.SLOT_CLOSED)
+                and e["data"].get("reason") == "interrupted"
+            ]
+        )
+        assert on_disk >= 1, "the fixture must land at least one closer to have one to lose"
+        assert wrote == on_disk, (
+            f"the sweep reported {wrote} closer(s) but {on_disk} are on disk: a closer "
+            "that landed before a later one lost the tail was not counted"
+        )
+
+    def test_a_colliding_free_form_slug_is_never_reconciled(self, caplog):
+        owner = "dr. eggbot"
+        other = "Dr. Eggbot"
+        slug = members.slug_for_name(owner)
+        assert members.slug_for_name(other) == slug
+        cfg = _fake_config(
+            {owner: _agent(model="owner-model"), other: _agent(model="other-model")},
+            default=owner,
+        )
+        svc = get_service()
+        svc.ensure(slug, owner)
+        before = svc.last_seq(slug)
+
+        eventlog_hooks.reconcile_members_at_startup(
+            cfg, SimpleNamespace(_slots={}), SimpleNamespace(get_by_slot=lambda key: None)
+        )
+
+        assert svc.last_seq(slug) == before
+        assert "model" not in svc.snapshot(slug)["values"].get(types.PROJ_ROSTER, {})
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "kiro_crew.eventlog_hooks" and record.levelname == "WARNING"
+        ] == ["member event-log startup reconcile skipped ambiguous slug='dr-eggbot' (2 members)"]
+
+    def test_a_malformed_colliding_claimant_blocks_reconciliation(self, caplog):
+        owner = "dr. eggbot"
+        malformed = "Dr. Eggbot "
+        slug = members.slug_for_name(owner)
+        assert members.slug_for_name(malformed) == slug
+        cfg = _fake_config(
+            {owner: _agent(model="owner-model"), malformed: _agent(model="other-model")},
+            default=owner,
+        )
+        svc = get_service()
+        svc.ensure(slug, owner)
+        before = svc.last_seq(slug)
+
+        eventlog_hooks.reconcile_members_at_startup(
+            cfg, SimpleNamespace(_slots={}), SimpleNamespace(get_by_slot=lambda key: None)
+        )
+
+        assert svc.last_seq(slug) == before
+        assert "model" not in svc.snapshot(slug)["values"].get(types.PROJ_ROSTER, {})
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "kiro_crew.eventlog_hooks" and record.levelname == "WARNING"
+        ]
+        assert warnings == [
+            "member event-log startup reconcile skipped 1 non-dispatchable name(s) and 0 unresolved slug(s)",
+            "member event-log startup reconcile skipped ambiguous slug='dr-eggbot' (2 members)",
+        ]
+        assert malformed not in caplog.text
+
+    def test_a_foreign_log_header_is_never_reconciled(self, caplog):
+        name = "dr. eggbot"
+        slug = members.slug_for_name(name)
+        cfg = _fake_config({name: _agent(model="member-model")}, default=name)
+        svc = get_service()
+        svc.ensure(slug, "former member")
+        before = svc.last_seq(slug)
+
+        eventlog_hooks.reconcile_members_at_startup(
+            cfg, SimpleNamespace(_slots={}), SimpleNamespace(get_by_slot=lambda key: None)
+        )
+
+        assert svc.last_seq(slug) == before
+        assert svc.logged_name(slug) == "former member"
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "kiro_crew.eventlog_hooks" and record.levelname == "WARNING"
+        ] == ["member event-log startup reconcile skipped slug='dr-eggbot' with foreign header"]
+
+    def test_invalid_names_and_unresolved_slugs_are_counted_without_values(
+        self, caplog, monkeypatch
+    ):
+        invalid = "unsafe password=shortvalue "
+        unresolved = "valid member"
+        cfg = _fake_config(
+            {invalid: _agent(model="invalid-model"), unresolved: _agent(model="valid-model")},
+            default=unresolved,
+        )
+
+        real_member_slug = members.member_slug
+
+        def _resolve_or_fail(name, config):
+            if name == unresolved:
+                raise RuntimeError
+            return real_member_slug(name, config)
+
+        monkeypatch.setattr(members, "member_slug", _resolve_or_fail)
+        eventlog_hooks.reconcile_members_at_startup(
+            cfg, SimpleNamespace(_slots={}), SimpleNamespace(get_by_slot=lambda key: None)
+        )
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "kiro_crew.eventlog_hooks" and record.levelname == "WARNING"
+        ]
+        assert messages == [
+            "member event-log startup reconcile skipped 1 non-dispatchable name(s) and 1 unresolved slug(s)"
+        ]
+        assert invalid not in caplog.text
+        assert unresolved not in caplog.text
+
+    def test_reconcile_failure_does_not_log_exception_text(self, caplog, monkeypatch):
+        name = "dr. eggbot"
+        slug = members.slug_for_name(name)
+        cfg = _fake_config({name: _agent(model="member-model")}, default=name)
+        svc = get_service()
+        svc.ensure(slug, name)
+        private_header = "HEADER_PRIVATE_VALUE"
+
+        def _fail_logged_name(_slug):
+            raise RuntimeError(private_header)
+
+        monkeypatch.setattr(svc, "logged_name", _fail_logged_name)
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.eventlog_hooks"):
+            eventlog_hooks.reconcile_members_at_startup(
+                cfg, SimpleNamespace(_slots={}), SimpleNamespace(get_by_slot=lambda key: None)
+            )
+
+        assert private_header not in caplog.text
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "kiro_crew.eventlog_hooks" and record.levelname == "WARNING"
+        ] == ["member event-log startup reconcile failed for slug='dr-eggbot'"]
+
+    def test_a_placeholder_log_header_is_ambiguous_and_never_reconciled(self, caplog):
+        """A header equal to the slug names nobody, and a slug can be REUSED, so
+        the sweep cannot tell "this member's own log, written before the roster
+        knew the name" from "a retired member's log whose slug a new member was
+        handed". A write into the wrong log is append-only and unrecoverable;
+        the sweep skips and reports the slug, exactly like a foreign header."""
+        name = "dr. eggbot"
+        slug = members.slug_for_name(name)
+        cfg = _fake_config({name: _agent(model="member-model")}, default=name)
+        svc = get_service()
+        svc.ensure(slug, slug)
+        before = svc.last_seq(slug)
+
+        eventlog_hooks.reconcile_members_at_startup(
+            cfg, SimpleNamespace(_slots={}), SimpleNamespace(get_by_slot=lambda key: None)
+        )
+
+        assert svc.last_seq(slug) == before
+        assert svc.logged_name(slug) == slug
+        assert "model" not in svc.snapshot(slug)["values"].get(types.PROJ_ROSTER, {})
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "kiro_crew.eventlog_hooks" and record.levelname == "WARNING"
+        ] == ["member event-log startup reconcile skipped slug='dr-eggbot' with placeholder header"]
+
+    def test_a_recreated_member_handed_a_retired_slug_never_inherits_the_old_log(self, caplog):
+        """The reuse sequence: a package-discovered template is registered with no
+        ``member_id`` under a hyphenated name that folds onto itself as slug, its
+        log is written under that slug, the row is pruned, and a display-name
+        member is later created -- the allocator finds nothing reserving the slug
+        and hands the new member the identical ``member_id``. Reconciliation
+        must not write the new member's configuration into the retired log."""
+        retired = "issue-radar"
+        slug = members.slug_for_name(retired)
+        assert slug == retired, "fixture needs a name that folds onto itself"
+        svc = get_service()
+        # The retired template's own writer: name == slug, so the header holds
+        # the slug (the nameless-writer placeholder shape).
+        old_cfg = _fake_config({retired: _agent(model="retired-model")}, default=retired)
+        svc.ensure(slug, retired)
+        eventlog_hooks.reconcile_member_config(
+            slug, retired, old_cfg.agents[retired], svc.snapshot(slug)["values"].get("roster", {})
+        )
+        svc.append(slug, types.PATROL_STARTED, {"slot_key": "member-issue-radar"})
+        before = svc.last_seq(slug)
+
+        # Pruned, then recreated as a display-name member that was allocated the
+        # very same identity (nothing reserved the slug once the row was gone).
+        new_name = "Issue Radar"
+        assert new_name != slug
+        new_cfg = _fake_config(
+            {new_name: _agent(member_id=slug, model="new-model")}, default=new_name
+        )
+        assert members.member_slug(new_name, new_cfg) == slug
+
+        eventlog_hooks.reconcile_members_at_startup(
+            new_cfg, SimpleNamespace(_slots={}), SimpleNamespace(get_by_slot=lambda key: None)
+        )
+
+        assert svc.last_seq(slug) == before, "the retired log received the new member's events"
+        assert svc.logged_name(slug) == retired
+        roster = svc.snapshot(slug)["values"][types.PROJ_ROSTER]
+        assert roster["model"] == "retired-model"
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "kiro_crew.eventlog_hooks" and record.levelname == "WARNING"
+        ] == [
+            "member event-log startup reconcile skipped slug='issue-radar' with placeholder header"
+        ]
+        assert new_name not in caplog.text
+
     def test_an_explicit_member_id_decides_which_log_is_reconciled(self):
         """Reconcile by persisted identity, not by folding the display name.
 
@@ -347,10 +1372,8 @@ class TestStartupReconcile:
         sweep that folds the name instead creates and reconciles a SECOND log,
         so the member's history splits and their real log is never corrected.
         """
-        # No space: the sweep skips any name failing _AGENT_NAME_RE, so a
-        # two-word fixture would be skipped and the test would pass vacuously.
-        name = "AliceExample"
-        member_id = "alice-two"
+        name = "dr. eggbot"
+        member_id = "eggbot-two"
         folded = members.slug_for_name(name)
         assert folded != member_id, "fixture must distinguish the two identities"
 

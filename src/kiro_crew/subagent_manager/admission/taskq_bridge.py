@@ -333,7 +333,13 @@ class _TaskqBridgeMixin(ManagerComponent):
         # here, so a recovered row faces the gate its caller faced; the value is
         # still recorded in ``scope_ref``, which the schema defines as
         # references rather than grants and which no start path reads.
-        _PROCESS_LOCAL_PARAMS = ("_agent_prevalidated", "approval_mode")
+        #
+        # ``_parent_spawn_policy`` is a read of the parent agent spec at THIS
+        # request's moment, kept in the in-memory queue so its synchronous drain
+        # scans nothing on the loop; the durable pump re-resolves it off-loop
+        # before every re-check, so the row never carries a snapshot that an
+        # edited spec would leave stale across a restart.
+        _PROCESS_LOCAL_PARAMS = ("_agent_prevalidated", "approval_mode", "_parent_spawn_policy")
         durable_params = {k: v for k, v in params.items() if k not in _PROCESS_LOCAL_PARAMS}
         return _taskq.TaskRecord(
             id=agent_id,
@@ -449,6 +455,7 @@ class _TaskqBridgeMixin(ManagerComponent):
         batch_id: str,
         queued: "SubagentInfo",
         refused: "SubagentInfo",
+        wait: "Mapping[str, Any] | None" = None,
     ) -> None:
         """Hand a drained row's defer to the coroutine dispatcher to write.
 
@@ -470,6 +477,7 @@ class _TaskqBridgeMixin(ManagerComponent):
             batch_id=batch_id,
             queued=queued,
             refused=refused,
+            wait=dict(wait or {}),
         )
 
     async def finish_parked_defer(self, info: "SubagentInfo") -> "SubagentInfo":
@@ -523,7 +531,12 @@ class _TaskqBridgeMixin(ManagerComponent):
             _asyncio.get_event_loop().call_later(wait, self._manager._drain_queue)
         except RuntimeError:
             pass
-        self._manager._emit_queue_depth(point.parent_session_key, point.batch_id)
+        # The defer is written: publish the gate's label with the depth. A
+        # refused row (``not ok`` above) publishes nothing, so no label outlives
+        # a row that never waited.
+        self._manager._emit_queue_depth(
+            point.parent_session_key, point.batch_id, wait=dict(point.wait) or None
+        )
         return point.queued
 
     async def taskq_should_window_async(self, agent_id: str) -> bool:

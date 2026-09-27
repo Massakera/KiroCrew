@@ -89,8 +89,13 @@ class _Oracle:
 
 
 @pytest.fixture
-def wired(tmp_path, monkeypatch):
-    """A consented keystone, a live config, a seeded store, and a surfaced session."""
+def wired(tmp_path, monkeypatch, opened):
+    """A consented keystone, a live config, a seeded store, and a surfaced session.
+
+    The store goes through ``test/conftest.py``'s ``opened`` register-and-close
+    fixture: a dropped ``VectorMemoryStore`` keeps its ``db``/``-wal``/``-shm``
+    descriptors until the cyclic collector runs.
+    """
     _Oracle.asked = []
 
     keystone = tmp_path / "decisions_consent.json"
@@ -119,7 +124,7 @@ def wired(tmp_path, monkeypatch):
         "kiro_crew.decisions.capability.is_decisions_denied", lambda *_a, **_kw: False
     )
 
-    store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+    store = opened(VectorMemoryStore(db_path=tmp_path / "mem.db"))
     store.init()
     _seed(store)
     # The embedder the real path would use, pinned so the query vector is the one the
@@ -813,8 +818,9 @@ class TestTheHookIsNotOnThePromptPath:
     """There is no seam on the prompt-assembly path, and that absence is deliberate.
 
     Prompt assembly asks `MemoryStore.get_context` for preferences with
-    `include_activity=False`, and that flag also gates episodic retrieval, so the block
-    is not built. A `keep=` parameter there is a second door nothing opens, which the
+    `include_activity=False`, and reaches `get_episodic_context` only through the
+    budgeted activity block (`MemoryStore.get_activity_context`) with the raw request
+    and no keep. A `keep=` parameter there is a second door nothing opens, which the
     next reader would take for a live path -- so these three assertions pin that it
     stays absent.
     """

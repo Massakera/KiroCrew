@@ -273,6 +273,33 @@ class TestApiSpawn:
         assert _run(mod.api_spawn, req).status == 200
         assert mgr.spawn.call_args.kwargs["batch_total"] == 0
 
+    def test_a_deferred_row_answers_queued_with_the_gate_reason(self) -> None:
+        """The memory guard parked the row: the caller is told it WAITS and why,
+        under the same ``id`` (the wave reconcile and the run card key on it)."""
+        mgr = _mgr()
+        mgr.spawn.return_value = _info(
+            id="q1",
+            queued=True,
+            queued_reason="low_memory",
+            queued_reason_detail="low memory: 3.2 GB available, need 4 GB",
+        )
+        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"}))
+        assert resp.status == 200
+        body = _payload(resp)
+        assert body["id"] == "q1"
+        assert body["status"] == "queued"
+        assert body["reason"] == "low_memory"
+        assert body["reason_detail"] == "low memory: 3.2 GB available, need 4 GB"
+
+    def test_a_capacity_queued_row_still_answers_spawned(self) -> None:
+        """Waiting behind the cap for a stagger tick is the ordinary wave shape;
+        its wire answer does not change."""
+        mgr = _mgr()
+        mgr.spawn.return_value = _info(id="q2", queued=True, queued_reason="concurrency_limit")
+        body = _payload(_run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"})))
+        assert body["status"] == "spawned"
+        assert "reason" not in body
+
     @pytest.mark.parametrize("source", ["crew", "subagent"])
     @pytest.mark.parametrize("unavailable", [False, True])
     def test_execution_record_lookup_runs_off_loop_before_spawn(
@@ -695,14 +722,35 @@ class TestApiSpawnStatus:
         assert data["result_meta"]["offset"] == 1
         assert data["error"] == ""
 
-    def test_running_agent_reports_progress_fields(self) -> None:
+    def test_running_agent_reports_redacted_partial_transcript(self) -> None:
+        streaming_text = "working\nsecret AKIAIOSFODNN7EXAMPLE\nstill working"
         mgr = _mgr()
-        mgr.get.return_value = _info(done=False)
+        mgr.get.return_value = _info(done=False, streaming_text=streaming_text)
         req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
         data = _payload(_run(mod.api_spawn_status, req))
         assert data["done"] is False
+        assert data["result"] == mod._redact(streaming_text)
         assert data["turns"] == 2 and data["last_tool"] == "fs_read"
         assert isinstance(data["elapsed"], int)
+
+    def test_running_agent_pages_partial_transcript(self) -> None:
+        mgr = _mgr()
+        mgr.get.return_value = _info(done=False, streaming_text="l0\nl1\nl2")
+        req = _Req(
+            _state(subagents=mgr),
+            None,
+            match_info={"agent_id": "a1"},
+            query={"offset": "1", "limit": "1"},
+        )
+        data = _payload(_run(mod.api_spawn_status, req))
+        assert data["done"] is False
+        assert data["result"] == "l1"
+        assert data["result_meta"] == {
+            "total_lines": 3,
+            "offset": 1,
+            "returned_lines": 1,
+            "has_more": True,
+        }
 
     def test_done_agent_prefers_full_result_from_disk(self, tmp_path: Path) -> None:
         result_file = tmp_path / "result.txt"

@@ -97,6 +97,7 @@ from kiro_crew.notifications.bus import (
 from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY
 from kiro_crew.platform_compat import IS_MACOS
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.slack.client import BLOCKS_REMOTE_MEDIA_ERROR, blocks_request_remote_media
 from kiro_crew.slack.format import build_options_blocks, extract_options
 from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
 from kiro_crew.solo_spawn import (
@@ -108,8 +109,10 @@ from kiro_crew.solo_spawn import (
 )
 from kiro_crew.spawn_warm import warm_project_agents_for_spawn
 from kiro_crew.subagent import (
+    DEFERRED_QUEUED_REASONS,
     effort_applied_note,
     effort_drop_reason,
+    parent_spawn_allowlists,
     stage_boundary_owner_for_run,
 )
 from kiro_crew.subagent_persistence import _agent_dir, read_state
@@ -387,34 +390,102 @@ def _sel():
 #: ``subagent.AGENT_NOT_FOUND_CODE``.
 _SPAWN_REJECTED_CODE = "spawn_rejected"
 
+#: Wire text for a run control that reached the gateway with no session identity.
+#: Actionable on purpose: the MCP wrapper hands this string to the model verbatim,
+#: and "not found" alone would send the caller looking for a typo in the run id.
+_IDENTITY_LESS_RUN_CONTROL = (
+    "not found: run controls are scoped to the session that started the run, and "
+    "this call carried no session identity (X-Session-Key). A kiro-cli process that "
+    "multiplexes sessions cannot name one; see the strict-identity diagnosis in "
+    "`kirocrew doctor` (mcp_gateway.stub_servers)."
+)
+
+
+def _run_belongs_to_caller(caller: str, run_id: str, parent: object) -> bool:
+    """Whether *caller* may control run *run_id* whose originating session is *parent*.
+
+    Ownership is the ONLY admission: the run's parent session, or the run itself.
+    A caller with no identity owns nothing that a session started -- it is admitted
+    to a run with no parent (one the host operator started from the CLI, which
+    carries the internal secret and no session) and to nothing else. Neither the
+    caller's memory store nor the transport it arrived on widens this.
+    """
+    if caller == f"subagent:{run_id}":
+        return True
+    if parent is None:
+        # No record of this run at all: nothing vouches for who started it, so
+        # nobody owns it. Reading "unknown" as "parentless" would let a caller
+        # with no identity act on any id it can name.
+        return False
+    parent_key = parent if isinstance(parent, str) else ""
+    return parent_key == caller
+
 
 async def _spawn_scope_refusal(
     request: web.Request, *, claimed_session: str | None = None
 ) -> web.Response | None:
-    """Keep run controls with their originating session, regardless of target member."""
+    """Keep run controls with their originating session, regardless of target member.
+
+    Every INTERNAL caller (kiro-cli's MCP servers, the CLI) takes the ownership
+    check, whatever memory store its identity resolved to and whether it resolved
+    one at all: a verified Global-memory session is still only the owner of its
+    own runs, and a caller that presented no ``X-Session-Key`` owns no run a
+    session started. Only the dashboard owner (cookie auth, no ``internal_auth``)
+    is admitted without it, because that surface IS the owner. Refusals answer
+    404 ``task_scope_denied`` so a run id is never confirmed to a caller that may
+    not see it; the identity-less refusal says why, since a wrong run id and a
+    missing identity are indistinguishable from the caller's side otherwise.
+    """
     scope, refusal = await internal_memory_scope(
         request, "spawn.access", claimed_session=claimed_session
     )
-    if refusal is not None or scope is None:
+    if refusal is not None:
         return refusal
+    if request.get("internal_auth") is not True:
+        return None  # the dashboard owner's own surface
     caller = request.headers.get("X-Session-Key", "")
     state = request.app["state"]
     run_id = request.match_info["agent_id"]
     info = state.subagents.get(run_id) if state.subagents else None
     record = None if info is not None else await asyncio.to_thread(read_state, run_id)
-    parent = (
-        info.parent_session_key if info is not None else (record or {}).get("parent_session_key")
-    )
-    if parent == caller or caller == f"subagent:{run_id}":
+    parent: object
+    if info is not None:
+        parent = info.parent_session_key
+    elif record is not None:
+        # The persisted record spells the field ``parent_session``
+        # (``subagent_persistence.write_state``). A record that lacks it is an
+        # unknown owner, not a parentless run: ``None`` stays ``None``.
+        parent = record.get("parent_session")
+    else:
+        # A harness-native child has no managed run and no persisted record; its
+        # ownership is the dashboard slot that tracks its card. Anything else
+        # unknown stays ``None`` and is refused.
+        card = (getattr(state, "_native_cards", None) or {}).get(run_id)
+        # The card stores the bare slot key (``_register_native_card``); the
+        # caller's identity is that slot's session key, ``dashboard:<slot>``.
+        slot = card.get("slot") if isinstance(card, dict) else None
+        parent = f"dashboard:{slot}" if isinstance(slot, str) and slot else None
+    if _run_belongs_to_caller(caller, run_id, parent):
         return None
     _sel().log_api_access(
-        caller="internal",
+        caller=caller or "internal",
         operation="spawn.access",
         outcome="denied",
         source="subagent",
-        error="The run belongs to another originating session.",
+        error=(
+            "The run belongs to another originating session."
+            if caller
+            else "The caller presented no session identity."
+        ),
+        resources=f"run={run_id} scope={'private' if scope else 'global'}",
     )
-    return web.json_response({"error": "not found", "code": "task_scope_denied"}, status=404)
+    return web.json_response(
+        {
+            "error": "not found" if caller else _IDENTITY_LESS_RUN_CONTROL,
+            "code": "task_scope_denied",
+        },
+        status=404,
+    )
 
 
 async def _spawn_request_memory_mode(
@@ -627,6 +698,19 @@ async def api_spawn(request: web.Request) -> web.Response:
         parent_execution = caller.execution
         if parent_execution is None and parent_session:
             parent_execution = await asyncio.to_thread(read_session_execution, parent_session)
+        # The parent agent spec's ``availableAgents`` declaration, read off-loop
+        # from the template the record named, so the gate needs neither a second
+        # record read nor a directory scan on the loop. A parentless request has
+        # no declaration to honour: the synthesized context below carries the
+        # CHILD's template, which must not be mistaken for a parent.
+        parent_spawn_policy = (
+            (
+                parent_execution.template_id,
+                await asyncio.to_thread(parent_spawn_allowlists, parent_execution.template_id),
+            )
+            if parent_execution is not None
+            else ("", ())
+        )
         if parent_execution is None:
             parent_execution = ExecutionContext(
                 None, MemoryStoreRef("default"), "template", agent or "kirocrew"
@@ -766,6 +850,7 @@ async def api_spawn(request: web.Request) -> web.Response:
         _execution_context=admitted_execution.to_record(),
         _stage_boundary_owner=_stage_boundary_owner_for_parent(state, parent_session),
         acp_backend=acp_backend,
+        _parent_spawn_policy=parent_spawn_policy,
     )
     if not info:
         # Reached mgr.spawn (submission COUNTED at the top of spawn()) but
@@ -804,6 +889,20 @@ async def api_spawn(request: web.Request) -> web.Response:
     }
     if acp_backend:
         resp["backend"] = acp_backend
+    # A row the gate DEFERRED (memory floor, critical posture, adaptive cap at
+    # 0) is accepted and keyed like any other -- same ``id``, counted in its
+    # wave -- but it is not running and may not run for a long time: the pump
+    # re-checks it every admit wait for as long as the host stays below the
+    # bar. Saying ``spawned`` for it left the caller waiting on a completion
+    # event that was not coming. ``queued`` names the wait; ``reason`` is the
+    # kind, ``reason_detail`` the gate's own sentence. A row waiting only for a
+    # slot or the stagger tick (``concurrency_limit``) keeps ``spawned``: that
+    # wait is the ordinary wave shape and clears within seconds.
+    queued_reason = str(getattr(info, "queued_reason", "") or "")
+    if queued_reason in DEFERRED_QUEUED_REASONS:
+        resp["status"] = "queued"
+        resp["reason"] = queued_reason
+        resp["reason_detail"] = _redact(str(getattr(info, "queued_reason_detail", "") or ""))
     # Server-side effort verdict: only this side knows the model the factory's
     # effort gate will see (explicit per-call value, else the subagent role
     # pin, else the session chain for the effective agent — a crew's pin, else
@@ -814,19 +913,14 @@ async def api_spawn(request: web.Request) -> web.Response:
         # cannot undo the submission or turn an unknown selection into "auto".
         selection: tuple[str, str] | None
         try:
-            selection = (
-                ("template", agent)
-                if agent
-                else (
-                    ("member", crew)
-                    if crew
-                    else (
-                        state.sessions.get_agent_selection(parent_session)
-                        if parent_session
-                        else ("template", "")
-                    )
-                )
-            )
+            if agent:
+                selection = ("template", agent)
+            elif crew:
+                selection = ("member", crew)
+            elif parent_session:
+                selection = state.sessions.get_agent_selection(parent_session)
+            else:
+                selection = ("template", "")
         except Exception:
             selection = None
 
@@ -1290,6 +1384,11 @@ async def api_spawn_status(request: web.Request) -> web.Response:
         data["turns"] = info.turns
         data["last_tool"] = _redact(info.last_tool)
         data["elapsed"] = round(time.time() - info.started)
+        partial = _redact(getattr(info, "streaming_text", ""))
+        view, view_meta = await _apply_result_view(request, partial)
+        data["result"] = view
+        if view_meta:
+            data["result_meta"] = view_meta
         # Same predicate, same present-only-while-true convention as
         # api_spawn_list. This endpoint is the one a blocking `kirocrew spawn
         # run` polls every 2s (cli_commands.py), so leaving it out would keep the
@@ -1344,12 +1443,15 @@ async def api_spawn_list(request: web.Request) -> web.Response:
         return refusal
     agents = []
     caller = request.headers.get("X-Session-Key", "")
+    # An internal caller lists only the runs it may control, by the same
+    # ownership rule the per-run routes apply: its own runs, or -- with no
+    # identity at all -- only runs no session started. Listing is a read, but a
+    # run id, its task text and its parent key are exactly what a later steer
+    # needs, so the list must not hand out what the control route would refuse.
+    # The dashboard owner (no ``internal_auth``) still sees everything.
+    internal = request.get("internal_auth") is True
     for info in state.subagents.all_agents:
-        if (
-            scope is not None
-            and info.parent_session_key != caller
-            and caller != f"subagent:{info.id}"
-        ):
+        if internal and not _run_belongs_to_caller(caller, info.id, info.parent_session_key):
             continue
         entry: dict[str, object] = {
             "id": info.id,
@@ -1950,6 +2052,12 @@ async def api_notification_agent_push(request: web.Request) -> web.Response:
 
 _MAX_BLOCKS = 50  # Slack Block Kit limit
 _MAX_WALK_DEPTH = 10  # defense-in-depth against deeply nested LLM output
+
+#: The Block Kit media boundary is defined and enforced at the Slack client seam
+#: (``slack/client.py``), which every outbound tree passes through. This entry
+#: keeps its own 400 with a machine-readable code for agent callers, so it asks
+#: that one predicate instead of restating the rule in a second place.
+_blocks_request_remote_media = blocks_request_remote_media
 
 
 def _redact_all(value: str) -> str:
@@ -2603,6 +2711,18 @@ async def api_send_message(request: web.Request) -> web.Response:
     blocks = body.get("blocks")
     if blocks and not isinstance(blocks, list):
         return web.json_response({"error": "blocks must be an array"}, status=400)
+    if isinstance(blocks, list) and _blocks_request_remote_media(blocks):
+        return web.json_response(
+            {
+                "error": (
+                    "agent-supplied Block Kit cannot contain image/video blocks "
+                    "or image_url/thumbnail_url/video_url fields because Slack "
+                    "fetches that media without a recipient click"
+                ),
+                "code": BLOCKS_REMOTE_MEDIA_ERROR,
+            },
+            status=400,
+        )
 
     # ── Channel-addressed leg ──
     # Handled before the Slack-shaped validation below, because a Webex room id is
@@ -2681,6 +2801,25 @@ async def api_send_message(request: web.Request) -> web.Response:
     ):
         return web.json_response(
             {"error": "unfurl_links and unfurl_media must be booleans"}, status=400
+        )
+    # Refused, not silently dropped (same posture as _SLACK_ONLY_BODY_FIELDS):
+    # this endpoint is reachable from agent-authored tool calls, and a Slack
+    # unfurl is a zero-click fetch of a possibly agent-written URL, so an
+    # explicit ``true`` is the one bit a prompt-injected agent needs to
+    # re-enable the exfiltration channel. ``false``/absent are accepted for
+    # backward compatibility — they ask for what is now always the case.
+    # See docs/request-for-change/rfc-redaction-explain-and-reveal.md §5.
+    if unfurl_links or unfurl_media:
+        return web.json_response(
+            {
+                "error": (
+                    "unfurl_links/unfurl_media cannot be enabled: bot posts "
+                    "never fetch link or media previews (a preview is a "
+                    "zero-click request of a possibly agent-written URL)"
+                ),
+                "code": "unfurl_disabled",
+            },
+            status=400,
         )
 
     thread_ts = body.get("thread_ts")
@@ -2984,7 +3123,9 @@ async def api_send_message(request: web.Request) -> web.Response:
                     # clobbers the plan. _in_stage_execution closes it — same predicate
                     # the user-typed path uses (chat_handlers._api_chat).
                     if slot.running or slot._in_stage_execution:
-                        if len(slot._queue) >= 50:
+                        from kiro_crew.dashboard.slot_queue_repository import MAX_LIVE_QUEUE_ENTRIES
+
+                        if len(slot._queue) >= MAX_LIVE_QUEUE_ENTRIES:
                             evicted = slot.queue_pop(0)
                             logger.warning(
                                 "Queue full for slot %s — evicting oldest message", slot_key
@@ -3109,8 +3250,6 @@ async def api_send_message(request: web.Request) -> web.Response:
                                 blocks,
                                 text,
                                 thread_ts=thread_ts,
-                                unfurl_links=unfurl_links,
-                                unfurl_media=unfurl_media,
                                 reply_broadcast=reply_broadcast,
                             )
                         else:
@@ -3118,8 +3257,6 @@ async def api_send_message(request: web.Request) -> web.Response:
                                 channel,
                                 text,
                                 thread_ts=thread_ts,
-                                unfurl_links=unfurl_links,
-                                unfurl_media=unfurl_media,
                                 reply_broadcast=reply_broadcast,
                             )
                             if options:
@@ -3559,6 +3696,22 @@ async def api_update_message(request: web.Request) -> web.Response:
     if blocks is not None and not isinstance(blocks, list):
         return web.json_response(
             {"error": "blocks must be a list", "code": "invalid_blocks"}, status=400
+        )
+    # The edit path publishes replacement content, so it carries the SAME
+    # server-fetched-media boundary as api_send_message: without this, an
+    # agent could send clean blocks and then EDIT remote media into the
+    # message — Slack fetches Block Kit media regardless of unfurl flags.
+    if isinstance(blocks, list) and _blocks_request_remote_media(blocks):
+        return web.json_response(
+            {
+                "error": (
+                    "agent-supplied Block Kit cannot contain image/video blocks "
+                    "or image_url/thumbnail_url/video_url fields because Slack "
+                    "fetches that media without a recipient click"
+                ),
+                "code": BLOCKS_REMOTE_MEDIA_ERROR,
+            },
+            status=400,
         )
     if not text and not blocks:
         return web.json_response(

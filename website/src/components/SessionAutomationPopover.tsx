@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { Activity, Goal, Radar, RotateCw, Square, Trash2, X } from 'lucide-react'
-import { useIsFetching, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useIsFetching, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError, type MonitorWrite } from '../api/client'
 import {
   deriveAutomationStatus,
@@ -13,7 +13,7 @@ import {
   type LegacyGoalLoop,
   type StructuredMonitor,
 } from '../monitoring/automation'
-import { fmtDateTimeNumeric, fmtNumber } from '../i18n/format'
+import { fmtDateTimeNumeric, fmtNumber, fmtUnit, type FormatUnit } from '../i18n/format'
 import { Badge, Btn, IconButton, Input, SendBtn } from './ui'
 import { PopoverContent } from './ui/popover'
 import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
@@ -150,6 +150,23 @@ function boundedInteger(
 const fieldClass = 'space-y-1 min-w-0'
 const labelClass = 'block text-[11px] font-medium text-muted'
 const errorClass = 'text-[11px] text-danger'
+// Fail closed to the operator ceiling shipped by the backend when its live read is unavailable.
+const SHIPPED_RUNTIME_CEILING_SECS = 604_800
+
+/* The runtime bound is typed in seconds, and a seven-digit second count says
+   nothing about how long the reader is granting. Glossed with the largest
+   whole unit that divides the bound exactly, so the gloss never rounds a
+   bound the reader is held to; anything else stays in seconds. */
+const DURATION_UNITS: ReadonlyArray<[number, FormatUnit]> = [[86_400, 'day'], [3_600, 'hour'], [60, 'minute']]
+
+function describeDuration(secs: number): string {
+  for (const [unitSecs, unit] of DURATION_UNITS) {
+    if (secs >= unitSecs && secs % unitSecs === 0) {
+      return fmtUnit(secs / unitSecs, unit, { unitDisplay: 'long' })
+    }
+  }
+  return fmtUnit(secs, 'second', { unitDisplay: 'long' })
+}
 
 function FieldError({ id, message }: { id: string; message?: string }) {
   return message ? <p id={id} role="status" aria-live="polite" className={errorClass}>{message}</p> : null
@@ -204,6 +221,32 @@ export default function SessionAutomationPopover({
   const sessionModeUnsupported = sessionMode === 'crew' || sessionMode === 'member'
   const legacyView = automation?.kind === 'legacy_goal_loop'
     || (!monitor && boundedModeSlot !== slotKey)
+  /* THE RUNTIME INPUT'S REAL CEILING. `contract.json` carries the ABSOLUTE
+     maximum any install may configure (30 days), while the create/update
+     handlers enforce the LIVE operator ceiling. The form validates against
+     the smaller value after the per-slot read lands. Until then, or if the
+     read fails, it uses the shipped operator ceiling rather than accepting a
+     value a default server will reject after submit. */
+  const liveCeiling = useQuery({
+    queryKey: ['monitor-runtime-ceiling', slotKey],
+    enabled: open && !legacyView,
+    queryFn: () => api.monitorForSlot(slotKey),
+    select: response => response.max_runtime_ceiling_secs,
+    staleTime: 60_000,
+    retry: false,
+  })
+  const ceiling = liveCeiling.isError ? undefined : liveCeiling.data
+  const runtimeLimits = {
+    minimum: STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs.minimum,
+    maximum: typeof ceiling === 'number' && Number.isSafeInteger(ceiling) && ceiling >= 1
+      ? Math.min(STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs.maximum, ceiling)
+      : SHIPPED_RUNTIME_CEILING_SECS,
+  }
+  /* Both read-failure notices sit behind the request error: a failed save is
+     what the reader must act on first, and stacking a read alert under it puts
+     two unrelated errors in front of them at once. */
+  const ceilingFailed = !errors.request && liveCeiling.isError
+  const snapshotNoticeDue = !errors.request && snapshotFailed
 
   useEffect(() => {
     if (!open) return
@@ -343,7 +386,7 @@ export default function SessionAutomationPopover({
     if (!editedMonitor && !creationReady) return
     if (editedMonitor && !hasDirtyFields) return
     const cadence = boundedInteger(draft.cadence, STRUCTURED_MONITOR_LIMITS.cadenceSecs)
-    const runtime = boundedInteger(draft.runtime, STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs)
+    const runtime = boundedInteger(draft.runtime, runtimeLimits)
     const turns = boundedInteger(draft.turns, STRUCTURED_MONITOR_LIMITS.maxAgentTurns)
     const tokens = boundedInteger(draft.tokens, STRUCTURED_MONITOR_LIMITS.maxTokens)
     const providerErrors = boundedInteger(
@@ -372,7 +415,14 @@ export default function SessionAutomationPopover({
       nextErrors.cadence = rangeError(STRUCTURED_MONITOR_LIMITS.cadenceSecs)
     }
     if (validates('runtime') && runtime === null) {
-      nextErrors.runtime = rangeError(STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs)
+      nextErrors.runtime = i18nT(
+        'components.sessionAutomationPopover.limit_range_duration',
+        {
+          min: fmtNumber(runtimeLimits.minimum),
+          max: fmtNumber(runtimeLimits.maximum),
+          duration: describeDuration(runtimeLimits.maximum),
+        },
+      )
     }
     if (validates('turns') && turns === null) {
       nextErrors.turns = rangeError(STRUCTURED_MONITOR_LIMITS.maxAgentTurns)
@@ -633,8 +683,8 @@ export default function SessionAutomationPopover({
                   type="number"
                   inputMode="numeric"
                   autoComplete="off"
-                  min={STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs.minimum}
-                  max={STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs.maximum}
+                  min={runtimeLimits.minimum}
+                  max={runtimeLimits.maximum}
                   step={1}
                   value={draft.runtime}
                   aria-labelledby={`${id}-runtime-label`}
@@ -724,14 +774,27 @@ export default function SessionAutomationPopover({
 
         {/* No hand-off: navigating away would discard the unsaved monitor draft. */}
         <ErrorNotice message={errors.request} className="mt-3" />
-        {!errors.request && snapshotFailed ? (
+        {ceilingFailed || snapshotNoticeDue ? (
           <div className="mt-3 space-y-2">
+            {/* ONE notice for the two reads that can fail together. The snapshot
+               and the live ceiling are separate queries with the same failure
+               mode and the same wording, so a notice per read puts two
+               identical alerts with two identical buttons in front of the
+               reader. One button retries whichever reads failed. */}
             {/* No hand-off: a failed refresh must preserve the unsaved monitor draft. */}
-            <ErrorNotice message={i18nT('components.sessionAutomationPopover.snapshot_failed')} />
+            <ErrorNotice
+              message={i18nT('components.sessionAutomationPopover.snapshot_failed')}
+              testId="monitor-read-error"
+            />
             <Btn
               type="button"
-              disabled={snapshotFetching}
-              onClick={() => { void queryClient.refetchQueries({ queryKey: ['session-automation', slotKey], exact: true }) }}
+              disabled={(ceilingFailed && liveCeiling.isFetching) || (snapshotNoticeDue && snapshotFetching)}
+              onClick={() => {
+                if (ceilingFailed) void liveCeiling.refetch()
+                if (snapshotNoticeDue) {
+                  void queryClient.refetchQueries({ queryKey: ['session-automation', slotKey], exact: true })
+                }
+              }}
             >
               {i18nT('components.sessionAutomationPopover.retry_snapshot')}
             </Btn>

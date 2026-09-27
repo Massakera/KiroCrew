@@ -88,6 +88,7 @@ from kiro_crew.hooks import (
 )
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.messaging.split import iter_fence_spans
+from kiro_crew.platform import binary_content_is_flagged
 from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
 from kiro_crew.security import (
     is_sensitive_path,
@@ -361,15 +362,124 @@ def _inside(offset: int, spans: list[tuple[int, int]]) -> bool:
     return any(start <= offset < end for start, end in spans)
 
 
+def seam_carries_markup_debt(source_head: str, tail: str) -> bool:
+    r"""True when sealing *source_head* away changes how the extraction reader
+    classifies the literalness of the point where *tail* resumes.
+
+    This is the ONE seam check for a stream splitter that seals a prefix chunk
+    and continues a live tail (Discord's ``_rotate_on_length``). The tail is
+    later scanned ALONE by :func:`iter_local_refs`, and a marker ANYWHERE in it
+    is judged by :func:`_literal_image_marker` reading the tail with the sealed
+    prefix gone. In the full source that same marker is judged with the prefix
+    still present. A LEAK is exactly a disagreement between the two readings:
+
+      * the full text reads a marker LITERAL (an unclosed inline-code run, an
+        odd backslash escape, an open fence, or a four-wide indent opened in the
+        sealed prefix still covers it) but the tail alone reads it REAL -- the
+        semantic seal then uploads a file the author wrote as literal text; or
+      * the full text reads a marker REAL but the tail alone reads it LITERAL
+        (a mid-line cut left the tail beginning tab-led, so the tail reads as
+        indented code while the source line was not indented) -- the seal drops
+        it and ships the raw local path as display text.
+
+    Rather than enumerate opener families (backtick, backslash, fence, indent)
+    and re-derive each at the seam -- the losing game that drew one review block
+    per family -- this asks two questions, both answered by the extraction
+    reader's own primitives:
+
+      1. Does the sealed prefix END INSIDE an open inline-code span? The tail is
+         sealed later WITHOUT the prefix, possibly across more than one further
+         seal, so any inline-code span the prefix opens and never closes is lost
+         the instant the prefix is sealed away. A marker the full text keeps
+         literal because that span still covers it (``\`\`example ... \`![a]\`
+         and ![b]() ... \`\``) then reads REAL once the tail is scanned alone.
+         The ref-set at the rotation seam cannot see this -- the tail still
+         carries the closing delimiter AT THAT INSTANT -- so it must be caught as
+         an open opener in the prefix. ``mask_inline_code`` masks only balanced
+         inline-code pairs, so a surviving backtick in the masked prefix is
+         exactly an opener with no closer before the seam. The mask is bounded to
+         the seam's own blank-line block via :func:`_block_bounds`, the SAME
+         segmentation the reader uses -- masking the whole prefix instead would
+         pair two unmatched backticks in separate paragraphs and miss a still-open
+         opener in the seam's own block.
+      2. Does a synthetic marker at the tail's own resume point (first line, past
+         leading whitespace) classify differently with the prefix present than
+         without it? This covers escape debt, a four-wide indent flip in either
+         direction (including the tab-led tail, where the reader keys its indent
+         verdict off the marker's column), and any fence/inline opener that
+         changes the FIRST line's reading -- present or arriving later.
+
+    Any disagreement degrades. ``_literal_image_marker`` folds all four contexts
+    with the block segmentation the real reader uses. Empty inputs return False.
+    """
+    if not source_head or not tail:
+        return False
+    # Check 1: an inline-code opener in the sealed prefix with no closer before
+    # the seam. A backtick INSIDE a fenced span is the fence's own delimiter, not
+    # an inline opener, and the fence-aware per-chunk span scan owns that case --
+    # so a seam sitting inside an open fence is literal in both readings and
+    # skipped here. Otherwise the mask must be BLOCK-BOUNDED exactly as the
+    # extraction reader bounds it: a surviving backtick is only debt when it
+    # opened in the SAME blank-line-bounded block the seam ends in. Masking the
+    # whole post-fence prefix instead crossed blank-line boundaries the reader
+    # treats as block breaks, so two unmatched backticks in separate paragraphs
+    # cancelled each other and a still-open opener in the seam's own block went
+    # unseen. ``_block_bounds`` is the reader's own segmentation, shared so the
+    # two cannot drift; the block that HOLDS the seam is the one ending at it, so
+    # the last character of the sealed prefix (offset ``seam - 1``) selects it.
+    seam = len(source_head)
+    fenced = list(iter_fence_spans(source_head))
+    if any(start < seam <= end for start, end in fenced):
+        pass  # seam inside an open fence: owned by the per-chunk span scan
+    else:
+        block_start, _block_end = _block_bounds(source_head, seam - 1, fenced)
+        if "`" in mask_inline_code(source_head[block_start:seam]):
+            return True
+    # Check 2: a synthetic probe at the tail's first-line resume point. Placed
+    # past leading newlines and the first line's own indentation, because the
+    # reader keys its indent/inline verdict off the marker's column within its
+    # line; a probe at raw column 0 would erase the tab-led-tail indentation
+    # debt this must catch.
+    probe = "![]("
+    base = len(source_head)
+    newlines = len(tail) - len(tail.lstrip("\n"))
+    first_line = tail[newlines:].split("\n", 1)[0]
+    indent = len(first_line) - len(first_line.lstrip(" \t"))
+    at = newlines + indent
+    tail_probe = tail[:at] + probe + tail[at:]
+    full_probe = source_head + tail_probe
+    tail_verdict = _literal_image_marker(tail_probe, at, list(iter_fence_spans(tail_probe)))
+    full_verdict = _literal_image_marker(full_probe, base + at, list(iter_fence_spans(full_probe)))
+    return tail_verdict != full_verdict
+
+
+#: Blank-line block divider -- a lone paragraph break, the same boundary the
+#: upload extraction reader uses to bound an inline-code block.
+_BLANK_LINE_RE = re.compile(r"\n[ \t]*\r?\n")
+
+
+def _block_bounds(text: str, offset: int, fenced: list[tuple[int, int]]) -> tuple[int, int]:
+    """The ``[start, end)`` of the inline-code block that holds *offset*.
+
+    A block is bounded by fenced spans and blank lines -- the segmentation the
+    extraction reader keys its inline-code verdict off. Shared by
+    :func:`_literal_image_marker` (which masks the block that holds a marker) and
+    :func:`seam_carries_markup_debt` (which masks the block a sealed prefix ends
+    in) so the two cannot drift into disagreeing about where a block begins.
+    """
+    boundaries = [*fenced, *(m.span() for m in _BLANK_LINE_RE.finditer(text))]
+    start = max((end for _s, end in boundaries if end <= offset), default=0)
+    end = min((s for s, _e in boundaries if s > offset), default=len(text))
+    return start, end
+
+
 def _literal_image_marker(text: str, offset: int, fenced: list[tuple[int, int]]) -> bool:
     prefix = text[:offset]
     escaped = (len(prefix) - len(prefix.rstrip("\\"))) % 2 == 1
     line_start = text.rfind("\n", 0, offset) + 1
     line = text[line_start:].split("\n", 1)[0]
     column = offset - line_start
-    boundaries = [*fenced, *(m.span() for m in re.finditer(r"\n[ \t]*\r?\n", text))]
-    block_start = max((end for start, end in boundaries if end <= offset), default=0)
-    block_end = min((start for start, end in boundaries if start > offset), default=len(text))
+    block_start, block_end = _block_bounds(text, offset, fenced)
     return (
         escaped
         or _inside(offset, fenced)
@@ -436,16 +546,37 @@ def local_destination(raw_dest: str) -> Path | None:
     return path
 
 
-def _payload_passes_redaction(data: bytes) -> bool:
-    """Whether the exact outbound bytes pass both mandatory egress scanners."""
+def _payload_is_flagged(data: bytes) -> bool:
+    """Whether the shared binary egress scan flags the exact outbound bytes.
+
+    Delegates the whole decision to ``platform.binary_content_is_flagged`` -- the
+    one binary-content scan every file-delivery gate shares -- so this leg and
+    those gates give one answer to one question. Two things follow from the
+    delegation rather than from anything written here: a credential at UTF-16 or
+    UTF-32 spacing is seen, because that scan ends in
+    ``platform.wide_content_is_flagged``, and a container's own standard symbol
+    table does not count as a credential, because that scan re-asks its positive
+    with those tables masked. Both are properties of the shared scan, which is
+    exactly why the decision belongs there and not here.
+
+    This function holds no detector and no decode. All it adds is the refusal
+    conversion this leg's contract needs: :func:`extract_local_refs` must never
+    raise, since a reply has to go out even when nothing about its attachments can
+    be decided, so a scan that cannot answer becomes a flagged verdict here rather
+    than an exception. Flagged is the fail-closed direction: the caller turns it
+    into a rejection and the bytes stay on the host. A composed host whose
+    credential policy fails to load therefore refuses the upload, which is the
+    same answer it gives the owner-facing gates by raising.
+
+    Synchronous, like the scan it calls: the module's async callers reach it
+    through :func:`extract_local_refs_off_loop`, which already runs this whole
+    path in a thread, so the CPU work stays off the event loop.
+    """
     try:
-        source = data.decode("latin-1")
-        checked, _ = redact_exfiltration_urls(source)
-        checked, _ = redact_credentials(checked)
+        return binary_content_is_flagged(data)
     except Exception:
         logger.warning("outbound file payload scan failed", exc_info=True)
-        return False
-    return checked == source
+        return True
 
 
 def _inspect(
@@ -527,7 +658,7 @@ def _inspect(
         mime = sniff_raster_mime(data[:SNIFF_BYTES])
         if mime is None:
             return Rejection(dest, REASON_NOT_RASTER, "not a PNG, JPEG, GIF, WebP or BMP image")
-        if not _payload_passes_redaction(data):
+        if _payload_is_flagged(data):
             return Rejection(
                 dest, REASON_SENSITIVE, "the file failed outbound content security checks"
             )

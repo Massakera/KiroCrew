@@ -65,14 +65,29 @@ _MCP_CAPABILITY = "mcp"
 #: KAS's table: an entry here is a promise that auto-approving the Crew tool and
 #: allowing the KAS capability mean the same thing. Anything absent is treated as
 #: unclassifiable and left to prompt (see the module docstring).
+#:
+#: Keyed on the names an ``allowedTools`` list carries, which are Crew's (and
+#: kiro-cli's) names, not KAS's internal toolIds. The sub-agent tool is
+#: ``use_subagent`` there; KAS calls the same tool ``invoke_sub_agent``, and that
+#: spelling is deliberately NOT a key. The governance ceiling filters
+#: ``allowedTools`` by ref before this table reads it, so a second spelling for
+#: one tool would let a spec obtain under the alias the grant the ceiling withholds
+#: under the Crew name. ``disclose_context`` stays: it is KAS's skill tool, Crew
+#: has no name of its own for it, so there is no Crew spelling it could alias.
 CAPABILITY_BY_TOOL: dict[str, str] = {
     # Network.
     "web_fetch": "web_fetch",
     "web_search": "web_search",
     # Sub-agents and skills.
-    "invoke_sub_agent": "subagent",
+    "use_subagent": "subagent",
     "disclose_context": "skill",
 }
+
+#: KAS toolId -> the Crew name ``allowedTools`` must use for the same tool. A
+#: spec carrying the KAS spelling gets no grant (see :data:`CAPABILITY_BY_TOOL`
+#: for why it is not an alias), so it is named at WARNING with the fix: the
+#: spawn it meant to auto-approve now prompts, and the author should know why.
+KAS_SPELLINGS: dict[str, str] = {"invoke_sub_agent": "use_subagent"}
 
 #: Tools this module refuses to translate even though the capability exists.
 #:
@@ -110,6 +125,69 @@ WITHHELD_FROM_AUTO_APPROVE: frozenset[str] = frozenset(
         "control_bash_process",
     }
 )
+
+#: kiro-cli tool name -> the KAS tool ids that do the same job.
+#:
+#: This is the one kiro-cli <-> KAS tool-name table. A matcher in an agent
+#: spec's ``hooks`` names tools in kiro-cli's vocabulary (``execute_bash``,
+#: ``fs_write``). KAS names its own tools differently, and the name it states for
+#: a call is the ``toolId`` of the permission request's ``_meta.kiro``
+#: (``AcpEvent.harness_tool_id``): a shell command is ``run_command``, a partial
+#: edit is ``str_replace``. Every id here is one a live KAS session (kiro-cli
+#: 2.24, ``--agent-engine v3``) stated on a permission request for that kind of
+#: call, and each row stays inside the KAS capability its kiro-cli name belongs
+#: to in KAS's tool table (``policy/capabilities.ts``), so a row never reaches a
+#: tool of a different kind.
+#:
+#: Coverage is per id, not per capability: a row lists the ids seen for that
+#: kind of call, and a KAS id outside every row (a process-control tool) is met
+#: only by a matcher that names it as written. A kiro-cli tool with no row
+#: (``use_aws``) meets no KAS call. Read it through
+#: :func:`kas_tool_match_names` and :data:`KAS_TOOL_MATCH_VOCABULARY`; the rows
+#: themselves are for a caller that must go from a kiro-cli name to KAS ids.
+KAS_TOOL_IDS_BY_KIRO_TOOL: dict[str, tuple[str, ...]] = {
+    "execute_bash": ("run_command",),
+    "fs_read": ("read_file", "list_directory"),
+    "fs_write": ("fs_write", "fs_append", "str_replace", "delete_file"),
+    "grep": ("grep_search",),
+    "glob": ("file_search",),
+    "web_fetch": ("web_fetch",),
+    "web_search": ("remote_web_search",),
+    "use_subagent": ("invoke_sub_agent",),
+}
+
+#: Other spellings of a kiro-cli tool that a spec may use, onto the name in
+#: :data:`KAS_TOOL_IDS_BY_KIRO_TOOL`: kiro-cli's legacy ``shell`` key, and the
+#: short ``read``/``write`` names KAS's own tool table classifies the same way.
+KIRO_TOOL_ALIASES: dict[str, str] = {
+    "shell": "execute_bash",
+    "read": "fs_read",
+    "write": "fs_write",
+}
+
+#: Every name a tool matcher can mean on KAS: the kiro-cli names and their
+#: aliases, and the KAS ids they reach.
+KAS_TOOL_MATCH_VOCABULARY: frozenset[str] = (
+    frozenset(KAS_TOOL_IDS_BY_KIRO_TOOL)
+    | frozenset(KIRO_TOOL_ALIASES)
+    | frozenset(tool_id for ids in KAS_TOOL_IDS_BY_KIRO_TOOL.values() for tool_id in ids)
+)
+
+
+def kas_tool_match_names(tool_id: str) -> tuple[str, ...]:
+    """The names a tool matcher is compared with for a KAS call to ``tool_id``.
+
+    First the kiro-cli name whose row reaches the id (the id itself when no row
+    does), then the KAS id, then the aliases, with no repeats. So a matcher written
+    as ``execute_bash``, ``run_command`` or ``shell`` meets a KAS shell call, and the
+    first name is the one a kiro-cli hook would be told the tool is called. Empty
+    for an empty id: a call KAS did not name matches no tool matcher.
+    """
+    if not tool_id:
+        return ()
+    kiro_names = sorted(name for name, ids in KAS_TOOL_IDS_BY_KIRO_TOOL.items() if tool_id in ids)
+    aliases = sorted(alias for alias, name in KIRO_TOOL_ALIASES.items() if name in kiro_names)
+    return tuple(dict.fromkeys([*kiro_names, tool_id, *aliases]))
 
 
 #: Glob syntax kiro-cli's ``allowedTools`` matcher documents for the TOOL part
@@ -222,6 +300,14 @@ def allowed_tools_to_permissions(
             "agent %r: allowedTools entries with no KAS capability, left to prompt: %s",
             agent_id,
             ", ".join(sorted(unclassified)),
+        )
+    for entry in sorted(set(unclassified) & set(KAS_SPELLINGS)):
+        logger.warning(
+            "agent %r: allowedTools lists %r, which is KAS's own name for the tool; "
+            "list %r instead to auto-approve it -- until then it prompts",
+            agent_id,
+            entry,
+            KAS_SPELLINGS[entry],
         )
     if withheld:
         # Louder than `unclassified`, and separate from it: this one is a policy

@@ -20,7 +20,7 @@ import { PlainCodeFallback, PlainFilePairFallback, PlainFilePairHeader } from '.
 import { isPierreFilePairWithinBudget } from './renderBudget'
 import { computePairPatch } from './diffOffThread'
 import { countDiffStats } from '../utils/diffLineCounts'
-import { PierreFarmHoldContext } from '../components/pierreStaging'
+import { PierreFarmHoldContext, WarmSwapHeldContext } from '../components/pierreStaging'
 import { usePlainDiff } from '../hooks/usePlainDiff'
 
 const CodeImpl = lazy(() => import('./PierreImpl').then(m => ({ default: m.PierreCodeImpl })))
@@ -38,75 +38,6 @@ const EditorImpl = lazy(() => import('./PierreEditorImpl').then(m => ({ default:
 interface PairIdentity {
   oldFile: FileContents | null
   newFile: FileContents | null
-}
-
-/**
- * Paint-hold for the opted-in oversized pair. Same contract as `WarmSwap` —
- * keep the readable fallback on screen until the impl has real painted rows —
- * but with a measurement that cannot be satisfied by anything except the
- * impl's own content: the children mount inside an IN-FLOW `height:0;
- * overflow:hidden` box, whose `clientHeight` is 0, so `scrollHeight` reads the
- * content's height exactly. (`WarmSwap`'s box is `absolute inset-0`, which
- * floors `scrollHeight` at the wrapper height the fallback itself provides —
- * fine for the staged, off-viewport mounts it was built for, wrong for a swap
- * happening under the user's cursor.) The children stay in the same DOM node
- * across the flip, so nothing remounts or re-highlights on reveal.
- *
- * `header` is a row the caller wants ABOVE the revealed content — it renders
- * outside the measured box, and only once the hold has released. Inside the
- * box its own height would pass for painted content and release the hold
- * before a single row exists; before release the caller's fallback already
- * carries the same row, so showing it early would double it.
- */
-function PatchPaintHold({ fallback, header, children, onVisible }: {
-  fallback: React.ReactNode
-  header?: React.ReactNode
-  children: React.ReactNode
-  onVisible?: () => void
-}) {
-  const contentRef = useRef<HTMLDivElement | null>(null)
-  const [painted, setPainted] = useState(false)
-  const farm = useContext(PierreFarmHoldContext)
-  useEffect(() => {
-    if (painted) onVisible?.()
-  }, [onVisible, painted])
-  useEffect(() => {
-    if (farm || painted) return
-    const el = contentRef.current
-    if (!el || typeof ResizeObserver === 'undefined') {
-      setPainted(true)
-      return
-    }
-    if (el.scrollHeight > WARM_PAINT_MIN_PX) {
-      setPainted(true)
-      return
-    }
-    const ro = new ResizeObserver(() => {
-      if (el.scrollHeight > WARM_PAINT_MIN_PX) {
-        setPainted(true)
-        ro.disconnect()
-      }
-    })
-    ro.observe(el)
-    const deadline = setTimeout(() => setPainted(true), WARM_SWAP_DEADLINE_MS)
-    return () => {
-      ro.disconnect()
-      clearTimeout(deadline)
-    }
-  }, [painted, farm])
-  if (farm) return <>{fallback}</>
-  return (
-    <>
-      {painted && header}
-      <div
-        style={painted ? undefined : { height: 0, overflow: 'hidden', visibility: 'hidden' }}
-        aria-hidden={painted ? undefined : true}
-      >
-        <div ref={contentRef}>{children}</div>
-      </div>
-      {!painted && fallback}
-    </>
-  )
 }
 
 export type { EditorMarker, PierreEditorHandle }
@@ -139,8 +70,11 @@ export const PierreEditor = memo(forwardRef<PierreEditorHandle, {
   diffExpandUnchanged?: boolean
   className?: string
 }>(function PierreEditor(props, ref) {
+  // The caller's `className` is the editor's sizing contract (a chat block
+  // caps it at 480px), so it must bound every render path: the plain
+  // fallback shown while the chunk loads as much as the Virtualizer after.
   return (
-    <Suspense fallback={<PlainCodeFallback text={props.file.contents} />}>
+    <Suspense fallback={<PlainCodeFallback text={props.file.contents} className={props.className} />}>
       <EditorImpl ref={ref} {...props} />
     </Suspense>
   )
@@ -210,14 +144,50 @@ function StagedSuspense({ fallback, children }: { fallback: React.ReactNode; chi
  * height, which is a scroll jump when the real height lands. The impl mounts
  * invisibly (absolute, zero footprint) so its chunk load, worker round-trip,
  * and paint all happen while the fallback holds the layout.
+ *
+ * The measurement is taken on an in-flow wrapper INSIDE that invisible box,
+ * never on the box itself. The box is pinned to the wrapper's four edges, so
+ * it is exactly as tall as the fallback beside it, and `scrollHeight` never
+ * reads below an element's own height: measured there, the fallback's own
+ * height would pass for a paint the moment the impl mounts, and the surface
+ * would collapse to Pierre's empty container until the highlight pool answers.
+ * The inner wrapper has no height but the impl's, so it reads 0 until Pierre
+ * has applied rows (or a failed pool has handed the surface plain text), and
+ * the deadline below is what releases a surface that never paints at all.
+ *
+ * `header` is a row the caller wants ABOVE the revealed content — it renders
+ * outside the measured wrapper, and only once the hold has released. Inside
+ * the wrapper its own height would pass for painted content and release the
+ * hold before a single row exists; before release the caller's fallback
+ * already carries the same row, so showing it early would double it.
+ *
+ * While the hold lasts, the fallback is rendered under `WarmSwapHeldContext`
+ * (`true` unless the caller passes `heldHint={false}`), and a fallback that
+ * has a header row carries the one-line "Highlighting code…" cue at that row's end
+ * (`PlainFallbackHeader`): the plain fallback is readable but uncoloured, and
+ * for the seconds a slow highlight pool takes, uncoloured text reads as a
+ * deliberate display mode rather than as a load in progress (#13937). The cue
+ * exists for exactly as long as the hold does — gone the moment `painted`
+ * flips true, whether on the first rows, on the plain text a failed pool hands
+ * the surface, or on the deadline fail-safe. It lives in a row that exists in
+ * both states (the fallback's header while held, Pierre's own header with its
+ * metadata in the same place once painted), so it costs the hold no height and
+ * sits outside the measured wrapper. A hold whose fallback has no header row
+ * shows no cue at all: an in-flow line of its own would grow the box and
+ * shrink it back on the paint, and an overlay was ruled out (#13937), so the
+ * ruling's "no change to the hold's geometry" leaves those surfaces silent by
+ * design. A caller whose fallback already carries a pending cue of its own
+ * passes `heldHint={false}`, so one hold never shows two.
  */
-function WarmSwap({ fallback, children, warmKey, onVisible }: {
+function WarmSwap({ fallback, header, heldHint = true, children, warmKey, onVisible }: {
   fallback: React.ReactNode
+  header?: React.ReactNode
+  heldHint?: boolean
   children: React.ReactNode
   warmKey?: string
   onVisible?: () => void
 }) {
-  const boxRef = useRef<HTMLDivElement | null>(null)
+  const implRef = useRef<HTMLDivElement | null>(null)
   const [painted, setPainted] = useState(false)
   // Measure-farm render: the fallback IS the measured geometry -- mounting the
   // impl invisibly would burn main thread for a surface that is never shown.
@@ -228,9 +198,9 @@ function WarmSwap({ fallback, children, warmKey, onVisible }: {
     if (farm) return
     if (painted) {
       // Record the surface's real painted height for future remounts. The
-      // box is the impl's own wrapper, so scrollHeight is the impl height.
+      // wrapper is the impl's own, so scrollHeight is the impl height.
       if (warmKey !== undefined) {
-        const el = boxRef.current
+        const el = implRef.current
         const h = el ? el.scrollHeight : 0
         if (h > WARM_PAINT_MIN_PX) {
           if (warmSwapHeights.size >= WARM_SWAP_DONE_CAP && !warmSwapHeights.has(warmKey)) warmSwapHeights.clear()
@@ -239,7 +209,8 @@ function WarmSwap({ fallback, children, warmKey, onVisible }: {
       }
       return
     }
-    const el = boxRef.current
+    // The impl's own in-flow height (see the note above): 0 until it paints.
+    const el = implRef.current
     if (!el || typeof ResizeObserver === 'undefined') {
       setPainted(true)
       return
@@ -275,14 +246,19 @@ function WarmSwap({ fallback, children, warmKey, onVisible }: {
       // side-by-side toggle) still settles to the impl's own height.
       style={!painted && knownH !== undefined ? { height: knownH, overflow: 'hidden' } : undefined}
     >
+      {painted && header}
       <div
-        ref={boxRef}
         className={painted ? undefined : 'absolute inset-0 overflow-hidden invisible'}
         aria-hidden={painted ? undefined : true}
       >
-        <WarmSwapRevealedContext.Provider value={painted}>{children}</WarmSwapRevealedContext.Provider>
+        {/* The measured element: in flow, so it is as tall as the impl and
+            nothing else -- the pinned box around it is as tall as the
+            fallback, which is not a paint. */}
+        <div ref={implRef}>
+          <WarmSwapRevealedContext.Provider value={painted}>{children}</WarmSwapRevealedContext.Provider>
+        </div>
       </div>
-      {!painted && fallback}
+      {!painted && <WarmSwapHeldContext.Provider value={heldHint}>{fallback}</WarmSwapHeldContext.Provider>}
     </div>
   )
 }
@@ -519,20 +495,21 @@ export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, o
         </Suspense>
       )
     }
-    // The Suspense fallback INSIDE the hold must be null: the hold measures
-    // its content box, and a visible fallback there would defeat the
-    // measurement exactly the way it defeated WarmSwap's. With null the box
-    // stays at zero height through the chunk load and the pre-highlight
-    // mount, so the held plain view owns the layout until the diff truly
-    // paints. The header goes to the hold as `header`, NOT as a child, for
-    // the same reason: inside the box its own height would satisfy the paint
-    // measurement and release the hold before a single row exists.
+    // The Suspense fallback INSIDE the hold must be null: WarmSwap measures
+    // the impl's own wrapper, and a visible fallback there would pass for a
+    // paint. With null the wrapper stays at zero height through the chunk
+    // load and the pre-highlight mount, so the held plain view owns the
+    // layout until the diff truly paints. The header goes to the hold as
+    // `header`, NOT as a child, for the same reason: inside the wrapper its
+    // own height would satisfy the paint measurement and release the hold
+    // before a single row exists. No held hint either: the fallback's
+    // "computing" strip above is already this hold's pending cue.
     return (
-      <PatchPaintHold fallback={holdFallback} header={header} onVisible={onVisible}>
+      <WarmSwap fallback={holdFallback} header={header} heldHint={false} onVisible={onVisible}>
         <Suspense fallback={null}>
           <PairPatchImpl patch={active.patch} options={patchOptions} className={className} />
         </Suspense>
-      </PatchPaintHold>
+      </WarmSwap>
     )
   }
 
@@ -570,12 +547,16 @@ export const PierreFilePair = memo(function PierreFilePair({ oldFile, newFile, o
   // A collapsed pair renders ONLY its header (~32px) — under the paint
   // threshold by design — so it must not warm-swap or it would sit on the
   // fallback until the deadline. Expanded pairs get the same treatment as
-  // Patch: readable text holds the layout until the diff paints.
+  // Patch: readable text holds the layout until the diff paints. The hold's
+  // pending cue rides in the fallback's header row (none when the caller
+  // disabled the header), and not in plain-diff mode, where the impl drops
+  // the colour and nothing is being highlighted.
   if (options?.collapsed) return impl
   return (
     <WarmSwap
       warmKey={warmKeyOf((newFile ?? oldFile)?.contents ?? '')}
       fallback={fallbackNode}
+      heldHint={!plain}
       onVisible={onVisible}
     >
       {impl}

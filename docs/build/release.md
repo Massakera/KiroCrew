@@ -180,6 +180,25 @@ code.
      `release/X.Y` before the RC is cut. Rebuilt stable bytes already carry the
      bare stamp, but insider, legacy promoted installs, and the byte-reuse escape
      hatch still depend on the display contract.
+   - *Bundled kiro-cli pin*: compare `packaging/kiro-cli-version` with the
+     version the release manifest names today
+     (`https://desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json`)
+     and decide whether to bump it — after testing the app against the newer
+     release, never blind. A bump is two files in one commit: the version in
+     `packaging/kiro-cli-version`, and in `packaging/kiro-cli-sha256` the
+     manifest's `sha256` for each staged artifact (`<version>/Kiro CLI.dmg`,
+     `<version>/kirocli-x86_64-linux.zip`, `<version>/kirocli-aarch64-linux.zip`,
+     and `<version>/kiro-cli-x86_64-pc-windows-msvc.msi`) as
+     `<sha>  <version>/<file>` lines, replacing the previous version's. A
+     Linux pin bump must also measure each staged binary's highest `GLIBC_*`
+     requirement as described in [desktop-app](desktop-app.md); neither arch
+     may exceed the desktop app's documented `GLIBC_2.34` compatibility floor.
+     version bump without its sha lines FAILS the desktop build lane with that
+     procedure in the error, never by shipping unverified bytes. A stale pin is
+     not a build failure: the pinned artifact stays downloadable under its own
+     version prefix, which is also why a hotfix rebuild of an older tag keeps
+     working after upstream releases. See [desktop-app](desktop-app.md) "Bundled
+     kiro-cli".
 2. **Cut the RC — verify content, not PR status.** On the target commit confirm:
    `github-release` has an `if:`; `CHANGELOG.md` line 5 is `## [X.Y.Z]` with zero
    non-bare-release `##` headings; no `### Contributors` (the GitHub Release
@@ -232,7 +251,7 @@ concurrency group, and their version derivation.
 | `release.yml` | trigger (`push` on `v*` tags) | Derives version + channel + wheel version from the tag. A prerelease tag builds, publishes to insider, and records the immutable promotion bundle. A bare tag verifies the same-commit successful prerelease run, then rebuilds under the bare version by default; `STABLE_PROMOTE_BYTES` opts one base into exact-byte reuse. Then it creates the GitHub Release. `concurrency: release-publish` with `cancel-in-progress: false` (queued). |
 | `dependency-vulnerability.yml` | reusable gate | `scripts/check_npm_audit.py`. On a release every build job needs it; on a nightly every **publish** job needs it and no build job does, so a slow registry delays publication rather than failing the build. |
 | `build-wheel.yml` | reusable build | Stamps the PEP 440 version into `pyproject.toml` and `__init__.py`, stamps the distribution channel, builds the frontend and stages it into the package, then `python -m build`. Uploads artifact `cli-wheel` (wheel + sdist). Credential-free. |
-| `build-desktop.yml` | reusable build | Matrix `macos-15` (universal macOS app) and `ubuntu-22.04` / `ubuntu-22.04-arm` (AppImage + deb + rpm) via `packaging/build-desktop.sh`, then a `smoke-linux-packages` job that installs the deb and rpm in Ubuntu 24.04 and Amazon Linux 2023 containers. Deliberately credential-free (`contents: read` only, pinned by `test_workflow_permissions.py`), so it builds **unsigned** and hands the `.app` downstream. `nightly.yml` passes `soft_fail_arm64: true`, which marks the arm64 leg alone `continue-on-error` so a failed arm64 build cannot skip the x64 publishers; the smoke never carries it, so a package that will not install still holds both arches. |
+| `build-desktop.yml` | reusable build | Matrix `macos-15` (universal macOS app) and `ubuntu-22.04` / `ubuntu-22.04-arm` (AppImage + deb + rpm) via `packaging/build-desktop.sh`, then a `smoke-linux-packages` job that installs the deb and rpm in Ubuntu 24.04 and Amazon Linux 2023 containers. Deliberately credential-free (`contents: read` only, pinned by `test_workflow_permissions.py`), so it builds **unsigned** and hands the `.app` downstream. `nightly.yml` passes `soft_fail_arm64: true`, which marks the arm64 leg alone `continue-on-error` so a failed arm64 build cannot skip the x64 publishers; the smoke never carries it, so a package that will not install still holds both arches. A second macOS job, `build-desktop-mac-single-arch`, builds arm64-only and x86_64-only DMGs as build-only artifacts behind the `mac_single_arch` input (`nightly.yml` passes true, `release.yml` keeps the default off). The job is `continue-on-error` and `sign-and-notarize.yml` excludes both artifact names when flattening, so the universal DMG stays the only mac bytes that lane signs and feeds; per-arch signing is a future lane. |
 | `build-windows.yml` | reusable build | `windows-latest`, an NSIS `Setup.exe`. Separate from `build-desktop.yml` because Authenticode signing has to happen *inside* the build (the installer compresses its own already-signed executable), so this job holds an AWS Signer identity and `build-desktop.yml` can stay credential-free. Callers pass `soft_fail: true`, so a Windows failure cannot skip the mac/Linux lanes. |
 | `publish-windows.yml` | reusable publish | Publishes the signed x64 installer and blockmap, then `feed/<channel>/latest.yml` and the `latest/` installer alias. It probes the soft-failed build artifact and skips when none exists; stable uses the fresh build by default or the optional candidate pair in byte-reuse mode. |
 | `publish-cli.yml` | reusable publish | Wheel + `SHA256SUMS` + KMS-signed `cli-manifest.json` to `cli/<channel>/<version>/`, the same signed manifest to `feed/<channel>/latest-cli.json`, and a PEP 503 index under `feed/<channel>/simple/`. |
@@ -483,7 +502,7 @@ version derivation and `uses:` calls.
    `*-mac.zip`, and submits it to CDSigner with a manifest generated at sign
    time from the actual bundle contents by
    `packaging/signing/generate-manifest.py`. `packaging/signing/sign.sh` polls
-   every 30s with a 15-minute ceiling. `awscurl` is installed **before** AWS
+   every 30s with a 45-minute ceiling. `awscurl` is installed **before** AWS
    credentials are configured, so a drifted release of it can never observe the
    signing credentials.
 2. **notarize** (macos-15). `packaging/signing/notarize.sh` submits and polls

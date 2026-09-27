@@ -47,7 +47,7 @@ _FLOAT_SLACK = 1e-6
 def store(tmp_path):
     s = KnowledgeStore(str(tmp_path / "test.db"))
     yield s
-    s.close()
+    s._close_all_for_tests()
 
 
 @pytest.fixture()
@@ -62,7 +62,7 @@ def store_factory(tmp_path):
 
     yield _make
     for s in stores:
-        s.close()
+        s._close_all_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +86,132 @@ class TestKnowledgeStore:
         assert item["item_type"] == "design_doc"
         assert item["summary"] == "Auth overview"
         assert json.loads(item["tags"]) == ["auth", "jwt"]
+
+    def test_close_all_releases_every_threads_connection_and_reopens_lazily(self, store):
+        """``close()`` is per-thread by contract; ``_close_all_for_tests()`` is the teardown seam.
+
+        A worker's connection has no other close path once the worker has
+        returned, and an unclosed sqlite3 connection is a reference cycle on
+        CPython 3.11+, so it holds its descriptors until the cyclic collector
+        runs. After ``_close_all_for_tests()`` every thread -- the closer included --
+        reconnects on its next take rather than touching a closed handle. The
+        worker here stays ALIVE across ``_close_all_for_tests()`` and takes ``store.db``
+        again on the same thread, so what is asserted is the generation check
+        on a thread whose thread-local still caches the closed handle, not a
+        fresh thread with empty thread-local state.
+        """
+        # The driver the store itself runs on: pysqlite3 on Linux x86_64 (CI), the
+        # stdlib elsewhere. Their ProgrammingError classes are unrelated types.
+        from kiro_crew._sqlite_compat import sqlite3
+
+        store.add_item("Doc", "body", "note")
+        took_first = threading.Event()
+        closed_all = threading.Event()
+        seen: dict[str, object] = {}
+
+        def worker() -> None:
+            first = store.db
+            seen["first"] = first
+            took_first.set()
+            assert closed_all.wait(timeout=10), "the teardown close never happened"
+            try:
+                first.execute("SELECT 1")
+            except sqlite3.ProgrammingError as exc:
+                seen["closed_error"] = exc
+            second = store.db
+            seen["second"] = second
+            seen["count_after"] = second.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"]
+
+        t = threading.Thread(target=worker)
+        t.start()
+        assert took_first.wait(timeout=10)
+        assert seen["first"] is not store.db, "the worker got the loop thread's handle"
+        store._close_all_for_tests()
+        closed_all.set()
+        t.join(timeout=10)
+        assert not t.is_alive()
+        assert "closed_error" in seen, "the closed handle still answered on the worker thread"
+        assert (
+            seen["second"] is not seen["first"]
+        ), "the worker reused the handle the teardown close closed"
+        assert seen["count_after"] == 1
+        # The closer's own thread reconnects too.
+        assert store.db.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"] == 1
+
+    def test_production_keeps_the_thread_guard_and_the_seam_refuses_without_the_flag(
+        self, tmp_path, monkeypatch
+    ):
+        """The cross-thread relaxation is confined to tests by a module flag.
+
+        With the flag off (production) a connection keeps SQLite's own
+        thread-affinity guard, so a handle cached from ``store.db`` and used on
+        another thread is refused rather than raced; and the every-thread close
+        refuses to run at all, because production has no moment at which every
+        thread is provably idle short of process exit. The refusal names the
+        file that flips the flag -- ``test/conftest.py``, which only the
+        ``test/`` testpath loads -- and says that the app test trees under
+        ``src/kiro_crew/apps/builtins`` do not activate the flip themselves,
+        rather than pointing at a conftest that holds none.
+        """
+        from kiro_crew._sqlite_compat import sqlite3
+        from kiro_crew.knowledge import store as store_mod
+
+        monkeypatch.setattr(store_mod, "_ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS", False)
+        prod = KnowledgeStore(str(tmp_path / "prod.db"))
+        try:
+            handle = prod.db
+            outcome: list = []
+
+            def misuse() -> None:
+                try:
+                    handle.execute("SELECT 1")
+                    outcome.append("allowed")
+                except sqlite3.ProgrammingError as exc:
+                    outcome.append(exc)
+
+            t = threading.Thread(target=misuse)
+            t.start()
+            t.join(timeout=10)
+            assert outcome and isinstance(outcome[0], sqlite3.ProgrammingError), (
+                "a production connection used from another thread was not refused: " f"{outcome!r}"
+            )
+            with pytest.raises(RuntimeError, match="test seam") as excinfo:
+                prod._close_all_for_tests()
+        finally:
+            prod.close()
+        message = str(excinfo.value)
+        assert "test/conftest.py" in message, message
+        assert "rootdir" not in message, message
+        assert "src/kiro_crew/apps/builtins" in message, message
+
+    def test_the_test_mode_connection_still_refuses_another_threads_use(self, store):
+        """Relaxing SQLite's guard for the teardown close does not relax it for USE.
+
+        Under the conftest's flag a connection is opened ``check_same_thread=False``
+        so another thread may close it; every other operation from a thread that
+        did not open it is refused exactly as production refuses it, so the suite
+        still catches a caller that caches ``store.db`` and uses it from a worker.
+        """
+        from kiro_crew._sqlite_compat import sqlite3
+
+        handle = store.db
+        outcome: list = []
+
+        def misuse() -> None:
+            try:
+                handle.execute("SELECT 1")
+                outcome.append("allowed")
+            except sqlite3.ProgrammingError as exc:
+                outcome.append(exc)
+
+        t = threading.Thread(target=misuse)
+        t.start()
+        t.join(timeout=10)
+        assert outcome and isinstance(
+            outcome[0], sqlite3.ProgrammingError
+        ), f"a test-mode connection used from another thread was not refused: {outcome!r}"
+        # The owner still works, and so does the loop-thread's own take.
+        assert handle.execute("SELECT 1").fetchone()[0] == 1
 
     def test_fts_search(self, store):
         store.add_item("Auth Design", "JWT tokens with refresh flow", "design_doc")
@@ -658,6 +784,18 @@ class TestFileReader:
         reader = FileReader()
         for ext in (".md", ".txt", ".py", ".html", ".json", ".jsonl", ".ndjson", ".yaml", ".csv"):
             assert ext in reader.SUPPORTED, f"{ext} missing from SUPPORTED"
+
+    def test_asciidoc_extensions_ingested_as_plain_text(self, tmp_path):
+        reader = FileReader()
+        assert ".asc" not in reader.SUPPORTED
+        for ext in (".adoc", ".asciidoc"):
+            assert ext in reader.SUPPORTED
+            assert ext not in reader._DISPATCH
+            f = tmp_path / f"guide{ext}"
+            f.write_text("= Guide\n\nhello asciidoc", encoding="utf-8")
+            text, meta = reader.read(str(f))
+            assert "hello asciidoc" in text
+            assert meta["format"] == ext.lstrip(".")
 
     def test_powershell_extensions_ingested_as_plain_text(self, tmp_path):
         # PowerShell scripts (.ps1), modules (.psm1), and module manifests
@@ -3889,7 +4027,7 @@ class TestSyncAllSkipsErroredSources:
             assert err_id not in attempted, "an errored column must never be retried"
             assert ok_id in attempted, "healthy source must still be synced"
         finally:
-            reopened.close()
+            reopened._close_all_for_tests()
 
 
 class TestCjkKeywordRecall:
@@ -4100,7 +4238,7 @@ class TestCjkKeywordRecall:
             assert sorted(done) == ["reader", "writer"]
             store.db.execute("INSERT INTO items_fts (items_fts) VALUES ('integrity-check')")
         finally:
-            store.close()
+            store._close_all_for_tests()
 
     def test_a_failed_migration_degrades_instead_of_faulting(self, store, monkeypatch):
         """A migration that cannot take the writer lock must not fault the read.
@@ -4421,7 +4559,7 @@ class TestCjkKeywordRecall:
             assert len(calls) == 1, f"rebuilt {len(calls)} times, expected once"
             assert all(self._titles(r) == ["run"] for r in results)
         finally:
-            store.close()
+            store._close_all_for_tests()
 
     def test_retriever_leg_migrates_a_legacy_index(self, tmp_path):
         """The retriever keyword leg is the other reader and must migrate too."""

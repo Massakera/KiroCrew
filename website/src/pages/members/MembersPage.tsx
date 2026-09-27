@@ -33,31 +33,38 @@
  * thread, so the UI does not announce it — there is no unpinned state to
  * contrast against.
  *
- * Which member is open rides the URL (`?member=<name>`), and the last one
- * opened is remembered per browser: a visit that names no member lands on
- * the remembered one if it is still on the roster. A fresh visit with
- * nothing remembered lands on the roster with no member pre-opened (the
- * 'Pick a member' empty pane), matching the below-md two-level list rule, so
- * the user picks rather than being primed on whichever row the sort floated
- * to the top (#11763).
+ * Which crewmate is open rides the URL (`?member=<name>`), and the last one
+ * opened is remembered per browser: a visit that names no one lands on the
+ * remembered crewmate if it is still on the roster, else on the most recently
+ * USED chat (greatest `last_active_ts`). That is the conversation the user
+ * most plausibly came back for, and it is a property of the user's own
+ * history, not of the list order: #11763 rejected priming the user on
+ * whichever row the SORT floated to the top, and that still holds — the
+ * default follows use, never the sort. Only an EMPTY roster opens nothing;
+ * it shows the New crewmate hero instead. Below md nothing auto-opens (the
+ * phone's two-level list rule).
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Cloud, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Pencil, Plus, RotateCw, Route, Sparkles, Square, Star, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Cloud, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Pencil, Plus, RotateCw, Route, Sparkles, Square, Star, Users, Zap } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { Btn } from '../../components/ui'
 import { CrewMemberMark } from '../../components/CrewMemberMark'
 import DeployMyCrewDialog from './DeployMyCrew'
+import NewCrewmateDialog, { type CreatedCrewmate } from './NewCrewmateDialog'
+import { sendTurn } from '../../chat-core/transport/sendTurn'
 import { useTranslation } from 'react-i18next'
-import { api, type MemberActivityEntry, type MemberRosterRow } from '../../api/client'
+import { api, type CrewTeam, type MemberActivityEntry, type MemberRosterRow } from '../../api/client'
 import { crewDisplayName } from '../../components/AgentSelector'
 import {
   MEMBERS_ROSTER_QUERY_KEY,
   memberActivityQueryKey,
+  memberProjectionsQuery,
   memberThreadQueryKey,
   membersRosterQuery,
   type MemberThreadOutcome,
 } from '../../api/membersQuery'
+import { teamsQuery } from '../../api/teamsQuery'
 import {
   AUTONUDGE_LOOPS_QUERY_KEY,
   type AutoNudgeLoop,
@@ -92,7 +99,7 @@ import { CrewLogTab } from '../chat/CrewLogPanel'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { useConnected } from '../../hooks/useConnected'
 import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FilterMenuLabel, FilterMenuContent } from '../../components/SearchFilterBar'
-import { DropdownMenu, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '../../components/ui/dropdown-menu'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '../../components/ui/dropdown-menu'
 import {
   countByFilter, narrowRoster, parseSort, parseSourceFilter, parseStatusFilters, queryNarrows, sortRoster,
   SORT_OPTIONS, SOURCE_FILTERS, STATUS_FILTERS,
@@ -112,6 +119,10 @@ import { loadColumnWidth } from '../../lib/columnWidth'
 import { tabStatus, type TabStatus } from '../../lib/sessionTabs'
 import { lastActivityEpoch } from '../chat/sessionOrder'
 import { activityDayLabel, floorCountText, groupActivityDays, projectLabel } from './activityDays'
+import TeamGroupHeader from './TeamGroupHeader'
+import TeamView, { type TeamMemberInput } from './TeamView'
+import TeamDialog from './TeamDialog'
+import { TEAM_COLLAPSED_KEY, TEAM_PARAM, groupRosterByTeam, parseCollapsedTeams, serializeCollapsedTeams } from './teamGroups'
 import { safeGetItem, safeSetItem } from '../../utils/safeStorage'
 import { useMemberProjection, useMemberRosterViews } from '../../state/useMemberProjection'
 import type { RosterView, ActivityView, WakeView } from '../../state/memberProjectionTypes'
@@ -121,14 +132,11 @@ import type { CrewmateIdentity } from '../chat/CrewmateMessage'
  *  The explicit tab wins over CapabilitiesPage's remembered last tab. */
 const CREW_MANAGER_PATH = '/capabilities?tab=crews'
 
-/** Adding a member IS creating a crew, so "add" is a navigation into the crew
- *  manager — but straight into its create form (`?new=1`), not onto the list
- *  the form sits behind: the user pressed "+", and a second "New crew" click
- *  was the whole complaint (#9513). `from=members` tells the manager where the
- *  user came from, so a successful create lands on the new member's thread
- *  here instead of back on the crew list. Spelled out in full (not built from
- *  CREW_MANAGER_PATH) so the i18n lint reads it as the route it is. */
-const CREW_CREATE_PATH = '/capabilities?tab=crews&new=1&from=members'
+/** Creating a crewmate happens IN this page: the header "+" and the empty-state
+ *  hero open `NewCrewmateDialog`, which performs the same `POST /api/agents`
+ *  write as the crew manager's create form (one write path, two front doors).
+ *  The crew manager stays the editor for an EXISTING crewmate (`crewEditPath`
+ *  below), so this page still never becomes a second editor. */
 
 /** One member's editor, reached THROUGH the crew manager: the deep link opens
  *  that crew's full editor — name, template, model, workspace, triggers, and
@@ -154,26 +162,33 @@ const MEMBER_PARAM = 'member'
  *  localStorage is already per-gateway. */
 const LAST_MEMBER_KEY = 'mc-members-last-member'
 
-/** Which member to RESTORE when the URL names none, or to fall back to when
+/** Which crewmate to RESTORE when the URL names none, or to fall back to when
  *  it names one that is gone (deleted or renamed since the link/memory was
- *  written): the remembered member if it is still on the roster, else
- *  `undefined`. It deliberately does NOT fall back to the first row — a fresh
- *  visit with nothing remembered lands on the roster with no member pre-opened
- *  (the empty column, matching the below-md two-level list rule), so the user
- *  picks the member they want rather than being primed on whichever row the
- *  sort floated to the top (#11763). `undefined` therefore means both "empty
- *  roster" and "nothing remembered": either way there is nothing to auto-open.
- *  Pure, so the cases — restore, nothing-remembered, stale — are tested
- *  directly. */
+ *  written): the remembered crewmate if it is still on the roster, else the
+ *  most recently USED one — the greatest `last_active_ts`, strict `>` so a tie
+ *  keeps the first in `ordered`. Product decision (CrewMates launch review):
+ *  when crewmates exist and none is selected, the most recently used chat
+ *  opens by default; the "pick one" landing is gone. This deliberately keys on
+ *  use, not on `ordered`'s position — #11763 rejected priming the user on
+ *  whichever row the SORT floated to the top, and a recency the user produced
+ *  themselves is a different thing from a sort they may not have chosen.
+ *  `undefined` when no crewmate exists: the built-in `default` assistant is not one.
+ *  Pure, so the cases — restore, most-recently-used, tie, stale, empty — are
+ *  tested directly. */
 export function resolveDefaultMember(
   remembered: string | null,
   ordered: readonly MemberRosterRow[],
 ): MemberRosterRow | undefined {
-  if (remembered) {
+  if (remembered && remembered !== 'default') {
     const hit = ordered.find((m) => m.name === remembered)
     if (hit) return hit
   }
-  return undefined
+  let best: MemberRosterRow | undefined
+  for (const m of ordered) {
+    if (m.name === 'default') continue
+    if (!best || (m.last_active_ts ?? 0) > (best.last_active_ts ?? 0)) best = m
+  }
+  return best
 }
 
 type MemberMemoryDisplay = 'global' | 'legacy' | 'private' | 'ownership_mismatch' | 'unavailable'
@@ -370,6 +385,7 @@ const PATROL_TICK_MS = 15_000
 /** Stable empty roster for the not-yet-answered read, so the memos keyed on
  *  `members` do not recompute on every render while the first fetch is out. */
 const EMPTY_ROSTER: readonly MemberRosterRow[] = []
+const EMPTY_TEAMS: readonly CrewTeam[] = []
 
 /** i18n translate function, taken from the hook so the row need not re-derive
  *  its type. */
@@ -396,6 +412,7 @@ function MemberRow({
   reduceMotion,
   scrollActiveRowIntoView,
   slugCollides,
+  indented,
 }: {
   m: MemberRosterRow
   t: TFn
@@ -410,6 +427,8 @@ function MemberRow({
   reduceMotion: boolean | null
   scrollActiveRowIntoView: (el: HTMLButtonElement | null) => void
   slugCollides: boolean
+  /** The row sits under a team header: stepped in so the header reads as its group. */
+  indented: boolean
 }) {
   // Withheld for a colliding slug, exactly as the page's merged list and drawer
   // do: this row shares its slug with another member, so a slug-keyed frame
@@ -466,6 +485,7 @@ function MemberRow({
           className={cn(
             'w-full flex items-center gap-2.5 text-sm text-left transition-all select-none',
             ROW_BOX_CLS, 'pr-8',
+            indented && 'pl-7',
             view.name === activeName ? ROW_ACTIVE_CLS : ROW_IDLE_CLS,
           )}
           aria-current={view.name === activeName ? 'true' : undefined}
@@ -620,6 +640,43 @@ function MemberRow({
   )
 }
 
+/** The intentionally-empty roster: one hero, one call to action. Type scale and
+ *  tokens follow `EmptyState` in components/ui.tsx; the face is the real ghost at
+ *  full strength rather than EmptyState's 12%-opacity icon, because here the
+ *  avatar IS the subject (what a crewmate looks like), not decoration. */
+function CrewmateEmptyHero({ onCreate, held }: {
+  onCreate: () => void
+  /**
+   * Why the CTA is held, or `null` when it is live. Set while a just-created
+   * crewmate's follow-up is still in flight: the roster re-read has not yet
+   * replaced this hero, and a second create through it would clear the first
+   * one's recovery record exactly as the header "+" would — so every door to
+   * the dialog reads the same hold.
+   */
+  held: string | null
+}) {
+  const { t } = useTranslation()
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 py-10 text-center animate-rise" data-testid="crewmate-empty-hero">
+      <div className="mb-1 opacity-90"><CrewAvatar seed="crewmate" size={72} /></div>
+      <div className="text-[17px] font-semibold text-text-strong" data-testid="crewmate-empty-title">{t('pages.membersPage.empty_title')}</div>
+      <p className="m-0 max-w-[400px] text-[13.5px] leading-relaxed text-muted">{t('pages.membersPage.empty_body')}</p>
+      <Btn
+        primary
+        onClick={onCreate}
+        disabled={held !== null}
+        title={held ?? undefined}
+        aria-label={held ?? undefined}
+        className="mt-2 h-9 px-4 text-[13.5px]"
+        data-testid="crewmate-empty-cta"
+      >
+        <Plus size={15} className="lucide-inline" aria-hidden="true" />
+        {t('pages.membersPage.add_member')}
+      </Btn>
+    </div>
+  )
+}
+
 export default function MembersPage() {
   const { t } = useTranslation()
   const navigate = useNavigate()
@@ -635,6 +692,9 @@ export default function MembersPage() {
   // error after a good read keeps showing the last roster.
   const rosterQuery = useQuery(membersRosterQuery)
   const rows = rosterQuery.data ?? EMPTY_ROSTER
+  // The raw roster's names (not the filtered/projected list): what the create
+  // dialog refuses up front, and the premise of its post-failure reconcile.
+  const existingNames = useMemo(() => rows.map((r) => r.name), [rows])
   const loaded = rosterQuery.data !== undefined || rosterQuery.isError
   const loadError = rosterQuery.data === undefined && rosterQuery.isError
   // ONE source of truth for the roster fields the page derives from (starred
@@ -729,6 +789,36 @@ export default function MembersPage() {
   // path as a click.
   const [searchParams, setSearchParams] = useSearchParams()
   const urlMember = searchParams.get(MEMBER_PARAM) ?? ''
+  // Teams: the roster's grouping and the main pane's OTHER occupant. The open
+  // team rides the URL like the open member (`?team=<id>`); the two parameters
+  // are exclusive -- opening one writes the URL without the other. The list is
+  // small and this page's own dialog is its only writer, so a failed read is
+  // the only state worth a notice. EVERY failed read, not only the first: a
+  // refetch that fails after a save or a return to the page leaves the cached
+  // list on screen, and that list is said to be stale rather than shown as
+  // current. With no answer at all the roster renders flat.
+  const teamsQ = useQuery(teamsQuery)
+  const teams = teamsQ.data ?? EMPTY_TEAMS
+  const teamsFailed = teamsQ.isError
+  const urlTeam = searchParams.get(TEAM_PARAM) ?? ''
+  const activeTeam = useMemo(() => teams.find((tm) => tm.id === urlTeam), [teams, urlTeam])
+  // Collapsed groups persist per browser, keyed by team id (the "No team" group
+  // by its fixed id), the same localStorage idiom as the roster filters.
+  const [rawCollapsedTeams, setRawCollapsedTeams] = usePersistedString(TEAM_COLLAPSED_KEY, '[]')
+  const collapsedTeams = useMemo(() => parseCollapsedTeams(rawCollapsedTeams), [rawCollapsedTeams])
+  const toggleTeamCollapsed = useCallback(
+    (id: string) =>
+      setRawCollapsedTeams((prev) => {
+        const next = parseCollapsedTeams(prev)
+        if (next.has(id)) next.delete(id)
+        else next.add(id)
+        return serializeCollapsedTeams(next)
+      }),
+    [setRawCollapsedTeams],
+  )
+  // The New team / Edit team dialog. `team` set = edit. Mounted only while
+  // open, so its fields start from the team it was opened for.
+  const [teamDialog, setTeamDialog] = useState<{ team?: CrewTeam } | null>(null)
   // Set when a URL NAMED a member that is gone: the user asked for someone
   // specific, so the outcome is said out loud — above the fallback thread on
   // md+ (`shown` = who opened instead), above the roster below md (`shown` is
@@ -738,6 +828,95 @@ export default function MembersPage() {
   // Deploy my crew. Page-level because a launch is crew-wide, and the panel's
   // own read is gated on this, so it stays false until someone asks for it.
   const [deployOpen, setDeployOpen] = useState(false)
+  // New crewmate dialog (header "+" and the empty-state hero open it).
+  const [createOpen, setCreateOpen] = useState(false)
+  // The crewmate just created here, until its chat has opened and its greeting has
+  // been seeded. A ref: it is a note between the create and the thread POST's answer.
+  // Greetings waiting for their crewmate's chat to be confirmed, keyed by
+  // NAME: two creates can race inside one thread round trip, and a single
+  // slot would let the second overwrite the first's greeting. An entry lives
+  // until its own thread answers — consumed on a confirmed slot, evicted on a
+  // collision or a failed open — so nothing outlives the open it waits for.
+  const pendingGreets = useRef(new Map<string, CreatedCrewmate>())
+  // The post-create follow-up (`openCreated` → roster re-read → thread open →
+  // seeded greeting) spans several awaits, and nothing above cancels them
+  // when the user leaves the page mid-way: a route change unmounts this
+  // component, but the roster refetch still resolves and `openThread`'s
+  // `onSuccess` still runs. Continuing would `setSearchParams` the page they
+  // navigated to back to `/members?member=<new name>`, or send the greeting
+  // into a chat nobody is looking at. Every post-await step checks this ref
+  // and, when the page is gone, drops the follow-up with its greeting.
+  const pageMounted = useRef(true)
+  useEffect(() => {
+    pageMounted.current = true
+    return () => {
+      pageMounted.current = false
+    }
+  }, [])
+  // A step AFTER a successful create that failed: the roster re-read, or the
+  // seeded greeting's send. The record is what the retry needs and the notice
+  // above the chat column says which step it was; the create itself is never
+  // in doubt here (the server has the crewmate), so the dialog does not reopen.
+  const [postCreateError, setPostCreateError] = useState<
+    | { kind: 'roster'; created: CreatedCrewmate }
+    | { kind: 'greeting'; created: CreatedCrewmate; slot: string; message: string }
+    | null
+  >(null)
+  // Mirror for the thread mutation's callbacks, which must read the CURRENT
+  // record, not the one of the render that armed them.
+  const postCreateErrorRef = useRef(postCreateError)
+  postCreateErrorRef.current = postCreateError
+  // Whether the post-create notice may be closed without its retry. A
+  // greeting failure always can: its chat is already open under it. A roster
+  // failure can only when the CACHED roster is non-empty — below md the
+  // notice column replaces the roster, so an undismissable notice over a
+  // roster that has other crewmates would lock every existing chat behind a
+  // server that keeps failing (Opus, round 36). Closing it leaves the old
+  // list, missing the new name until the next read; that is the honest
+  // trade against a page with no way back. Over an EMPTY cached roster it
+  // stays undismissable: "No crewmates yet" under "Radar was created" would
+  // be two contradicting statements in one column. "Empty" is the hero's own
+  // predicate (`hasNoCrewmates`), not `length > 0`: a roster holding only the
+  // built-in `default` row still renders the hero, so a dismiss over it would
+  // put that same contradiction on screen.
+  const postCreateDismissable =
+    postCreateError !== null && (postCreateError.kind !== 'roster' || !hasNoCrewmates(members))
+  // The crewmate whose follow-up (roster re-read, chat open, greeting send)
+  // is still in flight. One at a time, by design: `postCreateError` holds
+  // ONE record, so a second create started inside the first one's window
+  // could see both greetings refused and keep only the last failure — the
+  // first greeting would then have no retry. While this is set the header
+  // "+" is held (the hero is already gone once a crewmate exists), so the
+  // window cannot be entered; it clears at every terminal point of the
+  // follow-up, whether the greeting landed, was refused, or never got sent —
+  // a failed chat open included, where the greeting is parked (per name, in
+  // `pendingGreets`) for that crewmate's next successful open.
+  const [followUp, setFollowUp] = useState<CreatedCrewmate | null>(null)
+  // Mirror for the thread mutation's callbacks (same reason as
+  // `postCreateErrorRef`): a parked greeting must read the follow-up that is
+  // in flight NOW, not the one of the render that armed the callback.
+  const followUpRef = useRef(followUp)
+  followUpRef.current = followUp
+  // The one reason every create door (header "+", both heroes) is held, or
+  // `null` when creating is open. The failed-step record wins the wording:
+  // it is the one with a retry the user can act on.
+  const createHeld: string | null = postCreateError
+    ? postCreateError.kind === 'roster' && !postCreateDismissable
+      // A roster notice over an EMPTY cached roster has no dismiss (see its
+      // `onDismiss`), so its hold names only the retry; "retry or dismiss"
+      // is every dismissable notice's.
+      ? t('pages.membersPage.add_member_pending_roster', { name: postCreateError.created.name })
+      : t('pages.membersPage.add_member_pending', { name: postCreateError.created.name })
+    : followUp
+      ? t('pages.membersPage.add_member_settling', { name: followUp.name })
+      : loadError
+        // A failed arrival read leaves the dialog's exact-name check with
+        // nothing to check against (`existingNames` is empty), and the
+        // post-failure reconcile in the dialog is premised on the roster
+        // having been read. The door is held until a read lands; the
+        // notice's Try again is the way back.
+        ? t('pages.membersPage.roster_load_failed')
+        : null
   // The member the fallback is about to open in place of a gone one a link
   // named. Set right before the fallback's URL write, read (and cleared) by
   // the open that write triggers, so that open can skip the memory write. A
@@ -1114,6 +1293,16 @@ export default function MembersPage() {
   // every open re-POSTs. Across members the rule above stands untouched (a
   // late answer for another member is that member's newest, so it lands).
   const threadReqSeq = useRef<Record<string, number>>({})
+  // The "+" hold (`followUp`) is released by an open's outcome ONLY when the
+  // hold belongs to the crewmate that open was for. A parked greeting outlives
+  // its create's hold, so re-clicking crewmate A while crewmate B's greeting
+  // is still in flight lands A's collision / failure here; clearing
+  // unconditionally would drop B's hold mid-send, let a create C start, and
+  // leave two refusals racing for the one `postCreateError` record. A's own
+  // hold (if any) is the one this open may release.
+  const releaseFollowUp = useCallback((name: string) => {
+    if (followUpRef.current?.name === name) setFollowUp(null)
+  }, [])
   const openThread = useMutation({
     mutationFn: (m: MemberRosterRow) => api.memberThread(m.slug),
     onMutate: (m) => {
@@ -1133,9 +1322,34 @@ export default function MembersPage() {
         // first-bound-wins). Mounting it would be a silent misroute — the
         // defining failure for a page whose premise is identity.
         setThreadOutcome(m.name, () => ({ slot_key: '', collision: r.member }))
+        if (pendingGreets.current.delete(m.name)) releaseFollowUp(m.name)
         return
       }
       setThreadOutcome(m.name, () => ({ slot_key: r.slot_key }))
+      // The crewmate created moments ago: its first chat turn is seeded on the user's
+      // behalf so the chat opens with the crewmate's own greeting rather than an
+      // empty transcript. Once, on the first confirmed slot; the same send path the
+      // composer uses (chat-core `sendTurn`), so receipt/auth handling is shared.
+      // A greeting is NOT seeded while ANOTHER crewmate's follow-up is still
+      // live — its failure notice up, or its own greeting send still in
+      // flight: `postCreateError` holds one record, and a refused send here
+      // would overwrite (or race) that one's retry. The window is real: a
+      // parked greeting outlives its create's hold (a failed first open frees
+      // the "+"), so a second crewmate can be mid-greeting when the first is
+      // re-clicked. It stays parked and rides the next open of this crewmate
+      // instead, once the other follow-up is over. This crewmate's OWN
+      // follow-up (the create's first open) is not "another".
+      const greet = pendingGreets.current.get(m.name)
+      const otherFollowUp = followUpRef.current !== null && followUpRef.current.name !== m.name
+      if (greet && !postCreateErrorRef.current && !otherFollowUp) {
+        pendingGreets.current.delete(m.name)
+        if (pageMounted.current) {
+          const message = greet.job
+            ? t('pages.membersPage.greeting_seed_with_job', { name: greet.name, job: greet.job })
+            : t('pages.membersPage.greeting_seed', { name: greet.name })
+          void seedGreeting(greet, r.slot_key, message)
+        }
+      }
       if (m.slot_key !== r.slot_key) {
         queryClient.setQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY, (rows) =>
           rows?.map((row) => (row.name === m.name ? { ...row, slot_key: r.slot_key, bound: true } : row)),
@@ -1144,6 +1358,13 @@ export default function MembersPage() {
     },
     onError: (error, m, seq) => {
       if (seq !== threadReqSeq.current[m.name]) return
+      // The hold comes down — the failure notice under this line is the
+      // user's surface now — but a parked greeting STAYS parked: a transient
+      // thread POST failure right after a successful create is ordinary, and
+      // the next successful open of this crewmate (the re-click repair
+      // gesture, the reconnect re-POST) seeds it then. Deleting it here made
+      // that reopen an empty chat with no way to get the greeting back.
+      if (pendingGreets.current.has(m.name)) releaseFollowUp(m.name)
       setThreadOutcome(m.name, (prev) => ({
         slot_key: prev?.slot_key ?? '',
         failed: true,
@@ -1420,6 +1641,25 @@ export default function MembersPage() {
   const drivingExpanded = drivingExpandedFor === activeMemberKey
   const visibleDriving = drivingExpanded ? drivingSessions : drivingSessions.slice(0, DRIVING_VISIBLE)
 
+  const activeSlug = active?.slug ?? ''
+  const activeMemberName = active?.name ?? ''
+  // The open member's folded views, seeded into the projection store this page
+  // already reads through `useMemberProjection`. The roster list carries the
+  // `roster` view alone because that is the only one a list ROW paints, so the
+  // blocks below — the activity timeline and the patrol state — have no baseline
+  // until this read lands or a live frame arrives. Without it a member who has
+  // not moved since the gateway started opens to an empty drawer.
+  //
+  // Enabled for ONE member at a time, which is the whole shape of the change: the
+  // views are read for whoever is open rather than for all of them on every list
+  // request. Withheld for a colliding slug on the same ground `projectionSlug`
+  // withholds there — a slug two rows share cannot say which member the views
+  // describe, and the route answers 409 rather than guessing.
+  const projectionsEnabled = !!projectionSlug(activeSlug) && !!activeMemberName
+  const projectionsQuery = useQuery({
+    ...memberProjectionsQuery(activeSlug, activeMemberName),
+    enabled: projectionsEnabled,
+  })
   // Recent-activity pointers for the Work log tab, read when it is on
   // screen for a member and cached per exact member NAME, not slug — slugs are
   // lossy, and the whole point of the backend's member filter is that two
@@ -1430,8 +1670,6 @@ export default function MembersPage() {
   // render the affirmative "no activity"; a refetch error after a good read
   // keeps the last entries. The finite staleTime is the roster's: a return to
   // the summary shows the cached pointers and refreshes them behind.
-  const activeSlug = active?.slug ?? ''
-  const activeMemberName = active?.name ?? ''
   const activityQuery = useQuery({
     queryKey: memberActivityQueryKey(activeSlug, activeMemberName),
     queryFn: () => api.memberActivity(activeSlug, activeMemberName),
@@ -1722,6 +1960,24 @@ export default function MembersPage() {
   // stop, else the loop record's own field.
   const patrolStoppedReason =
     (activeWake?.patrol === 'stopped' ? activeWake.stopped_reason : undefined) ?? activePatrol?.stopped_reason
+  // The verdict reads TWO sources, so the readout is ready only when both have
+  // answered: the live loop registry for presence, and the durable `wake`
+  // projection for a stop that outlives the registry. The projection arrives with
+  // the open member's own read, and a verdict formed before it lands would show
+  // `none` — "nothing scheduled" — for a member the log records as stopped, which
+  // is the exact reading the durable record exists to prevent. The same three
+  // states the activity read keeps, for the same reason: no answer yet is pending,
+  // failed with no answer is an error, and only an answer is ready. Not-fetching
+  // cannot stand in for answered — a failed read is also not in flight, and
+  // treating it as ready renders the affirmative "nothing scheduled" off a
+  // baseline that never arrived. A withheld read (colliding slug, no member) is
+  // never pending, so it waits for nothing; a refetch error after a good answer
+  // keeps that answer.
+  const projectionsPending =
+    projectionsEnabled && projectionsQuery.data === undefined && !projectionsQuery.isError
+  const projectionsFailed =
+    projectionsEnabled && projectionsQuery.data === undefined && projectionsQuery.isError
+  const patrolReadoutReady = patrol.loaded && !projectionsPending
   // Clock for the "next wake" countdown, ticking only while the summary shows
   // an active loop — the same deadline-preserving reading the composer's goal
   // chip renders (see nextCycleText), on a coarser tick.
@@ -1748,7 +2004,7 @@ export default function MembersPage() {
     (m: MemberRosterRow, remember = true) => {
       activeNameRef.current = m.name
       setActiveName(m.name)
-      if (remember) safeSetItem(LAST_MEMBER_KEY, m.name)
+      if (remember && m.name !== 'default') safeSetItem(LAST_MEMBER_KEY, m.name)
       // A Side Chat belongs to the member it was asked about; nothing to reset
       // here — the panel's strip is bucketed per member slot, so switching
       // members swaps the whole strip and a Side tab stays with its member.
@@ -1782,9 +2038,9 @@ export default function MembersPage() {
         // page holds one history entry however many members are visited and
         // Back leaves it in one press — the Sessions sidebar's rule. The
         // breakpoint is named directly because the desktop half used to ride
-        // on `urlMember` always being set by the arrival auto-open: a fresh
-        // visit with nothing remembered now leaves the URL bare (#11763), and
-        // that first click must still replace.
+        // on `urlMember` always being set by the arrival auto-open: an EMPTY
+        // roster leaves the URL bare (nothing to open), and the open that
+        // follows the first create must still replace.
         setSearchParams({ [MEMBER_PARAM]: m.name }, { replace: true })
         return
       }
@@ -1798,23 +2054,113 @@ export default function MembersPage() {
     [activeName, urlMember, isMobile, activate, setSearchParams],
   )
 
-  // URL -> open member. Once the roster is in: a URL that names a member
+  // The seeded first turn of a just-created crewmate's chat. The receipt is
+  // read, not dropped — but only a REFUSED send is said and retried: the
+  // server answered no, nothing ran, so re-sending the same text to the same
+  // slot cannot duplicate a turn. `transport-error` and `response-late` are
+  // INDETERMINATE by the transport's own contract (sendTurn.ts: the request
+  // may well have started a turn and the reply is merely late), and `unknown`
+  // proves a 2xx was received; a retry on any of those is the duplicate
+  // greeting the contract names the seeder as the caller that must not cause.
+  // The chat is open under this line, so whether the greeting landed is
+  // visible there; the transcript is the honest surface for an indeterminate
+  // send, a notice offering a resend is not.
+  const seedGreeting = useCallback(async (created: CreatedCrewmate, slot: string, message: string) => {
+    setFollowUp(created)
+    try {
+      const receipt = await sendTurn({ message, slot })
+      if (receipt.status === 'refused') {
+        setPostCreateError({ kind: 'greeting', created, slot, message })
+      }
+    } finally {
+      setFollowUp(null)
+    }
+  }, [])
+
+  // A crewmate was just created in this page's dialog: close it, note the
+  // greeting to seed once its chat is confirmed (openThread.onSuccess), and
+  // open its chat. The roster is re-read BEFORE the URL names the new crewmate,
+  // so the URL sync effect finds it — a name not yet on the roster would read
+  // as "gone" and open someone else in its place. A FAILED re-read must not
+  // take that path either: react-query keeps the stale roster as `res.data`
+  // on error, so the name would be missing for the wrong reason. It is
+  // reported instead, with a retry that repeats exactly this step.
+  const openCreated = useCallback(async (created: CreatedCrewmate) => {
+    setPostCreateError(null)
+    setFollowUp(created)
+    pendingGreets.current.set(created.name, created)
+    // A re-read that did not actually land is a failed re-read. The star
+    // mutation's `cancelQueries` (above) can cut this refetch short, and a
+    // cancelled query REVERTS to its previous successful state: `refetch()`
+    // then resolves without `isError`, carrying the pre-create roster, and
+    // the new name would read as absent — greeting dropped, someone else's
+    // chat opened. Only a response newer than what we had counts as fresh.
+    const before = queryClient.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.dataUpdatedAt ?? 0
+    const res = await rosterQuery.refetch()
+    // The user left while the roster was re-reading: nothing below may run.
+    // The URL write would drag the page they chose back here, and the chat
+    // open would seed a greeting into a page that is gone.
+    if (!pageMounted.current) {
+      pendingGreets.current.delete(created.name)
+      return
+    }
+    const fresh = !res.isError && res.dataUpdatedAt > before
+    if (!fresh) {
+      // The greeting STAYS parked. The notice's retry repeats this step and
+      // re-parks the same record, but the notice can also be DISMISSED (over
+      // a roster with other rows), and the next roster read that does land
+      // then lists the new crewmate: its first open must still seed the
+      // greeting, once, through openThread's parked-greeting path. Deleting
+      // it here made that open an empty chat with nothing left to send.
+      setFollowUp(null)
+      setPostCreateError({ kind: 'roster', created })
+      return
+    }
+    const hit = res.data?.find((r) => r.name === created.name)
+    if (hit) {
+      // The hold now rides the thread open: released by openThread's
+      // onSuccess (collision, or the greeting send's own end) or onError.
+      openMember(hit)
+      return
+    }
+    // The re-read landed without the name (the server accepted a name the
+    // roster's read does not list). The URL write below lets the URL sync
+    // effect say "gone"; no chat of this name exists to greet, so the
+    // greeting is dropped with the hold rather than parked for a row that is
+    // not coming.
+    pendingGreets.current.delete(created.name)
+    setFollowUp(null)
+    setSearchParams({ [MEMBER_PARAM]: created.name }, { replace: true })
+  }, [rosterQuery, openMember, setSearchParams, queryClient])
+
+  const handleCreated = useCallback((created: CreatedCrewmate) => {
+    setCreateOpen(false)
+    void openCreated(created)
+  }, [openCreated])
+
+  const retryPostCreate = useCallback(() => {
+    const failed = postCreateError
+    if (!failed) return
+    setPostCreateError(null)
+    if (failed.kind === 'roster') void openCreated(failed.created)
+    else void seedGreeting(failed.created, failed.slot, failed.message)
+  }, [postCreateError, openCreated, seedGreeting])
+
+  // URL -> open crewmate. Once the roster is in: a URL that names a crewmate
   // opens it; a URL that names none (a fresh visit, the sidebar entry, a
-  // reload) is REPLACED with the remembered member if one is still on the
-  // roster, so returning users land back on the conversation they left. A
-  // fresh visit with NOTHING remembered does NOT auto-open the first row —
-  // the page stays on the roster with the empty column's 'Pick a member'
-  // pane, so the user chooses instead of being primed on whichever row the
-  // sort floated to the top (#11763). A URL naming a member that is gone
-  // (deleted or renamed) falls back to the remembered member if present, with
-  // a one-line notice above the thread naming the swap — the user asked for
-  // someone specific, and a silently mounted other thread is the misroute
-  // this page exists to prevent; with nothing remembered it returns to the
-  // roster with the notice rather than standing in the first row. Below md
-  // the page is a two-level list->detail navigation: no `?member=` IS the
-  // roster, so no auto-open there (same rule as SidePanelLayout's remembered
-  // tab), and a gone member in the URL returns to the roster instead of
-  // bouncing the phone user into a different member's thread.
+  // reload) is REPLACED with the remembered crewmate if one is still on the
+  // roster, so returning users land back on the conversation they left, else
+  // with the most recently USED one (`resolveDefaultMember`) — the default
+  // follows the user's own history, never the sort order (#11763). "Nothing
+  // to open" therefore means an EMPTY roster, and only that. A URL naming a
+  // crewmate that is gone (deleted or renamed) falls back the same way, with
+  // a one-line notice above the chat naming the swap — the user asked for
+  // someone specific, and a silently mounted other chat is the misroute this
+  // page exists to prevent. Below md the page is a two-level list->detail
+  // navigation: no `?member=` IS the roster, so no auto-open there (same rule
+  // as SidePanelLayout's remembered tab), and a gone crewmate in the URL
+  // returns to the roster instead of bouncing the phone user into a different
+  // crewmate's chat.
   useEffect(() => {
     if (!loaded || loadError) return
     if (urlMember) {
@@ -1841,6 +2187,21 @@ export default function MembersPage() {
       // a member the fresh roster still lacks takes the fallback then.
       if (rosterQuery.isFetching) return
     }
+    if (urlTeam) {
+      // A team is open in the main pane: no thread stands beside it, and the
+      // remembered-member fallback below must not overrule an explicit team
+      // link. A link naming a team that is gone (deleted elsewhere) returns to
+      // the bare roster once the team list has answered.
+      if (teamsQ.data !== undefined && !teamsQ.data.some((tm) => tm.id === urlTeam)) {
+        setSearchParams({}, { replace: true })
+        return
+      }
+      if (activeName) {
+        activeNameRef.current = ''
+        setActiveName('')
+      }
+      return
+    }
     if (isMobile) {
       if (urlMember) {
         // No thread to fall back to below md — the roster is the answer, so
@@ -1856,19 +2217,15 @@ export default function MembersPage() {
       }
       return
     }
-    // Desktop, URL names no member (or names a gone one): restore the
-    // remembered member if it is still on the roster. A fresh visit with
-    // NOTHING remembered no longer opens the first row — there is no member
-    // the user chose, so the page lands on the roster with the empty column's
-    // 'Pick a member' pane (the same rule the phone already follows: no
-    // `?member=` IS the roster). Auto-opening whichever row the 'recent' sort
-    // floated to the top primed the user to believe it was the member they
-    // asked for, which is the #11763 friction; the sort itself is left as-is.
+    // Desktop, URL names no crewmate (or names a gone one): restore the
+    // remembered crewmate if it is still on the roster, else open the most
+    // recently used one. `undefined` here means the roster is EMPTY — the
+    // chat column shows the New crewmate hero instead.
     const target = resolveDefaultMember(safeGetItem(LAST_MEMBER_KEY), orderedMembers)
     if (!target) {
-      // Named a gone member but nothing remembered to stand in for them: say
-      // where they went above the roster (shown: '' marks the roster variant
-      // of the notice, as below md) and clear the URL back to the bare list.
+      // Named a gone crewmate on an empty roster: say where they went above
+      // the roster (shown: '' marks the roster variant of the notice, as
+      // below md) and clear the URL back to the bare list.
       if (urlMember) {
         setGone((prev) =>
           prev && prev.name === urlMember && prev.shown === '' ? prev : { name: urlMember, shown: '' },
@@ -1876,12 +2233,11 @@ export default function MembersPage() {
         setSearchParams({}, { replace: true })
       }
       // Nothing to open means nothing may STAY open — the same clear the
-      // below-md branch does. A member can be open with nothing remembered:
-      // the write that remembers it is `safeSetItem`, which returns false when
-      // storage is denied, and then `safeGetItem` reads null. Returning to a
-      // bare `/members` from there (the crew editor's exit, the rail's Crew
-      // Members row) would otherwise leave the previous thread standing over a
-      // URL that names no one, next to the roster's 'Pick a member' pane.
+      // below-md branch does: a chat can still be mounted for a crewmate the
+      // roster no longer lists (deleted while open), and returning to a bare
+      // `/members` from there (the crew editor's exit, the rail's Crewmates
+      // row) would otherwise leave that chat standing over a URL that names
+      // no one, next to the empty roster's hero.
       if (activeName) {
         activeNameRef.current = ''
         setActiveName('')
@@ -1897,7 +2253,127 @@ export default function MembersPage() {
       goneStandInRef.current = target.name
     }
     setSearchParams({ [MEMBER_PARAM]: target.name }, { replace: true })
-  }, [loaded, loadError, urlMember, members, orderedMembers, activeName, isMobile, activate, setSearchParams, rosterQuery.isFetching])
+  }, [loaded, loadError, urlMember, urlTeam, teamsQ.data, members, orderedMembers, activeName, isMobile, activate, setSearchParams, rosterQuery.isFetching])
+
+  // Team open: the header row's click. Same history rule as openMember -- one
+  // entry above md or while something is already open, a PUSHED step from the
+  // bare roster below md so the back button pops.
+  const openTeam = useCallback(
+    (id: string) => {
+      if (urlMember || urlTeam || !isMobile) {
+        // The replace keeps the entry's own state: below md this branch is
+        // reached from the team view itself (Edit team -> Save re-opens the
+        // saved id over `?team=`), and dropping `fromRoster` there would send
+        // the next Back to a second copy of the roster instead of off the
+        // page -- closeTeamView reads that flag to choose between the two.
+        setSearchParams({ [TEAM_PARAM]: id }, { replace: true, state: location.state })
+        return
+      }
+      setSearchParams({ [TEAM_PARAM]: id }, { state: { fromRoster: true } })
+    },
+    [urlMember, urlTeam, isMobile, setSearchParams, location.state],
+  )
+  const closeTeamView = useCallback(() => {
+    if ((location.state as { fromRoster?: boolean } | null)?.fromRoster) navigate(-1)
+    else setSearchParams({}, { replace: true })
+  }, [location.state, navigate, setSearchParams])
+  // The roster, grouped: the DISPLAYED rows (after search / filter / sort) under
+  // their team headers, in the teams' stored order, unlisted rows last.
+  const rosterGroups = useMemo(() => groupRosterByTeam(teams, sortedMembers, members), [teams, sortedMembers, members])
+  const grouped = teams.length > 0
+  // The open team's crewmates for the team view -- the WHOLE team in roster
+  // order, not the filtered rows: a search typed into the roster narrows the
+  // list, not the team. Each carries the live readings the roster rows resolve.
+  const teamMembers = useMemo<TeamMemberInput[]>(() => {
+    if (!activeTeam) return []
+    const onTeam = new Set(activeTeam.members)
+    return orderedMembers
+      .filter((m) => onTeam.has(m.name))
+      .map((m) => {
+        const slotKey = slotKeyOf(m)
+        return {
+          row: m,
+          slotKey,
+          running: !!isRunning(m),
+          needsInput: !!(slotKey && liveNeedsYou[slotKey]),
+          slugCollides: collidingSlugs.has(m.slug),
+        }
+      })
+  }, [activeTeam, orderedMembers, slotKeyOf, isRunning, liveNeedsYou, collidingSlugs])
+
+  // The post-create notice (a failed roster re-read, or a refused greeting)
+  // with its retry, rendered ONCE in whichever column is on screen: the chat
+  // column at md and up, or whenever a chat is open. Below md with no chat
+  // open, a GREETING notice goes into the roster column instead: that column
+  // is the whole screen there, the "+" the notice holds sits in its header,
+  // and the notice's own dismiss is the one control that releases the hold —
+  // rendering it only in the hidden chat column left a phone with a held "+"
+  // and no visible reason or way out (Opus, round 43). A ROSTER notice below
+  // md already brings the chat column on screen (see the two `className`s).
+  // An open team view is the screen below md the way an open chat is (the
+  // roster is hidden under it), so the notice stays in the main column then.
+  const greetingNoticeInRoster =
+    isMobile && !activeName && !activeTeam && postCreateError !== null && postCreateError.kind !== 'roster'
+  const postCreateNotice = postCreateError && (
+    /* No hand-off: a chat may already be mounted under this line with
+       a draft in its composer (ChatPane keeps it in local state), and
+       the hand-off navigates away, unmounting it. The retry repeats the
+       one step that failed; the create itself already succeeded. */
+    <div
+      // A roster failure with no chat open is the whole column's
+      // content: centred like the hero it replaced, so the empty pane
+      // reads as intended, not broken. A greeting failure sits as a bar
+      // above the chat that is already open under it.
+      className={postCreateError.kind === 'roster' && !active
+        ? 'flex flex-1 flex-col items-center justify-center gap-3 px-6 py-10 text-center animate-rise'
+        : 'flex flex-wrap items-center gap-2 px-4 py-2'}
+      data-testid="member-post-create-error"
+    >
+      {/* The retry sits right after the text, not at the far edge of a
+          stretched notice: the two read as one sentence, and its label
+          names the one step it repeats ("Refresh your crewmates" / "Send
+          it again") so it cannot read as "create Radar again"; it names
+          the crewmates, not "the list", because below md the roster is
+          follows `postCreateDismissable`: a ROSTER failure over an
+          empty cached roster has none — closing it would put "No
+          crewmates yet" under a crewmate that exists, and the retry is
+          the only honest way off it; over a roster with other rows it
+          can be closed, so the existing chats stay reachable below md.
+          A GREETING failure can always be dismissed: its chat is already
+          open, or (below md, with none open) the roster is the screen. */}
+      <ErrorNotice
+        message={t(
+          postCreateError.kind === 'roster'
+            ? 'pages.membersPage.create_roster_failed'
+            : 'pages.membersPage.create_greeting_failed',
+          { name: postCreateError.created.name },
+        )}
+        variant="inline"
+        onDismiss={postCreateDismissable ? () => setPostCreateError(null) : undefined}
+        // Closing a GREETING notice is the only way to lose "Send it
+        // again" (the refused turn lives nowhere else), so the dismiss
+        // says so up front; a roster notice's dismiss costs nothing the
+        // list itself does not offer back, so it keeps the plain label.
+        dismissLabel={postCreateError.kind === 'greeting' ? t('pages.membersPage.create_greeting_dismiss') : undefined}
+        className="min-w-0"
+      />
+      <Btn onClick={retryPostCreate} className="shrink-0" data-testid="member-post-create-retry">
+        {t(postCreateError.kind === 'roster' ? 'pages.membersPage.create_retry_roster' : 'pages.membersPage.create_retry_greeting')}
+      </Btn>
+      {/* The text "Send it again" would send, quoted: it lives only in
+          this record (the refused turn never reached the transcript),
+          and a resend of words the user cannot see is a consent-shaped
+          hesitation. */}
+      {postCreateError.kind !== 'roster' && (
+        <blockquote
+          className="basis-full m-0 pl-3 border-l-2 border-border text-[12.5px] text-muted italic"
+          data-testid="member-post-create-greeting-preview"
+        >
+          {postCreateError.message}
+        </blockquote>
+      )}
+    </div>
+  )
 
   return (
     // No bottom inset on the root: the card columns carry their own pb-2 and
@@ -1918,8 +2394,16 @@ export default function MembersPage() {
           as one surface — including the kiro-light shell hook that steps the
           card back from the white canvas. */}
       <aside
+        // Below md the roster is the whole width, so it yields whenever the
+        // chat column must be seen: an open chat, or a ROSTER post-create
+        // notice (a failed re-read opens no chat, and a full-width `shrink-0`
+        // roster would push the notice and its retry off-screen). A GREETING
+        // notice does not imply an open chat — the header back can close the
+        // chat under it — so it alone must not hide the roster, or a phone
+        // shows a notice bar over a blank column until it is dismissed. An
+        // open team view takes the column the same way an open chat does.
         className={`${
-          activeName ? 'hidden md:flex' : 'flex'
+          activeName || activeTeam || postCreateError?.kind === 'roster' ? 'hidden md:flex' : 'flex'
         } ${LIST_SHELL_CLS} relative w-full md:w-[var(--roster-w)] shrink-0 flex-col min-h-0`}
         // CSS owns the breakpoint: the var is set unconditionally and only the
         // md: class consumes it, so resizing the window across 768px reacts
@@ -1938,12 +2422,6 @@ export default function MembersPage() {
             <CrewMemberMark size={15} className="inline-block text-muted shrink-0" />
             <h1 className={LIST_TITLE_CLS}>{t('pages.membersPage.title')}</h1>
           </div>
-          {/* Adding a member IS creating a crew, and the crew manager is the
-              only write path — so this is a navigation, not an inline form.
-              It lands ON the create form, not on the crew list (#9513).
-              A bare `Plus`, not `UserPlus`: the page icon beside it already
-              says "members", and a person-figure here would be the one
-              Lucide person on a page whose members are drawn as ghosts. */}
           {/* Crew-WIDE, so it sits in the page header rather than in a member's
               own drawer: one launch ships the whole checkout to one machine and
               names one stack, so there is no per-member deployment and a
@@ -1967,23 +2445,85 @@ export default function MembersPage() {
             <Cloud size={15} />
             {t('pages.membersPage.deploy_trigger')}
           </button>
-          <button
-            onClick={() => navigate(CREW_CREATE_PATH)}
-            className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
-            aria-label={t('pages.membersPage.add_member')}
-            title={t('pages.membersPage.add_member')}
-            data-testid="member-add"
-          >
-            <Plus size={15} />
-          </button>
+          {/* Two things can be added here, so the "+" opens a menu: a crewmate
+              or a team (the dialogs below). The trigger keeps the bare Plus
+              and its label. */}
+          {/* The crewmate item opens the in-page New crewmate dialog
+              (`NewCrewmateDialog`): creating a crewmate IS creating a crew,
+              and the dialog posts to the same endpoint the crew manager's
+              form does, so the page needs no hand-off to that manager (#9513
+              named the hand-off landing; the dialog replaced it). A bare
+              `Plus`, not `UserPlus`: the page icon beside it already says
+              "crewmates", and a person-figure here would be the one Lucide
+              person on a page whose crewmates are drawn as ghosts. */}
+          {/* The crewmate item is held while a create's follow-up step
+              (roster re-read, greeting) is still in flight or failed:
+              `openCreated` starts by clearing that record, so a second
+              create here would silently drop the first one's retry — the
+              greeting would stay unsent with nothing left to say so. The
+              notice above the chat column names the step; its retry or
+              dismissal is what re-enables the item. The hold is the ITEM's,
+              not the menu's: New team has no part in the follow-up. */}
+          {/* The whole menu is hidden while the empty roster's hero is the
+              create door: two doors to one dialog read as two different
+              actions (a team of no one has nothing to group yet either). It
+              returns with the first row, when the hero is gone. Also hidden
+              until the first read has answered: the names the dialog checks
+              a new one against are unknown until then. */}
+          {loaded && !(!loadError && hasNoCrewmates(members)) && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer data-[state=open]:bg-bg-hover data-[state=open]:text-text"
+                aria-label={t('pages.membersPage.add_menu')}
+                title={t('pages.membersPage.add_menu')}
+                data-testid="member-add"
+              >
+                <Plus size={15} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" data-testid="member-add-menu">
+              <DropdownMenuItem
+                onSelect={() => setCreateOpen(true)}
+                disabled={createHeld !== null}
+                // A disabled Radix item takes no pointer events, so a `title`
+                // would never show; the hold reason is written under the label
+                // instead, where mouse, keyboard and touch users all read it.
+                className={createHeld !== null ? 'items-start' : undefined}
+                data-testid="member-add-crewmate"
+              >
+                <Plus size={13} className="lucide-inline text-muted shrink-0" aria-hidden="true" />
+                <span className="flex-1 min-w-0 flex flex-col">
+                  <span>{t('pages.membersPage.add_member')}</span>
+                  {createHeld !== null && (
+                    <span className="text-[11.5px] text-muted whitespace-normal" data-testid="member-add-crewmate-held">
+                      {createHeld}
+                    </span>
+                  )}
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setTeamDialog({})} data-testid="member-add-team">
+                <Users size={13} className="lucide-inline text-muted" aria-hidden="true" />
+                <span className="flex-1">{t('pages.membersPage.team_new')}</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          )}
         </div>
+        {/* The count reads the cached roster; after a create whose re-read
+            failed that cache is a list without the new crewmate, and "0
+            crewmates" under "Radar was created" contradicts the notice. The
+            count reads as a dash until the retry refreshes the list — the SAME
+            dash a failed arrival read shows: one treatment of "count unknown",
+            not a dash in one case and a vanished line in the other. */}
         <div className={`px-4 pb-2 ${ROW_STATUS_CLS} text-muted`} data-testid="member-count">
           {/* "N of M" while any filter (not the search) narrows the list, so
               the header never contradicts a 1-row or empty view below it.
-              With no roster to count (the read failed) the line is a dash:
-              "0 members" above "Could not load the member roster" would
-              state as fact what is only unknown. */}
-          {loadError
+              With no roster to count (the read failed, or the post-create
+              re-read did) the line is a dash: "0 members" above "Could not
+              load the member roster" would state as fact what is only
+              unknown. */}
+          {loadError || postCreateError?.kind === 'roster'
             ? '\u2014'
             : narrowed
               ? t('pages.membersPage.member_count_filtered', {
@@ -1992,6 +2532,7 @@ export default function MembersPage() {
                 })
               : t('pages.membersPage.member_count', { count: members.length })}
         </div>
+        {greetingNoticeInRoster && postCreateNotice}
         {/* A failed registry read blanks EVERY roster badge at once. That is
             not "no member has a patrol" — it is a page-level unknown, so it
             is said here, on the roster the badges live on, not only inside
@@ -2005,6 +2546,19 @@ export default function MembersPage() {
               variant="inline"
               askAgent
               testId="member-roster-patrol-error"
+            />
+          </div>
+        )}
+        {/* A failed team read renders the roster FLAT, which is not "no teams"
+            -- it is unknown, and said here on the roster the grouping lives
+            on. No draft on this page, so the hand-off is safe. */}
+        {teamsFailed && (
+          <div className="px-4 pb-2">
+            <ErrorNotice
+              message={t('pages.membersPage.teams_load_failed')}
+              variant="inline"
+              askAgent
+              testId="member-roster-teams-error"
             />
           </div>
         )}
@@ -2160,20 +2714,12 @@ export default function MembersPage() {
           style={{ scrollbarWidth: 'none' }}
           aria-label={t('pages.membersPage.title')}
         >
-          {loaded && !loadError && members.length === 0 && (
-            <li className="px-4 py-6 text-xs text-muted">
-              <p>{t('pages.membersPage.empty_roster')}</p>
-              {/* The copy only says there is no one yet; this button IS the
-                  way to change that — the create form, same destination as
-                  the header "+". */}
-              <button
-                onClick={() => navigate(CREW_CREATE_PATH)}
-                className="mt-2 inline-flex items-center gap-1 text-[11.5px] px-2 py-1 rounded border border-border hover:bg-accent/40"
-                data-testid="member-empty-cta"
-              >
-                <Plus size={12} className="lucide-inline" />
-                {t('pages.membersPage.add_member')}
-              </button>
+          {loaded && !loadError && hasNoCrewmates(members) && (
+            // Below md only: above md the thread column carries the hero
+            // instead (see the DM thread section), so the two panes never
+            // show the same hero twice on a wide viewport.
+            <li className="md:hidden">
+              <CrewmateEmptyHero onCreate={() => setCreateOpen(true)} held={createHeld} />
             </li>
           )}
           {loaded && !loadError && hasNoCrewmates(members) && (
@@ -2199,14 +2745,28 @@ export default function MembersPage() {
           )}
           {loadError && (
             /* The shared notice, not a bare alert: a read failure on a list
-               that holds no draft, so the agent hand-off is safe here. */
-            <li className="px-2 py-4">
+               that holds no draft, so the agent hand-off is safe here. Below
+               md only: at md and up the chat column carries this same notice
+               (`member-column-load-error`), and the two side by side read as
+               one message doubled. */
+            <li className="px-2 py-4 md:hidden flex flex-col items-start gap-2">
               <ErrorNotice
                 message={t('pages.membersPage.roster_load_failed')}
                 variant="inline"
                 askAgent
+                // Same label as the chat-column notice for the same failure:
+                // two names for one helper on one screen reads as two helpers.
+                askAgentLabel={t('pages.membersPage.roster_load_failed_ask')}
+                // The roster column is narrow: let the link drop to its own
+                // line rather than squeeze the sentence to a word per line.
+                className="flex-wrap"
                 testId="member-roster-error"
               />
+              {/* The plain retry first: a failed read is usually transient,
+                  and "ask about it" alone reads as the only way out. */}
+              <Btn onClick={() => void rosterQuery.refetch()} data-testid="member-roster-retry">
+                {t('pages.membersPage.roster_load_retry')}
+              </Btn>
             </li>
           )}
           {filteredOut && (
@@ -2222,24 +2782,47 @@ export default function MembersPage() {
               </button>
             </li>
           )}
-          {sortedMembers.map((m) => (
-            <MemberRow
-              key={m.name}
-              m={m}
-              t={t}
-              activeName={activeName}
-              openMember={openMember}
-              toggleStar={toggleStar}
-              starPending={starPending}
-              slotKeyOf={slotKeyOf}
-              isRunning={isRunning}
-              isUnread={isUnread}
-              activePatrolOf={activePatrolOf}
-              reduceMotion={reduceMotion}
-              scrollActiveRowIntoView={scrollActiveRowIntoView}
-              slugCollides={collidingSlugs.has(m.slug)}
-            />
-          ))}
+          {/* Grouped by team once any team exists: a header row per team, its
+              crewmates indented under it, the rows no team lists in a trailing
+              muted "No team" group. With no teams the list is flat, as it was
+              before teams -- one anonymous group and no header. A collapsed
+              group hides its rows; the fold persists per team. */}
+          {rosterGroups.map((group) => {
+            const collapsed = grouped && collapsedTeams.has(group.id)
+            return (
+              <Fragment key={group.id}>
+                {grouped && (
+                  <TeamGroupHeader
+                    group={group}
+                    selected={!!activeTeam && group.id === activeTeam.id}
+                    collapsed={collapsed}
+                    onOpen={() => group.team && openTeam(group.team.id)}
+                    onToggle={() => toggleTeamCollapsed(group.id)}
+                  />
+                )}
+                {!collapsed &&
+                  group.members.map((m) => (
+                    <MemberRow
+                      key={m.name}
+                      m={m}
+                      t={t}
+                      activeName={activeName}
+                      openMember={openMember}
+                      toggleStar={toggleStar}
+                      starPending={starPending}
+                      slotKeyOf={slotKeyOf}
+                      isRunning={isRunning}
+                      isUnread={isUnread}
+                      activePatrolOf={activePatrolOf}
+                      reduceMotion={reduceMotion}
+                      scrollActiveRowIntoView={scrollActiveRowIntoView}
+                      slugCollides={collidingSlugs.has(m.slug)}
+                      indented={grouped}
+                    />
+                  ))}
+              </Fragment>
+            )
+          })}
         </ul>
         {/* Window-splitter between roster and thread: the same component as the
             Sessions sidebar's grip, sitting on the card's right border the same
@@ -2262,12 +2845,87 @@ export default function MembersPage() {
 
       {/* DM thread */}
       <section
-        className={`${activeName ? 'flex' : 'hidden md:flex'} flex-1 min-w-0 flex-col min-h-0`}
+        // Below md the column shows only while a chat or a team view is open —
+        // except while a ROSTER post-create notice is up: a failed re-read
+        // opens no chat, and hiding the column would hide the one place the
+        // failure and its retry are said. A greeting notice sits over its
+        // chat; once that chat is closed the roster is the screen and the
+        // notice waits for the reopen.
+        className={`${activeName || activeTeam || postCreateError?.kind === 'roster' ? 'flex' : 'hidden md:flex'} flex-1 min-w-0 flex-col min-h-0`}
       >
-        {!active && (
-          <div className="flex-1 flex items-center justify-center text-sm text-muted px-6 text-center">
-            {t('pages.membersPage.pick_a_member')}
+        {!greetingNoticeInRoster && postCreateNotice}
+        {/* The hero yields to a post-create notice: after the FIRST create a
+            failed re-read leaves the cached roster at [] while the crewmate
+            exists, and "No crewmates yet" under "Radar was created" would be
+            two contradicting statements in one column. It yields to an open
+            team view too: a team can exist before its first crewmate does,
+            and the pane is the team's then. */}
+        {!active && !activeTeam && !postCreateError && loaded && !loadError && hasNoCrewmates(members) && (
+          <CrewmateEmptyHero onCreate={() => setCreateOpen(true)} held={createHeld} />
+        )}
+        {/* A failed roster read at md and up: the roster column shows its own
+            notice, but this column would otherwise be blank — no chat can
+            open (the URL sync waits on the roster) and the hero is gated on a
+            successful read. Say the same failure here, so a wide window is
+            never half empty. Hidden below md, where this column is not shown
+            and the roster's notice is the screen. An open team view carries
+            its own copy of this notice (below), so it steps aside then. */}
+        {!active && !activeTeam && !postCreateError && loadError && (
+          <div className="hidden md:flex flex-1 flex-col items-center justify-center gap-3 px-6 py-10 text-center" data-testid="member-column-load-error">
+            <ErrorNotice
+              message={t('pages.membersPage.roster_load_failed')}
+              variant="inline"
+              askAgent
+              // Named, not "the agent": on a page of crewmates a bare "agent"
+              // reads as a third party, and the hand-off goes unused.
+              askAgentLabel={t('pages.membersPage.roster_load_failed_ask')}
+            />
+            {/* Same shape as the post-create roster notice: the plain retry
+                under the sentence, the hand-off link beside it as the second
+                option, never the only one. */}
+            <Btn onClick={() => void rosterQuery.refetch()} data-testid="member-column-load-retry">
+              {t('pages.membersPage.roster_load_retry')}
+            </Btn>
           </div>
+        )}
+        {/* The team view takes the pane a chat would: the manager's desk for
+            the open team. Keyed by team so switching teams remounts its reads. */}
+        {!active && activeTeam && (
+          <>
+            {/* Below md the roster -- and the notice it carries -- is hidden
+                while a team is open, so a failed team read is said HERE too:
+                the team on screen may be stale. md and up shows the roster's
+                own notice beside the pane, so this one steps out of the way. */}
+            {loadError && (
+              <div className="px-4 pt-3 md:hidden">
+                <ErrorNotice
+                  message={t('pages.membersPage.roster_load_failed')}
+                  variant="inline"
+                  askAgent
+                  testId="team-view-roster-error"
+                />
+              </div>
+            )}
+            {teamsFailed && (
+              <div className="px-4 pt-3 md:hidden">
+                <ErrorNotice
+                  message={t('pages.membersPage.teams_load_failed')}
+                  variant="inline"
+                  askAgent
+                  testId="team-view-teams-error"
+                />
+              </div>
+            )}
+            <TeamView
+              key={activeTeam.id}
+              team={activeTeam}
+              members={teamMembers}
+              rosterFailed={loadError}
+              onOpenMember={openMember}
+              onEdit={() => setTeamDialog({ team: activeTeam })}
+              onBack={closeTeamView}
+            />
+          </>
         )}
         {active && (
           <>
@@ -2677,12 +3335,12 @@ export default function MembersPage() {
             />
             <span className="flex-1">{t('pages.membersPage.patrol_title')}</span>
           </div>
-          {!patrol.loaded ? (
+          {!patrolReadoutReady ? (
             <div className="mb-4 space-y-1.5" data-testid="member-patrol-loading" aria-hidden>
               <div className="h-3 rounded bg-bg-hover animate-pulse" />
               <div className="h-3 w-3/4 rounded bg-bg-hover animate-pulse" />
             </div>
-          ) : patrol.failed ? (
+          ) : patrol.failed || projectionsFailed ? (
             /* The shared notice, not a hand-rolled alert: it keeps the
                structured error context and the agent hand-off. askAgent is
                safe here — a read failure on a drawer that holds no draft. */
@@ -3188,6 +3846,28 @@ export default function MembersPage() {
       {/* Crew-wide and read-only. It owns its own Dialog, and its launch read is
           gated on `open`, so a visit that never opens it costs no request. */}
       <DeployMyCrewDialog open={deployOpen} onClose={() => setDeployOpen(false)} members={members} />
+      {/* New team / Edit team. A saved team opens its team view; a deleted one
+          that was open drops `?team=` and the bare URL falls to the page's
+          default (the remembered or most recently used crewmate, or the hero
+          on an empty roster). */}
+      {teamDialog && (
+        <TeamDialog
+          open
+          team={teamDialog.team}
+          teams={teams}
+          members={orderedMembers}
+          onClose={() => setTeamDialog(null)}
+          onSaved={(saved) => {
+            setTeamDialog(null)
+            openTeam(saved.id)
+          }}
+          onDeleted={(removed) => {
+            setTeamDialog(null)
+            if (urlTeam === removed.id) setSearchParams({}, { replace: true })
+          }}
+        />
+      )}
+      <NewCrewmateDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} existingNames={existingNames} />
     </div>
   )
 }

@@ -81,10 +81,11 @@ interface DashboardState {
   slotFetchWriteMark: Record<string, number>
   // Slot keys in the order the session sidebar actually DISPLAYS them
   // (pinned-first + the user's sort, flat-view aware). Published by
-  // ChatSidebar; consumed by the chat-jump / chat-cycle keyboard shortcuts so
-  // Ctrl/Alt+N targets the Nth visible row rather than the Nth element of
-  // `slots` (which arrives in backend insertion order). Empty until the
-  // sidebar first renders — consumers fall back to `slots` order then.
+  // ChatSidebar; consumed by the chat-jump / chat-cycle keyboard shortcuts and
+  // by deleteSlot's close-landing pick after row identities map to slot keys.
+  // Keep the complete displayed order: truncating it to the shortcut count
+  // would break adjacent-row close landing. Empty until the sidebar first
+  // renders — consumers fall back to `slots` order then.
   sidebarOrder: string[]
   approvalMode: string
   channelTrusted: boolean
@@ -536,6 +537,20 @@ const confirmHold = (state: DashboardState, key: string, requestId: string): voi
   hold.awaitingFetches = [...(state.slotFetchesInFlight ?? [])]
   hold.confirmedUntil = Date.now() + CLOSE_CONFIRMED_MAX_MS
 }
+/** Arm a tombstone directly in its confirmed phase for a removal the server
+ *  already acknowledged. Pre-removal fetches remain paired with the hold so
+ *  their replies cannot restore the closed row. */
+const armConfirmedHold = (state: DashboardState, key: string): void => {
+  if (isUnsafeKey(key)) return
+  if (!state.closingSlots) state.closingSlots = {}
+  state.closingSlots[key] = {
+    requestId: 'confirmed',
+    inFlightUntil: null,
+    graceFrames: CLOSE_CONFIRMED_GRACE_FRAMES,
+    awaitingFetches: [...(state.slotFetchesInFlight ?? [])],
+    confirmedUntil: Date.now() + CLOSE_CONFIRMED_MAX_MS,
+  }
+}
 /** A `fetchSlots` request settled: no confirmed hold need wait for it any more.
  *  Runs AFTER that reply's own `applySlots`, so the reply itself is still held. */
 const settleSlotFetch = (state: DashboardState, requestId: string | undefined): void => {
@@ -563,6 +578,11 @@ const settleSlotFetch = (state: DashboardState, requestId: string | undefined): 
 const stampKey = (slotKey: string): string => `k:${slotKey}`
 /** Inverse of `stampKey`, for the two places that read the record back. */
 const slotKeyOfStamp = (stamped: string): string => stamped.slice(2)
+/** The `slotWriteSeq` value of `slotKey`'s last single-slot write, or 0. A
+ *  caller compares it with `slotWriteSeq` read earlier to learn whether some
+ *  writer touched the row since. */
+export const slotWriteStampOf = (state: DashboardState, slotKey: string): number =>
+  state.slotWrittenAt?.[stampKey(slotKey)] ?? 0
 
 /** Record that `key`'s row was just written by a single-slot writer.
  *
@@ -579,6 +599,14 @@ const stampSlotWrite = (state: DashboardState, key: string): void => {
 /** A single-slot mutation. Returning `false` means the writer's own guard
  *  declined and the row was left alone, so no write is stamped. */
 type RowPatch = (slot: ChatSlot) => boolean | void
+
+/** Payload of the `slot_patch` WebSocket frame (see `sseSlotPatch`). */
+export interface SlotPatchFrame {
+  /** Partial rows: `key` plus the fields that changed. */
+  slots?: Array<Partial<ChatSlot> & { key: string }>
+  /** Keys that left the server's registry. */
+  removed?: string[]
+}
 
 /** THE way a reducer changes a field of an EXISTING row of `state.slots`.
  *
@@ -772,8 +800,9 @@ const dashboardSlice = createSlice({
       state.slotsLoaded = true
       reconcileSlots(state, new Set(action.payload.map(s => s.key)))
     },
-    // Sidebar → shortcuts order feed (see DashboardState.sidebarOrder). The
-    // dispatch site diff-guards, so every action here is a real order change.
+    // Sidebar → shortcut and close-landing order feed (see
+    // DashboardState.sidebarOrder). The dispatch site diff-guards, so every
+    // action here is a real order change.
     setSidebarOrder(state, action: PayloadAction<string[]>) { state.sidebarOrder = action.payload },
     // Live TODO-list delta. Patched into the SAME slots array that sseSlots
     // populates rather than a parallel map, so the mid-turn push and the
@@ -825,6 +854,58 @@ const dashboardSlice = createSlice({
     sseSlotTitle(state, action: PayloadAction<{ key: string; title: string }>) {
       patchSlotRow(state, action.payload.key, slot => { slot.title = action.payload.title })
     },
+    /** A `slot_patch` frame: the server's one-row answer to a metadata edit
+     *  (pin, rename, folder move) or a close, sent INSTEAD of the full slot list
+     *  to a socket that declared the capability (see `useWebSocket`).
+     *
+     *  Each `slots` row carries `key` plus only the fields that changed, merged
+     *  through `patchSlotRow` so a `fetchSlots` reply already in flight cannot
+     *  put the older value back. A row for a key this tab does not hold is
+     *  dropped here; the frame handler refetches the list for it.
+     *
+     *  `removed` keys go through `applySlots` as the current list minus those
+     *  keys, the same path a full list takes: close tombstones spend their
+     *  frame budget, untouched rows keep their identity, and `reconcileSlots`
+     *  tears down the departed key's sub-agent and unread state. The fetches in
+     *  flight at that moment are marked stale for the removed key, so their
+     *  replies cannot restore it, while a later WebSocket list that names the
+     *  key again (a same-key replacement) applies as usual. `slotsGeneration` is
+     *  left alone because this is not a full snapshot, and the pin reconciler
+     *  counts only those. */
+    sseSlotPatch(state, action: PayloadAction<SlotPatchFrame>) {
+      const { slots: rows, removed } = action.payload
+      for (const row of rows ?? []) {
+        if (!row || typeof row.key !== 'string') continue
+        const { key, ...fields } = row
+        patchSlotRow(state, key, slot => {
+          if (Object.keys(fields).every(field => jsonEqual(
+            (slot as unknown as Record<string, unknown>)[field],
+            (fields as Record<string, unknown>)[field],
+          ))) return false
+          Object.assign(slot, fields)
+        })
+      }
+      if (removed?.length && state.slotsLoaded) {
+        const gone = new Set(removed)
+        for (const key of gone) {
+          if (!isUnsafeKey(key) && !state.closingSlots?.[key]) {
+            markStaleSlotFetches(state, key, [...(state.slotFetchesInFlight ?? [])])
+          }
+        }
+        const remaining = (state.slots ?? []).filter(s => !gone.has(s.key)) // row-read: membership filter, rows are carried over unchanged
+        applySlots(state, remaining)
+        // `remaining` is the local list, which `removeSlotOptimistic` already
+        // holds every in-flight close out of, so it under-states what is live:
+        // a key whose own DELETE has not been answered is still a session on
+        // the server, and this frame says nothing about it. The teardown is not
+        // recoverable (see `reconcileSlots`), so every tombstoned key this frame
+        // did not remove counts as live here; only the keys named in `removed`
+        // are torn down.
+        const live = new Set(remaining.map(s => s.key))
+        for (const key of Object.keys(state.closingSlots ?? {})) if (!gone.has(key)) live.add(key)
+        reconcileSlots(state, live)
+      }
+    },
     addSlotOptimistic(state, action: PayloadAction<ChatSlot>) {
       // A resume or fork under a key that was closing supersedes the tombstone:
       // the caller has a fresh server acknowledgement that the key is live.
@@ -845,6 +926,11 @@ const dashboardSlice = createSlice({
      *  `deleteSlot` before it awaits the peer navigation (see `confirmHold`). */
     confirmCloseHold(state, action: PayloadAction<{ key: string; requestId: string }>) {
       confirmHold(state, action.payload.key, action.payload.requestId)
+    },
+    /** A removal the server already confirmed (no DELETE of ours in flight): arm
+     *  the tombstone straight in its confirmed phase so a pre-pop straggler list cannot re-add the row. */
+    armConfirmedCloseHold(state, action: PayloadAction<string>) {
+      armConfirmedHold(state, action.payload)
     },
     removeSlotOptimistic(state, action: PayloadAction<string>) {
       state.slots = state.slots.filter(s => s.key !== action.payload)
@@ -927,6 +1013,41 @@ const dashboardSlice = createSlice({
         ))
         if (!row) return false
         Object.assign(row, action.payload.patch)
+      })
+    },
+    /**
+     * Drop the link rows that describe ONE binding from a slot, in place. The
+     * write counterpart of `patchSlotLink` for an unlink: the binding is gone
+     * server-side, so the rows that described it go too, and nothing else in
+     * `links` is rebuilt (a whole-array rewrite from a captured snapshot is what
+     * made two concurrent toggles unsafe). An `origin` row stays: the conversation
+     * a session was born in is not a binding an unlink can sever.
+     *
+     * Keyed on the `binding` the completed request named, never on the channel
+     * alone: between the click and the response another tab can unlink A and
+     * link B on the same channel, and the slots push for B can land here first.
+     * The server deleted exactly A (it refuses anything else with 409), so this
+     * removes exactly A's rows — a B row, same channel, different token, stays,
+     * and the tab does not read as disconnected from a binding the server still
+     * holds. The slot's `slack_*` fields describe the Slack THREAD row, so they
+     * clear in the same write as that row and only then: a Slack row that
+     * survives the compare keeps its fields.
+     */
+    dropSlotLinks(state, action: PayloadAction<{ key: string; channel: string; binding: string }>) {
+      patchSlotRow(state, action.payload.key, slot => {
+        if (!slot.links) return false
+        const before = slot.links.length
+        slot.links = slot.links.filter(candidate => !(
+          candidate.channel === action.payload.channel
+          && candidate.direction !== 'origin'
+          && candidate.binding === action.payload.binding
+        ))
+        if (slot.links.length === before) return false
+        if (action.payload.channel === 'slack') {
+          slot.slack_linked = false
+          slot.slack_channel = undefined
+          slot.slack_thread_ts = undefined
+        }
       })
     },
     updateSlotFolder(state, action: PayloadAction<{ key: string; folderId: string }>) {
@@ -1242,8 +1363,8 @@ const dashboardSlice = createSlice({
   },
 })
 
-export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, releaseCloseHold, confirmCloseHold, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, remoteSlotRead, setUpdateProgress,
-  setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink } = dashboardSlice.actions
+export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, sseSlotPatch, addSlotOptimistic, removeSlotOptimistic, releaseCloseHold, confirmCloseHold, armConfirmedCloseHold, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, remoteSlotRead, setUpdateProgress,
+  setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink, dropSlotLinks } = dashboardSlice.actions
 
 /**
  * Resolve a slot's surface key. Backend emits `surface` (mirrors `mode` today

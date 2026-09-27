@@ -38,6 +38,7 @@ from kiro_crew.autonudge import (
 )
 from kiro_crew.autonudge_selfarm import forget_self_arm, record_self_arm
 from kiro_crew.config.loader import workspace_dir_for
+from kiro_crew.monitoring.limits import validate_runtime_secs
 from kiro_crew.monitoring.models import (
     MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
     MONITOR_STATE_VERSION,
@@ -203,6 +204,13 @@ async def authorize_and_update_monitor(
         error = str(exc)
         await _audit("denied", error)
         return None, error, 409
+    except ValueError as exc:
+        # The store's own bounds (the runtime ceiling checked against a budget
+        # the patch supplies, an unknown budget field) are a client error with
+        # the refusing range in its text, matching the legacy update path.
+        error = str(exc)
+        await _audit("denied", error)
+        return None, error, 400
     if loop is None:
         error = "structured monitor not found or already terminal"
         await _audit("denied", error)
@@ -422,13 +430,6 @@ def resolve_stop_sentinel(slot_key: str, workspace: str = "default") -> str:
     ws_dir = workspace_dir_for(workspace)
     safe_key = slot_key.replace("/", "_").replace(":", "_")
     return str(ws_dir / f".stop-{safe_key}")
-
-
-# Wall-clock budget ceiling (7 days), the single authoritative bound. The
-# MONITOR_*_SCHEMA FieldSpecs mirror it for the MCP tools; enforcing it here
-# too covers the REST and workflow paths, which do not pass through those
-# schemas — without this bound REST accepts 604801 unchanged.
-MAX_RUNTIME_SECS_CEILING = 604800
 
 
 def normalize_banner(
@@ -718,13 +719,13 @@ async def authorize_and_update_nudge(
                 return _deny(f"{_name} must be a whole number", 400)
         idle_secs = None if idle_secs is None else int(idle_secs)
         max_cycles = None if max_cycles is None else int(max_cycles)
-        max_runtime_secs = None if max_runtime_secs is None else int(max_runtime_secs)
     except (TypeError, ValueError, OverflowError):
         return _deny("idle_secs, max_cycles and max_runtime_secs must be integers", 400)
-    if max_runtime_secs is not None and not (0 <= max_runtime_secs <= MAX_RUNTIME_SECS_CEILING):
-        return _deny(
-            f"max_runtime_secs must be between 0 and {MAX_RUNTIME_SECS_CEILING} (7 days)", 400
-        )
+    if max_runtime_secs is not None:
+        try:
+            max_runtime_secs = validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
+        except ValueError as exc:
+            return _deny(str(exc), 400)
     # ``active`` must be a real boolean. bool("false") is True, so accepting a
     # JSON string would turn an explicit pause request into a RESUME — the
     # opposite of what the caller asked for on a loop that runs tools
@@ -784,6 +785,8 @@ async def authorize_and_update_nudge(
             "and choose.",
             409,
         )
+    except ValueError as exc:
+        return _deny(str(exc), 400)
     except Exception as exc:  # noqa: BLE001 - audit the failure, then propagate
         _audit("error", f"svc.update failed: {type(exc).__name__}")
         raise
@@ -917,13 +920,9 @@ async def authorize_and_add_nudge(
     if not slot_key or not message:
         return _deny("session_key (or slot_key) and message required", 400)
     try:
-        _budget = int(max_runtime_secs)
-    except (TypeError, ValueError, OverflowError):
-        return _deny("max_runtime_secs must be an integer", 400)
-    if not (0 <= _budget <= MAX_RUNTIME_SECS_CEILING):
-        return _deny(
-            f"max_runtime_secs must be between 0 and {MAX_RUNTIME_SECS_CEILING} (7 days)", 400
-        )
+        max_runtime_secs = validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
+    except ValueError as exc:
+        return _deny(str(exc), 400)
     # Decidable from the ARGUMENTS alone (slot_key is in hand here), so it sits
     # with the other cheap shape guards rather than beside the banner
     # normalization further down: reaching that point first requires passing

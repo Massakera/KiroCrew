@@ -84,6 +84,19 @@ _LANDMARKS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _pin_ssh_accept_new(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ``_ssh_supports_accept_new`` at the seam ``_build_launcher_script`` reads.
+
+    The real probe runs the host's ``ssh -V``. It is ``lru_cache``d, but any test
+    that clears the cache (``TestSshSupportsAcceptNew`` does) hands the next
+    launcher-building test in the process a real spawn -- 32 across the three
+    launcher suites on a five-run hygiene sweep, a host program none of them is about
+    (test-hygiene class 7). ``True`` is what a modern host answers.
+    """
+    monkeypatch.setattr("kiro_crew.sandbox._ssh_supports_accept_new", lambda: True)
+
+
 class _FakeLibc:
     """``_libc``, with a ``mount`` that fails on a chosen call.
 
@@ -196,6 +209,11 @@ def _run(
         # the carve-out tests inject their own entry.
         "WRITABLE_DIRS": list(writable_dirs or []),
         "SENSITIVE_FILES": [str(lone)],
+        # Empty by default for the same reason as WRITABLE_DIRS: an entry here makes the
+        # region refuse before any mount when its path is absent or single-linked, which
+        # would end the run before the call numbering above is exercised. The alias tests
+        # inject their own entry.
+        "FAIL_CLOSED_FILE_MASKS": [],
         "SSH_DIR": str(ssh),
         "SSH_KNOWN_HOSTS": str(ssh / "known_hosts"),
         "HIDE_SSH": True,

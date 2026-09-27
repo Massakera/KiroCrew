@@ -5,7 +5,7 @@ import React, { createContext, useContext, memo, useEffect, useMemo, useRef, use
 import Clickable from './Clickable'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { X, Download, Loader2, MoreHorizontal, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, FileSpreadsheet, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
+import { X, Download, Loader2, MoreHorizontal, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, FileSpreadsheet, Copy, Image as ImageIcon, ImageOff, Film, Volume2, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
 import { copyCode, copyToClipboard } from '../utils/clipboard'
 import { capWhitespaceRuns, remarkBoundDepth, rehypeBoundRawDepth } from '../utils/markdownDepthBound'
 import { hastTableToCsv, hastTableToMarkdown } from '../utils/tableClipboard'
@@ -51,6 +51,7 @@ import { urlTransform, ALLOWED_PROTOCOLS, WINDOWS_ABS_PATH_RE, decodeLocalPath }
 import { safeHttpUrl } from '../lib/safeUrl'
 import { useLinkMeta, type LinkMeta } from '../lib/linkMeta'
 import { LinkChip, LinkCard } from './LinkPreview'
+import { InstantTip, useInstantTip } from './InstantTip'
 import { parseSourceLinkUrl, forgeChipLabel, type PullRequestLink } from '../utils/pullRequestLinks'
 import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import { JiraHostsCtx } from '../lib/jiraHosts'
@@ -60,12 +61,27 @@ import GithubLogo from './icons/GithubLogo'
 import GitlabLogo from './icons/GitlabLogo'
 import DiffBlock from './DiffBlock'
 import ErrorNotice from './ErrorNotice'
+import {
+  BlockedLinkChip,
+  CredentialTag,
+  RedactedCodeBlock,
+  RedactionCardSlot,
+  RedactionProvider,
+  codeHasRedactionMarkers,
+  countCredentialTags,
+  normalizeBlockedLinks,
+  normalizeCredentialRecords,
+  rehypeRedactionMarkers,
+  useAllowHolds,
+  type RedactionMarkers,
+} from './RedactionCards'
 import FoldableDiffBlock from './FoldableDiffBlock'
 import EditableCodeBlock from './EditableCodeBlock'
 import FilePathMenu, { revealOrOpen, useRevealFailure } from './FilePathMenu'
 import { SmoothResize } from './SmoothResize'
 import type { ContentBlock } from '../types'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+import { Trans } from 'react-i18next'
 
 /** Extract the artifact slug from an `/artifacts/<slug>` href. Returns null
  *  when the href isn't an artifact route. Handles a leading origin, a trailing
@@ -321,6 +337,20 @@ export const BasePathCtx = createContext<string | null>(null)
  * images keep the full inline size. Default false = full size.
  */
 export const CompactImagesCtx = createContext<boolean>(false)
+
+/**
+ * REMOTE (http/https) markdown images always render as click-to-load
+ * placeholders instead of fetching automatically. Agent-written markdown is
+ * untrusted, and an auto-loading `<img src="https://…?d=<data>">` is a
+ * zero-click request — the browser sends it the moment the message renders, so
+ * prompt-injected content could exfiltrate conversation data through the URL
+ * with nobody clicking anything. The placeholder keeps the destination host
+ * visible and loads only on the user's explicit click. Local images
+ * (`/api/file-raw` same-origin reads of files on this machine) are unaffected —
+ * they make no outbound request. Deferral is UNCONDITIONAL: there is no
+ * context, prop, or flag through which any caller could disable it. See
+ * docs/request-for-change/rfc-redaction-explain-and-reveal.md §5.
+ */
 
 /**
  * A per-message token appended to local image URLs.
@@ -1089,6 +1119,64 @@ function isElementWithProps(
 ): node is React.ReactElement<{ alt?: string; children?: React.ReactNode }> {
   return typeof node === 'object' && node !== null && 'props' in node
 }
+/**
+ * The text of an inline code span AS THE READER SEES IT — what its chip copies,
+ * names itself after, and probes as a path — or `null` when that cannot be
+ * vouched for from the tree, in which case there is no chip.
+ *
+ * Not `String(children)`: a raw-HTML `<code>npm <b>test</b></code>` arrives as
+ * an array of nodes, which stringifies to "npm ,[object Object]". Not `textOf`
+ * either: that is the heading-slug reader, where a `<br>` may vanish, but here
+ * `<code>printf a<br>printf b</code>` RENDERS two lines, so the clipboard must
+ * hold two lines — `printf aprintf b` is a different command.
+ *
+ * And not `textContent` over the raw subtree. The sanitizer admits `class` on
+ * every element and the utilities are global, so `<span class="hidden">` (or
+ * `sr-only`, `opacity-0`, …) hides text the reader never sees; an `<img>` shows
+ * a picture, not its `alt`. Text like that must never ride into the clipboard
+ * on a click that looked like "copy this command", and copying LESS than the
+ * visible text would be a different lie. So the payload is vouched for, not
+ * filtered: only text, a class-less `<br>` and class-less inline formatting
+ * elements whose rendering IS their text (`VOUCHED_INLINE_TAGS`) count;
+ * anything else — a styled child or break, an image, a media element, a
+ * component — makes the whole span unvouchable, and it stays an inert,
+ * selectable code span. (jsdom has no `innerText`, and `innerText` could not
+ * see `sr-only` anyway. A block child such as `<details>` is no vector: the
+ * HTML parser splits the code span around it.)
+ */
+const VOUCHED_INLINE_TAGS = new Set([
+  'b', 'strong', 'i', 'em', 'u', 's', 'del', 'ins', 'mark', 'sub', 'sup', 'small',
+  'kbd', 'samp', 'var', 'code', 'span', 'abbr', 'cite', 'dfn', 'time', 'bdi', 'bdo', 'wbr',
+])
+function codeTextOf(node: React.ReactNode): string | null {
+  if (node == null || typeof node === 'boolean') return ''
+  if (typeof node === 'string') return node
+  if (typeof node === 'number') return String(node)
+  if (Array.isArray(node)) {
+    let out = ''
+    for (const child of node) {
+      const text = codeTextOf(child)
+      if (text === null) return null
+      out += text
+    }
+    return out
+  }
+  if (isElementWithProps(node)) {
+    // The class guard comes FIRST, before any tag is trusted: a styled `<br>`
+    // (`<br class="hidden">`) renders no break, so the one command the reader
+    // sees would copy as two lines with the second one live.
+    const props = node.props as { className?: unknown; class?: unknown; children?: React.ReactNode }
+    if (props.className != null || props.class != null) return null
+    if (node.type === 'br') return '\n'
+    // The renderer's own `strong` / `em` overrides render exactly their text.
+    const vouched = typeof node.type === 'string'
+      ? VOUCHED_INLINE_TAGS.has(node.type)
+      : node.type === MD_COMPONENTS.strong || node.type === MD_COMPONENTS.em
+    if (!vouched) return null
+    return props.children == null ? '' : codeTextOf(props.children)
+  }
+  return null
+}
 function slugify(children: React.ReactNode): string | undefined {
   const raw = textOf(children).toLowerCase().replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').replace(/^-+|-+$/g, '')
   return raw || undefined
@@ -1514,7 +1602,21 @@ function activatePath(
   else actions.onFileOpen(path)
 }
 
-const CHIP_BASE = 'bg-bg-elevated px-1.5 py-0.5 rounded text-accent text-sm font-mono'
+/** What every inline-code chip shares: the geometry and the mono face that make
+ *  a span read as CODE. Deliberately no text colour and no hover underline —
+ *  those are the parts that tell a reader what a click will do, so each chip
+ *  class adds its own (`CHIP_ACTIONABLE` below, or the plain code look of
+ *  `CopyableCode`). One constant carried both for a long time, which dressed
+ *  every copy chip as a link: readers clicked expecting navigation and got a
+ *  silent clipboard write. */
+const CHIP_BASE = 'bg-bg-elevated px-1.5 py-0.5 rounded text-sm font-mono'
+
+/** The look of a chip whose click NAVIGATES or OPENS something — a confirmed
+ *  path, a session, an autolinked work item: the accent colour and the hover
+ *  underline that links wear, the pointer hand, and (at each call site) a
+ *  leading glyph. A chip that only copies must NOT use this: looking like a
+ *  link is a promise to go somewhere. */
+const CHIP_ACTIONABLE = `${CHIP_BASE} text-accent cursor-pointer hover:underline`
 
 /** Geometry of a path chip's leading glyph, shared by the confirmed chip and by
  *  the reserve that stands in for it while the path is unconfirmed.
@@ -1587,59 +1689,336 @@ function revealHintFor(isDir: boolean, platform: GatewayPlatform, directLocal: b
   return i18nT('components.markdownRenderer.click_to_open_shift_click_to_show_in_file_manager')
 }
 
-/** Click-to-copy inline code chip for non-path spans (commands, env vars, IDs).
- *  Uses a brief "copied" feedback state and stays a plain inline `<code>` to
- *  preserve line-wrapping. The copied state shows a small check icon inline;
- *  the icon is `pointer-events-none` and purely decorative so it cannot steal
- *  the click or affect layout reflow. */
 /**
- * The 1.5s "Copied!" acknowledgment, shared by every chip that copies.
+ * The copy acknowledgment, shared by every chip that copies.
  *
- * One definition so the two chips cannot drift on how long it lasts or whether it
+ * One definition so the chips cannot drift on how long it lasts or whether it
  * appears at all — the session chip advertises Ctrl+click in its tooltip, so the
  * gesture owes the same confirmation the click-to-copy chip gives.
+ *
+ * `copy` is the ONLY write path: it writes, and confirms only when
+ * `copyToClipboard` resolves true, per that helper's contract — a tick over an
+ * unchanged clipboard is worse than no cue at all. A refused write reports
+ * `failed` instead, which every caller renders through `CopyFailedNotice` in an
+ * `InstantTip` bubble — the copy chip in the bubble that also carries its hint
+ * and confirmation, the title-cued chips through `useTitleCuedCopy`. One
+ * failure surface for one operation: two shapes of "Copy failed" (a bubble on
+ * one chip, a red label pushed into the sentence on another) read as two
+ * different features, and the in-flow one reflowed the line for as long as it
+ * showed.
+ *
+ * Both outcomes are flashes that clear themselves: a confirmation already read
+ * is noise, and the failure surface is a bubble with no dismiss control, so a
+ * failure that never cleared would be a red mark the user could not remove.
+ * The failure holds longer (`COPY_FAILED_FLASH_MS`): it is the outcome the user
+ * did not expect and most needs — the text they asked for is NOT on their
+ * clipboard — so it gets the time to be noticed and read.
+ *
+ * Each outcome REPLACES the other, never sits beside it. A press resolves
+ * while the previous one's cue may still be showing — a refusal 500ms after a
+ * success lands inside the confirmation window — and the chip must state the
+ * LATEST outcome alone: "Copied!" beside "Copy failed" tells the user nothing
+ * about what is on the clipboard. One `outcome` and one timer make that
+ * structural: a new outcome cancels the old one's pending clear (a timer left
+ * running would later clear a flash that no longer exists) and starts its own.
+ *
+ * "Latest" is the latest PRESS, not the latest settlement. Two presses can be
+ * in flight together (`copyToClipboard` awaits the async API and falls back on
+ * rejection, so a refusal settles later than a success), and nothing orders
+ * their promises. Every press takes the next attempt number; a settlement whose
+ * number is no longer current belongs to a press the user has since superseded
+ * and is dropped, so a stale refusal cannot erase the confirmation the latest
+ * press earned, and a stale success cannot hide the refusal it got. Unmount
+ * advances the number too, so an in-flight settlement writes nothing.
+ *
+ * An outcome belongs to the TEXT that earned it. React reuses this hook when a
+ * span's text changes under it — a streaming transcript rewriting a chip, an
+ * editable preview — and the clipboard then holds the old text, so the new
+ * text must not wear "Copied!", and a settlement for the old text must not
+ * confirm the new one. A change of `text` therefore resets the outcome and
+ * advances the attempt number, like an unmount would.
  */
-function useCopiedFlash(): { copied: boolean; flash: () => void } {
-  const [copied, setCopied] = useState(false)
+/** How long "Copied!" shows. Exported so tests advance exactly this. */
+export const COPIED_FLASH_MS = 1500
+/** How long "Copy failed" shows — twice the confirmation, see `useCopiedFlash`. */
+export const COPY_FAILED_FLASH_MS = 3000
+/** The outcome on show, stamped with the press (attempt number) that earned
+ *  it — so a consumer can tell a NEW outcome of the same kind from the one it
+ *  is already showing (`InstantTip`'s hold needs that edge). */
+type CopyFlash = { kind: 'copied' | 'failed'; seq: number } | null
+/**
+ * Press order across EVERY chip, not per chip: the latest press anywhere is
+ * the one whose outcome the user is waiting for. A write can hang (a clipboard
+ * permission prompt) while the user moves on and presses another chip; if the
+ * old press then settles, a per-chip counter would accept it, and its "Copied!"
+ * would evict the newer chip's failure from the one bubble. Every press takes
+ * the next number here, and a settlement is applied only while its press is
+ * still the newest. Invalidations (text change, unmount) stay LOCAL: they move
+ * this chip's own marker off every attempt it has in flight, but must not
+ * touch the shared order — a streaming transcript re-renders unrelated chips
+ * constantly, and none of that is the user moving on from their press.
+ */
+let latestPress = 0
+function useCopiedFlash(text: string): {
+  copied: boolean
+  failed: boolean
+  /** 0 while idle, else the attempt number of the outcome on show: a fresh
+   *  value for every settled press. Hand it to `useInstantTip({ hold })`. */
+  flashSeq: number
+  copy: (text: string) => void
+} {
+  const [flash, setFlash] = useState<CopyFlash>(null)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current) }, [])
-  const flash = () => {
-    setCopied(true)
-    if (timerRef.current) clearTimeout(timerRef.current)
-    timerRef.current = setTimeout(() => setCopied(false), 1500)
+  const attemptRef = useRef(0)
+  const textRef = useRef(text)
+  // Drop whatever is in flight or showing: pending settlements no longer
+  // match the attempt number, and the pending clear is gone.
+  const invalidate = () => {
+    attemptRef.current += 1
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
   }
-  return { copied, flash }
+  useEffect(() => () => {
+    attemptRef.current += 1
+    if (timerRef.current) clearTimeout(timerRef.current)
+  }, [])
+  useEffect(() => {
+    if (textRef.current === text) return
+    textRef.current = text
+    invalidate()
+    setFlash(null)
+  }, [text])
+  const copy = (value: string) => {
+    const attempt = ++latestPress
+    attemptRef.current = attempt
+    void copyToClipboard(value).then(ok => {
+      // Superseded — by a later press on this chip or any other, by a text
+      // change, or by an unmount: the user has moved on from this press.
+      if (attempt !== attemptRef.current || attempt !== latestPress) return
+      if (timerRef.current) clearTimeout(timerRef.current)
+      setFlash({ kind: ok ? 'copied' : 'failed', seq: attempt })
+      timerRef.current = setTimeout(() => {
+        timerRef.current = null
+        setFlash(null)
+      }, ok ? COPIED_FLASH_MS : COPY_FAILED_FLASH_MS)
+    })
+  }
+  return {
+    copied: flash?.kind === 'copied',
+    failed: flash?.kind === 'failed',
+    flashSeq: flash?.seq ?? 0,
+    copy,
+  }
 }
 
+/**
+ * The refused-clipboard-write notice a chip renders.
+ *
+ * One component so the chips cannot drift on the surface (`ErrorNotice`, the
+ * rule `errors-use-error-notice` requires), the wording, or the hand-off
+ * decision. The wording names the next step, not only the outcome: the text
+ * the user wanted is still on screen, so selecting it IS the recovery, and a
+ * bare "Copy failed" left them asking what to do about it. Its `role="alert"`
+ * is the accessible error surface and the ONLY announcement of the refusal:
+ * nothing else carries the string, so it is heard once. Its `message` is the
+ * report key `ErrorNotice` looks up; a refused clipboard write is a
+ * browser-side outcome with no entry in the error journal, so the lookup finds
+ * nothing and the notice stands on the message alone.
+ *
+ * One placement: inside an `InstantTip` bubble, held for `COPY_FAILED_FLASH_MS`
+ * and closed by the flash's own timer. The copy chip's bubble also carries its
+ * hint and confirmation, so success and failure never read from different
+ * spots; the title-cued chips (session, path, broken image) open a bubble for
+ * the refusal alone (`useTitleCuedCopy`). Nothing enters the text flow — the
+ * in-flow red label those chips used to render pushed the sentence around for
+ * as long as it showed and read as a second, different feature beside the
+ * bubble. The bubble is `pointer-events-none`, so there is no dismiss control:
+ * the flash clears itself.
+ *
+ * The wording is the caller's, chosen by what the chip copies, and all four
+ * share one family, "Couldn’t copy …". The copy chip, whose clipboard text IS
+ * the span the reader sees, names the recovery: "Couldn’t copy — select the
+ * text to copy it manually". The title-cued chips (`useTitleCuedCopy`) copy
+ * something their label need not show — the session chip the normalised key
+ * behind the author's spelling or nickname, the broken-image chip the path
+ * behind its alt — so that sentence would have the reader copy the wrong
+ * thing; each names what failed to copy instead, in the reader's own terms:
+ * the session chip names the full session ID for its visible label ("Couldn’t
+ * copy the full session ID for chat-42…"), the path chip the path's tail
+ * ("Couldn’t copy the path vitest.config.mts" — a bubble the viewport clamp has
+ * pulled left still says which chip it answers), the broken-image chip its
+ * object ("… the image path").
+ */
+function CopyFailedNotice({ message }: { message: string }) {
+  return (
+    <>
+      {/* No hand-off: this renderer is embedded in hosts that hold unsaved
+          drafts it cannot identify — MarkdownPanel's editable preview and the
+          chat composer's — and the hand-off navigates away from them. Same
+          decision as the table copy notice above. (A button inside a
+          pointer-events-none bubble that closes itself would be dead anyway.) */}
+      <ErrorNotice
+        variant="inline"
+        message={message}
+        testId="md-chip-copy-error"
+      />
+    </>
+  )
+}
+
+/**
+ * The copy path of a chip whose hint and confirmation are its native `title`
+ * — the session and path chips' Ctrl/Cmd+click, the broken-image chip's click.
+ *
+ * The same gated write as the copy chip (`useCopiedFlash`), and the SAME
+ * failure surface: `CopyFailedNotice` in an `InstantTip` bubble opened at the
+ * pressed element — worded by the caller as the object that failed to copy,
+ * because what these chips copy is not always the text they show (see
+ * `CopyFailedNotice`). `press(el)` names the anchor (`arm`) and writes; a refusal
+ * then holds the bubble open for the failure's flash, a later outcome or the
+ * flash's end closes it. The bubble carries no hover or focus handlers — the
+ * native `title` is still this chip's hint, and its `Copied!` swap still its
+ * confirmation (moving those into the bubble too is #13608) — so it exists for
+ * the refusal alone and is held only while one shows.
+ */
+function useTitleCuedCopy(text: string, failureMessage: string): {
+  copied: boolean
+  /** Write `text`, naming `el` as where the outcome's bubble opens. */
+  press: (el: HTMLElement) => void
+  /** Render beside the chip: the bubble (a portal) that carries a refusal. */
+  failureBubble: React.ReactNode
+} {
+  const { copied, failed, flashSeq, copy } = useCopiedFlash(text)
+  const { tip, tipId, arm } = useInstantTip({ hold: failed ? flashSeq : 0, placement: 'flow' })
+  const press = (el: HTMLElement) => {
+    arm(el)
+    copy(text)
+  }
+  const failureBubble = (
+    <InstantTip tip={tip} tipId={tipId} className="w-max max-w-[calc(100vw-1rem)]">
+      <CopyFailedNotice message={failureMessage} />
+    </InstantTip>
+  )
+  return { copied, press, failureBubble }
+}
+
+/**
+ * Click-to-copy inline code chip for a span that names nothing the dashboard
+ * can open — a command, an env var, an identifier.
+ *
+ * Its click copies, so it wears plain CODE styling in the NEUTRAL text colour:
+ * `CHIP_BASE` with no accent, plus a dotted underline and the copy cursor —
+ * unlike the `CHIP_ACTIONABLE` look (accent, solid underline on hover, pointer,
+ * glyph) of the chips whose click navigates. Dressed as a link, this chip gets
+ * clicked for navigation and answers with a silent clipboard write; dressed in
+ * a second purple next to the path chip's (the Kiro inline-code colour), it is
+ * taken for the same kind of chip. The dotted underline is the affordance the
+ * rest of the app gives a term with an explanation on hover (`CrewLogPanel`,
+ * `OAuthRelayAffordance`), which is what the tooltip is; it is deliberately
+ * not a link's solid one. `index.css` keeps the colour neutral on the Kiro
+ * themes, whose inline-code rule would otherwise paint it purple (see
+ * `data-chip-action` below).
+ *
+ * Every cue is NON-LAYOUT, because the chip must stay a plain inline `<code>`
+ * so a long span still breaks across lines: an `inline-flex` chip is atomic and
+ * overflows its container, and an in-flow icon appended on copy pushes the
+ * rest of the line over for 1.5s and back. So:
+ *
+ *  - the tooltip is the shared portal-rendered `InstantTip` (pointer after a
+ *    short intent delay, keyboard focus at once), which paints in its own layer;
+ *  - BOTH outcomes land in that same bubble: it flips to "Copied!" for
+ *    `COPIED_FLASH_MS`, or to the `CopyFailedNotice` (ErrorNotice: icon, danger
+ *    tone) for `COPY_FAILED_FLASH_MS`. One place to look, whatever happened, and
+ *    nothing in the text flow — a red notice injected mid-sentence pushed the
+ *    prose around for as long as it showed;
+ *  - the bubble is HELD while an outcome shows (`useInstantTip({ hold })`): it
+ *    is the only visible confirmation, and a mouse user moves on right after
+ *    clicking, so a leave must not take it away; the flash's own timer ends it;
+ *  - assistive tech hears "Copied!" from an `sr-only` status region that sits
+ *    OUTSIDE the `<code>` (a `role="button"` element's children are
+ *    presentational, so a live region inside it would never be announced) and
+ *    is always mounted (a region that appears already filled is not reliably
+ *    read). The refusal is announced by the `ErrorNotice` itself — its
+ *    `role="alert"` is the accessible error surface, as everywhere else in the
+ *    app (`errors-use-error-notice`) — and by nothing else, so it is heard
+ *    once; the status region stays empty then. The bubble is normally already
+ *    open when a click settles (hover intent, or focus), so the notice lands
+ *    in an existing container rather than arriving with a fresh portal.
+ *
+ * The confirmation is gated on `copyToClipboard`'s boolean and a refused write
+ * is rendered, not swallowed — see `useCopiedFlash` and `CopyFailedNotice`.
+ *
+ * The accessible name says what the click does and to what ("Copy npm test").
+ * The text alone named a button whose purpose a screen-reader user could only
+ * guess at; the tooltip still reaches them as the description.
+ *
+ * `data-chip-action` is what the stylesheet keys the chip colours on
+ * (`index.css`, the inline-code rules): the Kiro themes paint every inline code
+ * span at a specificity the `text-accent` utility cannot beat, so the actionable
+ * chips need a rule of their own, and this attribute is how a chip says which
+ * kind it is. Two values, because two kinds are told apart: `copy` (this chip)
+ * and `navigate` (the path, session and link chips, whose click goes
+ * somewhere). WHAT a navigating chip opens is already stated by `data-path*`,
+ * `data-session-key` and the accessible name; a finer vocabulary here would
+ * duplicate them for no consumer. Set AFTER the inbound props, so raw HTML
+ * cannot claim another.
+ */
 function CopyableCode({ className, safeProps, text, children }: {
   className: string
   safeProps: Record<string, unknown>
   text: string
   children: React.ReactNode
 }) {
-  const { copied, flash } = useCopiedFlash()
+  const value = text.trim()
+  const { copied, failed, flashSeq, copy } = useCopiedFlash(value)
+  // Held by the outcome's attempt number, not a boolean: a second refusal is a
+  // new outcome that must reopen a bubble a scroll or Escape closed, and a
+  // boolean that stays true has no edge for it. `arm` names the pressed chip
+  // for that reopen — after an Escape no enter or focus fires for the retry.
+  // `flow`: above from the message's first line, below from any lower one, so
+  // the bubble never covers the words that lead up to the chip.
+  const { tip, tipHandlers, tipId, arm } = useInstantTip({ hold: flashSeq, placement: 'flow' })
   const handleCopy = (e: React.MouseEvent | React.KeyboardEvent) => {
     e.preventDefault()
     e.stopPropagation()
-    copyToClipboard(text.trim())
-    flash()
+    arm(e.currentTarget as HTMLElement)
+    copy(value)
   }
+  const cue = failed
+    ? <CopyFailedNotice message={i18nT('components.markdownRenderer.couldnt_copy_select_the_text_to_copy_it_manually')} />
+    : copied
+      ? i18nT('components.markdownRenderer.copied')
+      : i18nT('components.markdownRenderer.click_to_copy')
   return (
-    <code
-      className={`${className} cursor-pointer hover:underline`}
-      // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-copy)
-      role="button"
-      tabIndex={0}
-      onClick={handleCopy}
-      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') handleCopy(e) }}
-      title={copied
-        ? i18nT('components.markdownRenderer.copied')
-        : i18nT('components.markdownRenderer.click_to_copy')}
-      {...safeProps}
-    >
-      {children}
-      {copied && <Check size={12} aria-hidden="true" className="inline align-middle ml-0.5 opacity-70 pointer-events-none text-ok" />}
-    </code>
+    <>
+      <code
+        className={`${className} cursor-copy underline decoration-dotted decoration-muted underline-offset-2`}
+        // Inbound props first, so a `<code>` arriving from raw HTML cannot
+        // overwrite the role, the name or the handlers that make this honest.
+        {...safeProps}
+        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-copy)
+        role="button"
+        tabIndex={0}
+        aria-label={i18nT('components.markdownRenderer.copy_chip_name', { text: value })}
+        data-chip-action="copy"
+        // No native title, whatever raw HTML asked for: the bubble is this
+        // chip's one tooltip, and a `title="Open file"` beside "Click to copy"
+        // would name an action the click does not perform.
+        title={undefined}
+        onClick={handleCopy}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') handleCopy(e) }}
+        {...tipHandlers}
+      >
+        {children}
+      </code>
+      <InstantTip tip={tip} tipId={tipId} className="w-max max-w-[calc(100vw-1rem)]">{cue}</InstantTip>
+      {/* Always mounted, so the region exists before its text changes — a live
+          region that appears already filled is not reliably read. Empty, it
+          costs one out-of-flow node. Only the short, transient "Copied!" lives
+          here: the refusal's accessible surface is the ErrorNotice itself. */}
+      <span role="status" aria-live="polite" className="sr-only">
+        {copied ? i18nT('components.markdownRenderer.copied') : ''}
+      </span>
+    </>
   )
 }
 
@@ -1655,25 +2034,28 @@ function CopyableCode({ className, safeProps, text, children }: {
  * `stopPropagation` keeps the container's artifact-link delegation from also
  * firing for a click this chip has handled.
  */
-function SessionChip({ sessionKey, sessionTitle, safeProps, onOpen, children }: {
+function SessionChip({ sessionKey, sessionTitle, label, safeProps, onOpen, children }: {
   sessionKey: string
   sessionTitle: string
+  /** The span's visible text — the author's spelling of the key or short name. */
+  label: string
   safeProps: Record<string, unknown>
   onOpen: (key: string) => void
   children: React.ReactNode
 }) {
-  const { copied, flash } = useCopiedFlash()
-  const act = (e: { ctrlKey: boolean; metaKey: boolean; preventDefault: () => void; stopPropagation: () => void }) => {
+  const { copied, press, failureBubble } = useTitleCuedCopy(sessionKey, i18nT('components.markdownRenderer.the_copy_failed_ctrl_cmd_click_copies_the_full_session_id_for_label', { label }))
+  const act = (e: React.MouseEvent<HTMLElement> | React.KeyboardEvent<HTMLElement>) => {
     e.preventDefault()
     e.stopPropagation()
     // The NORMALISED key, not the author's spelling: `?sid=` rejects a
     // `dashboard_`-prefixed transcript filename.
-    if (e.ctrlKey || e.metaKey) { copyToClipboard(sessionKey); flash(); return }
+    if (e.ctrlKey || e.metaKey) { press(e.currentTarget); return }
     onOpen(sessionKey)
   }
   return (
+    <>
     <code
-      className={`${CHIP_BASE} cursor-pointer hover:underline`}
+      className={CHIP_ACTIONABLE}
       // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-switch)
       role="button"
       tabIndex={0}
@@ -1681,6 +2063,13 @@ function SessionChip({ sessionKey, sessionTitle, safeProps, onOpen, children }: 
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') act(e) }}
       {...safeProps}
       data-session-key={sessionKey}
+      data-chip-action="navigate"
+      // The name states the action, same rule as the copy and path chips, and
+      // keeps the VISIBLE text: an `aria-label` replaces the content as the
+      // name, so naming only the title would drop the key the message is
+      // about and make two sessions with one title indistinguishable. The
+      // title rides in the three-line description below.
+      aria-label={i18nT('components.markdownRenderer.switch_to_session_chip_name', { label })}
       // Title leads: the key alone does not say which conversation this is.
       title={copied
         ? i18nT('components.markdownRenderer.copied')
@@ -1690,6 +2079,8 @@ function SessionChip({ sessionKey, sessionTitle, safeProps, onOpen, children }: 
       {children}
       {copied && <Check size={12} aria-hidden="true" className="inline align-middle ml-0.5 opacity-70 pointer-events-none text-ok" />}
     </code>
+    {failureBubble}
+    </>
   )
 }
 
@@ -1710,7 +2101,15 @@ function SessionChip({ sessionKey, sessionTitle, safeProps, onOpen, children }: 
  * chip cannot borrow the container's.
  */
 function InlineCode({ children, ...props }: { children?: React.ReactNode } & Record<string, unknown>) {
-  const codeStr = String(children).replace(/\n$/, '')
+  // The span's TEXT as rendered (`codeTextOf`), not `String(children)`: a
+  // raw-HTML `<code>npm <b>test</b></code>` arrives as an array of nodes, which
+  // stringifies to "npm ,[object Object]" — and that string became the clipboard
+  // text, the probe subject and, worst, the chip's accessible name, which
+  // REPLACES the visible content a screen reader could read before. `null` means
+  // the tree cannot vouch that its text is what the reader sees (a styled or
+  // collapsible raw child, an image): no chip, no probe, no copy.
+  const visibleText = codeTextOf(children)
+  const codeStr = (visibleText ?? '').replace(/\n$/, '')
   const probeEnabled = useContext(PathProbeCtx)
   const actions = useContext(PathActionCtx)
   const sessionActions = useContext(SessionActionCtx)
@@ -1722,16 +2121,21 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
   // Failure state for the chip's reveal (Shift+click / no handler wired); rendered
   // beside the chip. Declared before the early returns below (rules of hooks).
   const reveal = useRevealFailure(raw)
+  // The confirmed path chip's Ctrl/Cmd+click copy — the same gated write every
+  // other copy affordance in this file uses, and the same failure surface (the
+  // bubble). Declared before the early returns below (rules of hooks).
+  const pathCopy = useTitleCuedCopy(raw, i18nT('components.markdownRenderer.the_copy_failed_ctrl_cmd_click_copies_the_path_label', { label: basenameOf(raw.replace(/[\\/]+$/, '')) || raw }))
 
-  // `data-path*` / `data-session-key` describe a chip THIS component rendered, so
-  // only it may set them. rehypeSanitize allowlists every `data-*` attribute
-  // (isAllowedAttr: `k.startsWith('data')`), so raw HTML arrives here with a
-  // forged pair intact; spreading it would publish attributes claiming a
-  // backend-confirmed path that was never probed. Drop any inbound copy.
+  // `data-path*` / `data-session-key` / `data-chip-action` describe a chip THIS
+  // component rendered, so only it may set them. rehypeSanitize allowlists every
+  // `data-*` attribute (isAllowedAttr: `k.startsWith('data')`), so raw HTML
+  // arrives here with a forged pair intact; spreading it would publish
+  // attributes claiming a backend-confirmed path that was never probed, or dress
+  // a copy chip in the actionable colour. Drop any inbound copy.
   const safeProps = Object.fromEntries(
     Object.entries(props).filter(([k]) => {
       const name = k.toLowerCase()
-      return !name.startsWith('data-path') && !name.startsWith('data-session')
+      return !name.startsWith('data-path') && !name.startsWith('data-session') && name !== 'data-chip-action'
     }),
   )
 
@@ -1747,14 +2151,23 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     const reserve = pathResolution.shaped ? <ChipGlyphReserve path={pathResolution.splitPath} /> : null
     // Inside an anchor the link owns the click, so stay the inert span this was
     // before #4433 rather than cancelling the navigation to copy. Nothing is
-    // lost: the browser's own "Copy link address" still reaches the URL.
-    if (insideLink) return <code className={CHIP_BASE} {...safeProps}>{reserve}{children}</code>
+    // lost: the browser's own "Copy link address" still reaches the URL. It IS
+    // a link label, so it keeps the link colour (`navigate`: the stylesheet's
+    // actionable rule — the class alone loses to the Kiro inline-code colour).
+    if (insideLink) return <code className={`${CHIP_BASE} text-accent`} {...safeProps} data-chip-action="navigate">{reserve}{children}</code>
+    // Nothing a chip could honestly act on: the tree cannot vouch that its text
+    // is what the reader sees (`codeTextOf` -> null: a styled or collapsible
+    // raw child, an image), or there is no visible text at all (an image-only
+    // span, where a button would write '' — clearing the clipboard — and then
+    // confirm it). Stay an inert, selectable code span.
+    if (visibleText === null || raw === '') return <code className={CHIP_BASE} {...safeProps}>{reserve}{children}</code>
     const session = resolveSessionChip(raw, sessionActions)
     if (session) {
       return (
         <SessionChip
           sessionKey={session.key}
           sessionTitle={session.title}
+          label={raw}
           safeProps={safeProps}
           onOpen={sessionActions.onSessionOpen!}
         >{children}</SessionChip>
@@ -1781,7 +2194,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
           {/* The glyph is what tells this chip apart from a copy chip at
               rest: without it the two are pixel-identical and the click
               outcome (open a tab vs copy) is a surprise. */}
-          <code className={`${CHIP_BASE} cursor-pointer hover:underline`} {...safeProps}>{reserve}{children}<ExternalLink className="lucide-inline ml-1" aria-hidden /></code>
+          <code className={CHIP_ACTIONABLE} {...safeProps} data-chip-action="navigate">{reserve}{children}<ExternalLink className="lucide-inline ml-1" aria-hidden /></code>
         </a>
       )
     }
@@ -1805,11 +2218,11 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
   const Glyph = isDir ? Folder : fileIcon(path)
   /** stopPropagation keeps the container's artifact-link delegation from also
    *  firing for a click that this chip has already handled. */
-  const act = (e: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean; preventDefault: () => void; stopPropagation: () => void }) => {
+  const act = (e: React.MouseEvent<HTMLElement> | React.KeyboardEvent<HTMLElement>) => {
     e.preventDefault()
     e.stopPropagation()
     // Ctrl/Cmd+Click copies the path text rather than opening/revealing.
-    if (e.ctrlKey || e.metaKey) { copyToClipboard(raw); return }
+    if (e.ctrlKey || e.metaKey) { pathCopy.press(e.currentTarget); return }
     activatePath(path, kind, e.shiftKey, actions, reveal.onError, targetLine, targetEndLine)
   }
   // Right-click opens the shared file-path menu (Open in default app / reveal /
@@ -1822,7 +2235,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     <>
     <FilePathMenu filePath={path} kind={kind}>
       <code
-        className={`${CHIP_BASE} cursor-pointer hover:underline`}
+        className={CHIP_ACTIONABLE}
         // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-open path chip), same pattern as CopyableCode
         role="button"
         tabIndex={0}
@@ -1831,8 +2244,16 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
         {...safeProps}
         data-path={path}
         data-path-kind={kind}
+        data-chip-action="navigate"
         data-path-line={targetLine}
         data-path-end-line={targetEndLine}
+        // The name states what the click does and to what — "Open src/a.py:12"
+        // for a file, "Browse src/" for a directory — so a screen-reader user
+        // can tell this chip from the copy chip before pressing it. `raw`, for
+        // the same reason the title uses it: the line suffix is the target.
+        aria-label={isDir
+          ? i18nT('components.markdownRenderer.browse_path_chip_name', { path: raw })
+          : i18nT('components.markdownRenderer.open_path_chip_name', { path: raw })}
         // The resolved path leads the tooltip, not just the instruction. A native
         // tooltip paints in the browser's own layer, above page content, and any
         // element overlaying the chip must be pointer-events-none to let the click
@@ -1843,7 +2264,12 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
         // `raw`, not `path`, so a `file:447` chip discloses the line it will jump
         // to. That keeps the disclosure honest without a second catalog string:
         // the location is already in the text the user is hovering.
-        title={`${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
+        //
+        // While a Ctrl/Cmd+click copy is confirmed the title says so, the same
+        // acknowledgment the session chip gives the same gesture.
+        title={pathCopy.copied
+          ? i18nT('components.markdownRenderer.copied')
+          : `${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
       >
         <Glyph size={CHIP_GLYPH_SIZE} aria-hidden="true" className={`${CHIP_GLYPH_GEOMETRY} opacity-70`} />
         {targetLine != null && raw.length > splitPath.length
@@ -1860,6 +2286,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     {reveal.error && (
       <ErrorNotice variant="inline" className="ml-1.5 align-baseline" message={reveal.error} askAgent onDismiss={reveal.clear} testId="md-chip-reveal-error" />
     )}
+    {pathCopy.failureBubble}
     </>
   )
 }
@@ -2035,7 +2462,7 @@ function MarkdownTable({ node, children }: { node?: HastElement; children?: Reac
   )
 }
 
-const MD_COMPONENTS: Components = {
+const MD_COMPONENTS = {
   code({ className, children, ...props }) {
     // Only a <code> inside a <pre> may render a block-level component here
     // (CodeBlock / MermaidBlock / ExcalidrawBlock are each rooted in a <div>).
@@ -2043,7 +2470,7 @@ const MD_COMPONENTS: Components = {
     // prose stays inline whatever class it carries, because a <div> inside the
     // enclosing <p> crashes React's reconciler. That comment carries the full
     // reasoning. `data-fenced` is destructured out so it never reaches the DOM.
-    const { 'data-fenced': fenced, ...rest } = props as Record<string, unknown>
+    const { 'data-fenced': fenced, 'data-cred-base': credBase, ...rest } = props as Record<string, unknown>
     if (fenced === undefined) return <InlineCode {...rest}>{children}</InlineCode>
 
     // remark-rehype stamps `language-<first word of the info string>`; keep the
@@ -2055,6 +2482,11 @@ const MD_COMPONENTS: Components = {
     const lang = match?.[1]
     const codeStr = String(children).replace(/\n$/, '')
 
+    // `rehypeRedactionMarkers` stamps the ordinal of this block's first
+    // credential tag when it holds any this reply has a record for. It is
+    // checked before the diagram and special-fence renderers, which would
+    // otherwise show the placeholder without its lock tag and card.
+    if (typeof credBase === 'string') return <RedactedCodeBlock code={codeStr} lang={lang} base={Number(credBase)} />
     if (lang === 'mermaid') return <MermaidBlock code={codeStr} />
     if (lang === 'excalidraw') return <ExcalidrawBlock code={codeStr} />
 
@@ -2155,7 +2587,23 @@ const MD_COMPONENTS: Components = {
   strong({ node, children }) { return <strong {...sp(node)} className="font-semibold text-text-strong">{children}</strong> },
   em({ node, children }) { return <em {...sp(node)} className="italic">{children}</em> },
   img: ImgWithFallback,
-}
+  video({ node, children }) { return <DeferredMedia tag="video" node={node}>{children}</DeferredMedia> },
+  audio({ node, children }) { return <DeferredMedia tag="audio" node={node}>{children}</DeferredMedia> },
+  source: MdSourceEl,
+  // Custom element names the `rehypeRedactionMarkers` pass injects after
+  // sanitize. `Components` is keyed by the intrinsic HTML tags, so the custom
+  // keys are added through the assertion below rather than inline — react-markdown
+  // resolves the component by tag name at runtime regardless of the static type.
+  'blocked-link'({ node }: { node?: HastElement }) {
+    return <BlockedLinkChip domain={String(node?.properties?.domain ?? '')} placeholder={String(node?.properties?.placeholder ?? '')} />
+  },
+  'cred-tag'({ node }: { node?: HastElement }) {
+    return <CredentialTag ordinal={Number(node?.properties?.ordinal)} placeholder={String(node?.properties?.placeholder ?? '')} />
+  },
+  'redaction-card-slot'({ node }: { node?: HastElement }) {
+    return <RedactionCardSlot ids={String(node?.properties?.ids ?? '')} />
+  },
+} as Components
 
 /** Markdown image with a React-rendered fallback chip when the URL is broken
  *  (see `BrokenImage`). The fallback is React-rendered rather than a hand-built
@@ -2182,7 +2630,7 @@ const MD_COMPONENTS: Components = {
  * is already honest there.
  */
 function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; probeUrl?: string }) {
-  const { copied, flash } = useCopiedFlash()
+  const { copied, press, failureBubble } = useTitleCuedCopy(path, i18nT('components.markdownRenderer.couldnt_copy_the_image_path'))
   const [confirmedGone, setConfirmedGone] = useState(false)
   useEffect(() => {
     // The verdict belongs to THIS probeUrl. A reused instance handed a different
@@ -2196,11 +2644,10 @@ function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; prob
       .catch(() => { /* unknown stays unknown — generic wording */ })
     return () => { cancelled = true }
   }, [probeUrl])
-  const handleCopy = (e: React.MouseEvent | React.KeyboardEvent) => {
+  const handleCopy = (e: React.MouseEvent<HTMLElement> | React.KeyboardEvent<HTMLElement>) => {
     e.preventDefault()
     e.stopPropagation()
-    copyToClipboard(path)
-    flash()
+    press(e.currentTarget)
   }
   // The path leads the tooltip (same rule as the file-path chip) so a
   // truncated chip still discloses the real target — except when alt is
@@ -2210,6 +2657,7 @@ function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; prob
     ? `${path}\n${i18nT('components.markdownRenderer.click_to_copy')}`
     : i18nT('components.markdownRenderer.click_to_copy')
   return (
+    <>
     <span
       className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-bg-elevated px-2 py-1 text-sm text-muted cursor-pointer hover:text-text"
       role="button"
@@ -2229,6 +2677,8 @@ function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; prob
         ? <Check size={12} aria-hidden="true" className="shrink-0 text-ok" />
         : <Copy size={12} aria-hidden="true" className="shrink-0 opacity-70" />}
     </span>
+    {failureBubble}
+    </>
   )
 }
 /** Style reserving a not-yet-loaded transcript image's EXACT display box.
@@ -2269,6 +2719,142 @@ export function pendingImageBoxStyle(compact: boolean): React.CSSProperties {
   return compact ? { width: '240px', height: '180px' } : { width: '420px', height: '236px' }
 }
 
+function remoteHost(value: string): string {
+  try { return new URL(value, window.location.href).host } catch { return value }
+}
+
+/** Hosts shown to the user are derived from the same remote URL collection
+ * that controls the gate and approval scope. Preserve first-seen order while
+ * removing duplicate hosts. */
+function distinctHosts(remotes: readonly string[]): string[] {
+  return [...new Set(remotes.map(remoteHost))]
+}
+
+/** The disclosed hosts as ONE string. A span per host bought nothing a single
+ *  `break-all` span does not, and the label and value now share one
+ *  translatable sentence, so the value has to be a single interpolated node. */
+function hostSentence(remotes: readonly string[]) {
+  return distinctHosts(remotes).join(', ')
+}
+
+/** `Site: <host/>` as ONE key. A key that ends in a colon leaves the rest of its
+ *  own sentence outside it, so a translator who needs the value first — or a
+ *  narrow no-break space before the colon, as French does — cannot express that
+ *  without a code change. The placeholder is SELF-CLOSING because a closing tag
+ *  in a catalog value reads as raw JSX to the catalog's integrity check; Trans
+ *  fills it with the styled host span.
+ *
+ *  *loaded* switches to the past tense, because the same host carries two
+ *  different facts either side of the click: on the chip it is where the file
+ *  WOULD be fetched from, and under a mounted image or player it is where the
+ *  file DID come from. One string for both reads as the first sense in a place
+ *  that means the second. */
+function RemoteHostFact({
+  remotes,
+  className,
+  loaded = false,
+}: {
+  remotes: readonly string[]
+  className?: string
+  loaded?: boolean
+}) {
+  const hosts = distinctHosts(remotes)
+  return (
+    <span className={className ?? 'mt-0.5 block basis-full text-start text-[11px] leading-relaxed text-muted'}>
+      <Trans
+        i18nKey={loaded
+          ? 'components.markdownRenderer.remote_media_loaded_from'
+          : hosts.length > 1
+            ? 'components.markdownRenderer.remote_media_sites'
+            : 'components.markdownRenderer.remote_media_site'}
+        components={{
+          host: (
+            <span className="break-all font-mono text-[12px] font-medium text-text">
+              {hostSentence(remotes)}
+            </span>
+          ),
+        }}
+      />
+    </span>
+  )
+}
+
+/** One class for BOTH click-to-load chips, so the image gate and the media gate cannot
+ *  drift apart the way their predicates once did.
+ *
+ *  The resting state carries the button affordance: a `border-strong` boundary and a
+ *  raised `bg-hover` surface make the clickable area obvious before the pointer arrives
+ *  (a reader of the previous hairline-on-flat version read it as a callout panel and
+ *  could not tell what was clickable -- bad on a security-critical control). The label
+ *  deliberately stays plain text at rest and picks up accent only on hover: this app's
+ *  anchor style IS accent text, so accenting a label inside a button reads as a nested
+ *  hyperlink, which is the defect that de-linking fixed. */
+/** Approving remote media UNMOUNTS the button that was focused, so a keyboard
+ *  user is left with focus on nothing: the browser falls back to <body> and the
+ *  next Tab restarts from the top of the chat, losing their place in a
+ *  transcript that can be hundreds of messages long. A sighted mouse user never
+ *  notices, which is why this only shows up when you drive the gate from the
+ *  keyboard. So the element that REPLACES the button takes the focus, making the
+ *  approval behave like every other in-place expansion: focus stays where the
+ *  content appeared. Only on a real approval -- an element that mounts already
+ *  approved (a local image, a re-render after the message scrolled back into
+ *  view) must NOT steal focus from wherever the user actually is. */
+function useApprovalFocus<T extends HTMLElement>(approved: boolean) {
+  const target = useRef<T | null>(null)
+  const approvedBefore = useRef(approved)
+  useEffect(() => {
+    const justApproved = approved && !approvedBefore.current
+    approvedBefore.current = approved
+    if (justApproved) target.current?.focus()
+  }, [approved])
+  return target
+}
+
+const REMOTE_MEDIA_CHIP_CLASS =
+  // NAMED group, and the label below pairs with the same name. A bare `group`
+  // compiles to `.group:hover .group-hover\:…`, which ANY hovered ancestor
+  // carrying `group` satisfies -- the message wrapper carries one, so hovering
+  // anywhere in the message lit up EVERY chip's label at once. On a control whose
+  // whole job is to say which single element you are about to approve, a
+  // highlight that fires for a pointer nowhere near it is a false affordance.
+  'group/remote-media inline-flex max-w-full flex-wrap items-center gap-x-2 gap-y-1 rounded-md'
+  + ' border border-border-strong bg-bg-hover px-2.5 py-1.5 text-sm text-muted'
+  + ' cursor-pointer transition-colors hover:border-accent hover:bg-bg-elevated'
+
+function RemoteMediaDisclosure({
+  description,
+  remotes,
+}: { description?: string; remotes: readonly string[] }) {
+  const hostCount = distinctHosts(remotes).length
+  return (
+    <>
+      {/* The host is disclosure, not a second control. It used to sit on the
+          action row ahead of the label, where a monospace token in front of
+          "click to load" read as a separate, possibly-clickable link — a reader
+          said they "would not dare" click it. Here it is plainly the value of a
+          labelled fact, while still being the full host, never truncated, and
+          still derived from the same collector output the approval unlocks. */}
+      <RemoteHostFact remotes={remotes} />
+      {/* One consequence line, not two. The deleted second line ("Other
+          external content stays blocked.") restated the scope this sentence
+          already carries in the word "only", and the pair repeated under every
+          chip -- four times in one reply in the review capture. Repetition
+          reads as boilerplate, and boilerplate is what a reader skips; the
+          sentence they DO read has to be the one that carries the fact. */}
+      <span className="block basis-full text-start text-[11px] leading-relaxed text-muted">
+        {i18nT(hostCount > 1
+          ? 'components.markdownRenderer.remote_media_loads_once_plural'
+          : 'components.markdownRenderer.remote_media_loads_once')}
+      </span>
+      {description && (
+        <span className="block basis-full text-start text-[11px] leading-relaxed text-muted">
+          {i18nT('components.markdownRenderer.remote_media_model_description', { description })}
+        </span>
+      )}
+    </>
+  )
+}
+
 function ImgWithFallback({
   node,
   src,
@@ -2277,6 +2863,11 @@ function ImgWithFallback({
 }: React.ImgHTMLAttributes<HTMLImageElement> & ExtraProps) {
   const [errored, setErrored] = useState(false)
   const [loaded, setLoaded] = useState(false)
+  // A remote image the user explicitly chose to load.
+  // Per-src like the outcome flags: a reused instance handed a different src
+  // must not inherit the previous image's approval.
+  const [remoteApproved, setRemoteApproved] = useState(false)
+  const approvedImageRef = useApprovalFocus<HTMLSpanElement>(remoteApproved)
   // Both flags describe the outcome of loading THIS `src`, so neither may
   // outlive it. React reuses an instance whenever the element at a key keeps its
   // type, so a reused image can be handed a different `src`; without this a good
@@ -2290,6 +2881,7 @@ function ImgWithFallback({
     setOutcomeSrc(src)
     setErrored(false)
     setLoaded(false)
+    setRemoteApproved(false)
   }
   const basePath = useContext(BasePathCtx)
   const compact = useContext(CompactImagesCtx)
@@ -2301,8 +2893,12 @@ function ImgWithFallback({
   // /api/file-raw the same way; it must NOT take the basePath-relative branch
   // below, which is only for genuinely relative paths (issue #3497).
   const isWinAbs = WINDOWS_ABS_PATH_RE.test(src)
-  const isLocal = src.startsWith('/') || src.startsWith('~') || src.startsWith('.') || isWinAbs
-    || (basePath && !src.startsWith('http'))
+  // Root-relative gateway routes are URLs, not on-disk paths. Keeping them
+  // out of the file-path rewrite lets the media gate defer proxy endpoints
+  // while allowing only its explicit local-bytes routes through.
+  const isGatewayRoute = src.startsWith('/api/')
+  const isLocal = (!isGatewayRoute && (src.startsWith('/') || src.startsWith('~') || src.startsWith('.') || isWinAbs))
+    || (basePath && !src.startsWith('http') && !isGatewayRoute)
   let url: string
   // The on-disk path the backend is asked to read — what the broken-image
   // fallback discloses and copies. Stays `src` verbatim for remote URLs.
@@ -2335,6 +2931,23 @@ function ImgWithFallback({
     if (version) url += `&v=${encodeURIComponent(version)}`
   } else {
     url = src
+  }
+  if (isGatewayRouteMediaUrl(url)) return <GatewayMediaRefused />
+  if (isRemoteMediaUrl(url) && !remoteApproved) {
+    return (
+      <button
+        type="button"
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); setRemoteApproved(true) }}
+        title={src}
+        className={REMOTE_MEDIA_CHIP_CLASS}
+      >
+        <ImageIcon size={14} aria-hidden="true" className="shrink-0" />
+        <span className="font-medium text-text transition-colors group-hover/remote-media:text-accent">
+          {i18nT('components.markdownRenderer.remote_image_click_to_load')}
+        </span>
+        <RemoteMediaDisclosure description={alt || undefined} remotes={[src]} />
+      </button>
+    )
   }
   if (errored) {
     return <BrokenImage path={diskPath} alt={alt} probeUrl={isLocal ? url : undefined} />
@@ -2395,7 +3008,10 @@ function ImgWithFallback({
   // variable) so the i18n lint's className exemption still recognizes these as
   // class strings, not untranslated copy.
   return (
-    <span className="relative block my-2">
+    // tabIndex=-1: focusable by script (the approval hand-off) but never a Tab
+    // stop of its own, so the gate adds no new stop for users who never
+    // approve anything.
+    <span className="relative block my-2" ref={approvedImageRef} tabIndex={-1}>
       {/* Loading skeleton: a decorative overlay ON TOP of the (still
           transparent) <img>, never a wrapper around it — the img's own layout
           contract (ms-auto on the IMG, definite max-w caps, no shrink-to-fit
@@ -2422,6 +3038,15 @@ function ImgWithFallback({
       {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-noninteractive-element-interactions */}
       <img
         src={url} alt={alt || ''} loading="lazy"
+        // A remote image the user approved is fetched with NO referrer. The
+        // approval binds the request this renderer initiates, but a server can
+        // still 302 it onward, and a redirect target that receives the
+        // dashboard URL learns the conversation it was embedded in. Suppressing
+        // the referrer costs nothing here (no remote host needs it to serve an
+        // image) and is the part of the redirect residual a renderer CAN close;
+        // binding the final host needs the fetch under our control, which the
+        // RFC records as a step-3 decision.
+        {...(isRemoteMediaUrl(url) ? { referrerPolicy: 'no-referrer' as const } : {})}
         // Sent-prompt images align to the END edge, matching the bubble they
         // were sent from. `ms-auto` (logical, RTL-correct) sits on the IMG, never
         // on its wrapper: preflight makes <img> display:block so text-align is
@@ -2451,8 +3076,224 @@ function ImgWithFallback({
         onError={() => setErrored(true)}
         {...props}
       />
+      {/* Provenance survives the click. Once loaded, a remote image is pixel
+          for pixel indistinguishable from a local one, so the only record of
+          where it came from would be a chip that no longer exists — and a
+          reader coming back to the conversation, or reading it with a screen
+          reader, has no way to tell that this chart was fetched from the
+          network. The same one-key sentence the chip used, in a muted caption. */}
+      {isRemoteMediaUrl(url) && <RemoteHostFact remotes={[url]} loaded className="mt-1 block text-[11px] leading-relaxed text-muted" />}
     </span>
   )
+}
+
+/** Same-origin routes proven to serve local media bytes without proxying a
+ *  model-selected remote URL. Keep this list narrow: every other http(s) URL,
+ *  including same-origin gateway routes such as `/api/link-meta`, is deferred. */
+const SAFE_LOCAL_MEDIA_PATH_PREFIXES = ['/api/file-raw'] as const
+
+/** True for an http(s) media URL that must wait for an explicit click.
+ *  Classified with the browser's own URL parser (`new URL(value,
+ *  location.href)`) rather than a hand-written prefix check, because the fetch
+ *  will use that parser too. Cross-origin URLs always defer. Same-origin URLs
+ *  also defer unless their pathname is an explicitly allowlisted local-bytes
+ *  route. Non-http(s) schemes make no request and are left to the markdown URL
+ *  transform's existing policy. */
+function isRemoteMediaUrl(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const s = value.trim()
+  if (!s) return false
+  let u: URL
+  try { u = new URL(s, window.location.href) } catch { return false }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+  if (u.origin !== window.location.origin) return true
+  return !SAFE_LOCAL_MEDIA_PATH_PREFIXES.some(prefix =>
+    u.pathname === prefix || u.pathname.startsWith(`${prefix}/`),
+  )
+}
+
+/** True for a same-origin http(s) URL outside the local-bytes allowlist: a
+ *  gateway route such as `/api/link-meta?url=…` that may make the server fetch
+ *  some other, model-chosen host. The chip can only name the host the browser
+ *  contacts, which for these is the dashboard itself, so a click-to-load chip
+ *  would ask for consent while naming the wrong destination. These are refused
+ *  outright instead of deferred: nothing loads, and there is no button. */
+function isGatewayRouteMediaUrl(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const s = value.trim()
+  if (!s) return false
+  let u: URL
+  try { u = new URL(s, window.location.href) } catch { return false }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+  if (u.origin !== window.location.origin) return false
+  return isRemoteMediaUrl(s)
+}
+
+/** The refusal shown in place of media whose address is a gateway route. No
+ *  button and no host: there is nothing honest to consent to. */
+function GatewayMediaRefused() {
+  return (
+    <span
+      className="inline-flex max-w-full items-center gap-2 rounded-md border border-border bg-bg-hover px-2 py-1 text-[12px] text-muted"
+      data-testid="remote-media-gateway-refused"
+    >
+      <ImageOff size={14} aria-hidden="true" className="shrink-0" />
+      {i18nT('components.markdownRenderer.remote_media_gateway_refused')}
+    </span>
+  )
+}
+
+/** `srcset` is a comma-separated candidate list (`a.webp 1x, b.webp 2x`), so
+ *  it is checked per candidate — a remote SECOND candidate must not hide
+ *  behind a local first one. Splitting on whitespace AND commas over-splits a
+ *  URL that itself contains a comma, but every fragment is still URL-tested,
+ *  so over-splitting can only classify MORE values as remote, never fewer. */
+function srcsetHasRemote(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  return value.split(/[\s,]+/).some(isRemoteMediaUrl)
+}
+
+/** Approval scope for a media element's children: a `<source>` inside a
+ *  video/audio the user clicked to load may render; one outside stays
+ *  dropped. See DeferredMedia. */
+const MediaApprovedCtx = createContext<boolean>(false)
+
+/** `<video>` / `<audio>` under the unconditional remote-media deferral.
+ *
+ *  The image deferral (ImgWithFallback) covers only `img`, but the sanitizer's
+ *  tag allowlist also admits raw-HTML `video`/`audio`/`source`, whose `src`,
+ *  `poster` and child-source URLs the browser fetches on mount — `poster`
+ *  unconditionally, `src` per `preload`. An agent-written
+ *  `<video poster="https://…?d=<data>">` would therefore be the same
+ *  zero-click request the img gate exists to stop. So a media element that
+ *  references ANY remote URL renders as the same click-to-load chip, and only
+ *  the user's click mounts the native element (children included, via
+ *  MediaApprovedCtx). Media with only non-remote references mounts directly.
+ */
+function remoteSrcsetUrls(value: unknown): string[] {
+  if (typeof value !== 'string') return []
+  return value
+    .split(',')
+    .map(candidate => candidate.trim().split(/\s+/, 1)[0])
+    .filter(isRemoteMediaUrl)
+}
+
+function collectRemotes(node?: HastElement): string[] {
+  const props = node?.properties ?? {}
+  const remotes: string[] = []
+  for (const key of ['src', 'poster']) {
+    const value = props[key]
+    if (isRemoteMediaUrl(value)) remotes.push(String(value))
+  }
+  // Every DESCENDANT `<source>`, not only direct children: `<picture>` is an
+  // admitted tag, so `<video><picture><source srcset=…>` puts a remote source one
+  // level down. A collector that stops at depth one would leave that host out of
+  // the chip while a click still fetched it -- the disclosed set has to be the
+  // set the approval unlocks, or the approval is for something else.
+  const walk = (parent?: HastElement): void => {
+    for (const child of parent?.children ?? []) {
+      if (child.type !== 'element') continue
+      if (child.tagName === 'source') {
+        const src = child.properties?.src
+        if (isRemoteMediaUrl(src)) remotes.push(String(src))
+        remotes.push(...remoteSrcsetUrls(child.properties?.srcSet))
+      }
+      walk(child as HastElement)
+    }
+  }
+  walk(node)
+  return remotes
+}
+
+function DeferredMedia({ tag, node, children }: { tag: 'video' | 'audio'; node?: HastElement; children?: React.ReactNode }) {
+  const [approved, setApproved] = useState(false)
+  // <video controls>/<audio controls> are focusable in their own right, so the
+  // approved element itself receives the focus the button gave up.
+  const approvedMediaRef = useApprovalFocus<HTMLVideoElement & HTMLAudioElement>(approved)
+  const props = node?.properties ?? {}
+  // One collection controls whether the gate renders, exactly what an approval
+  // unlocks, its reset signature, and every host disclosed on the button.
+  const remotes = collectRemotes(node)
+  const description = [props.alt, props.title, props.ariaLabel]
+    .find(value => typeof value === 'string' && value.trim()) as string | undefined
+  // Approval belongs to THIS set of remote URLs, so it must not outlive it.
+  // React reuses the instance at a stable render position (a streaming
+  // message re-renders in place), so a media element the user approved for
+  // URL X that is then swapped to URL Y would otherwise mount Y with no
+  // click — the exact zero-click fetch this gate exists to stop. Same
+  // render-time bail-out pattern as ImgWithFallback's outcomeSrc reset.
+  //
+  // The signature must be INJECTIVE, not merely derived from the collector: a
+  // delimiter join is not. An HTML attribute may contain a newline, so
+  // ['a\nb'] and ['a','b'] share one `join('\n')` — and two different remote
+  // sets with one signature is approval inheritance, which is this gate's own
+  // failure mode wearing the collector's clothes. JSON.stringify escapes the
+  // separator, so distinct sets have distinct signatures by construction.
+  const sig = JSON.stringify(remotes)
+  const [approvedSig, setApprovedSig] = useState(sig)
+  if (approvedSig !== sig) {
+    setApprovedSig(sig)
+    setApproved(false)
+  }
+  if (remotes.some(isGatewayRouteMediaUrl)) return <GatewayMediaRefused />
+  if (!approved && remotes.length > 0) {
+    return (
+      <button
+        type="button"
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); setApproved(true) }}
+        title={remotes.join('\n')}
+        className={REMOTE_MEDIA_CHIP_CLASS}
+      >
+        {tag === 'video'
+          ? <Film size={14} aria-hidden="true" className="shrink-0" />
+          : <Volume2 size={14} aria-hidden="true" className="shrink-0" />}
+        <span className="font-medium text-text transition-colors group-hover/remote-media:text-accent">
+          {i18nT(tag === 'video'
+            ? 'components.markdownRenderer.remote_video_click_to_load'
+            : 'components.markdownRenderer.remote_audio_click_to_load')}
+        </span>
+        <RemoteMediaDisclosure description={description} remotes={remotes} />
+      </button>
+    )
+  }
+  const El = tag
+  return (
+    // `approved`, never a literal: this branch is also where a media element with
+    // NOTHING remote to gate mounts, and a context that claims approval there
+    // tells `MdSourceEl` to keep a remote `<source>` it would otherwise drop.
+    // Approval has one source of truth, and this is a reader of it.
+    <MediaApprovedCtx.Provider value={approved}>
+      {/* No referrer suppression here, unlike the approved <img>: referrerPolicy
+          is a content attribute of a/area/img/iframe/link/script only, and a
+          media element has no per-element equivalent — its fetch follows the
+          document policy. So the redirect residual is narrower for images than
+          for media, which the RFC records rather than papers over. */}
+      <El {...spa(tag, node)} ref={approvedMediaRef}>{children}</El>
+      {/* Provenance outlives the approval here for the same reason it does under
+          an approved image: a player with a poster frame carries no visible
+          trace of which host served it, and the chip that said so is gone. A
+          disclosure that only exists before the click is a disclosure the reader
+          cannot go back and check. A player with nothing remote gets no caption:
+          a local file was never fetched from a host, so naming one would be a
+          claim about a request that did not happen. */}
+      {remotes.length > 0 && (
+        <RemoteHostFact remotes={remotes} loaded className="mt-1 block text-[11px] leading-relaxed text-muted" />
+      )}
+    </MediaApprovedCtx.Provider>
+  )
+}
+
+/** `<source>` under the unconditional remote-media deferral: a remote source may render only
+ *  inside a media element the user approved (MediaApprovedCtx). A stray or
+ *  `<picture>`-hosted remote source is dropped — the sibling `<img>` already
+ *  goes through ImgWithFallback's own gate, and a `srcset` swap must not
+ *  smuggle an ungated remote fetch past it. */
+function MdSourceEl({ node }: { node?: HastElement }) {
+  const approved = useContext(MediaApprovedCtx)
+  const props = node?.properties ?? {}
+  const remote = isRemoteMediaUrl(props.src) || srcsetHasRemote(props.srcSet)
+  if (!approved && remote) return null
+  return <source {...spa('source', node)} />
 }
 
 // Disable single-$ inline math so currency strings like `$9.99` don't
@@ -2514,7 +3355,8 @@ const cleanUrl = (url: string) => url.replace(/[\x00-\x1f\x7f]/g, '').trim().toL
  * Matching is case-insensitive because hast camelCases some property names
  * (`viewBox`, `colSpan`, `ariaHidden`, `data-*` → `dataSourcepos`); we always
  * compare on the lowercased key. `aria*`/`data*` prefixes are allowed wholesale
- * (inert, a11y/metadata only).
+ * (inert, a11y/metadata only) — except the transcript's own `data-message-*`
+ * hooks, which are reserved (see isAllowedAttr).
  */
 const GLOBAL_ATTRS = new Set([
   'classname', 'class', 'id', 'title', 'dir', 'lang', 'role', 'align',
@@ -2553,6 +3395,20 @@ const SVG_ATTRS = new Set([
 /** True when `key` is a permitted attribute for element `tag` (both lowercased). */
 function isAllowedAttr(tag: string, key: string): boolean {
   const k = key.toLowerCase()
+  // `data-message-*` is reserved for the transcript's own UI hooks — the
+  // `data-message-actions` strip, `data-message-edit` pencil and
+  // `data-message-editing` root that UserMessage renders AROUND a message, never
+  // inside one. usePinnedPrompt measures the strip's rect and reads the editing
+  // marker off the row it is about to hide, and index.css re-shows
+  // `[data-message-actions]` inside that hidden row; a body that could mint one
+  // of them (a prompt typed, or relayed from a connected channel) would be
+  // measured as the strip, drop the banner for its whole scroll region, or paint
+  // itself visible inside the hidden row. Same reservation rehypeMarkFencedCode
+  // makes for `data-fenced`, and for the same reason by NORMALIZED key: the HTML
+  // parser lowercases attribute names and hast camelCases `data-*`, so
+  // `data-message-edit`, `data-Message-Edit` and `dataMessageEdit` all reach
+  // here as some casing of `datamessageedit`. Every other `data-*` stays admitted.
+  if (k.replace(/-/g, '').startsWith('datamessage')) return false
   if (k.startsWith('aria') || k.startsWith('data')) return true
   if (GLOBAL_ATTRS.has(k)) return true
   if (TAG_ATTRS[tag]?.has(k)) return true
@@ -4239,7 +5095,7 @@ function deferIncompleteStreamingTable(content: string): string {
   return lines.slice(0, start).join('\n')
 }
 
-const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLine, glow, smooth, softBreaks, live, unfurl }: { content: string; sourcePos?: boolean; startLine?: number; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean }) {
+const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLine, glow, smooth, softBreaks, live, unfurl, markers }: { content: string; sourcePos?: boolean; startLine?: number; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; markers?: RedactionMarkers }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Declared before the early return below — Rules of Hooks.
   //
@@ -4288,6 +5144,13 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
     if (!smooth) tail.push([rehypeStreamingGlow, { tailChars: GLOW_TAIL_CHARS }])
     if (smooth) tail.push(rehypeStreamingReveal)
     rehypePlugins = [...baseRehype, ...tail]
+  }
+  // After sanitize (baseRehype ends with it) and after the streaming tail, so
+  // the injected marker elements are not stripped and the glow/reveal passes
+  // have already claimed the trailing text. Only added when the message
+  // carries records, so every other surface is untouched.
+  if (markers && (markers.ordinals.size > 0 || markers.domains.size > 0)) {
+    rehypePlugins = [...rehypePlugins, [rehypeRedactionMarkers, markers]]
   }
   // Last, so it wraps the root shape every other plugin has finished producing:
   // an earlier position would let a later plugin read `div` where it expects the
@@ -4418,7 +5281,18 @@ function extractPathHintFromText(text: string | undefined): string | undefined {
   return undefined
 }
 
-function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle, readOnlyCode }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean; readOnlyCode?: boolean }) {
+function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle, readOnlyCode, markers }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean; readOnlyCode?: boolean; markers?: RedactionMarkers }) {
+  // A fence holding lock tags renders them in place whatever its language:
+  // the diagram, diff and formatted-markdown renderers would show the
+  // placeholder without its tag and card (see RedactedCodeBlock).
+  if (
+    (block.type === 'code' || block.type === 'diff' || block.type === 'mermaid' || block.type === 'excalidraw')
+    && block.complete && markers && markers.ordinals.size > 0
+    && codeHasRedactionMarkers(block.content, markers.base, markers.credentials)
+  ) {
+    const lang = block.type === 'code' ? block.language : block.type
+    return <RedactedCodeBlock code={block.content} lang={lang} base={markers.base} />
+  }
   switch (block.type) {
     case 'diff': {
       const pathHint = prevBlock?.type === 'markdown'
@@ -4493,11 +5367,11 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slo
       // `live` = this block is the streaming tail (see MarkdownRenderer). ORed
       // with the block's own `complete` flag so a provisional block is treated
       // as live too, whatever produced it.
-      return <MarkdownBlock content={block.content} sourcePos={sourcePos} startLine={block.startLine} glow={glow} smooth={smooth} softBreaks={softBreaks} live={!block.complete || !!live} unfurl={unfurl} />
+      return <MarkdownBlock content={block.content} sourcePos={sourcePos} startLine={block.startLine} glow={glow} smooth={smooth} softBreaks={softBreaks} live={!block.complete || !!live} unfurl={unfurl} markers={markers} />
   }
 }
 
-export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false, readOnlyCode = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean; /** Render fenced code with the plain CodeBlock (copy only) instead of EditableCodeBlock. For content the reader must not be able to alter in place -- an approval's command beside its Approve control. */ readOnlyCode?: boolean }) {
+export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false, readOnlyCode = false, blockedLinks, redactions, redactionCoach = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean; /** Render fenced code with the plain CodeBlock (copy only) instead of EditableCodeBlock. For content the reader must not be able to alter in place -- an approval's command beside its Approve control. */ readOnlyCode?: boolean; /** Raw `meta.blocked_links` off the assistant message — the step-3 suspicious-URL records this message's redaction placeholders render from. Validated here; absent/malformed leaves every placeholder as plain text. */ blockedLinks?: unknown; /** Raw `meta.redactions` off the assistant message: one record per credential placeholder, validated here. */ redactions?: unknown; /** This reply is the session's first with removed values: show the one-time coach after its first such block. */ redactionCoach?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
   // One message = one config-rule scan pool. The blocks below each mount their
@@ -4533,6 +5407,26 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
   /** Stable identity so every chip in a long transcript doesn't re-render when
    *  this component does. */
   const pathActions = useMemo<PathActions>(() => ({ onFileOpen, onFolderOpen }), [onFileOpen, onFolderOpen])
+  // The message's redaction records, validated once. The sets are what the
+  // injection pass gates on; the full records ride down through context.
+  // A host allowed from a card still open keeps that card's records here:
+  // the reloaded reply shows the host's links as plain links and no longer
+  // carries them.
+  const replyKey = slotKey && messageTs ? `${slotKey}|${messageTs}` : undefined
+  const holds = useAllowHolds(replyKey)
+  const ownBlocked = useMemo(() => normalizeBlockedLinks(blockedLinks), [blockedLinks])
+  const heldDomains = useMemo(() => {
+    const own = new Set(ownBlocked.map(r => r.domain))
+    return new Set([...holds.keys()].filter(d => !own.has(d)))
+  }, [ownBlocked, holds])
+  const blockedRecords = useMemo(
+    () => heldDomains.size ? [...ownBlocked, ...[...heldDomains].flatMap(d => holds.get(d)?.records ?? [])] : ownBlocked,
+    [ownBlocked, heldDomains, holds],
+  )
+  const credentialRecords = useMemo(() => normalizeCredentialRecords(redactions), [redactions])
+  const blockedDomains = useMemo(() => new Set(blockedRecords.map(r => r.domain)), [blockedRecords])
+  const credentialMap = useMemo(() => new Map(credentialRecords.map(r => [r.ordinal, r])), [credentialRecords])
+  const credentialOrdinals = useMemo(() => new Set(credentialMap.keys()), [credentialMap])
   const sessionActions = useMemo<SessionActions>(
     // The write time the SHORT-name chip needs. Absent, non-absolute, or
     // unparseable yields undefined, and a short name then resolves to NOTHING —
@@ -4572,6 +5466,17 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
     for (let i = blocks.length - 1; i >= 0; i--) if (blocks[i].type === 'markdown') return i
     return -1
   }, [blocks])
+  // Each block renders its own sub-document, so the credential ordinal its
+  // first tag carries is the count of tags in every block before it.
+  const blockMarkers = useMemo<Array<RedactionMarkers | undefined>>(() => {
+    if (credentialOrdinals.size === 0 && blockedDomains.size === 0) return blocks.map(() => undefined)
+    let base = 0
+    return blocks.map(b => {
+      const m: RedactionMarkers = { ordinals: credentialOrdinals, domains: blockedDomains, held: heldDomains, credentials: credentialMap, base }
+      base += countCredentialTags(b.content)
+      return m
+    })
+  }, [blocks, credentialOrdinals, blockedDomains, heldDomains, credentialMap])
 
   // Settle the reveal edge once the content stops changing, and NEVER un-settle
   // it. One-way is the whole point: `.ft-word` spans persist across chunks
@@ -4608,12 +5513,12 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
   // re-mounts don't re-fade.
   const animOn = !!smooth
   const animClass = animOn ? ' ft-anim-smooth' : ''
-  // `ft-idle` is folded into streamClass rather than interpolated separately so
-  // the root element below stays byte-identical to base. The repo's
-  // accessible-interactive-elements rule greps ADDED lines for a non-role div or
-  // span carrying a click handler (check-added: true), so merely re-touching that
-  // line trips a WCAG-affordance gate even though this change adds no affordance
-  // -- the element and its handler are untouched.
+  // The root tag below is laid out one attribute per line: the repo's
+  // accessible-interactive-elements rule greps ADDED lines for a non-role div
+  // or span carrying a click handler (check-added: true), so an attribute can
+  // join the tag only if no single added line holds both the element and its
+  // handler. The element, its class list and its delegating handler are the
+  // base's; `data-tip-flow` is the one addition.
   const streamClass =
     (animOn && streaming ? ' ft-streaming' : '') +
     (animOn && revealIdle ? ' ft-idle' : '')
@@ -4622,9 +5527,17 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
     // Presentational content wrapper for rendered markdown blocks. The onClick is
     // pure event delegation for `/artifacts/<slug>` links only — path chips bind
     // their own handlers (see InlineCode), so this wrapper is not an interactive
-    // control and carries no role.
+    // control and carries no role. `data-image-scope` is the lightbox's grouping
+    // root; `data-tip-flow` is the InstantTip flow container (one rendered
+    // message, so a chip's bubble opens off the words it reports on) — two
+    // attributes on the one per-message root, each owned by its feature.
     // eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions
-    <div className={`group${animClass}${streamClass}`} onClick={handleClick} data-image-scope="">
+    <div
+      className={`group${animClass}${streamClass}`}
+      onClick={handleClick}
+      data-image-scope=""
+      data-tip-flow=""
+    >
       {/* PathProbeCtx: suppress path stat probes while the message is still
           streaming, so partial paths ('/Users' en route to '/Users/me/x.ts')
           neither burn requests nor flash the wrong affordance.
@@ -4639,10 +5552,15 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
           lightbox scoping on the div above is unaffected) and lives in this module
           so a caller that mocks it in tests never needs to re-export the context. */}
       <CompactImagesCtx.Provider value={compactImages}>
+      {/* Remote media is always click-to-load; deferral is unconditional inline. */}
       {/* ImageVersionCtx: scopes local image URLs to this message so an agent
           rewriting one file across turns is not served the previous bytes from
           the in-document resource cache. */}
       <ImageVersionCtx.Provider value={messageTs ?? null}>
+      {/* RedactionProvider: this reply's credential and blocked-link records,
+          and which of their cards is open. A Provider renders no DOM node, so
+          the scoping on the wrapper div above is unaffected. */}
+      <RedactionProvider credentials={credentialRecords} blockedLinks={blockedRecords} slotKey={slotKey} replyKey={replyKey} coached={redactionCoach && credentialRecords.length > 0}>
         {blocks.map((block, i) => (
           // Key on startLine (stable across streaming) instead of block.type, so
           // a code -> diff reclassification mid-stream doesn't unmount the
@@ -4667,8 +5585,10 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             collapseDiffs={collapseDiffs}
             mdCardToggle={mdCardToggle}
             readOnlyCode={readOnlyCode}
+            markers={blockMarkers[i]}
           />
         ))}
+      </RedactionProvider>
       </ImageVersionCtx.Provider>
       </CompactImagesCtx.Provider>
       </SessionActionCtx.Provider>
@@ -4793,6 +5713,37 @@ export function Lightbox() {
   // spring-back or a finished pinch does not also close via the backdrop handler.
   // Declared before the hook because `onPinchEnd` sets it.
   const suppressClickRef = useRef(false)
+  // Armed only when setPointerCapture THROWS on pointer-down (see the <img>
+  // handler below). An uncaptured drag gets no retargeting and no
+  // lostpointercapture (capture never existed), so once the pointer leaves
+  // the image the element hears nothing again: without a fallback,
+  // `dragging` stays true and the lightbox sits in pan mode with no contact
+  // held. Window-level up/cancel listeners for that specific pointerId are
+  // the one place the terminal event can still be heard — the same
+  // acquisition-side fallback the shared usePointerDrag hook arms.
+  //
+  // Keyed by pointerId, NOT a single slot: two uncaptured contacts can be live
+  // at once (a pan pointer whose capture threw, then a second image press that
+  // seats a pinch), and each must keep its own window listeners until ITS OWN
+  // up/cancel. A single slot let a second arm — or any disarm — evict a live
+  // pointer's listeners, stranding that contact in the pinch tracker so the
+  // next touch seated a ghost pinch. Each entry disposes on its pointer's own
+  // terminal event, on a same-pointer re-press, and on unmount.
+  const panFallbacksRef = useRef<Map<number, () => void>>(new Map())
+  const armPanFallback = useCallback((pointerId: number, dispose: () => void) => {
+    // A stale entry for this same pointerId (id reuse across gestures) is
+    // replaced; sibling pointers' fallbacks are left untouched.
+    panFallbacksRef.current.get(pointerId)?.()
+    panFallbacksRef.current.set(pointerId, dispose)
+  }, [])
+  const disposePanFallback = useCallback((pointerId: number) => {
+    const dispose = panFallbacksRef.current.get(pointerId)
+    if (dispose) { dispose(); panFallbacksRef.current.delete(pointerId) }
+  }, [])
+  const disposeAllPanFallbacks = useCallback(() => {
+    panFallbacksRef.current.forEach(dispose => dispose())
+    panFallbacksRef.current.clear()
+  }, [])
   // Zoom (enlarge) factor and pan offset for the current image, plus the pinch
   // gesture that drives them. 1 = fit-to-screen; larger values scale the fit box
   // up so the image overflows the viewport and can be panned. Reset to fit
@@ -4827,6 +5778,15 @@ export function Lightbox() {
       lastTapRef.current = { t: 0, x: 0, y: 0 }
       const d = dragRef.current
       if (d.active) { d.active = false; d.dragging = false; setDragging(false) }
+      // Tear down the PAN, but do NOT disarm the window fallback here. When the
+      // pan pointer was uncaptured its release only reaches the window listener,
+      // and that listener is the sole place its contact gets dropped from the
+      // pinch hook. Disarming it now — while that pointer is still down — would
+      // strand the contact if the finger then lifts outside the overlay, seating
+      // a ghost pinch on the next single touch. Each pointer's fallback lives in
+      // the per-pointer registry and self-disposes on that pointer's own
+      // up/cancel (onWindowEnd -> terminatePan(pointerId)), a same-pointer
+      // re-press, or unmount.
     },
     // A finished pinch is not a tap. Without this the click synthesised after the
     // last finger lifts reaches the backdrop handler and closes the viewer the
@@ -4842,12 +5802,26 @@ export function Lightbox() {
 
   // End a drag on either pointerup OR pointercancel (touch/pen interrupted, or
   // capture lost) so `active`/`dragging` never latch on with no contact held.
+  // Shared by the element handlers and the window fallback below, so an
+  // uncaptured drag terminates down the same path.
+  //
+  // `pointerId` disposes only THAT pointer's window fallback (a sibling
+  // uncaptured contact keeps its own until its own terminal event). Omitted =
+  // no fallback to drop (e.g. a captured drag, whose element handler ends it).
+  const terminatePan = useCallback((pointerId?: number) => {
+    const d = dragRef.current
+    d.active = false
+    if (pointerId !== undefined) disposePanFallback(pointerId)
+    if (d.dragging) { d.dragging = false; setDragging(false) }
+  }, [disposePanFallback])
   const endDrag = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
     const d = dragRef.current
     if (d.active) { try { e.currentTarget.releasePointerCapture(e.pointerId) } catch { /* no capture */ } }
-    d.active = false
-    if (d.dragging) { d.dragging = false; setDragging(false) }
-  }, [])
+    terminatePan(e.pointerId)
+  }, [terminatePan])
+  // If the component unmounts mid-uncaptured-drag, no window listener may
+  // outlive it — drop every armed fallback.
+  useEffect(() => disposeAllPanFallbacks, [disposeAllPanFallbacks])
   // ── one-finger overlay drag: dismiss down, page sideways ─────────────────
   // A touch drag anywhere over the overlay locks an AXIS once it crosses the
   // slop, then either pulls the image down to dismiss or sideways to page
@@ -4904,6 +5878,9 @@ export function Lightbox() {
     abortSwipe()
     const d = dragRef.current
     if (d.active) { d.active = false; d.dragging = false; setDragging(false) }
+    // A double-tap resets the whole gesture (zoom snaps), so every uncaptured
+    // contact's fallback goes with it.
+    disposeAllPanFallbacks()
     if (zoomRef.current > LIGHTBOX_ZOOM_MIN) {
       setZoom(LIGHTBOX_ZOOM_MIN)
       setPan({ x: 0, y: 0 })
@@ -4915,7 +5892,7 @@ export function Lightbox() {
     setZoom(z)
     setPan(clampPan((e.clientX - cx) * (1 - z), (e.clientY - cy) * (1 - z), z))
     return true
-  }, [abortSwipe, clampPan, setPan, setZoom, zoomRef])
+  }, [abortSwipe, clampPan, setPan, setZoom, zoomRef, disposeAllPanFallbacks])
   // ── pinch-to-zoom (touch, two fingers) ───────────────────────────────────
   // Browser page zoom is off on touch across the shell (viewport meta in
   // index.html, root `touch-action` in index.css, `gesturestart` suppression in
@@ -5158,7 +6135,37 @@ export function Lightbox() {
           onPointerDown={e => {
             if (zoom <= LIGHTBOX_ZOOM_MIN) return // nothing to pan at fit
             e.preventDefault()
-            try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* unsupported */ }
+            // A re-press of THIS pointerId replaces its own stale fallback; a
+            // sibling uncaptured contact keeps its listeners (it ends on its
+            // own up/cancel), so a second image press no longer strands the
+            // first contact.
+            disposePanFallback(e.pointerId)
+            let captured = true
+            try { e.currentTarget.setPointerCapture(e.pointerId) } catch { captured = false }
+            if (!captured) {
+              // Capture is best-effort for liveness (the pan still starts),
+              // but the gesture must remain terminable: without retargeting,
+              // a release outside the image never reaches it.
+              const pointerId = e.pointerId
+              const onWindowEnd = (ev: PointerEvent) => {
+                if (ev.pointerId !== pointerId) return
+                // The pan pointer-down bubbles to `onOverlayPointerDown`, which
+                // records this contact in the pinch hook. On the captured path
+                // `endSwipe` drops it via `trackPointerUp`; on this uncaptured
+                // path the overlay never hears the release, so without this the
+                // contact latches forever and the next single touch seats a
+                // spurious pinch against the stale point. Drop it first, then
+                // terminate the pan for this pointer only.
+                trackPointerUp(ev)
+                terminatePan(pointerId)
+              }
+              window.addEventListener('pointerup', onWindowEnd)
+              window.addEventListener('pointercancel', onWindowEnd)
+              armPanFallback(pointerId, () => {
+                window.removeEventListener('pointerup', onWindowEnd)
+                window.removeEventListener('pointercancel', onWindowEnd)
+              })
+            }
             dragRef.current = { startX: e.clientX, startY: e.clientY, baseX: pan.x, baseY: pan.y, moved: 0, active: true, dragging: false }
           }}
           onPointerMove={e => {

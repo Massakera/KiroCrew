@@ -2106,7 +2106,7 @@ async def test_an_unresolved_actionable_state_re_asserts_once_per_period(tmp_pat
             target="https://github.com/acme/widgets/pull/7",
             objective="review_ready",
             cadence_secs=60,
-            budgets=MonitorBudgets(max_runtime_secs=10_000_000),
+            budgets=MonitorBudgets(max_runtime_secs=604_800),
             now=0.0,
         )
         assert loop.monitor is not None
@@ -2178,7 +2178,7 @@ async def test_a_retarget_clears_the_coalescing_window(tmp_path):
             target="https://github.com/acme/widgets/pull/7",
             objective="review_ready",
             cadence_secs=60,
-            budgets=MonitorBudgets(max_runtime_secs=10_000_000),
+            budgets=MonitorBudgets(max_runtime_secs=604_800),
             now=0.0,
         )
         assert loop.monitor is not None
@@ -2250,7 +2250,7 @@ async def test_a_stalled_watch_is_recorded_as_a_stall_not_as_the_subject(tmp_pat
             # than the wall-clock floor -- this test is about the recorded reason,
             # and the floor has its own case in test_monitor_decision.
             cadence_secs=DEFAULT_MONITOR_CADENCE_SECS,
-            budgets=MonitorBudgets(max_runtime_secs=10_000_000),
+            budgets=MonitorBudgets(max_runtime_secs=604_800),
             now=0.0,
         )
         assert loop.monitor is not None
@@ -2330,7 +2330,7 @@ async def test_the_stall_condition_cannot_outlive_the_tick_that_tripped_it(tmp_p
             # than the wall-clock floor -- this test is about the recorded reason,
             # and the floor has its own case in test_monitor_decision.
             cadence_secs=DEFAULT_MONITOR_CADENCE_SECS,
-            budgets=MonitorBudgets(max_runtime_secs=10_000_000),
+            budgets=MonitorBudgets(max_runtime_secs=604_800),
             now=0.0,
         )
         assert loop.monitor is not None

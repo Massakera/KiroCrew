@@ -126,8 +126,8 @@ describe('private member memory lifecycle', () => {
 
     await screen.findByRole('heading', { name: `Memory for ${LEGACY_STORE}` })
     expect(screen.getByText('Memory V1', { exact: true })).toBeVisible()
-    const guidance = screen.getByText(/This member keeps its current memory \(V1\)\. Member memory \(V2\) is only available when creating a new crew member\./)
-    expect(guidance).toHaveTextContent(/^This member keeps its current memory \(V1\)\. Member memory \(V2\) is only available when creating a new crew member\.$/)
+    const guidance = screen.getByText(/This crewmate keeps its current memory \(V1\)\. Its own memory \(V2\) is only available when creating a new crewmate\./)
+    expect(guidance).toHaveTextContent(/^This crewmate keeps its current memory \(V1\)\. Its own memory \(V2\) is only available when creating a new crewmate\.$/)
     expect(screen.queryByText(/This member cannot return to its previous memory/)).toBeNull()
     expect(screen.queryByText('Member memory · V2')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Copy memories' })).toBeNull()
@@ -774,10 +774,10 @@ describe('private member memory lifecycle', () => {
     renderWithProviders(<MemoryTab refreshTrigger={0} />)
     await loaded()
     expect(screen.getByText('Facts save details. Lessons guide the member’s work. Experiences are events the member can recall.', { exact: true })).toBeVisible()
-    fireEvent.click(screen.getByRole('button', { name: /^Experiences/ }))
+    fireEvent.click(screen.getByRole('radio', { name: /^Experiences/ }))
     expect(await screen.findByText(EPISODE.text)).toBeInTheDocument()
     expect(screen.queryByText(FACT.value_json)).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'All' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'All' }))
     expect(await screen.findByText(FACT.value_json)).toBeInTheDocument()
   })
 

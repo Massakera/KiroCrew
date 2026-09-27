@@ -226,6 +226,11 @@ plain file read.
 
 ## The patrol cycle
 
+A `monitor_start` response saying “requested” confirms receipt only. Do not
+retry within that turn; confirm activation from the gateway arm notice or a
+later `monitor_inspect`. A refusal means no new loop was armed.
+
+
 The conductor patrols with `monitor_start`, never `wait`, at roughly a 90-second
 interval, and arms the loop with both the full cycle instructions and the exit
 condition. Two cycle-order rules are structural rather than stylistic:

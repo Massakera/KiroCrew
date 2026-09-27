@@ -4,6 +4,7 @@ import AskAgentButton, { handoffErrorToAgent } from './AskAgentButton'
 import type { ErrorReport } from '../utils/errorReport'
 
 import { i18nT } from '../i18n/t'
+import { withOriginLink } from './withOriginLink'
 
 export type ErrorNoticeMenuItemComponent = ComponentType<{
   title?: string
@@ -21,15 +22,23 @@ export type ErrorNoticeMenuItemComponent = ComponentType<{
  * notice. `describedBy` points back to that passive alert. Successful selection
  * follows Radix's normal close path. A staging failure prevents that close so
  * the diagnostic and recovery action stay visible.
+ *
+ * `outcome` is an optional one-line consequence rendered under the label, for a
+ * host whose every other item names its outcome in a sub-line: there, a bare
+ * "Ask the agent" was the one control a reader could not identify ("no idea
+ * what it does or why it's in this menu"). The host words it for the notice it
+ * follows; the tooltip keeps describing the mechanism.
  */
 export function ErrorNoticeMenuItem({
   Item,
   message,
   describedBy,
+  outcome,
 }: {
   Item: ErrorNoticeMenuItemComponent
   message?: string | null
   describedBy: string
+  outcome?: string
 }) {
   if (!message) return null
 
@@ -42,7 +51,14 @@ export function ErrorNoticeMenuItem({
       }}
     >
       <Sparkles size={13} className="shrink-0 text-muted" aria-hidden="true" />
-      {i18nT('components.askAgent.ask_the_agent')}
+      {outcome ? (
+        <span className="flex min-w-0 flex-col">
+          <span className="truncate">{i18nT('components.askAgent.ask_the_agent')}</span>
+          <span className="truncate text-[11px] text-muted">{outcome}</span>
+        </span>
+      ) : (
+        i18nT('components.askAgent.ask_the_agent')
+      )}
     </Item>
   )
 }
@@ -73,9 +89,12 @@ export default function ErrorNotice({
   report,
   title,
   onDismiss,
+  dismissLabel,
   variant = 'block',
   askAgent = false,
   askAgentLabel,
+  actionPlacement = 'beside',
+  messagePlacement = 'beside',
   footer,
   onHandoff,
   className = '',
@@ -97,6 +116,18 @@ export default function ErrorNotice({
   title?: string
   /** Renders a dismiss affordance when provided. */
   onDismiss?: () => void
+  /**
+   * Name of the dismiss control — its accessible name AND its tooltip — when
+   * the bare "Dismiss" would leave out what the click commits to: a notice
+   * whose dismissal is REMEMBERED (it stays away on the next visit until its
+   * condition changes) owes the user that promise where they can read it
+   * before clicking, sighted or not. Ignored without `onDismiss`. The control
+   * only ever removes the notice; there is no toned-down or muted register
+   * for an error (a failure toned down to a polite status is still a failure
+   * — see `errors-use-error-notice`), so a caller that wants the notice gone
+   * hides it, and one that wants it seen renders it exactly like this.
+   */
+  dismissLabel?: string
   /** `block` = boxed banner; `inline` = compact text for an existing flex row. */
   variant?: 'block' | 'inline'
   /**
@@ -123,6 +154,30 @@ export default function ErrorNotice({
    * `askAgent` is off.
    */
   askAgentLabel?: string
+  /**
+   * Where the hand-off sits in the block variant. `beside` (default) puts it in
+   * the banner's right-hand column, which is right for a banner that spans a
+   * page. `below` stacks it under the text, inside the text column: in a
+   * NARROW host — the chat sidebar is ~300px — a sibling column takes a third
+   * of the width and the title and message wrap one or two words per line. Not
+   * a container query: jsdom cannot evaluate one, so the pin would be
+   * untestable, and `container-type` on the shared root would collapse a
+   * notice laid out in a shrink-to-fit context. Ignored by the inline variant
+   * and when `askAgent` is off.
+   */
+  actionPlacement?: 'beside' | 'below'
+  /**
+   * Where the `message` sits relative to the `title`. `beside` (default) runs
+   * the two as one sentence -- right when the message is the human-readable
+   * clause ("Save failed: the folder no longer exists"). `below` puts the message
+   * on its own line under the title, smaller and secondary: for a notice whose
+   * `message` is a raw server string kept because it is the journal lookup key
+   * (the hand-off recovers endpoint and status from it) while the plain-language
+   * `title` carries the meaning -- "config store" and "gateway" mean nothing to
+   * a first-time reader, so they read as a detail, not as the lead. In the
+   * inline variant the row wraps to make the line. Ignored without a `title`.
+   */
+  messagePlacement?: 'beside' | 'below'
   /**
    * Rendered INSIDE the banner, under the message (block variant only) — for
    * a follow-on line that answers the message above it (a resolved outcome, a
@@ -166,18 +221,26 @@ export default function ErrorNotice({
   testId?: string
 }) {
   if (!message) return null
+  // The secondary line: smaller than the title, lighter than the lead, but still
+  // the alert's own colour -- it is the failure's text, demoted, not a caption.
+  const messageBelow = messagePlacement === 'below' && Boolean(title)
+
+  // One name for the dismiss control, read two ways: `aria-label` for the
+  // accessibility tree and `title` as the tooltip, so a sighted user hovering
+  // the icon-only ✕ sees the same promise a screen reader announces.
+  const dismissName = dismissLabel ?? i18nT('components.errorNotice.dismiss')
 
   if (variant === 'inline') {
     return (
       <span
         role="alert"
-        className={`inline-flex items-center gap-1.5 text-[12px] text-danger ${className}`}
+        className={`inline-flex items-center gap-1.5 text-[12px] text-danger ${messageBelow ? 'flex-wrap' : ''} ${className}`}
         id={id}
         data-testid={testId}
       >
         <AlertTriangle size={14} className="shrink-0" aria-hidden="true" />
         {title && <strong className="font-semibold">{title}</strong>}
-        <span className={`min-w-0 ${messageClassName}`} style={{ overflowWrap: 'anywhere' }} title={messageTooltip}>{message}</span>
+        <span className={`min-w-0 ${messageBelow ? 'basis-full text-[11px] font-normal text-danger/80' : ''} ${messageClassName}`} style={{ overflowWrap: 'anywhere' }} title={messageTooltip}>{withOriginLink(message)}</span>
         {askAgent && (
           <AskAgentButton
             report={report}
@@ -190,7 +253,8 @@ export default function ErrorNotice({
           <button
             type="button"
             className="shrink-0 bg-transparent border-none p-0 cursor-pointer text-danger/70 hover:text-danger transition-colors"
-            aria-label={i18nT('components.errorNotice.dismiss')}
+            aria-label={dismissName}
+            title={dismissName}
             onClick={onDismiss}
           >
             <X size={13} aria-hidden="true" />
@@ -212,12 +276,22 @@ export default function ErrorNotice({
         {title && <strong className="font-semibold">{title} </strong>}
         {/* Wrapped only when asked: the bare text node is the shape every
             existing consumer's tests read. */}
-        {messageClassName || messageTooltip
-          ? <span className={messageClassName} title={messageTooltip}>{message}</span>
-          : message}
+        {messageBelow || messageClassName || messageTooltip
+          ? <span className={`${messageBelow ? 'block text-[12px] font-normal text-danger/80' : ''} ${messageClassName}`} title={messageTooltip}>{withOriginLink(message)}</span>
+          : withOriginLink(message)}
         {footer && <div className="mt-1 font-normal">{footer}</div>}
+        {askAgent && actionPlacement === 'below' && (
+          <div className="mt-1.5">
+            <AskAgentButton
+              report={report}
+              message={message}
+              onHandoff={onHandoff}
+              label={askAgentLabel}
+            />
+          </div>
+        )}
       </div>
-      {askAgent && (
+      {askAgent && actionPlacement === 'beside' && (
         <AskAgentButton
           report={report}
           message={message}
@@ -230,7 +304,8 @@ export default function ErrorNotice({
         <button
           type="button"
           className="shrink-0 bg-transparent border-none p-0 cursor-pointer text-danger/70 hover:text-danger transition-colors"
-          aria-label={i18nT('components.errorNotice.dismiss')}
+          aria-label={dismissName}
+          title={dismissName}
           onClick={onDismiss}
         >
           <X size={14} aria-hidden="true" />

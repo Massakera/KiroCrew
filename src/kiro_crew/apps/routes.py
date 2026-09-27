@@ -68,6 +68,7 @@ from kiro_crew.apps.hooks_integration import (
 from kiro_crew.apps.lifecycle_scripts import run_lifecycle_script as _run_lifecycle_script
 from kiro_crew.apps.manager import (
     _credential_free_source_metadata,
+    app_enabled_state,
     app_lifecycle_lock,
     apps_dir,
     cleanup_migrated_builtin,
@@ -705,6 +706,24 @@ async def _app_may_run_after_install(name: str, *, fresh_install: bool = False) 
     return await asyncio.get_running_loop().run_in_executor(subprocess_executor(), _read_live_state)
 
 
+async def _restore_app_after_failed_update(name: str) -> None:
+    """Put an app back the way a failed update found it.
+
+    The update stopped the backend and scrubbed the resources before it touched
+    any file, and the old tree is intact (``update_app`` restores it on a failed
+    replacement), so the app is left usable rather than broken. What comes back
+    is what was there: resources and a backend for an app that may run, nothing
+    for a disabled one -- ``register_app`` never consults ``enabled``, so an
+    unconditional re-register would publish a disabled app's agents, skills,
+    MCP servers and crons, and nothing scrubs them again until the next
+    enable/disable. Live read: a failed update leaves the record unchanged.
+    """
+    if not await _app_may_run_after_install(name):
+        return
+    await _register_app_off_loop(name)
+    await asyncio.get_running_loop().run_in_executor(subprocess_executor(), start_app_backend, name)
+
+
 async def _suspend_app_for_session_approval_reconsent(
     name: str,
 ) -> RegistrationResult:
@@ -887,13 +906,36 @@ async def handle_update_app(request: web.Request) -> web.Response:
     source = body.get("source", info.get("source", ""))
 
     # Registry-installed apps: re-clone from registry.
-    # Attempt install first, only deregister old resources on success
-    # to avoid leaving the app in a broken state on failure.
+    # Same order as the local-source branch below: stop the backend and scrub
+    # its resources BEFORE the files are replaced. For an already-installed
+    # app ``install_from_registry`` reaches ``update_app``, which renames the
+    # live tree aside and copies the new one in -- on Windows that fails with a
+    # sharing violation (WinError 32) while the backend still holds a file open
+    # under the tree. A failed install must not leave the app broken either:
+    # the failure path restores what was there (``_restore_app_after_failed_update``),
+    # exactly as the local-source branch does.
     if is_registry_source(source):
         registry_name = registry_name_from_source(source)
         async with app_lifecycle_lock(name):
+            # Preflight BEFORE the stop so a retryable refusal leaves app state
+            # untouched (app-kit-platform: refusal "without mutating app state").
+            # ``install_from_registry`` re-checks at its own replacement boundary.
+            startup_refusal = await _refuse_while_startup_hook_runs(name, action="update")
+            if startup_refusal is not None:
+                return startup_refusal
+
+            # Stop the backend, then deregister old resources -- same order as
+            # uninstall and the disable rollback. Stopping pops the tracking record,
+            # so the health watch cannot re-register the OLD manifest's MCP servers
+            # after the scrub (see app-kit-platform §17).
+            await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), stop_app_backend, name
+            )
+            await _deregister_app_off_loop(name)
+
             reg_install = await install_from_registry(registry_name)
             if not reg_install.get("ok"):
+                await _restore_app_after_failed_update(name)
                 sel().log_api_access(
                     caller="dashboard",
                     operation="app_update",
@@ -902,16 +944,6 @@ async def handle_update_app(request: web.Request) -> web.Response:
                     error=reg_install.get("error", ""),
                 )
                 return web.json_response(reg_install, status=400)
-            # Install succeeded — now safe to swap resources. Stop the backend BEFORE
-            # deregistering, matching uninstall and the disable rollback: stopping pops
-            # the tracking record, which is what stops the health watch from
-            # re-registering the OLD manifest's MCP servers in the window between the
-            # two (see app-kit-platform §17). Deregistering first leaves that window
-            # open, and the entries the update removed would survive it.
-            await asyncio.get_running_loop().run_in_executor(
-                subprocess_executor(), stop_app_backend, name
-            )
-            await _deregister_app_off_loop(name)
             # Live read, not the pre-update ``info`` snapshot: ``update_app`` drops
             # ``enabled`` when the new version adds ``permissions.sessionApproval``,
             # and a backend started here would run an app the UI shows as disabled.
@@ -933,11 +965,11 @@ async def handle_update_app(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # Per-app lifecycle lock: the deregister → stop → copy → re-register
+    # Per-app lifecycle lock: the stop → deregister → copy → re-register
     # sequence must not interleave with another update/install/uninstall of
     # the same app — update_app moves user data through a shared
     # ``.{name}-data-tmp`` path, so an interleaving can destroy it.
-    # (The registry branch above holds the same lock around install_from_registry.)
+    # (The registry branch above holds the same lock around the same sequence.)
     async with app_lifecycle_lock(name):
         startup_refusal = await _refuse_while_startup_hook_runs(name, action="update")
         if startup_refusal is not None:
@@ -959,12 +991,7 @@ async def handle_update_app(request: web.Request) -> web.Response:
             subprocess_executor(), lambda: update_app(source, expected_name=name)
         )
         if not up_result.ok:
-            # Re-register old resources on failure
-            await _register_app_off_loop(name)
-            if info.get("enabled"):
-                await asyncio.get_running_loop().run_in_executor(
-                    subprocess_executor(), start_app_backend, name
-                )
+            await _restore_app_after_failed_update(name)
             sel().log_api_access(
                 caller="dashboard",
                 operation="app_update",
@@ -1725,6 +1752,19 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                             name,
                             exc_info=True,
                         )
+
+            # Step 7: remove the clone. Off-loop like Step 5 (a git tree), and INSIDE
+            # the lock held since Step 2: a second acquisition queues behind a parked
+            # install and would delete the tree that install just re-cloned. PR body.
+            if is_registry_source(info.get("source", "")):
+                app_reg_name = registry_name_from_source(info.get("source", ""))
+                if app_reg_name:
+                    from kiro_crew.apps.registry import app_source_dir
+
+                    ws_dir = app_source_dir(app_reg_name)
+                    if ws_dir.is_dir():
+                        await asyncio.to_thread(shutil.rmtree, ws_dir, ignore_errors=True)
+                        uninstall_log.append(f"Removed workspace for {app_reg_name}")
     if not result.ok:
         sel().log_api_access(
             caller="dashboard",
@@ -1751,17 +1791,6 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             )
         else:
             uninstall_log.append(f"Dropped {dropped} conversation pointer(s)")
-
-    # Step 6: Clean up workspace (each registry app has its own workspace)
-    if is_registry_source(info.get("source", "")):
-        app_reg_name = registry_name_from_source(info.get("source", ""))
-        if app_reg_name:
-            from kiro_crew.apps.registry import app_source_dir
-
-            ws_dir = app_source_dir(app_reg_name)
-            if ws_dir.is_dir():
-                shutil.rmtree(ws_dir, ignore_errors=True)
-                uninstall_log.append(f"Removed workspace for {app_reg_name}")
 
     sel().log_api_access(
         caller="dashboard", operation="app_uninstall", outcome="completed", resources=name
@@ -1889,6 +1918,9 @@ async def handle_enable_app(request: web.Request) -> web.Response:
     # install/update/uninstall of the same app (e.g. enabling while an
     # off-loop uninstall is deleting the app directory).
     async with app_lifecycle_lock(name):
+        # A re-enable repeats every step but the Python hooks: the flag does not prove
+        # onEnable ran (a file-only CLI enable skips it), while hook_reconcile loads hooks.
+        was_enabled = app_enabled_state(name) is True
         result = enable_app(name, session_approval_consent=session_approval_consent)
         if not result.ok:
             sel().log_api_access(
@@ -2004,21 +2036,25 @@ async def handle_enable_app(request: web.Request) -> web.Response:
         # Invoke Python lifecycle hooks (routes + on_startup) — runs AFTER shell scripts
         try:
             state = request.app.get("state")
-            hooks_result = await on_app_enable(
-                name,
-                info,
-                cron_service=getattr(state, "crons", None),
-                # state exposes broadcast_ws, not broadcast: the old
-                # getattr(state, "broadcast", None) always resolved to None, so an
-                # app enabled from the dashboard got NO event bus at all.
-                broadcast_fn=(
-                    build_broadcast_fn(state.broadcast_ws) if state is not None else None
-                ),
-                spawn_impl=(
-                    build_spawn_impl(getattr(state, "subagents", None))
-                    if state is not None
-                    else None
-                ),
+            hooks_result = (
+                None
+                if was_enabled
+                else await on_app_enable(
+                    name,
+                    info,
+                    cron_service=getattr(state, "crons", None),
+                    # state exposes broadcast_ws, not broadcast: the old
+                    # getattr(state, "broadcast", None) always resolved to None, so an
+                    # app enabled from the dashboard got NO event bus at all.
+                    broadcast_fn=(
+                        build_broadcast_fn(state.broadcast_ws) if state is not None else None
+                    ),
+                    spawn_impl=(
+                        build_spawn_impl(getattr(state, "subagents", None))
+                        if state is not None
+                        else None
+                    ),
+                )
             )
             if hooks_result:
                 # Redact any sensitive content in health_status issues
@@ -2099,6 +2135,9 @@ async def handle_disable_app(request: web.Request) -> web.Response:
         startup_refusal = await _refuse_while_startup_hook_runs(name, action="disable")
         if startup_refusal is not None:
             return startup_refusal
+        # Teardown decides whether app code may run from `enabled`; read it under the lock.
+        if (enabled := app_enabled_state(name)) is not None:
+            info = {**info, "enabled": enabled}
 
         # `onDisable` is NOT run here: it runs inside `teardown_app_runtime`
         # below, so that revoking an app's execution grant runs it too. Keeping it

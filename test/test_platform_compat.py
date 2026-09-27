@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import types
@@ -490,19 +491,143 @@ class TestProcessHelpers:
                 child.kill()
                 child.wait()
 
+    def test_pid_is_zombie_reads_the_running_state_of_self(self):
+        # A running process is not a zombie on the platforms that expose the
+        # state (Linux /proc, macOS kinfo); elsewhere the answer is "unknown".
+        expected = False if sys.platform in ("linux", "darwin") else None
+        assert pc.pid_is_zombie(os.getpid()) is expected
+
+    def test_pid_is_zombie_is_unknown_for_an_unreadable_or_invalid_pid(self):
+        assert pc.pid_is_zombie(0) is None
+        assert pc.pid_is_zombie(-1) is None
+        if sys.platform == "linux":
+            # No /proc entry: unreadable, not "not a zombie".
+            assert pc.pid_is_zombie(2_000_000_000) is None
+
+    def test_pid_is_zombie_reads_the_linux_stat_state_field(self, monkeypatch):
+        # The comm field is parenthesised and may itself contain spaces and
+        # parentheses, so the state is the first field after the LAST ')'.
+        tail = " ".join(str(i) for i in range(4, 24))
+        seen: list[str] = []
+
+        def _stat_path(text: str):
+            class _FakeStatPath:
+                def __init__(self, path):
+                    seen.append(str(path))
+
+                def read_text(self, *args, **kwargs):
+                    return text
+
+            return _FakeStatPath
+
+        monkeypatch.setattr(pc.sys, "platform", "linux")
+        for state, expected in (("Z", True), ("X", True), ("S", False), ("R", False)):
+            monkeypatch.setattr(
+                pc, "Path", _stat_path(f"4242 (kiro (cli) worker) {state} 1 {tail}")
+            )
+            assert pc.pid_is_zombie(4242) is expected, state
+        assert seen == ["/proc/4242/stat"] * 4
+
+        class _Unreadable:
+            def __init__(self, _p):
+                pass
+
+            def read_text(self, *args, **kwargs):
+                raise PermissionError("[Errno 13] Permission denied")
+
+        monkeypatch.setattr(pc, "Path", _Unreadable)
+        assert pc.pid_is_zombie(4242) is None
+
+    def test_kill_process_group_signals_the_captured_id_and_resolves_nothing(self, monkeypatch):
+        # The caller hands over a group id it captured while the leader was alive;
+        # the primitive addresses THAT id -- no pid is consulted, so a recycled pid
+        # cannot redirect the signal. The POSIX branch, on every platform: the
+        # branch flag is pinned and the two group syscalls are supplied through
+        # the seams the primitive reads (created where the runner lacks them).
+        signalled: list[tuple[int, int]] = []
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(
+            os, "killpg", lambda pgid, sig: signalled.append((pgid, sig)), raising=False
+        )
+        monkeypatch.setattr(
+            os,
+            "getpgid",
+            lambda _pid: pytest.fail("kill_process_group resolved a group from a pid"),
+            raising=False,
+        )
+
+        assert pc.kill_process_group(2**22 + 4242, pc.SIGKILL) is True
+
+        assert signalled == [(2**22 + 4242, pc.SIGKILL)]
+
+    def test_kill_process_group_refuses_broadcast_and_self_instead_of_degrading(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(
+            os, "killpg", lambda pgid, sig: pytest.fail(f"signalled group {pgid}"), raising=False
+        )
+        for refused in (0, 1, -1, pc._OWN_PGID, "4242", 4242.0):
+            with pytest.raises(ValueError, match="refusing broadcast/self process group"):
+                pc.kill_process_group(refused, pc.SIGKILL)  # type: ignore[arg-type]
+
+    def test_kill_process_group_lets_the_signal_s_errors_propagate(self, monkeypatch):
+        def _gone(pgid, sig):
+            raise ProcessLookupError("[Errno 3] No such process")
+
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(os, "killpg", _gone, raising=False)
+        with pytest.raises(ProcessLookupError):
+            pc.kill_process_group(2**22 + 4343, pc.SIGKILL)
+
+    def test_kill_process_group_is_posix_only(self, monkeypatch):
+        # The other branch: no group syscall is reached, whatever the runner has.
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(
+            os, "killpg", lambda pgid, sig: pytest.fail(f"signalled group {pgid}"), raising=False
+        )
+        with pytest.raises(OSError, match="no POSIX process groups"):
+            pc.kill_process_group(2**22 + 4444, pc.SIGKILL)
+
     def test_get_ppid_returns_int(self):
         # Returns the parent (>0 normally) or -1 on failure — never raises.
         ppid = pc.get_ppid(os.getpid())
         assert isinstance(ppid, int)
 
-    def test_kill_pid_nonexistent_is_safe(self):
-        # Both platforms raise on non-existent pid — same exception shape so
+    def test_kill_pid_nonexistent_is_safe(self, monkeypatch):
+        # Both platforms raise ProcessLookupError on a non-existent pid, so
         # callers' ``except (ProcessLookupError, OSError)`` handlers fire
-        # uniformly. POSIX: os.kill raises ProcessLookupError. Windows:
-        # taskkill returns rc=128 which _raise_taskkill_error re-badges as
-        # ProcessLookupError.
+        # uniformly. POSIX: os.kill raises it. Windows: taskkill's rc=128 is
+        # re-badged to it by _raise_taskkill_error.
+        #
+        # On POSIX this is a REAL SIGKILL, so "nonexistent" has to hold by
+        # construction, not by luck: any number inside the kernel's pid range
+        # can be handed to an unrelated process between the premise and the
+        # signal. Linux caps pids at PID_MAX_LIMIT (4194304) and macOS at
+        # PID_MAX (99998), so a probe pid above both is refused by the range
+        # check itself and never resolves to a process. Pinned against the
+        # running host where the ceiling is readable, so a kernel that raised
+        # it would fail here rather than turn this test into a kill at whatever
+        # holds that number.
+        #
+        # Windows exposes no readable pid ceiling, so no pid can be proven
+        # unused there and a real ``taskkill /F`` at this number could stop an
+        # unrelated process. The Windows arm therefore runs the same call with
+        # ``taskkill`` stubbed to the rc=128 it returns for a missing pid, so the
+        # contract stays asserted on the Windows shard without the real kill.
+        nonexistent = 2_000_000_000
+        if pc.IS_WINDOWS:
+            recorded: list[list[str]] = []
+
+            def _taskkill_not_found(argv, *_a, **_kw):
+                recorded.append(list(argv))
+                return types.SimpleNamespace(returncode=128, stdout=b"", stderr=b"not found")
+
+            monkeypatch.setattr(pc.subprocess, "run", _taskkill_not_found)
+        elif pc.IS_LINUX:
+            assert nonexistent > int(Path("/proc/sys/kernel/pid_max").read_text())
         with pytest.raises(ProcessLookupError):
-            pc.kill_pid(2_000_000_000, pc.SIGKILL)
+            pc.kill_pid(nonexistent, pc.SIGKILL)
+        if pc.IS_WINDOWS:
+            assert len(recorded) == 1 and str(nonexistent) in recorded[0], recorded
 
     def test_process_matches_false_for_unused_pid(self):
         assert pc.process_matches(2_000_000_000, ("kiro-cli", "claude")) is False
@@ -1107,6 +1232,165 @@ class TestResourceShims:
 
     def test_proc_rss_bytes_for_pid_none_for_unused_pid(self):
         assert pc.proc_rss_bytes_for_pid(2_000_000_000) is None
+
+
+class TestPeakRssIsThisProcesss:
+    """``proc_peak_rss_bytes`` reports the PROCESS's own high-water mark.
+
+    On Linux ``execve`` seeds the new image's ``ru_maxrss`` with the pre-exec
+    image's peak, so a gateway launched from a large parent would otherwise
+    publish that parent's peak on ``proc_mem_peak_mb`` and the
+    ``memory.peak_rss_bytes`` gauge for its whole life.
+    """
+
+    _STATUS = "Name:\tpython\nVmPeak:\t 1400000 kB\nVmHWM:\t   11432 kB\nVmRSS:\t   11432 kB\n"
+
+    # These tests drive the POSIX reader (``_posix_peak_rss_bytes``) directly, with
+    # ``sys.platform`` and the status-file seam pinned, so they run on every host:
+    # ``proc_peak_rss_bytes`` itself dispatches on the import-time ``IS_POSIX`` and
+    # on Windows answers from the Win32 counters, which have their own tests. The
+    # ``resource`` module exists only on POSIX, so the ``getrusage`` stand-in is
+    # installed with ``raising=False`` -- on Windows it CREATES the attribute the
+    # reader would consult, which is exactly what must never happen.
+
+    @staticmethod
+    def _never_getrusage(monkeypatch):
+        def inherited(*_a, **_k):
+            raise AssertionError("ru_maxrss consulted on linux: that is the parent's peak")
+
+        monkeypatch.setattr(
+            pc, "resource", types.SimpleNamespace(RUSAGE_SELF=0, getrusage=inherited), raising=False
+        )
+
+    def test_linux_peak_is_its_own_vmhwm_never_getrusage(self, tmp_path, monkeypatch):
+        status = tmp_path / "status"
+        status.write_text(self._STATUS, encoding="utf-8")
+        self._never_getrusage(monkeypatch)
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", status)
+        monkeypatch.setattr(pc, "_LINUX_PEAK_RSS_FLOOR", 0)
+        assert pc._posix_peak_rss_bytes() == 11432 * 1024
+        # An unreadable /proc is None (the callers' documented 0), not the
+        # inherited number and not the floor a readable earlier call left behind.
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", tmp_path / "gone")
+        assert pc._posix_peak_rss_bytes() is None
+
+    @pytest.mark.skipif(
+        not pc.IS_POSIX, reason="proc_rss_bytes's POSIX last resort; Windows reads Win32 counters"
+    )
+    def test_the_current_readings_last_resort_is_the_same_own_peak(self, tmp_path, monkeypatch):
+        status = tmp_path / "status"
+        status.write_text(self._STATUS, encoding="utf-8")
+        self._never_getrusage(monkeypatch)
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", status)
+        monkeypatch.setattr(pc, "_LINUX_PEAK_RSS_FLOOR", 0)
+        monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: None)
+        assert pc.proc_rss_bytes() == 11432 * 1024
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            "Name:\tpython\nVmRSS:\t   11432 kB\n",  # no high-water field at all
+            "VmHWM:\t   11432 MB\n",  # a unit the kernel never prints
+            "VmHWM:\t   lots kB\n",
+            "VmHWM:\n",
+            "",
+        ],
+    )
+    def test_an_unreadable_status_is_none_not_a_guess(self, status):
+        assert pc._peak_rss_from_status(status) is None
+
+    def test_the_linux_reading_never_decreases(self, tmp_path, monkeypatch):
+        # The kernel folds the live RSS into hiwater_rss lazily from batched
+        # per-thread counters, so consecutive VmHWM readings around an unmap
+        # can dip by a few hundred KiB. The contract is a peak, so the reader
+        # holds its floor -- and drops it only for an unreadable file, which
+        # is None, not a stale number.
+        status = tmp_path / "status"
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", status)
+        monkeypatch.setattr(pc, "_LINUX_PEAK_RSS_FLOOR", 0)
+        readings = []
+        for kib in (186_335_232 // 1024, 185_970_688 // 1024, 200_000):
+            status.write_text(f"VmHWM:\t{kib} kB\n", encoding="utf-8")
+            readings.append(pc._linux_peak_rss_bytes())
+        assert readings == [186_335_232, 186_335_232, 200_000 * 1024]
+        status.unlink()
+        assert pc._linux_peak_rss_bytes() is None
+
+    @pytest.mark.parametrize(
+        ("platform", "ru_maxrss", "expected"),
+        [("darwin", 123_456_789, 123_456_789), ("freebsd13", 11432, 11432 * 1024)],
+    )
+    def test_off_linux_getrusage_is_read_in_the_platforms_unit(
+        self, monkeypatch, platform, ru_maxrss, expected
+    ):
+        monkeypatch.setattr(sys, "platform", platform)
+        monkeypatch.setattr(
+            pc,
+            "resource",
+            types.SimpleNamespace(
+                RUSAGE_SELF=0, getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=ru_maxrss)
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", Path("/nonexistent/status"))
+        assert pc._posix_peak_rss_bytes() == expected
+
+    def test_the_two_status_parsers_agree(self):
+        # pdf_extract_child keeps its own copy (it must not import this module
+        # under a capped address space); the two must read the same text alike.
+        from kiro_crew import pdf_extract_child
+
+        for text in (self._STATUS, "VmHWM:\t 1 kB\n", "VmHWM:\t 1 MB\n", ""):
+            assert pc._peak_rss_from_status(text) == pdf_extract_child._peak_rss_from_status(text)
+
+    def test_a_child_of_a_bloated_parent_reports_its_own_small_peak(self, tmp_path):
+        """A parent that has touched twice the bar spawns a child that reports its
+        own peak under it. The planted condition is proven, not assumed: the
+        parent's measured peak must exceed the bar, and on Linux the child's raw
+        ``ru_maxrss`` must show the inheritance the reader exists to bypass."""
+        bar = 256 * 1024 * 1024
+        child = textwrap.dedent("""
+            import json, sys
+            from kiro_crew import platform_compat as pc
+            json.dump(
+                {"own_peak": pc.proc_peak_rss_bytes(),
+                 "inherited": pc._ru_maxrss_bytes() if pc.IS_POSIX else None},
+                sys.stdout,
+            )
+            """)
+        parent = textwrap.dedent(f"""
+            import json, subprocess, sys
+            from kiro_crew import platform_compat as pc
+            blob = bytearray({2 * bar})
+            for i in range(0, len(blob), 4096):
+                blob[i] = 1
+            del blob
+            report = {{"parent_peak": pc.proc_peak_rss_bytes()}}
+            run = subprocess.run(
+                [sys.executable, "-c", {child!r}], cwd={str(tmp_path)!r},
+                capture_output=True, text=True, timeout=60, check=True,
+            )
+            report.update(json.loads(run.stdout))
+            json.dump(report, sys.stdout)
+            """)
+        run = subprocess.run(
+            [sys.executable, "-c", parent],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+            timeout=90,
+            check=True,
+        )
+        report = json.loads(run.stdout)
+        assert report["parent_peak"] > bar, "the parent never crossed the bar"
+        if sys.platform.startswith("linux"):
+            # The kernel fact the Linux reader exists for: seen, or the pin is hollow.
+            assert report["inherited"] > bar, "ru_maxrss did not inherit the parent's peak"
+        assert 0 < report["own_peak"] < bar, report
 
     def test_proc_rss_tree_mb_for_pid_windows_only(self):
         # Windows-only: the lineage-validated tree walk. On POSIX it returns None
@@ -3890,7 +4174,8 @@ class TestResourceShimFailures:
         # the labelled last-resort peak -- so reaching 0 needs BOTH the
         # current-RSS reader and the fallback to fail. Asserting only the
         # getrusage failure would pass on a platform whose primary reader was
-        # silently removed.
+        # silently removed. On Linux the fallback peak is VmHWM, not getrusage,
+        # so its status file has to be unreadable too.
         if not pc.IS_POSIX:
             pytest.skip("POSIX resource.getrusage branch")
 
@@ -3898,20 +4183,24 @@ class TestResourceShimFailures:
             raise OSError("getrusage failed")
 
         monkeypatch.setattr(pc.resource, "getrusage", boom)
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", Path("/nonexistent/status"))
         monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: None)
         monkeypatch.setattr(pc, "_macos_current_rss_bytes", lambda: None)
         assert pc.proc_rss_bytes() == 0
 
-    def test_proc_peak_rss_bytes_returns_zero_on_getrusage_failure(self, monkeypatch):
-        # The peak reading has getrusage as its ONLY POSIX source, so its
-        # failure branch is still a plain 0.
+    def test_proc_peak_rss_bytes_returns_zero_when_its_source_fails(self, monkeypatch):
+        # The peak reading has ONE source per POSIX platform: VmHWM on Linux,
+        # getrusage elsewhere. That source failing is a plain 0, and on Linux
+        # the failure must not fall through to getrusage, whose ru_maxrss is
+        # the parent's inherited peak (test_linux_peak_is_its_own_vmhwm).
         if not pc.IS_POSIX:
-            pytest.skip("POSIX resource.getrusage branch")
+            pytest.skip("POSIX peak-RSS branch")
 
         def boom(*args, **kwargs):
             raise OSError("getrusage failed")
 
         monkeypatch.setattr(pc.resource, "getrusage", boom)
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", Path("/nonexistent/status"))
         assert pc.proc_peak_rss_bytes() == 0
 
     def test_proc_cpu_seconds_returns_zero_on_getrusage_failure(self, monkeypatch):
@@ -4191,14 +4480,14 @@ class TestFindListeningPidsErrors:
                     local_address=bytes([127, 0, 0, 1]),
                     local_scope_id=0,
                     local_port=7777,
-                    pid=4242,
+                    pid=99_999_999_991,
                 ),
                 types.SimpleNamespace(
                     state=2,
                     local_address=bytes([0, 0, 0, 0]),
                     local_scope_id=0,
                     local_port=7777,
-                    pid=7777,
+                    pid=99_999_999_992,
                 ),
             ],
             True: [
@@ -4207,7 +4496,7 @@ class TestFindListeningPidsErrors:
                     local_address=bytes(16),
                     local_scope_id=0,
                     local_port=7777,
-                    pid=8888,
+                    pid=99_999_999_993,
                 )
             ],
         }
@@ -4220,7 +4509,7 @@ class TestFindListeningPidsErrors:
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_windows_tcp_owner_rows", _rows, raising=False)
 
-        assert pc._windows_loopback_listener_owner_pids(7777) == {4242}
+        assert pc._windows_loopback_listener_owner_pids(7777) == {99_999_999_991}
         assert calls == [(False, 3), (True, 3)]
 
         rows[True] = None

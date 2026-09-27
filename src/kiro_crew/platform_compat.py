@@ -1829,6 +1829,14 @@ def darwin_process_environ(pid: int) -> list[bytes] | None:
     an *argument* that merely looks like an environment entry can never be read
     as one -- the point of the read is that a user's own shell can reproduce any
     argv.
+
+    An Apple PLATFORM binary (``/bin/sleep``, ``/usr/bin/env``) is one of the
+    ``None`` cases on macOS 26: the kernel answers with an argv-only record for
+    it even to a same-uid reader (``ps -E`` shows no environment either), so
+    the read fails closed and such a process is never identified as ours. The
+    launchers this oracle exists for (``node``, ``python``, an MCP CLI) are
+    never platform binaries; a test that needs a readable child must spawn one
+    of those, not ``sleep``.
     """
     libc = _darwin_sysctl_handle()
     if libc is None:
@@ -6143,6 +6151,35 @@ def pid_exists(pid: int) -> bool:
         return False
 
 
+def pid_is_zombie(pid: int) -> bool | None:
+    """Whether *pid* has exited and only waits to be reaped: True / False, None when unreadable.
+
+    ``pid_exists`` answers True for a zombie (``os.kill(pid, 0)`` reaches it),
+    so a caller asking "is this process still RUNNING" -- a survivor check
+    after a signal, where the signalled process sits in the zombie state until
+    its parent, or init, collects it -- needs this beside it. Linux reads the
+    state field of ``/proc/<pid>/stat`` (``Z``, or ``X`` for one being torn
+    down); macOS asks the kernel (:func:`darwin_pid_is_zombie`); elsewhere, and
+    for a process that cannot be read, None -- the caller decides what
+    "unknown" means for it. Never signals anything.
+    """
+    if pid <= 0:
+        return None
+    if sys.platform == "linux":
+        try:
+            stat_data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        close_paren = stat_data.rfind(")")
+        fields = stat_data[close_paren + 2 :].split() if close_paren >= 0 else []
+        if not fields:
+            return None
+        return fields[0] in ("Z", "X", "x")
+    if sys.platform == "darwin":
+        return darwin_pid_is_zombie(pid)
+    return None
+
+
 #: Seconds before the ``ps`` start-time probe is abandoned. Only the BSD leg
 #: spawns anything; Linux reads /proc and Windows calls the kernel directly.
 _START_TIME_PS_TIMEOUT = 2
@@ -6507,6 +6544,34 @@ def kill_pid(pid: int, sig: int = SIGTERM) -> bool:
         raise OSError(f"taskkill invocation failed: {exc}") from exc
     if r.returncode != 0:
         _raise_taskkill_error(pid, r.returncode, r.stderr or r.stdout)
+    return True
+
+
+def kill_process_group(pgid: int, sig: int = SIGTERM) -> bool:
+    """Signal the POSIX process group *pgid* -- an id the CALLER captured and verified.
+
+    The group-addressed sibling of :func:`kill_process_tree`, for a caller that
+    holds a group id it read while the group's leader was alive and identity-
+    checked (:func:`kiro_crew.process_identity.isolated_group_of`) and must not
+    resolve anything from a pid at signal time: ``os.getpgid(pid)`` of a pid the
+    kernel has since handed to another process names that process's group.
+    ``os.killpg(pgid, sig)`` in-process, **letting exceptions propagate**
+    (``ProcessLookupError`` when the group has emptied, ``PermissionError``
+    when a member is unsignalable).
+
+    Carries the same broadcast guard as :func:`kill_process_tree`, refusing
+    with ``ValueError`` instead of degrading: ``killpg(1, sig)`` is ``kill(-1,
+    sig)`` in libc -- a signal to every process this uid owns -- so a non-int
+    id, an id <= 1, or our own group is never signalled, and there is no pid to
+    fall back to here. POSIX only: Windows has no process groups in this sense
+    (``OSError``); its trees are terminated through pinned handles
+    (:func:`kill_process_tree_pinned`).
+    """
+    if not IS_POSIX:
+        raise OSError("kill_process_group: no POSIX process groups on this platform")
+    if type(pgid) is not int or pgid <= 1 or pgid == _OWN_PGID:
+        raise ValueError(f"kill_process_group: refusing broadcast/self process group {pgid!r}")
+    os.killpg(pgid, sig)
     return True
 
 
@@ -8100,13 +8165,83 @@ def _scale_ru_maxrss(ru_maxrss: int) -> int:
 def _ru_maxrss_bytes() -> int | None:
     """Peak (high-water) RSS in bytes from ``getrusage``, or None on failure.
 
-    POSIX only. This is a **peak**, not a live reading: ``ru_maxrss`` never
-    decreases for the life of the process.
+    POSIX only, and NOT the Linux reader: there ``execve`` folds the pre-exec
+    image's high-water mark into the new process's ``ru_maxrss`` (``fs/exec.c``
+    ``exec_mmap`` -> ``setmax_mm_hiwater_rss``), so a gateway started from a
+    large parent -- a launcher, a test runner, a bloated shell -- reports that
+    parent's peak as its own for life. :func:`_linux_peak_rss_bytes` is the
+    Linux source; :func:`_posix_peak_rss_bytes` picks. This is a **peak**, not
+    a live reading: ``ru_maxrss`` never decreases for the life of the process.
     """
     try:
         return _scale_ru_maxrss(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     except (ImportError, OSError, ValueError, AttributeError):
         return None
+
+
+#: Where Linux reports THIS process's own peak resident size: ``VmHWM`` in
+#: ``/proc/self/status`` is the current ``mm``'s high-water mark, which a fresh
+#: image starts from zero, unlike ``ru_maxrss`` (see :func:`_ru_maxrss_bytes`).
+_LINUX_STATUS_PATH = Path("/proc/self/status")
+_LINUX_PEAK_RSS_FIELD = "VmHWM:"
+#: The highest ``VmHWM`` this process has read. The kernel answers ``VmHWM``
+#: with ``max(hiwater_rss, live RSS)`` but folds the live figure into
+#: ``hiwater_rss`` only at unmap/exit, from per-thread counters it syncs in
+#: batches, so a reading taken while a mapping is live can sit a few hundred KiB
+#: above what the next reading, after the unmap, reports (measured 136-376 KiB
+#: on a 128 MiB mapping). A peak that never decreases is the contract, so the
+#: reader keeps its own floor.
+_LINUX_PEAK_RSS_FLOOR = 0
+
+
+def _peak_rss_from_status(status: str) -> int | None:
+    """Parse ``VmHWM`` out of a ``/proc/<pid>/status`` text, in bytes.
+
+    The kernel prints the field as ``VmHWM:\\t   11432 kB`` -- always kB, so any
+    other shape (a missing field, a unit that is not kB, a non-numeric value) is
+    unreadable rather than a guess. ``kiro_crew.pdf_extract_child`` carries the
+    same parser by design: that module keeps its imports minimal because it runs
+    under a capped address space, so it does not import this one.
+    """
+    for line in status.splitlines():
+        if not line.startswith(_LINUX_PEAK_RSS_FIELD):
+            continue
+        parts = line.split()
+        if len(parts) == 3 and parts[2] == "kB" and parts[1].isdigit():
+            return int(parts[1]) * 1024
+        return None
+    return None
+
+
+def _linux_peak_rss_bytes() -> int | None:
+    """This process's OWN peak RSS in bytes from ``VmHWM``, or None if unreadable.
+
+    Monotonic across calls (see :data:`_LINUX_PEAK_RSS_FLOOR`); an unreadable
+    status file is None even when a floor exists, so a failure reads as one.
+    """
+    global _LINUX_PEAK_RSS_FLOOR
+    try:
+        peak = _peak_rss_from_status(_LINUX_STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if peak is None:
+        return None
+    if peak > _LINUX_PEAK_RSS_FLOOR:
+        _LINUX_PEAK_RSS_FLOOR = peak
+    return _LINUX_PEAK_RSS_FLOOR
+
+
+def _posix_peak_rss_bytes() -> int | None:
+    """Peak RSS in bytes for THIS process, or None where it cannot be read.
+
+    Linux reads its own ``VmHWM``; an unreadable ``/proc`` is None, never the
+    inherited ``ru_maxrss`` -- a wrong number is worse than a missing one in a
+    figure an operator uses to size a host. Every other POSIX platform reads
+    ``ru_maxrss`` in its unit.
+    """
+    if sys.platform.startswith("linux"):
+        return _linux_peak_rss_bytes()
+    return _ru_maxrss_bytes()
 
 
 def _linux_current_rss_bytes() -> int | None:
@@ -8207,11 +8342,12 @@ def proc_rss_bytes() -> int:
     - Linux: ``/proc/self/statm`` resident pages.
     - macOS: Mach ``task_info(MACH_TASK_BASIC_INFO).resident_size``.
     - Windows: ``GetProcessMemoryInfo().WorkingSetSize``.
-    - Last resort on POSIX only: ``getrusage(RUSAGE_SELF).ru_maxrss``, which is
-      a **peak** that never decreases. It is here so an unreadable ``/proc`` or
-      an unavailable ``libSystem`` still yields an order-of-magnitude number
-      rather than 0, and it over-reports by construction — see
-      :func:`proc_peak_rss_bytes` for the peak as a deliberate reading.
+    - Last resort on POSIX only: the process's own peak (``VmHWM`` on Linux,
+      ``getrusage(RUSAGE_SELF).ru_maxrss`` elsewhere), which never decreases.
+      It is here so an unavailable ``libSystem`` or a ``statm`` that will not
+      parse still yields an order-of-magnitude number rather than 0, and it
+      over-reports by construction — see :func:`proc_peak_rss_bytes` for the
+      peak as a deliberate reading.
     """
     if IS_POSIX:
         current = (
@@ -8219,7 +8355,7 @@ def proc_rss_bytes() -> int:
         )
         if current is not None:
             return current
-        return _ru_maxrss_bytes() or 0
+        return _posix_peak_rss_bytes() or 0
     counters = _windows_memory_counters()
     return 0 if counters is None else int(counters.WorkingSetSize)
 
@@ -8334,12 +8470,14 @@ def proc_peak_rss_bytes() -> int:
 
     The high-water mark since the process started: it never decreases, which is
     what makes it useful for diagnosing a transient spike that a live reading
-    has already forgotten — and useless as the live reading itself. POSIX reads
-    ``getrusage(RUSAGE_SELF).ru_maxrss``; Windows reads
+    has already forgotten — and useless as the live reading itself. Linux reads
+    this process's own ``/proc/self/status`` ``VmHWM`` (``ru_maxrss`` there is
+    inherited across ``execve`` from the parent, see :func:`_ru_maxrss_bytes`);
+    other POSIX reads ``getrusage(RUSAGE_SELF).ru_maxrss``; Windows reads
     ``GetProcessMemoryInfo().PeakWorkingSetSize``.
     """
     if IS_POSIX:
-        return _ru_maxrss_bytes() or 0
+        return _posix_peak_rss_bytes() or 0
     counters = _windows_memory_counters()
     return 0 if counters is None else int(counters.PeakWorkingSetSize)
 
@@ -9290,6 +9428,44 @@ def nofile_soft_limit() -> int:
     if soft == resource.RLIM_INFINITY:
         return 0
     return max(0, int(soft))
+
+
+def python_launcher_hops() -> int:
+    """How many EXTRA processes a Python child spawned from ``sys.executable`` occupies.
+
+    On Windows a virtual environment's ``Scripts\\python.exe`` is not an
+    interpreter: it is the venv redirector, which reads ``pyvenv.cfg``,
+    ``CreateProcess``-es the base interpreter as its own child, and stays alive
+    as that child's parent until it exits. A ``-m`` child launched through
+    ``sys.executable`` from a venv-hosted gateway is therefore TWO live processes
+    in the child's Job, not one. A caller sizing an ``ActiveProcessLimit`` for
+    "this child and nothing else" has to count that hop, or the redirector's own
+    ``CreateProcess`` is what the limit refuses (``ERROR_NOT_ENOUGH_QUOTA``, which
+    the redirector reports as ``Unable to create process using ...`` and exit
+    101) and the child never runs at all.
+
+    Returns ``1`` when ``sys.executable`` is such a redirector -- the interpreter
+    Python actually runs is ``sys._base_executable`` and it is a different file --
+    and ``0`` everywhere else: on POSIX a venv's
+    ``bin/python`` is a symlink or a copy of the real interpreter and spawns
+    nothing. Over-counting is harmless (a ceiling of two instead of one still
+    bounds a fork bomb); under-counting is the defect this exists to remove.
+    """
+    if not IS_WINDOWS:
+        return 0
+    base = getattr(sys, "_base_executable", None)
+    if not base:
+        return 0
+    try:
+        same = os.path.normcase(os.path.realpath(sys.executable)) == os.path.normcase(
+            os.path.realpath(base)
+        )
+    except OSError:
+        # Cannot resolve either path: fall back to the unresolved spellings and
+        # fail toward the hop, since over-counting is harmless and under-counting
+        # is the defect this exists to remove.
+        same = os.path.normcase(sys.executable) == os.path.normcase(base)
+    return 0 if same else 1
 
 
 # ---------------------------------------------------------------------------

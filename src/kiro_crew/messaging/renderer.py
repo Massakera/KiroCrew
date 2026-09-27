@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,6 +46,7 @@ from kiro_crew.constants import (
     MARKER_CLOSERS,
     OPTIONS_RE_TRAILER,
     _leading_wrapper_start,
+    relocate_glued_tail_marker,
     strip_control_comments,
 )
 from kiro_crew.messaging.display_safety import redact_for_display
@@ -409,6 +411,33 @@ def count_redaction_tags(text: str) -> tuple[int, int]:
     return cred_count, url_count
 
 
+def repaired_after_a_sent_tail(
+    sent_tail: str, remainder: str, redactor: Callable[[str], str]
+) -> str | None:
+    """*remainder* with the span that completes a key after *sent_tail* given up.
+
+    ``None`` when the pair is clean, which is the common answer.
+
+    A streaming channel seals a chunk whose tail is a credential PREFIX. That
+    prefix matches nothing, so every scan passes it and the message is sent; the
+    characters completing the key arrive afterwards, and the reader scrolling the
+    two messages reads the key whole while neither message holds it. The sent
+    message cannot be recalled, so the side still open to repair is the one not yet
+    delivered, and giving up the span that completes the key is what closes the
+    seam: the delivered message keeps a fragment, which is not a credential.
+
+    Only that leading span is given up. Everything after it is the reply as written,
+    sliced rather than reassembled, so no break and no markup is lost anywhere else
+    in the message.
+    """
+    from kiro_crew.messaging.split import offset_clear_of_a_sent_tail
+
+    offset = offset_clear_of_a_sent_tail(sent_tail, remainder, redactor)
+    if not offset:
+        return None
+    return CREDENTIAL_REDACTION_TAGS[0] + remainder[offset:]
+
+
 def _choice_display_safe(text: str, capabilities: TransportCapabilities | None) -> str:
     """The choice-label display sink, target-aware when the target is known.
 
@@ -564,6 +593,7 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
     Stripping a genuine steering frame is ``TurnDriver``'s job and happens before
     a renderer sees the text.
     """
+    text = relocate_glued_tail_marker(text)
     match = OPTIONS_RE_TRAILER.search(text)
     if match:
         choices = [c.strip() for c in match.group("labels").split("|") if c.strip()]

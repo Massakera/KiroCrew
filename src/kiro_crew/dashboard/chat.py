@@ -71,6 +71,7 @@ from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     api_chat_slot_reload,
     api_chat_slot_reset_conversation,
     api_chat_slot_resume,
+    api_chat_slot_selection_capabilities,
     api_chat_slot_source_links,
     api_chat_slot_stop,
     api_chat_slot_summary,
@@ -134,6 +135,7 @@ from kiro_crew.dashboard.chat_slack import (  # noqa: F401
 from kiro_crew.dashboard.chat_tags import (  # noqa: F401
     api_chat_slot_drop,
     api_chat_slot_tags,
+    api_chat_tag_adopt,
     api_chat_tag_column_create,
     api_chat_tag_column_delete,
     api_chat_tag_column_update,

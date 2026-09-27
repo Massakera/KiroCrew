@@ -32,6 +32,7 @@ from kiro_crew.hooks import (
     get_global_hook_store,
     hook_gate_kwargs,
 )
+from kiro_crew.image_refs import strip_image_refs
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.platform.tool_paths import (
     command_shaped_strings,
@@ -62,10 +63,19 @@ from kiro_crew.sel import sel as _sel
 _PROMPT_BUSY_RETRIES = 2
 _PROMPT_BUSY_DELAY = 1.5  # seconds between retries
 
-# Cap on the wrapper chain walked to find a turn's billing stats. A provider is
-# wrapped at most a few layers deep, so a longer walk means a cycle or an
-# unrelated object graph, not a deeper seam.
-_WRAPPER_WALK_MAX_NODES = 8
+# Runaway guard for the wrapper chain walked to find a turn's billing stats,
+# NOT a depth limit. The walk is depth-first along the documented holders and
+# identity-deduped, so a real provider stack is exhausted long before this;
+# the bound exists for a source that synthesizes attributes (a ``MagicMock``
+# answers every ``getattr`` with a fresh child). Sized so no plausible wrapper
+# depth reaches it: session sharing, a channel link, a subagent companion and
+# a fallback wrapper each add a layer, and the same object graph is the one
+# ``dashboard.handlers.usage._wrapper_chain`` walks for the model with the
+# same guard.
+_WRAPPER_WALK_MAX_NODES = 64
+
+# Holder attributes the billing-stats walk follows, in order.
+_BILLING_STAT_HOLDERS: tuple[str, ...] = ("_client", "_handle", "_sess", "provider")
 
 # Sentinel for "no prior stats object was observed", distinct from a provider that
 # legitimately exposes None. Used by provider_last_turn_usage's identity guard.
@@ -773,8 +783,8 @@ def resolve_substitute_set_model(provider: Any) -> Callable[[str], Awaitable[Non
     """The provider's substitute-path ``set_model`` coroutine, or ``None``.
 
     Prefers ``provider.set_model``; falls back to the wrapped client
-    (``provider.client`` / ``provider._client``) for wrappers like
-    ``AcpProvider`` that do not re-export it. Callers pre-filter candidates
+    (``provider.client`` / ``provider._client``) for wrappers that do not
+    re-export it. Callers pre-filter candidates
     against the advertised list, so the explicit-pick guard inside
     ``AcpClient.set_model`` / ``AcpSessionProvider.set_model`` does not fire
     for a served candidate.
@@ -1483,7 +1493,12 @@ async def run_bg_oneliner(
             raise RuntimeError(
                 "run_bg_oneliner(strict_model=True) requires a session with set_model()"
             )
-        async for event in session.prompt(prompt):
+        # A one-liner's prompt is text ABOUT a session (a summary, a title, a
+        # label), so any image path in it is quoted history, not an attachment.
+        # Left in, the prompt builder re-inlines every still-readable file as an
+        # image block: a session summary carried one per pasted screenshot, and
+        # a text-only background model rejected the whole request on each pass.
+        async for event in session.prompt(strip_image_refs(prompt)):
             if event.kind == EVENT_TEXT_CHUNK:
                 text += event.text
             elif event.kind == EVENT_PERMISSION_REQUEST:
@@ -1873,23 +1888,30 @@ def _billing_stat_holders(provider: Any) -> "list[Any]":
     provider on ``_handle``, and the shared background session hands non-kiro
     callers a thin adapter whose only link to the runner is ``_sess.provider``.
     Walking all of them keeps a background turn on the claude_code / bedrock seam
-    from reporting 0 credits for a turn that was billed. Bounded and
-    identity-deduped so a self-referential wrapper chain cannot loop.
+    from reporting 0 credits for a turn that was billed. Depth-first along
+    :data:`_BILLING_STAT_HOLDERS` and identity-deduped, so a self-referential
+    wrapper chain cannot loop and a stack of wrapper layers cannot exhaust the
+    node budget on holder-less siblings before the runner is reached — the
+    stats sit at the bottom of the chain, and a breadth-first walk with a node
+    budget stops short of them a few layers down. :data:`_WRAPPER_WALK_MAX_NODES`
+    is a runaway guard for attribute-synthesizing sources, not a depth limit.
 
     A name absent from this tuple is exactly how a new seam's spend went
-    unreported, which is why the billing read now prefers the provider's declared
+    unreported, which is why the billing read prefers the provider's declared
     :meth:`LLMProvider.billing_stats` and only falls back here.
     """
     out: list[Any] = []
     seen: set[int] = set()
+    # A stack: the LAST entry is visited next, so children are pushed in
+    # reverse holder order to come off in holder order.
     frontier: list[Any] = [provider]
     while frontier and len(out) < _WRAPPER_WALK_MAX_NODES:
-        node = frontier.pop(0)
+        node = frontier.pop()
         if node is None or id(node) in seen:
             continue
         seen.add(id(node))
         out.append(node)
-        for attr in ("_client", "_handle", "_sess", "provider"):
+        for attr in reversed(_BILLING_STAT_HOLDERS):
             frontier.append(getattr(node, attr, None))
     return out
 

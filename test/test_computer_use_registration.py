@@ -38,7 +38,26 @@ import pytest
 
 from kiro_crew import agent, agent_state, mcp_cleanup, mcp_discovery, onboarding_import
 from kiro_crew.agent import install_agent
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
 from kiro_crew.platform_compat import IS_POSIX
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    Every ``install_agent`` here ends in ``_write_derived_permissions``, which
+    reads ``installed_kiro_cli_version`` function-locally from
+    ``kiro_crew.kiro_cli``: one real ``kiro-cli --version`` spawn per binary
+    identity, process-cached, so whichever test in the worker installs first pays
+    it against the HOST's install with the checkout as the child's cwd. Pinned to
+    the floor release, as ``test_agent.py`` and the generated-writer suites pin it.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
+
 
 CU_SERVER = "kirocrew-computer"
 CU_REF = f"@{CU_SERVER}"
@@ -286,15 +305,44 @@ def test_refresh_strips_a_stale_remote_transport(tmp_path: Path):
     assert "headers" not in spec
 
 
-def test_refresh_drops_a_user_added_auto_approve(tmp_path: Path):
-    """A user's OWN ``autoApprove`` does NOT survive a refresh.
+def test_refresh_keeps_a_user_added_auto_approve(tmp_path: Path):
+    """A user's OWN ``autoApprove`` survives a refresh.
 
-    The managed spec must never SEED it (the test above), and a hand-added one is
-    dropped as well: an autoApproved MCP tool is approved inside kiro-cli with no
-    permission request, so such a grant exempts the tool from the gate with no card
-    ever shown. The direction is fail-closed and ``mcp.honour_auto_approve`` is the
-    way back.
+    The managed spec must never SEED one (the test above), but a hand-added one is
+    the owner's deliberate statement about their own tools and is respected: the
+    cost is theirs to carry, since an autoApproved MCP tool is approved inside
+    kiro-cli with no permission request, so the call never reaches the gate.
+    ``mcp.honour_auto_approve`` is on by default and the test below is the way back.
     """
+    cfg_dir = _bundled_defaults(tmp_path)
+    _existing_config(
+        tmp_path,
+        {
+            "command": "/usr/bin/kirocrew",
+            "args": [CU_SUBCOMMAND],
+            "autoApprove": [f"{CU_SERVER}/computer_get_state"],
+        },
+    )
+    spec = _installed(_run_install(tmp_path, cfg_dir))["mcpServers"][CU_SERVER]
+    assert spec["autoApprove"] == [f"{CU_SERVER}/computer_get_state"]
+
+
+def test_refresh_drops_a_user_added_auto_approve_when_opted_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """With ``mcp.honour_auto_approve`` off, the strict floor still applies.
+
+    This is the operator who wants every MCP call to reach the gate: an
+    ``autoApprove`` no server spec declares is dropped, the server itself stays, and
+    the tool goes through the approval card instead.
+    """
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig()
+    cfg.mcp.honour_auto_approve = False
+    monkeypatch.setattr(live, "snapshot", lambda: cfg)
+
     cfg_dir = _bundled_defaults(tmp_path)
     _existing_config(
         tmp_path,

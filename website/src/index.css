@@ -1617,6 +1617,29 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
   100%{transform:rotate(360deg)}
 }
 
+/* ── Custom font ligatures ──
+   The "Custom" Font Family option sets --font-body to the user's installed
+   family app-wide (useZoom), so chat prose, the composer, and sidebar session
+   and folder names pick it up by inheritance — no per-surface font-family rule
+   is needed, and a Nerd Font's glyphs render from the family alone. This turns
+   on ligatures app-wide ONLY while Custom is active AND the "Enable ligatures"
+   toggle is on (html[data-font-family="custom"][data-custom-ligatures="on"], both
+   set by useZoom), so a programming font (Fira Code, Cascadia Code, …) shows its
+   ligatures on demand without changing how the built-in Sans/Mono presets render.
+   Code and diffs inside messages keep --mono via the more-specific rules below
+   AND reset ligatures to normal, so a custom font never turns on calt ligatures
+   in code that did not have them. */
+html[data-font-family="custom"][data-custom-ligatures="on"] body{font-variant-ligatures:common-ligatures contextual}
+/* OFF must be explicit `none`, not the absence of the rule above: contextual
+   (calt) and common (liga) ligatures are ON by default in CSS, so a font like
+   JetBrains Mono keeps rendering =>/!=/-> under the initial `normal` value —
+   only `none` actually turns them off. */
+html[data-font-family="custom"][data-custom-ligatures="off"] body{font-variant-ligatures:none}
+/* Also cover Pierre's .code-block / .diff-block hosts: their lines are not
+   always <pre>, so without these selectors the OFF rule's `none` would leak
+   into rendered code and diffs by inheritance. */
+.msg-content code,.msg-content pre,.msg-content .code-block,.msg-content .diff-block{font-variant-ligatures:normal}
+
 /* ── Code in messages ── */
 .msg-content code{font-family:var(--mono);font-size:.9em}
 .msg-content :not(pre)>code{background:rgba(0,0,0,.15);padding:.15em .4em;border-radius:4px;overflow-wrap:break-word;word-break:break-all}
@@ -1624,6 +1647,25 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 /* Kiro theme: inline code = neutral elevated surface (Prey/750) + light-purple text (Figma 3906:185658) */
 [data-theme="kiro-dark"] .msg-content :not(pre)>code{background:#28242e;color:#c19aff}
 [data-theme="kiro-light"] .msg-content :not(pre)>code{background:var(--bg-hover);color:#723acc}
+/* Inline-code CHIPS (MarkdownRenderer): a chip's colour says what its click does. A chip whose
+   click navigates (`navigate`: a confirmed path, a session, an autolinked work item or a span
+   inside a link) wears the accent, the colour links wear; a chip that only copies (`copy`)
+   wears the NEUTRAL text colour, plus its dotted underline and copy cursor (set by the
+   component). Two values, because these two rules are the attribute's only consumer and two
+   kinds are all they tell apart. Neutral, not the Kiro inline-code purple above: on these
+   themes that purple and the accent are two near-identical purples, and a reader takes both
+   for the same kind of chip — "link-coloured = navigates, neutral = copies" has to hold on
+   every theme, and on the others inline code already inherits the text colour. The two Kiro
+   rules above set `color` at specificity (0,2,2), and the utilities are emitted unlayered, so
+   the `text-accent` utility (0,1,0) the actionable chips carry lost to them: every chip
+   painted in the code colour. Both chip states therefore get their own rule here, at (0,3,2),
+   keyed on the `data-chip-action` the renderer sets (raw HTML cannot: InlineCode drops any
+   inbound one). Kiro dark uses Purple/300, the same step-up message links take below. A span
+   that is no chip at all (an image-only raw span) keeps the theme's purple. */
+[data-theme="kiro-dark"] .msg-content :not(pre)>code[data-chip-action="copy"]{color:var(--text)}
+[data-theme="kiro-light"] .msg-content :not(pre)>code[data-chip-action="copy"]{color:var(--text)}
+[data-theme="kiro-dark"] .msg-content :not(pre)>code[data-chip-action="navigate"]{color:#b07fff}
+[data-theme="kiro-light"] .msg-content :not(pre)>code[data-chip-action="navigate"]{color:var(--accent)}
 /* Kiro dark: brighten message links — #8e48ff (=accent, same as the button fill) reads dull as thin
    text on the dark bg, so step up to Purple/300 for equal perceived vibrancy. Scoped to Kiro. */
 [data-theme="kiro-dark"] .msg-content a{color:#b07fff;text-decoration-color:rgba(176,127,255,.45)}
@@ -1787,6 +1829,45 @@ file-tree-container{
 .edit-grow::after{content:attr(data-replicated-value) " ";visibility:hidden}
 .edit-grow>textarea,.edit-grow::after{grid-area:1/1;font:inherit;line-height:inherit;letter-spacing:inherit;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
 .edit-grow>textarea{width:100%;min-width:0}
+
+/* Pinned-prompt stand-in. While a user prompt is pinned, its transcript row is
+   `visibility: hidden` (ChatPage's row wrapper, VirtualTranscript, ChatMessageList)
+   and the PinnedPrompt card is drawn in its place — but the card copies only the
+   BUBBLE, and the row also carries the message's action strip (copy, copy link,
+   pin, edit, timestamp). Visibility is inherited, so a `visible` descendant of the
+   hidden row is drawn and clickable: this re-shows the strip in its own place,
+   directly under the card, which folds down the bubble's remaining height and so
+   never covers it. Shown outright rather than behind the strip's hover reveal
+   (`opacity-0` + `group-hover/msg:opacity-100`): the card lives in an overlay
+   that is a sibling of the scroller, so hovering it can never be a hover of this
+   row, and a hover-only strip under a card is one the reader has to find by
+   pointing at a blank gap. Before this rule a prompt taller than the viewport had
+   no action strip at all — its bottom is only on screen once its top is above the
+   fold, i.e. once the whole row is hidden. Pinned by
+   src/test/UserMessage.pinnedStandinActions.test.tsx, which reads this rule.
+   Keyed on the `folding` VALUE, not the bare marker. The hosts write that value
+   while the strip is still UNCOVERED — some of it below the card's resting
+   bottom, on screen (usePinnedPrompt measures the strip's own rect). That is the
+   whole fold and the strip's own height of scroll after it: the card reaches its
+   clamp while the strip, hanging under the bubble, is still sliding under it, so
+   a value keyed on the fold alone dropped the strip out from under the pointer
+   for those last pixels and left the band blank. Once the strip is under the
+   card or behind the header, a strip left `visible` would be invisible yet
+   focusable — Tab through the transcript stopping on controls nobody can see,
+   each stop scrolling the transcript away from the position the pin exists to
+   hold. With the marker empty the strip inherits the row's `hidden` again and is
+   neither drawn nor in the tab order.
+   Edit is the one control left out (`data-message-edit`), for any marker value:
+   it swaps the bubble for a textarea + Cancel/Send tree that is not part of the
+   strip, so it would open inside the hidden row where nothing can see, focus or
+   dismiss it. `display:none` rather than `visibility:hidden` so the strip closes
+   the gap; it returns as soon as the row is no longer the stand-in.
+   The re-show matches the strip only as a direct child of UserMessage's
+   `data-role="user"` root, the one place it is rendered: structural scoping, so
+   the sanitizer's `data-message-*` reservation (MarkdownRenderer) is not the only
+   guard keeping a marker minted inside a message body off this paint path. */
+[data-pinned-standin="folding"] [data-role="user"] > [data-message-actions]{visibility:visible;opacity:1}
+[data-pinned-standin] [data-message-edit]{display:none}
 
 /* ── Auto-hiding scrollbar for code/diff blocks ── */
 .scroll-fade::-webkit-scrollbar{height:6px}
@@ -2433,6 +2514,33 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    fade completes (REVEAL_FLASH_FADE_MS in ChatSidebar.tsx covers it). */
 .session-row.session-reveal-flash,.folder-row.session-reveal-flash,.folder-col.session-reveal-flash{outline:2px solid var(--accent);outline-offset:-2px}
 .session-row.session-reveal-flash-fade,.folder-row.session-reveal-flash-fade,.folder-col.session-reveal-flash-fade{outline-color:transparent}
+/* Pinned folder headers in the Sessions lane (ChatSidebar renderFolderHeader).
+   A sticky row needs an opaque surface or the session rows scroll visibly
+   through it; it takes the card's own surface so it reads as part of the
+   panel. `:where()` keeps this at one class of specificity so the row's
+   `hover:bg-bg-hover` still wins on hover. kiro-light steps the card back to
+   --panel (.sidebar-inner above), so the pinned row follows it. A host that
+   repaints the card sets --folder-row-sticky-bg to the same surface (the
+   /embed/sessions wrapper in ChatPage paints it --bg).
+   --folder-row-sticky-h is the header's height, which is what a nested header
+   is offset by per depth, so the row is held to it: a default-agent badge or
+   the rename input would otherwise grow the row 4-6px and the pinned header
+   below would overlap it. Both fit inside the row's padding at this height.
+   The Playwright spec sidebar-sticky-folder-header.spec.ts measures the row
+   against it.
+   --folder-row-sticky-inset is the lane's top padding (LIST_BODY_CLS `p-2`):
+   sticky offsets count from the scroll container's padding edge, so without
+   it the pinned row sits 8px low and sessions scroll through the gap above. */
+.sidebar,.folder-row-sticky{--folder-row-sticky-h:32px;--folder-row-sticky-inset:0.5rem}
+.folder-row-sticky{height:var(--folder-row-sticky-h)}
+/* Rows scrolled into view (arrow-key roving, focus, reveal) stop below the
+   pinned header stack of their folder block (ChatSidebar renderFolderBlock
+   sets --folder-pin-stack); unfiled rows have no stack and keep 0. Chromium's
+   `block: 'nearest'` ignores this margin for a row already in view, so the
+   arrow-key rove re-aligns such a row itself (chat/sessionRowNav.ts). */
+:where(.sidebar) .session-row{scroll-margin-top:var(--folder-pin-stack,0px)}
+:where(.sidebar) .folder-row-sticky{background-color:var(--folder-row-sticky-bg,var(--bg-elevated))}
+:where([data-theme="kiro-light"] .sidebar-inner) .folder-row-sticky{background-color:var(--folder-row-sticky-bg,var(--panel))}
 /* Stalled goal loop (ChatSidebar `goalLoopStalled`): the loop is armed but its
    last turn died and nothing is executing — the whole card flashes danger-red
    until the user resumes. Two-class specificity outranks the Tailwind

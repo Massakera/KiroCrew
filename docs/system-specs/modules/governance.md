@@ -17,7 +17,12 @@ implementation companion to the design doc (Pippin `kirocrew/MVTDhLpm2SSW`).
 > performs on behalf of the agent across every surface (CLI, dashboard, Slack,
 > cron, heartbeat, sub-agents, apps). The underlying kiro-cli agent config
 > (`~/.kiro/agents/*.json`) is **out of scope**: Kiro Crew enforces its own
-> ceiling at its own gate even when the kiro side grants more.
+> ceiling at its own gate even when the kiro side grants more. The one place a
+> kiro-cli spec field is READ at a Crew gate is the spawn gate's honouring of
+> the parent agent's `toolsSettings.subagent.availableAgents` — an
+> intersection with `capabilities.spawn.scopes.agents` that only ever narrows
+> (see [subagent](subagent.md) § Parent agent spec allowlist); it is not a
+> governance scope and never widens what this model denies.
 
 Subagent admission checks explicit target names. When execution resolves an
 omitted name from the original conversation or parent session, the runner also
@@ -920,6 +925,16 @@ comes from inside the rebuild itself, never a separate guard probe, which would 
 concurrent default-home rewrite and record a projection that never landed. An unseeded
 baseline rebuilds once rather than skipping — a redundant rewrite costs a file write, a
 skipped one costs the tighten.
+
+A builtin can also be governed by a **capability** rather than by its name:
+`BUILTIN_TOOL_CAPABILITIES` maps `use_subagent` to `capabilities.spawn`. A capability is not
+a `tools` rule, so the name check cannot see it, and an auto-approved spawn raises no
+permission request, so the per-spawn check at the gate never runs for it. `may_skip_gate`
+therefore also withholds the grant while that capability restricts anything at the level
+asked (off, or any scope; an enabled gate with no scopes permits every use). Every writer asks
+this one predicate, so the grant is withheld on every backend and channel alike: kiro-cli's
+own spec, the KAS wire projection, and the `permissions` block written to disk. With no such
+policy nothing changes.
 
 What no hook can do is narrow a session **already negotiated**: kiro-cli holds the grants it
 was given, and nothing reaches into a running one. That limit has the same shape as an

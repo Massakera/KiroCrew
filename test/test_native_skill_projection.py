@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import errno
 import gc
 import hashlib
+import itertools
 import json
 import os
 import shutil
+import stat
 import threading
 import time
+import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -19,6 +24,56 @@ from conftest import requires_symlinks
 from kiro_crew.acp import skill_projection as projection
 from kiro_crew.agent_spec_format import iter_agent_spec_files
 from kiro_crew.hooks import FileTooLargeError
+
+
+def _hold_the_prune_clock(monkeypatch):
+    """Freeze ``time.monotonic`` for a test that asserts how many aliases one
+    prune walk RECLAIMS rather than how the time budget cuts it short.
+
+    Those counts only hold if the walk finishes. The budget is real wall-clock
+    time, so on a slow CI runner it ends a nine-candidate walk one reclaim early
+    and the count assertion reads that as a wrong cap. A clock that never
+    advances leaves the budget itself untouched and simply never spends it;
+    the budget's own semantics are pinned by :func:`_prune_walk`, which drives
+    this same clock one tick per candidate, and by the zero-budget tests.
+    """
+    monkeypatch.setattr(projection.time, "monotonic", lambda: 0.0)
+
+
+def _alias_is_live(directory, alias):
+    """Test-only single-alias liveness over the one product lease scan.
+
+    The product ``_alias_has_external_lease`` wrapper was removed -- it had zero
+    product callers, so retaining it as a "for direct callers" convenience was
+    misleading. The prune consults ``_scan_projection_leases`` once and tests
+    membership in its returned ``live_aliases`` set; these tests do the same via
+    this helper so they exercise the real scan (including its crash-residue
+    reclamation and uncertainty accounting) rather than a shim that outlived its
+    only users. Uncertainty is live, matching the fail-closed prune contract.
+    """
+    live_aliases, uncertain = projection._scan_projection_leases(directory)
+    if uncertain:
+        return True
+    return alias in live_aliases
+
+
+@pytest.fixture
+def cyclic_gc_quiesced():
+    """Keep a cyclic-GC pass (and any finalizer it runs) out of a deep JSON parse.
+
+    A recursion-limit fixture drives the parser to the bottom of the stack; a
+    collection firing there could run an inherited finalizer with no stack
+    left. Drain first, disable for the parse, then restore and drain again.
+    """
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 @pytest.fixture
@@ -44,6 +99,9 @@ def native_tree(tmp_path, monkeypatch):
         "list_agents",
         lambda **kw: [SimpleNamespace(name="custom", filename="custom.json", scope="global")],
     )
+    # The projection reads the settings files the control-plane mount reads;
+    # point the global one into the temp tree so no test reads this host's own.
+    monkeypatch.setattr("kiro_crew.agent._KIRO_MCP_JSON", home / "settings" / "mcp.json")
     return home, agents, project
 
 
@@ -463,13 +521,40 @@ def test_generated_view_keeps_lifecycle_ownership_out_of_the_agent_spec(native_t
     metadata = json.loads(_metadata_file(agents, prepared).read_text(encoding="utf-8"))
     assert metadata[projection._MANAGED_MARKER] == projection._MANAGED_MARKER_VALUE
     assert metadata[projection._MANAGED_CREW_HOME] == (home.parent / "crew").as_posix()
-    assert metadata[projection._MANAGED_WORK_DIR] == project.absolute().as_posix()
+    assert "x-kirocrew-work-dir" not in metadata
     assert metadata[projection._MANAGED_AGENT] == "custom"
     assert metadata[projection._MANAGED_SOURCE] == (agents / "custom.json").as_posix()
     assert (
         metadata[projection._MANAGED_ALIAS_SHA256]
         == hashlib.sha256(alias_path.read_bytes()).hexdigest()
     )
+
+
+def test_current_publication_recovers_from_deeply_nested_sidecar(native_tree):
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project)
+    metadata_path = _metadata_file(agents, first)
+    metadata_path.write_text("[" * 20000 + "]" * 20000, encoding="utf-8")
+
+    prepared = projection.prepare_native_skill_projection(project)
+
+    assert prepared is not None
+    assert prepared.agent("custom") == first.agent("custom")
+    alias_path = _alias_file(agents, prepared)
+    assert json.loads(alias_path.read_text(encoding="utf-8")) == prepared.specs["custom"]
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert (
+        metadata[projection._MANAGED_ALIAS_SHA256]
+        == hashlib.sha256(alias_path.read_bytes()).hexdigest()
+    )
+
+
+def test_legacy_alias_rejects_deeply_nested_json(native_tree):
+    _home, agents, _project = native_tree
+    path = agents / f"{projection.NATIVE_SKILL_ALIAS_PREFIX}{'a' * 24}.json"
+
+    assert not projection._is_legacy_projected_view(path, b"[" * 20000 + b"]" * 20000)
 
 
 def test_prune_keeps_alias_held_by_a_live_projection(native_tree, monkeypatch):
@@ -538,7 +623,7 @@ def test_every_reclaim_stage_admits_an_ordinary_local_alias(native_tree):
     gc.collect()
 
     assert projection._active_aliases() == set(), "a dropped projection still claims its aliases"
-    assert not projection._alias_has_external_lease(
+    assert not _alias_is_live(
         agents, alias_path.stem
     ), "the dropped projection's lease still reads as live"
 
@@ -591,8 +676,8 @@ def test_a_held_lease_stays_readable_so_it_only_keeps_the_aliases_it_names(nativ
     assert holder != records[0]
 
     # The lease naming `mine` is HELD by this process for prepared's lifetime.
-    assert projection._alias_has_external_lease(agents, mine) is True
-    assert projection._alias_has_external_lease(agents, "kirocrew-skill-view-notnamedhere") is False
+    assert _alias_is_live(agents, mine) is True
+    assert _alias_is_live(agents, "kirocrew-skill-view-notnamedhere") is False
     assert prepared is not None
 
 
@@ -617,10 +702,7 @@ def test_a_lease_is_never_published_past_the_bound_its_reader_enforces(native_tr
         assert len(records) == 1
         assert len(records[0].read_bytes()) <= projection._PROJECTION_LEASE_MAX_BYTES
         # A record AT the cap is admitted, so it keeps only what it names.
-        assert (
-            projection._alias_has_external_lease(agents, "kirocrew-skill-view-notnamedhere")
-            is False
-        )
+        assert _alias_is_live(agents, "kirocrew-skill-view-notnamedhere") is False
     finally:
         stack.close()
 
@@ -648,7 +730,7 @@ def _legacy_alias(agents, digest="0" * 24, name=None, resources=None, age_secs=3
     return path
 
 
-def test_prune_spares_a_legacy_alias_that_may_be_mid_publish(native_tree):
+def test_prune_spares_a_legacy_alias_that_may_be_mid_publish(native_tree, monkeypatch):
     """The one window the re-preparation contract does not cover.
 
     A publisher from a build predating the lease holds no lease, so between its
@@ -661,6 +743,8 @@ def test_prune_spares_a_legacy_alias_that_may_be_mid_publish(native_tree):
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
     fresh = _legacy_alias(agents, "f" * 24, age_secs=0)
     stale = _legacy_alias(agents, "e" * 24)
+    # Both candidates must be classified, so the walk must not end on the clock.
+    _hold_the_prune_clock(monkeypatch)
 
     assert projection.prepare_native_skill_projection(project) is not None
 
@@ -688,7 +772,7 @@ def test_prune_reclaims_the_backlog_left_by_builds_that_wrote_no_ownership(nativ
     assert _alias_file(agents, prepared).exists(), "this run's own alias was reclaimed"
 
 
-def test_prune_leaves_an_unattributable_alias_even_with_the_right_name(native_tree):
+def test_prune_leaves_an_unattributable_alias_even_with_the_right_name(native_tree, monkeypatch):
     """Shape is not provenance, and an unlink is not undoable.
 
     An operator's own agent could in principle carry this name, so one positive
@@ -701,6 +785,8 @@ def test_prune_leaves_an_unattributable_alias_even_with_the_right_name(native_tr
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
     unattributable = _legacy_alias(agents, "9" * 24, owned=False)
     attributable = _legacy_alias(agents, "8" * 24)
+    # Both candidates must be classified, so the walk must not end on the clock.
+    _hold_the_prune_clock(monkeypatch)
 
     assert projection.prepare_native_skill_projection(project) is not None
 
@@ -752,7 +838,10 @@ def test_prune_caps_reclaims_per_run_so_the_backlog_drains_over_spawns(native_tr
     """
     _home, agents, project = native_tree
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    monkeypatch.setattr(projection, "_PROJECTION_PRUNE_WORK_LIMIT", 4, raising=False)
     monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 3)
+    # The survivor counts below assume each walk ends on the cap, not the clock.
+    _hold_the_prune_clock(monkeypatch)
     backlog = [_legacy_alias(agents, f"{n:024x}") for n in range(8)]
 
     assert projection.prepare_native_skill_projection(project) is not None
@@ -771,9 +860,10 @@ def _crew_home_id():
 def _prune_walk(monkeypatch, classifications, blocked=frozenset()):
     """Record each candidate the walk classifies, and end it after *classifications*.
 
-    The lease probe is the first per-candidate cost in the loop, so the names it
-    sees ARE the candidates this call examined, and answering "leased" for
-    *blocked* pins an entry unreclaimable without inventing a live projection.
+    The classification step runs once per candidate the budgeted loop examines,
+    so the names it sees ARE the candidates this call examined, and answering
+    "not reclaimed" for *blocked* pins an entry unreclaimable without inventing a
+    live projection.
 
     Time is frozen and advanced ONLY by that probe, so one tick means one
     candidate. A clock that ticked per READ cannot express this: the
@@ -781,7 +871,7 @@ def _prune_walk(monkeypatch, classifications, blocked=frozenset()):
     reads rather than by work. Nothing sleeps, and the count is exact.
     """
     seen = []
-    real = projection._alias_has_external_lease
+    real = projection._reclaim_prune_candidate
     if classifications == 0:
         monkeypatch.setattr(projection, "_PRUNE_MAX_SECONDS_PER_RUN", 0.0)
     budget = projection._PRUNE_MAX_SECONDS_PER_RUN
@@ -792,12 +882,12 @@ def _prune_walk(monkeypatch, classifications, blocked=frozenset()):
         # the budget by one float ulp, which is one candidate either way.
         return 0.0 if not classifications else budget * ticks[0] / classifications
 
-    def probe(directory, alias):
-        seen.append(alias)
+    def probe(directory, path, crew_home_id):
+        seen.append(path.stem)
         ticks[0] += 1
-        return True if alias in blocked else real(directory, alias)
+        return False if path.stem in blocked else real(directory, path, crew_home_id)
 
-    monkeypatch.setattr(projection, "_alias_has_external_lease", probe)
+    monkeypatch.setattr(projection, "_reclaim_prune_candidate", probe)
     monkeypatch.setattr(projection.time, "monotonic", clock)
     return seen
 
@@ -826,8 +916,8 @@ def test_a_backlog_cannot_stretch_the_locked_section_past_this_calls_budget(
 def test_the_walk_stops_on_its_deadline_without_reclaiming_anything(native_tree, monkeypatch):
     """The deadline is the guarantee; the candidate cap only makes cost predictable.
 
-    Per-candidate cost is not flat -- the lease probe rescans the lease directory
-    for every candidate -- so a count alone cannot bound wall-clock time. A spent
+    Per-candidate cost is not flat -- classification reads each alias and its
+    sidecar -- so a count alone cannot bound wall-clock time. A spent
     budget is proved by a zero-length walk, which needs no clock and no sleep.
     """
     _home, agents, _project = native_tree
@@ -903,19 +993,66 @@ def test_the_rotation_offset_is_not_a_constant_and_stays_in_range(native_tree):
     assert len(drawn) > 1, "a constant offset walks one prefix forever"
 
 
-def test_prune_reclaims_alias_whose_work_dir_was_deleted(native_tree, monkeypatch, tmp_path):
+def test_every_work_dir_shares_one_alias_per_agent(native_tree, tmp_path):
+    """The alias is named by the view, not by where it is spawned.
+
+    Every subagent and cron run spawns in its own directory. Keying the alias on
+    that directory wrote a full copy of every agent per run, and kiro-cli's
+    subagent tool lists every copy it finds in the agents directory.
+    """
     _home, agents, project = native_tree
-    gone = tmp_path / "gone-workdir"
-    gone.mkdir()
     (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
-    first = projection.prepare_native_skill_projection(gone)
+    runs = []
+    for n in range(5):
+        run_dir = tmp_path / f"subagent_{n:08x}"
+        run_dir.mkdir()
+        runs.append(projection.prepare_native_skill_projection(run_dir))
+    live = projection.prepare_native_skill_projection(project)
+    assert {run.agent("custom") for run in runs} == {live.agent("custom")}
+    views = list(agents.glob(f"{projection.NATIVE_SKILL_ALIAS_PREFIX}*.json"))
+    assert views == [_alias_file(agents, live)]
+
+
+def test_two_crew_homes_never_share_an_alias(native_tree, monkeypatch, tmp_path):
+    """Identical views from two data homes must not contend for one file.
+
+    A shared file would flip its ownership sidecar to whichever home spawned
+    last, so each home's cleanup would misjudge the other's live view.
+    """
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    monkeypatch.setattr(projection, "data_home", lambda: tmp_path / "crew-a")
+    first = projection.prepare_native_skill_projection(project)
+    monkeypatch.setattr(projection, "data_home", lambda: tmp_path / "crew-b")
+    second = projection.prepare_native_skill_projection(project)
+    assert first.agent("custom") != second.agent("custom")
+    assert _alias_file(agents, first).exists()
+    assert _alias_file(agents, second).exists()
+
+
+def test_republishing_identical_view_keeps_the_file_in_place(native_tree, tmp_path):
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project)
+    before = os.stat(_alias_file(agents, first))
+    other = tmp_path / "other"
+    other.mkdir()
+    second = projection.prepare_native_skill_projection(other)
+    after = os.stat(_alias_file(agents, second))
+    assert (before.st_ino, before.st_mtime_ns) == (after.st_ino, after.st_mtime_ns)
+
+
+def test_editing_an_agent_publishes_a_new_alias_and_reclaims_the_old(native_tree):
+    _home, agents, project = native_tree
+    source = agents / "custom.json"
+    source.write_text('{"name":"custom","description":"v1"}', encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project)
     stale = _alias_file(agents, first)
-    assert stale.exists()
     del first
     gc.collect()
-    shutil.rmtree(gone)
-    # A spawn for a still-live work_dir triggers the prune of the dead one.
-    projection.prepare_native_skill_projection(project)
+    source.write_text('{"name":"custom","description":"v2"}', encoding="utf-8")
+    second = projection.prepare_native_skill_projection(project)
+    assert _alias_file(agents, second) != stale
     assert not stale.exists()
 
 
@@ -931,7 +1068,8 @@ def test_prune_reclaims_unused_alias_whose_work_dir_still_exists(native_tree, tm
     _home, agents, project = native_tree
     run_dir = tmp_path / "subagent_deadbeef"
     run_dir.mkdir()
-    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    source = agents / "custom.json"
+    source.write_text('{"name":"custom","description":"old"}', encoding="utf-8")
     ended = projection.prepare_native_skill_projection(run_dir)
     alias = _alias_file(agents, ended)
     metadata = _metadata_file(agents, ended)
@@ -939,6 +1077,7 @@ def test_prune_reclaims_unused_alias_whose_work_dir_still_exists(native_tree, tm
     gc.collect()
     assert run_dir.is_dir(), "the run directory is deliberately left in place"
 
+    source.write_text('{"name":"custom","description":"new"}', encoding="utf-8")
     projection.prepare_native_skill_projection(project)
     assert not alias.exists(), "an unused alias survived because its work dir still exists"
     assert not metadata.exists(), "the ownership sidecar outlived its alias"
@@ -964,12 +1103,17 @@ def test_prune_reclaims_at_least_as_many_aliases_as_one_spawn_publishes(
         lambda **kw: [SimpleNamespace(name=n, filename=f"{n}.json", scope="global") for n in names],
     )
     monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 1)
+    _hold_the_prune_clock(monkeypatch)
     run_dir = tmp_path / "subagent_00000001"
     run_dir.mkdir()
     ended = projection.prepare_native_skill_projection(run_dir)
     left_behind = [_alias_file(agents, ended, n) for n in names]
     del ended
     gc.collect()
+    for name in names:
+        (agents / f"{name}.json").write_text(
+            json.dumps({"name": name, "description": "edited"}), encoding="utf-8"
+        )
 
     live = projection.prepare_native_skill_projection(project)
     assert live is not None
@@ -989,10 +1133,21 @@ def test_prune_drains_headroom_beyond_one_spawn_publishes(native_tree, monkeypat
         lambda **kw: [SimpleNamespace(name=n, filename=f"{n}.json", scope="global") for n in names],
     )
     monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 2)
+    _hold_the_prune_clock(monkeypatch)
+
+    def edit(version):
+        for name in names:
+            (agents / f"{name}.json").write_text(
+                json.dumps({"name": name, "description": version}), encoding="utf-8"
+            )
+
     run_dirs = [tmp_path / f"subagent_{n:08x}" for n in range(2)]
-    for run_dir in run_dirs:
+    ended = []
+    for n, run_dir in enumerate(run_dirs):
         run_dir.mkdir()
-    ended = [projection.prepare_native_skill_projection(run_dir) for run_dir in run_dirs]
+        edit(f"v{n}")
+        ended.append(projection.prepare_native_skill_projection(run_dir))
+    edit("live")
     backlog = [_alias_file(agents, prepared, name) for prepared in ended for name in names]
     del ended
     gc.collect()
@@ -1186,7 +1341,6 @@ def test_prune_never_touches_another_homes_alias(native_tree):
                 "name": foreign.stem,
                 projection._MANAGED_MARKER: projection._MANAGED_MARKER_VALUE,
                 projection._MANAGED_CREW_HOME: "/some/other/crew/home",
-                projection._MANAGED_WORK_DIR: "/nonexistent/workdir",
                 projection._MANAGED_AGENT: "ghost",
                 projection._MANAGED_SOURCE: "/nonexistent/workdir/.kiro/agents/ghost.json",
             }
@@ -1357,14 +1511,399 @@ def test_lease_scan_reclaims_valid_unlocked_crash_residue(native_tree):
     lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
     lease_dir.mkdir()
     stale = lease_dir / "crashed.json"
+    holder = lease_dir / "crashed.hold"
     projection.atomic_write(
         stale,
         json.dumps({"aliases": ["kirocrew-skill-view-stale"]}),
         restrict_to_owner=True,
     )
+    projection.atomic_write(holder, "", restrict_to_owner=True)
 
-    assert not projection._alias_has_external_lease(agents, "kirocrew-skill-view-stale")
+    assert not _alias_is_live(agents, "kirocrew-skill-view-stale")
     assert not stale.exists()
+    assert not holder.exists()
+
+
+def test_lease_scan_does_not_mutate_before_finding_later_held_match(native_tree, monkeypatch):
+    _home, agents, _project = native_tree
+    alias = "kirocrew-skill-view-held"
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    stale = lease_dir / "stale-first.json"
+    stale_holder = lease_dir / "stale-first.hold"
+    projection.atomic_write(
+        stale,
+        json.dumps({"aliases": ["kirocrew-skill-view-stale"]}),
+        restrict_to_owner=True,
+    )
+    projection.atomic_write(stale_holder, "", restrict_to_owner=True)
+    held = projection._acquire_projection_lease(agents, {alias})
+    held_record = next(path for path in lease_dir.glob("*.json") if path != stale)
+
+    class MutationSensitiveEntries:
+        def __init__(self):
+            self.active = False
+            self.index = 0
+
+        def __enter__(self):
+            self.active = True
+            return self
+
+        def __exit__(self, *_args):
+            self.active = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index == 0:
+                self.index += 1
+                return SimpleNamespace(name=stale.name)
+            if self.index == 1 and stale.exists():
+                self.index += 1
+                return SimpleNamespace(name=held_record.name)
+            raise StopIteration
+
+    entries = MutationSensitiveEntries()
+    real_scandir = projection.os.scandir
+    in_scan_unlinks = []
+    real_unlink = projection._unlink_projection_lease_if_unchanged
+
+    def mutation_sensitive_scandir(path, *args, **kwargs):
+        if path == lease_dir:
+            return entries
+        return real_scandir(path, *args, **kwargs)
+
+    def record_unlink(path, identity):
+        if entries.active:
+            in_scan_unlinks.append(path)
+        return real_unlink(path, identity)
+
+    try:
+        with monkeypatch.context() as scan_patch:
+            scan_patch.setattr(projection.os, "scandir", mutation_sensitive_scandir)
+            scan_patch.setattr(projection, "_unlink_projection_lease_if_unchanged", record_unlink)
+            # The alias is live because a held lease names it; the scan collects
+            # that into its union rather than early-returning on the match.
+            assert _alias_is_live(agents, alias) is True
+            # The invariant that still holds: nothing is unlinked DURING the
+            # active scandir iteration -- cleanup is deferred until it closes.
+            assert in_scan_unlinks == []
+        # Held leases preserve liveness without suppressing reclamation of residue
+        # in the SAME clean scan: liveness is carried by the union, so after the
+        # scandir closes the unlocked crash residue is reclaimed even though a
+        # held lease was found later in the pass.
+        assert not stale.exists() and not stale_holder.exists()
+    finally:
+        held.close()
+
+
+def test_lease_scan_error_defers_unlocked_residue_cleanup(native_tree, monkeypatch):
+    _home, agents, _project = native_tree
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    stale = lease_dir / "stale-before-error.json"
+    holder = lease_dir / "stale-before-error.hold"
+    projection.atomic_write(
+        stale,
+        json.dumps({"aliases": ["kirocrew-skill-view-stale"]}),
+        restrict_to_owner=True,
+    )
+    projection.atomic_write(holder, "", restrict_to_owner=True)
+
+    class ErrorAfterFirstEntry:
+        def __init__(self):
+            self.yielded = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if not self.yielded:
+                self.yielded = True
+                return SimpleNamespace(name=stale.name)
+            raise OSError("test scandir iteration error")
+
+    real_scandir = projection.os.scandir
+    normalized_lease_dir = os.path.normcase(os.path.normpath(os.fspath(lease_dir)))
+
+    def error_after_first_entry_scandir(path, *args, **kwargs):
+        try:
+            normalized_path = os.path.normcase(os.path.normpath(os.fspath(path)))
+        except TypeError:
+            return real_scandir(path, *args, **kwargs)
+        if normalized_path == normalized_lease_dir:
+            return ErrorAfterFirstEntry()
+        return real_scandir(path, *args, **kwargs)
+
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", error_after_first_entry_scandir)
+        assert _alias_is_live(agents, "kirocrew-skill-view-other") is True
+
+    assert stale.exists() and holder.exists()
+
+
+def test_lease_scan_cap_drains_validated_residue_before_answering_live(native_tree, monkeypatch):
+    """A cap keeps the answer live but reclaims the residue it already validated.
+
+    Hitting the record ceiling is uncertainty, so the alias is retained -- but the
+    crash/finalizer residue the scan lock-validated BEFORE the cap has been proven
+    stale and must not be absorbed. A prior build discarded it on any short scan,
+    so a flood of records past the ceiling could permanently defer cleanup of
+    leases already known dead. Only the records seen before the cap are reclaimed;
+    a record beyond the ceiling is never scanned and never touched. This is the
+    one behaviour that separates a cap from an open/iteration error, which trusts
+    nothing it saw.
+    """
+    _home, agents, _project = native_tree
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    stale = lease_dir / "stale-before-cap.json"
+    stale_holder = lease_dir / "stale-before-cap.hold"
+    projection.atomic_write(
+        stale,
+        json.dumps({"aliases": ["kirocrew-skill-view-stale"]}),
+        restrict_to_owner=True,
+    )
+    projection.atomic_write(stale_holder, "", restrict_to_owner=True)
+    beyond = lease_dir / "beyond-cap.json"
+    beyond_holder = lease_dir / "beyond-cap.hold"
+    projection.atomic_write(
+        beyond,
+        json.dumps({"aliases": ["kirocrew-skill-view-beyond"]}),
+        restrict_to_owner=True,
+    )
+    projection.atomic_write(beyond_holder, "", restrict_to_owner=True)
+
+    monkeypatch.setattr(projection, "_PROJECTION_LEASE_SCAN_LIMIT", 1, raising=False)
+
+    class OrderedEntries:
+        def __init__(self):
+            self.active = False
+            self._entries = iter(())
+
+        def __enter__(self):
+            self.active = True
+            self._entries = iter(
+                (SimpleNamespace(name=stale.name), SimpleNamespace(name=beyond.name))
+            )
+            return self
+
+        def __exit__(self, *_args):
+            self.active = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._entries)
+
+    entries = OrderedEntries()
+    in_scan_unlinks = []
+    real_scandir = projection.os.scandir
+    real_unlink = projection._unlink_projection_lease_if_unchanged
+    normalized_lease_dir = os.path.normcase(os.path.normpath(os.fspath(lease_dir)))
+
+    def ordered_scandir(path, *args, **kwargs):
+        try:
+            normalized_path = os.path.normcase(os.path.normpath(os.fspath(path)))
+        except TypeError:
+            return real_scandir(path, *args, **kwargs)
+        if normalized_path == normalized_lease_dir:
+            return entries
+        return real_scandir(path, *args, **kwargs)
+
+    def record_unlink(path, identity):
+        if entries.active:
+            in_scan_unlinks.append(path)
+        return real_unlink(path, identity)
+
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", ordered_scandir)
+        scan_patch.setattr(projection, "_unlink_projection_lease_if_unchanged", record_unlink)
+        assert _alias_is_live(agents, "kirocrew-skill-view-query") is True
+
+    # The residue validated before the cap is reclaimed only after iterator
+    # closure; the record past the cap was never scanned and remains on disk.
+    assert in_scan_unlinks == []
+    assert not stale.exists() and not stale_holder.exists()
+    assert beyond.exists() and beyond_holder.exists()
+
+
+def test_lease_scan_overflow_is_uncertain_and_retains_stale_alias(native_tree, monkeypatch):
+    _home, agents, project = native_tree
+    source = agents / "custom.json"
+    source.write_text('{"name":"custom"}', encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project)
+    stale = _alias_file(agents, first)
+    del first
+    gc.collect()
+    source.unlink()
+
+    # The scan ceiling bounds EVERY directory entry, not just the ``.json``
+    # records (see _scan_projection_leases / defect: unrelated or ``.hold``
+    # entries once bypassed the cap and could force an unbounded walk). With the
+    # entries ordered record, holder, record, holder, ... a ceiling of 3 admits
+    # residue-0's record and holder plus residue-1's record before it trips, so
+    # exactly two records are probed and residue past that is never scanned.
+    monkeypatch.setattr(projection, "_PROJECTION_LEASE_SCAN_LIMIT", 3, raising=False)
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir(exist_ok=True)
+    for index in range(3):
+        stem = f"residue-{index}"
+        (lease_dir / f"{stem}{projection._PROJECTION_LEASE_RECORD_SUFFIX}").write_text(
+            json.dumps({"aliases": [f"other-{index}"]}), encoding="utf-8"
+        )
+        (lease_dir / f"{stem}{projection._PROJECTION_LEASE_HOLDER_SUFFIX}").write_text(
+            "", encoding="utf-8"
+        )
+
+    # Pin the entry order so the ceiling's interaction with the record/holder
+    # interleave is deterministic rather than dependent on filesystem scandir
+    # order. Records and holders alternate, matching on-disk creation order.
+    ordered_names = []
+    for index in range(3):
+        ordered_names.append(f"residue-{index}{projection._PROJECTION_LEASE_RECORD_SUFFIX}")
+        ordered_names.append(f"residue-{index}{projection._PROJECTION_LEASE_HOLDER_SUFFIX}")
+
+    class OrderedEntries:
+        def __init__(self):
+            self._entries = iter(SimpleNamespace(name=name) for name in ordered_names)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._entries)
+
+    real_scandir = projection.os.scandir
+    normalized_lease_dir = os.path.normcase(os.path.normpath(os.fspath(lease_dir)))
+
+    def ordered_scandir(path, *args, **kwargs):
+        try:
+            same = os.path.normcase(os.path.normpath(os.fspath(path))) == normalized_lease_dir
+        except TypeError:
+            same = False
+        if same:
+            return OrderedEntries()
+        return real_scandir(path, *args, **kwargs)
+
+    # Scoped: os.scandir is process-global, and the tmp-tree teardown (an
+    # os.walk-based rmtree on Windows) must see the real one.
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", ordered_scandir)
+
+        holder_probes = 0
+        real_open_lock_file = projection.platform_compat.open_lock_file
+
+        def count_holder_probes(path):
+            nonlocal holder_probes
+            if path.parent == lease_dir:
+                holder_probes += 1
+            return real_open_lock_file(path)
+
+        monkeypatch.setattr(projection.platform_compat, "open_lock_file", count_holder_probes)
+
+        projection._prune_stale_managed_aliases(
+            agents, projection.data_home().absolute().as_posix(), keep=set()
+        )
+
+    # Ceiling 3 over record, holder, record, ... admits residue-0's record and
+    # holder and residue-1's record before tripping, so two records are probed.
+    assert holder_probes == 2
+    assert stale.exists(), "a capped lease scan must retain rather than authorize deletion"
+    # The two residue leases lock-validated before the cap are reclaimed; residue
+    # past the ceiling was never scanned and must remain untouched.
+    remaining_records = sum(
+        1
+        for index in range(3)
+        if (lease_dir / f"residue-{index}{projection._PROJECTION_LEASE_RECORD_SUFFIX}").exists()
+    )
+    remaining_holders = sum(
+        1
+        for index in range(3)
+        if (lease_dir / f"residue-{index}{projection._PROJECTION_LEASE_HOLDER_SUFFIX}").exists()
+    )
+    assert remaining_records == 1
+    assert remaining_holders == 1
+
+
+def test_prune_work_cap_counts_retained_candidates_before_reclaims(native_tree, monkeypatch):
+    """Reconciled contract: retained candidates do NOT starve the stale-work budget.
+
+    Before this fix the bounded candidate scan counted kept/active/live aliases
+    toward the work limit, so a retained entry sorting ahead of the backlog
+    consumed a stale-work slot and left real backlog unexamined -- and a run's own
+    just-published aliases sort early, making the starvation order-dependent
+    rather than rare. The scan now skips retained entries WITHOUT charging the
+    stale-work budget, while still bounding total traversal at the class limit
+    plus the bounded skip set, so it is not an unbounded bypass. Here three live
+    aliases are interleaved ahead of the stale backlog; with a stale-work limit of
+    3 all three stale candidates are still examined and reclaimed, and the lease
+    directory is scanned exactly once.
+    """
+    live_stems = {f"kirocrew-skill-view-{0xA00 + index:024x}" for index in range(3)}
+    _home, agents, _project = native_tree
+    stale = [_legacy_alias(agents, f"{index:024x}") for index in range(3)]
+
+    monkeypatch.setattr(projection, "_PROJECTION_PRUNE_WORK_LIMIT", 3, raising=False)
+    monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 64)
+    # Every stale candidate must be reached, so the walk must not end on the clock.
+    _hold_the_prune_clock(monkeypatch)
+
+    scans = 0
+
+    def one_batch_scan(_directory):
+        nonlocal scans
+        scans += 1
+        # Every live alias is reported by the single batch scan; the prune folds
+        # them into the skip set the candidate generator excludes without charging
+        # the stale-work budget.
+        return set(live_stems), False
+
+    monkeypatch.setattr(projection, "_scan_projection_leases", one_batch_scan)
+
+    projection._prune_stale_managed_aliases(
+        agents, projection.data_home().absolute().as_posix(), keep=set()
+    )
+
+    assert scans == 1, "the lease directory must be scanned once per prune, never per candidate"
+    assert not any(
+        path.exists() for path in stale
+    ), "live aliases consumed stale-work budget and starved backlog reclamation"
+
+
+def test_is_legacy_projected_view_deeply_nested_alias_reads_as_unreadable(
+    native_tree, cyclic_gc_quiesced
+):
+    """A legacy-named alias nested past the interpreter limit is not legacy, and does not abort.
+
+    ``_is_legacy_projected_view`` is the third ownership JSON reader; its
+    ``json.loads`` guard caught only ``(ValueError, TypeError)``, so a
+    hand-authored alias whose JSON nests past the recursion limit raised
+    ``RecursionError`` (a ``RuntimeError``) straight through the reader and
+    aborted the caller instead of failing closed. The reader must treat such a
+    file as an unreadable view (return ``False``), never legacy to reclaim.
+    Fails at pytest call on 694b43971 (2000 levels does not trip recursion, so
+    the fixture nests 100000 deep, matching the sidecar/lease readers' fixtures).
+    """
+    _home, agents, _project = native_tree
+    alias_path = agents / f"{projection.NATIVE_SKILL_ALIAS_PREFIX}{'0' * 24}.json"
+    deep = ("[" * 100000 + "]" * 100000).encode("utf-8")
+    alias_path.write_bytes(deep)
+    assert projection._is_legacy_projected_view(alias_path, deep) is False
 
 
 def test_windows_alias_unlink_rechecks_identity_under_publication_lock(tmp_path, monkeypatch):
@@ -1552,8 +2091,1318 @@ def test_census_counts_what_the_reclaim_would_keep_and_remove(native_tree, tmp_p
     )
 
     # Retention is bounded and the bound is reported, not silently exceeded.
-    monkeypatch.setattr(projection, "_CENSUS_MAX_LEASES", 1)
+    monkeypatch.setattr(projection, "_PROJECTION_LEASE_SCAN_LIMIT", 1, raising=False)
     census = projection.census_projected_aliases(agents)
     assert census["truncated"] == 1
     assert census["total"] == published + 1
     del live
+
+
+def test_boot_drain_pause_outlasts_the_lock_poll_cap():
+    """A spawn blocked on the publication lock polls with backoff up to the
+    lock's poll cap. A between-batch gap shorter than that cap can open and
+    close while the waiter sleeps, so it never takes the lock and runs into
+    the 2s acquisition ceiling instead."""
+    from kiro_crew import platform_compat
+
+    assert projection._DRAIN_BATCH_PAUSE_SECS > platform_compat._LOCK_POLL_MAX_SECS
+    assert projection._DRAIN_BATCH_PAUSE_SECS < projection._PROJECTION_LOCK_TIMEOUT_SECS
+
+
+def _released_backlog(agents, project, count):
+    """*count* stale aliases of one agent, each with its sidecar, no lease held.
+
+    Every version stays held while the next is published, so no spawn prunes
+    it; releasing them all at once leaves a backlog, as a capped prune does.
+    """
+    source = agents / "custom.json"
+    held = []
+    for n in range(count):
+        source.write_text(json.dumps({"name": "custom", "description": f"v{n}"}), encoding="utf-8")
+        held.append(projection.prepare_native_skill_projection(project))
+    backlog = [(_alias_file(agents, p), _metadata_file(agents, p)) for p in held]
+    del held
+    gc.collect()
+    assert all(alias.exists() and meta.exists() for alias, meta in backlog)
+    return backlog
+
+
+def _recorded_batches(monkeypatch):
+    """What each of the drain's prune batches reclaimed, in order."""
+    real_prune = projection._prune_stale_managed_aliases
+    batches = []
+
+    def recording(directory, crew_home_id, **kwargs):
+        reclaimed = real_prune(directory, crew_home_id, **kwargs)
+        batches.append(reclaimed)
+        return reclaimed
+
+    monkeypatch.setattr(projection, "_prune_stale_managed_aliases", recording)
+    return batches
+
+
+def test_boot_drain_clears_a_backlog_past_the_per_spawn_cap(native_tree, monkeypatch):
+    _home, agents, project = native_tree
+    backlog = _released_backlog(agents, project, 7)
+    monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 2)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    assert projection.drain_stale_aliases() == 7
+    assert not any(alias.exists() or meta.exists() for alias, meta in backlog)
+
+
+def test_boot_drain_keeps_aliases_a_live_projection_holds(native_tree, monkeypatch):
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    live = projection.prepare_native_skill_projection(project)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+    projection.drain_stale_aliases()
+    assert _alias_file(agents, live).exists()
+    assert _metadata_file(agents, live).exists()
+
+
+def test_boot_drain_retries_a_batch_that_missed_the_lock(native_tree, monkeypatch):
+    """One contended batch at boot -- a spawn publishing while the drain
+    runs -- must not abandon the whole backlog until the next restart."""
+    _home, agents, project = native_tree
+    backlog = _released_backlog(agents, project, 5)
+    real_lock = projection._projection_alias_lock
+    # The second batch misses the lock; every later one takes it, however many
+    # the drain needs (a scripted list that runs dry would raise StopIteration
+    # into the drain's catch-all and end it early, hiding a short count).
+    outcomes = itertools.chain(["ok", "held"], itertools.repeat("ok"))
+    attempts = []
+
+    def flaky(directory):
+        outcome = next(outcomes)
+        attempts.append(outcome)
+        if outcome == "held":
+            raise OSError("held")
+        return real_lock(directory)
+
+    monkeypatch.setattr(projection, "_projection_alias_lock", flaky)
+    monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 2)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+    # The exact batch sequence below assumes each walk ends on the cap, not the clock.
+    _hold_the_prune_clock(monkeypatch)
+
+    assert projection.drain_stale_aliases() == 5
+    assert not any(alias.exists() or meta.exists() for alias, meta in backlog)
+    # Batches reclaim 2, miss, 2, 1, then three idle batches end the drain: the
+    # miss counted as one idle batch, and the reclaims after it restarted the
+    # idle run rather than ending the loop.
+    assert attempts == ["ok", "held", "ok", "ok", "ok", "ok", "ok"]
+
+
+def test_boot_drain_ends_when_the_lock_is_never_available(native_tree, monkeypatch):
+    """The lock helper raises OSError for a busy lock AND for a lock-file fault
+    (a symlinked lock, a permission error). Either one, repeated, is a run of
+    idle batches: the drain ends at that bound instead of paying every batch,
+    and raises nothing into the boot janitor."""
+    _home, agents, _project = native_tree
+    attempts = []
+
+    def faulted(_directory):
+        attempts.append(1)
+        raise OSError("skill projection lock is a symlink or junction")
+
+    monkeypatch.setattr(projection, "_projection_alias_lock", faulted)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    assert projection.drain_stale_aliases() == 0
+    assert len(attempts) == projection._DRAIN_IDLE_BATCHES
+
+
+def test_boot_drain_continues_past_a_batch_the_budget_cut_short(native_tree, monkeypatch):
+    """A batch that spends its time budget before reaching a reclaimable entry
+    returns zero, and that zero is not the end of the backlog: the per-spawn
+    prune walks from a random offset, so a prefix of kept or leased entries
+    can eat a whole budget. Only a run of consecutive zeros, each from a fresh
+    offset, means the sweep is done."""
+    _home, agents, project = native_tree
+    backlog = _released_backlog(agents, project, 5)
+    real_budget = projection._PRUNE_MAX_SECONDS_PER_RUN
+    batches = _recorded_batches(monkeypatch)
+    recording = projection._prune_stale_managed_aliases
+    # Every batch after the starved one must finish its walk for the reclaim
+    # counts below to mean anything; with the clock held, the real budget is
+    # never spent by wall-clock time.
+    _hold_the_prune_clock(monkeypatch)
+
+    def starve_the_first_batch(directory, crew_home_id, **kwargs):
+        # A zero budget is spent at the first candidate, before any is classified.
+        monkeypatch.setattr(
+            projection, "_PRUNE_MAX_SECONDS_PER_RUN", 0.0 if not batches else real_budget
+        )
+        return recording(directory, crew_home_id, **kwargs)
+
+    monkeypatch.setattr(projection, "_prune_stale_managed_aliases", starve_the_first_batch)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    assert projection.drain_stale_aliases() == 5
+    # The reclaiming batch restarted the idle count, so the drain paid the full
+    # run of idle batches after it rather than stopping at the first zero.
+    assert batches == [0, 5] + [0] * projection._DRAIN_IDLE_BATCHES
+    assert not any(alias.exists() or meta.exists() for alias, meta in backlog)
+
+
+def test_boot_drain_ends_after_a_run_of_batches_that_reclaim_nothing(native_tree, monkeypatch):
+    """The continue-past-a-cut-short-batch rule must not turn a clean directory
+    into a thousand-batch walk: a short run of batches that reclaim nothing
+    ends it."""
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    live = projection.prepare_native_skill_projection(project)
+    batches = _recorded_batches(monkeypatch)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    assert projection.drain_stale_aliases() == 0
+    assert batches == [0] * projection._DRAIN_IDLE_BATCHES
+    assert _alias_file(agents, live).exists()
+
+
+def test_boot_drain_ends_on_idle_batches_when_every_budget_is_spent(native_tree, monkeypatch):
+    """The stopping rule cannot be "a walk that saw every candidate": on a large
+    directory whose entries mostly belong to another data home or are leased,
+    every batch spends its time budget first, so no walk is ever exhaustive.
+    Such a drain must still end on the idle-batch run instead of paying all
+    _DRAIN_MAX_BATCHES batches for nothing."""
+    _home, agents, project = native_tree
+    backlog = _released_backlog(agents, project, 3)
+    batches = _recorded_batches(monkeypatch)
+    # Spent at the first candidate, on every batch: reclaimed is always zero and
+    # the walk never classifies anything.
+    monkeypatch.setattr(projection, "_PRUNE_MAX_SECONDS_PER_RUN", 0.0)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    assert projection.drain_stale_aliases() == 0
+    assert batches == [0] * projection._DRAIN_IDLE_BATCHES
+    # Nothing was reclaimable within the budget, so the backlog is untouched and
+    # later spawns (or the next boot) clear it.
+    assert all(alias.exists() and meta.exists() for alias, meta in backlog)
+
+
+def test_boot_drain_idle_count_restarts_on_any_reclaim(native_tree, monkeypatch):
+    """Only CONSECUTIVE zeros end the drain. A reclaim restarts the count, so a
+    backlog that yields intermittently is cleared rather than abandoned at the
+    first pair of quiet batches."""
+    _home, agents, _project = native_tree
+    # Never runs dry: a StopIteration would end the drain through its catch-all.
+    reclaims = itertools.chain([0, 0, 1], itertools.repeat(0))
+    batches = []
+
+    def scripted(directory, crew_home_id, **kwargs):
+        reclaimed = next(reclaims)
+        batches.append(reclaimed)
+        return reclaimed
+
+    monkeypatch.setattr(projection, "_prune_stale_managed_aliases", scripted)
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+
+    assert projection.drain_stale_aliases() == 1
+    # Two idle, one reclaim that restarts the count, then a full idle run.
+    assert batches == [0, 0, 1] + [0] * projection._DRAIN_IDLE_BATCHES
+
+
+def test_boot_drain_ends_when_the_alias_directory_cannot_be_listed(native_tree, monkeypatch):
+    """An unlistable directory reclaims nothing on every batch, so the drain
+    ends on the idle run without touching the backlog and without raising."""
+    import errno
+
+    _home, agents, project = native_tree
+    backlog = _released_backlog(agents, project, 2)
+    batches = _recorded_batches(monkeypatch)
+    real_scandir = projection.os.scandir
+    normalized_agents = os.path.normcase(os.path.normpath(os.fspath(agents)))
+
+    def unlistable(path, *args, **kwargs):
+        try:
+            same = os.path.normcase(os.path.normpath(os.fspath(path))) == normalized_agents
+        except TypeError:
+            same = False
+        if same:
+            raise OSError(errno.EIO, "input/output error", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(projection, "_DRAIN_BATCH_PAUSE_SECS", 0)
+    # Scoped: os.scandir is process-global, and the tmp-tree teardown (an
+    # os.walk-based rmtree on Windows) must see the real one.
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", unlistable)
+        drained = projection.drain_stale_aliases()
+
+    assert drained == 0
+    assert batches == [0] * projection._DRAIN_IDLE_BATCHES
+    assert all(alias.exists() and meta.exists() for alias, meta in backlog)
+
+
+# ── Residual bounds: dual-coverage adoption, crash-residue recovery, batch lease scan ──
+
+
+def test_lease_scan_unions_aliases_from_every_held_lease(native_tree):
+    """Finding 3: one scan unions the aliases named by every held lease."""
+    _home, agents, _project = native_tree
+    a = projection._acquire_projection_lease(
+        agents, {"kirocrew-skill-view-aaa", "kirocrew-skill-view-bbb"}
+    )
+    b = projection._acquire_projection_lease(agents, {"kirocrew-skill-view-ccc"})
+    try:
+        live, uncertain = projection._scan_projection_leases(agents)
+    finally:
+        a.close()
+        b.close()
+    assert uncertain is False
+    assert live == {
+        "kirocrew-skill-view-aaa",
+        "kirocrew-skill-view-bbb",
+        "kirocrew-skill-view-ccc",
+    }
+
+
+def test_prune_scans_the_lease_directory_once_for_many_candidates(native_tree, monkeypatch):
+    """Finding 3: the lease directory is scanned ONCE per prune, not once per candidate.
+
+    On the old per-candidate path this scanned the whole lease directory once for
+    every retained candidate; the batch scan reads it once. Fails at pytest call
+    on fcef4c9a4 (four candidates -> four scans there, one here).
+    """
+    _home, agents, _project = native_tree
+    candidates = [_legacy_alias(agents, f"{index:024x}") for index in range(4)]
+    walked = [_legacy_alias(agents, f"{index:024x}") for index in range(100, 104)]
+    external = projection._acquire_projection_lease(agents, {p.stem for p in candidates})
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    normalized_lease_dir = os.path.normcase(os.path.normpath(os.fspath(lease_dir)))
+    scandir_calls = 0
+    real_scandir = projection.os.scandir
+
+    def counting_scandir(path, *args, **kwargs):
+        nonlocal scandir_calls
+        try:
+            same = os.path.normcase(os.path.normpath(os.fspath(path))) == normalized_lease_dir
+        except TypeError:
+            same = False
+        if same:
+            scandir_calls += 1
+        return real_scandir(path, *args, **kwargs)
+
+    # Scoped: os.scandir is process-global, and the tmp-tree teardown (an
+    # os.walk-based rmtree on Windows) must see the real one.
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", counting_scandir)
+        try:
+            projection._prune_stale_managed_aliases(
+                agents, projection.data_home().absolute().as_posix(), keep=set()
+            )
+        finally:
+            external.close()
+
+    assert scandir_calls == 1, "the lease directory must be scanned once, not once per candidate"
+    assert all(p.exists() for p in candidates)
+    assert not any(p.exists() for p in walked), "unleased candidates are walked and reclaimed"
+
+
+def test_a_lease_released_during_the_walk_keeps_its_aliases_for_that_call(native_tree, monkeypatch):
+    """A release races the snapshot lock-free, so a stale snapshot may only keep.
+
+    The lease is closed after the one scan and before the walk; the aliases it
+    named survive this call, and an unleased stale alias beside them is still
+    reclaimed, so the walk did run.
+    """
+    _home, agents, _project = native_tree
+    leased = [_legacy_alias(agents, f"{index:024x}") for index in range(3)]
+    free = _legacy_alias(agents, "f" * 24)
+    lease = projection._acquire_projection_lease(agents, {p.stem for p in leased})
+    real_candidates = projection._projection_prune_candidates
+
+    def release_then_enumerate(directory, skip):
+        lease.close()
+        return real_candidates(directory, skip)
+
+    monkeypatch.setattr(projection, "_projection_prune_candidates", release_then_enumerate)
+    reclaimed = projection._prune_stale_managed_aliases(
+        agents, projection.data_home().absolute().as_posix(), keep=set()
+    )
+
+    assert all(p.exists() for p in leased), "a lease released mid-walk must still keep its aliases"
+    assert not free.exists() and reclaimed == 1
+
+
+@pytest.mark.parametrize("ceiling", [projection._PROJECTION_LOCK_TIMEOUT_SECS, 1.7, 4.0])
+def test_prune_budget_follows_the_lock_ceiling_and_keeps_the_publication_reserve(ceiling):
+    """The walk budget is the ceiling minus the lease scan and a named reserve."""
+    budget = projection._prune_budget_within(ceiling)
+    reserve = projection._PROJECTION_PUBLICATION_RESERVE_SECS
+    scan = projection._PROJECTION_LEASE_SCAN_MAX_SECONDS
+    assert reserve > 0
+    assert budget + scan + reserve <= ceiling + 1e-9
+    assert budget == pytest.approx(ceiling - scan - reserve)
+    shipped = projection._prune_budget_within(projection._PROJECTION_LOCK_TIMEOUT_SECS)
+    assert projection._PRUNE_MAX_SECONDS_PER_RUN == shipped > 0
+
+
+def test_prune_skips_all_candidate_deletion_when_lease_scan_is_uncertain(native_tree, monkeypatch):
+    """Finding 3: any lease-scan uncertainty authorizes NO candidate deletion."""
+    _home, agents, _project = native_tree
+    stale = [_legacy_alias(agents, f"{index:024x}") for index in range(3)]
+    monkeypatch.setattr(projection, "_scan_projection_leases", lambda _directory: (set(), True))
+
+    projection._prune_stale_managed_aliases(
+        agents, projection.data_home().absolute().as_posix(), keep=set()
+    )
+
+    assert all(p.exists() for p in stale), "an uncertain lease scan must authorize no deletion"
+
+
+# ── Residual bounds, second pass: unbounded lease traversal, keep-starved prune,
+#    crash-residue digest validity, sidecar-less foreign adoption, cap summary ──
+
+
+def test_lease_record_scan_bounds_all_entries_not_only_records(native_tree, monkeypatch):
+    """Defect 1: the scan ceiling must bound EVERY entry, not only ``.json`` records.
+
+    The lease scan counted only ``.json`` records toward
+    _PROJECTION_LEASE_SCAN_LIMIT, so a directory padded with arbitrary ``.hold``
+    or unrelated entries slipped past the ceiling: a scan holding the publication
+    lock could then walk a number of entries proportional to the whole directory
+    rather than to the limit. With the ceiling of 2 and a leading pad of
+    non-record entries, the fixed scan stops after 2 walked entries and yields no
+    record; the old code walked every pad entry looking for records. Counting the
+    walked entries proves the bound is over entries, not records.
+    """
+    lease_dir = agents_dir(native_tree) / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    monkeypatch.setattr(projection, "_PROJECTION_LEASE_SCAN_LIMIT", 2, raising=False)
+
+    # Many non-record entries first, then a real record far past the ceiling.
+    pad_names = [f"pad-{index}{projection._PROJECTION_LEASE_HOLDER_SUFFIX}" for index in range(50)]
+    record_name = f"real{projection._PROJECTION_LEASE_RECORD_SUFFIX}"
+    ordered = [*pad_names, record_name]
+
+    walked = 0
+
+    class CountingEntries:
+        def __init__(self):
+            self._entries = iter(ordered)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal walked
+            name = next(self._entries)
+            walked += 1
+            return SimpleNamespace(name=name)
+
+    real_scandir = projection.os.scandir
+    normalized = os.path.normcase(os.path.normpath(os.fspath(lease_dir)))
+
+    def counting_scandir(path, *args, **kwargs):
+        try:
+            same = os.path.normcase(os.path.normpath(os.fspath(path))) == normalized
+        except TypeError:
+            same = False
+        return CountingEntries() if same else real_scandir(path, *args, **kwargs)
+
+    # Scoped: os.scandir is process-global, and the tmp-tree teardown (an
+    # os.walk-based rmtree on Windows) must see the real one.
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", counting_scandir)
+
+        records = []
+
+        def recording_probe(lease_path):
+            records.append(lease_path.name)
+            return [], None
+
+        scan_patch.setattr(projection, "_probe_projection_lease", recording_probe)
+        live, uncertain = projection._scan_projection_leases(agents_dir(native_tree))
+
+    # Fixed: the ceiling stops the walk after it has counted the limit, pulling
+    # at most _PROJECTION_LEASE_SCAN_LIMIT + 1 entries from the iterator (the last
+    # one is the entry that trips the break), so no record is reached. The old
+    # code walked all 51 entries because pads did not count toward the ceiling.
+    assert walked <= projection._PROJECTION_LEASE_SCAN_LIMIT + 1
+    assert walked < len(ordered), "the scan walked the whole padded directory"
+    assert records == []
+    assert live == set() and uncertain is True
+
+
+def test_lease_record_scan_still_yields_records_within_the_bound(native_tree, monkeypatch):
+    """Defect 1 companion: a record within the ceiling is still yielded.
+
+    Bounding all entries must not stop yielding legitimate records that fall
+    within the ceiling -- only the padding past it is skipped.
+    """
+    lease_dir = agents_dir(native_tree) / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    monkeypatch.setattr(projection, "_PROJECTION_LEASE_SCAN_LIMIT", 4, raising=False)
+    ordered = [
+        f"a{projection._PROJECTION_LEASE_RECORD_SUFFIX}",
+        f"a{projection._PROJECTION_LEASE_HOLDER_SUFFIX}",
+        f"b{projection._PROJECTION_LEASE_RECORD_SUFFIX}",
+        f"b{projection._PROJECTION_LEASE_HOLDER_SUFFIX}",
+        f"c{projection._PROJECTION_LEASE_RECORD_SUFFIX}",
+    ]
+
+    class OrderedEntries:
+        def __init__(self):
+            self._entries = iter(SimpleNamespace(name=name) for name in ordered)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._entries)
+
+    real_scandir = projection.os.scandir
+    normalized = os.path.normcase(os.path.normpath(os.fspath(lease_dir)))
+
+    def ordered_scandir(path, *args, **kwargs):
+        try:
+            same = os.path.normcase(os.path.normpath(os.fspath(path))) == normalized
+        except TypeError:
+            same = False
+        return OrderedEntries() if same else real_scandir(path, *args, **kwargs)
+
+    # Scoped: os.scandir is process-global, and the tmp-tree teardown (an
+    # os.walk-based rmtree on Windows) must see the real one.
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", ordered_scandir)
+
+        record_names = []
+
+        def recording_probe(lease_path):
+            record_names.append(lease_path.name)
+            return [lease_path.stem], None
+
+        scan_patch.setattr(projection, "_probe_projection_lease", recording_probe)
+        live, uncertain = projection._scan_projection_leases(agents_dir(native_tree))
+
+    # Ceiling 4 over record, holder, record, holder, record admits a.json and
+    # b.json (records at walked positions 1 and 3); c.json sits past the ceiling.
+    assert record_names == [
+        f"a{projection._PROJECTION_LEASE_RECORD_SUFFIX}",
+        f"b{projection._PROJECTION_LEASE_RECORD_SUFFIX}",
+    ]
+    # Both held records union into the live set, and the cap answers uncertain.
+    assert live == {"a", "b"} and uncertain is True
+
+
+def test_prune_does_not_let_the_run_keep_alias_starve_backlog_reclamation(native_tree, monkeypatch):
+    """Defect 2: a kept alias sorting early must not consume a stale-work slot.
+
+    The bounded candidate scan counted the run's own just-published keep alias
+    toward the stale-work limit. Because that alias sorts early in the directory,
+    it stole a work slot and left one backlog alias unexamined: with a work limit
+    of 4 and reclaim cap _PRUNE_MAX_RECLAIMS_PER_RUN + len(keep) = 4, the old code
+    reclaimed only 3 of the first 4 stale candidates. The fix skips the keep alias
+    without charging the stale budget, so all 4 stale candidates in the window are
+    examined and reclaimed. A pinned entry order puts the keep alias FIRST, which
+    is the order-dependent worst case the CI regression only hits by luck.
+    """
+    _home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    monkeypatch.setattr(projection, "_PROJECTION_PRUNE_WORK_LIMIT", 4, raising=False)
+    monkeypatch.setattr(projection, "_PRUNE_MAX_RECLAIMS_PER_RUN", 3)
+    # The exact reclaim count below assumes the walk ends on the cap, not the clock.
+    _hold_the_prune_clock(monkeypatch)
+    backlog = [_legacy_alias(agents, f"{index:024x}") for index in range(8)]
+
+    # The run's own alias is named by its view digest, so it is identified at
+    # scan time as the one Crew-prefixed alias that is not part of the backlog.
+    backlog_names = {path.name for path in backlog}
+    real_scandir = projection.os.scandir
+    normalized_agents = os.path.normcase(os.path.normpath(os.fspath(agents)))
+
+    def keep_first_scandir(path, *args, **kwargs):
+        try:
+            same = os.path.normcase(os.path.normpath(os.fspath(path))) == normalized_agents
+        except TypeError:
+            same = False
+        if not same:
+            return real_scandir(path, *args, **kwargs)
+        # Materialize the real entries, then force the run's own keep alias to the
+        # front so it lands inside the bounded candidate window.
+        entries = list(real_scandir(path, *args, **kwargs))
+        entries.sort(
+            key=lambda e: (
+                0
+                if e.name.startswith(projection.NATIVE_SKILL_ALIAS_PREFIX)
+                and e.name.endswith(".json")
+                and e.name not in backlog_names
+                else 1
+            )
+        )
+
+        class _Ctx:
+            def __init__(self):
+                self._entries = iter(entries)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return None
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._entries)
+
+        return _Ctx()
+
+    # Scoped: os.scandir is process-global, and the tmp-tree teardown (an
+    # os.walk-based rmtree on Windows) must see the real one.
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", keep_first_scandir)
+
+        prepared = projection.prepare_native_skill_projection(project)
+    assert prepared is not None
+    # Exactly four backlog aliases reclaimed in the first run despite the keep
+    # alias sorting first; the old keep-starved scan reclaimed only three.
+    assert sum(1 for path in backlog if not path.exists()) == 4
+    keep_stem = prepared.aliases["custom"]
+    assert (agents / f"{keep_stem}.json").exists(), "the run's own alias must survive"
+
+
+def test_prune_candidate_traversal_counts_unrelated_entries_and_caps_skip_credit(
+    native_tree, monkeypatch
+):
+    """Neither arbitrary padding nor a large skip set can extend the walk."""
+    _home, agents, _project = native_tree
+    work_limit = 3
+    skip = {f"kirocrew-skill-view-{0xB00 + index:024x}" for index in range(20)}
+    names = [
+        *(f"unrelated-{index}.json" for index in range(50)),
+        *(f"{stem}.json" for stem in sorted(skip)),
+        *(f"kirocrew-skill-view-{index:024x}.json" for index in range(2)),
+    ]
+    walked = 0
+
+    class CountingEntries:
+        def __init__(self):
+            self._entries = iter(names)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal walked
+            name = next(self._entries)
+            walked += 1
+            return SimpleNamespace(name=name)
+
+    real_scandir = projection.os.scandir
+
+    def counting_scandir(path, *args, **kwargs):
+        if path == agents:
+            return CountingEntries()
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(projection, "_PROJECTION_PRUNE_WORK_LIMIT", work_limit, raising=False)
+    # Scoped: os.scandir is process-global, and the tmp-tree teardown (an
+    # os.walk-based rmtree on Windows) must see the real one.
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", counting_scandir)
+
+        yielded = list(projection._projection_prune_candidates(agents, skip))
+    assert yielded == []
+    ceiling = (2 * work_limit) + work_limit
+    assert walked <= ceiling + 1
+    assert walked < len(names), "the prune walked the padded directory"
+
+    spec = (Path(__file__).parents[1] / "docs/system-specs/modules/acp-client.md").read_text(
+        encoding="utf-8"
+    )
+    normalized_spec = " ".join(spec.split())
+    for contract in (
+        "Reclaims, stale-candidate work, and total traversal have separate PER RUN ceilings",
+        "every directory entry consumes the separately bounded traversal budget",
+        "skip credit is capped at one work-limit",
+        "the ceiling guarantees bounded entry traversal rather than eventual drain",
+    ):
+        assert contract in normalized_spec
+
+
+def test_deeply_nested_ownership_sidecar_reads_as_unowned_in_the_prune(
+    native_tree, cyclic_gc_quiesced
+):
+    """A recursive JSON shape is unreadable ownership, not a prune exception."""
+    _home, agents, project = native_tree
+    source = agents / "custom.json"
+    source.write_text('{"name":"custom"}', encoding="utf-8")
+    first = projection.prepare_native_skill_projection(project)
+    assert first is not None
+    alias_path = _alias_file(agents, first)
+    metadata_path = _metadata_file(agents, first)
+    del first
+    gc.collect()
+
+    metadata_path.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+    alias_raw = alias_path.read_bytes()
+
+    assert projection._managed_metadata_for_alias(agents, alias_path, alias_raw) is None
+    projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+    assert alias_path.read_bytes() == alias_raw
+
+
+def test_alias_has_external_lease_product_symbol_is_removed(native_tree):
+    """Defect 6: the zero-consumer product wrapper is deleted, not merely unused.
+
+    Its only callers were tests, which now exercise _scan_projection_leases
+    directly. Leaving it in place kept misleading "for direct callers"
+    documentation alive, so its removal is part of the fix.
+    """
+    assert not hasattr(projection, "_alias_has_external_lease")
+    # The batch scan the tests now use directly is present and callable.
+    _home, agents, _project = native_tree
+    live, uncertain = projection._scan_projection_leases(agents)
+    assert live == set() and uncertain is False
+
+
+def agents_dir(native_tree):
+    return native_tree[1]
+
+
+def test_prune_classification_seam_is_the_production_step(native_tree):
+    """The per-candidate unit a test observes is the production classification.
+
+    Kept, active and leased names never reach the budgeted loop, so the unit it
+    pays for is the ownership classification in ``_reclaim_prune_candidate``.
+    """
+    _home, agents, _project = native_tree
+    backlog = _legacy_alias(agents, "c" * 24)
+    assert projection._reclaim_prune_candidate(agents, backlog, _crew_home_id()) is True
+    assert not backlog.exists()
+
+
+def test_capped_lease_scan_reports_its_ceiling_and_reclaimed_count(
+    native_tree, monkeypatch, caplog
+):
+    """A capped scan authorizes no alias deletion, so it has to say it capped.
+
+    Otherwise an incremental drain is invisible: the prune returns before its own
+    reclaim log, and per-lease reclaims are DEBUG only.
+    """
+    _home, agents, _project = native_tree
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    for n in range(3):
+        projection.atomic_write(
+            lease_dir / f"residue-{n}.json",
+            json.dumps({"aliases": [f"kirocrew-skill-view-{n}"]}),
+            restrict_to_owner=True,
+        )
+        projection.atomic_write(lease_dir / f"residue-{n}.hold", "", restrict_to_owner=True)
+    monkeypatch.setattr(projection, "_PROJECTION_LEASE_SCAN_LIMIT", 3, raising=False)
+
+    with caplog.at_level("INFO", logger=projection.logger.name):
+        live, uncertain = projection._scan_projection_leases(agents)
+
+    assert live == set() and uncertain is True
+    remaining = {p.name for p in lease_dir.glob("*.json")}
+    reclaimed = 3 - len(remaining)
+    assert f"lease scan reached its 3-entry ceiling; reclaimed {reclaimed} stale" in caplog.text
+
+
+def test_lease_scan_stops_on_its_deadline_and_answers_uncertain(native_tree, monkeypatch, caplog):
+    """A count alone cannot bound wall-clock time under the publication lock.
+
+    The entry cap bounds how many parse-plus-lock-probe steps run, not how long a
+    slow filesystem takes over them, so the scan also checks a deadline between
+    entries. Expiry is treated like the cap: residue validated before it drains,
+    nothing past it is examined, and the pass answers uncertain so no alias is
+    deleted. The clock jumps past the budget once the first entry has been
+    examined, so no sleep is needed.
+    """
+    _home, agents, _project = native_tree
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    for n in range(3):
+        projection.atomic_write(
+            lease_dir / f"residue-{n}.json",
+            json.dumps({"aliases": [f"kirocrew-skill-view-{n}"]}),
+            restrict_to_owner=True,
+        )
+        projection.atomic_write(lease_dir / f"residue-{n}.hold", "", restrict_to_owner=True)
+    budget = projection._PROJECTION_LEASE_SCAN_MAX_SECONDS
+    calls = [0]
+
+    def clock():
+        # The deadline read and the first entry's check see t=0; every later
+        # check sees the budget spent.
+        calls[0] += 1
+        return 0.0 if calls[0] <= 2 else budget
+
+    probed: list[str] = []
+    real_probe = projection._probe_projection_lease
+
+    def probe(path):
+        probed.append(path.name)
+        return real_probe(path)
+
+    monkeypatch.setattr(projection.time, "monotonic", clock)
+    monkeypatch.setattr(projection, "_probe_projection_lease", probe)
+
+    with caplog.at_level("INFO", logger=projection.logger.name):
+        live, uncertain = projection._scan_projection_leases(agents)
+
+    assert live == set() and uncertain is True
+    assert len(probed) <= 1, "the scan probed a lease after its deadline was spent"
+    assert "lease scan spent its 0.4-second budget after 1 entr(ies)" in caplog.text
+    remaining = {p.name for p in lease_dir.iterdir()}
+    assert len(remaining) >= 4, "the scan reclaimed residue it never examined"
+
+
+def test_candidate_walk_deferral_is_logged_at_info(native_tree, monkeypatch, caplog):
+    """Past the candidate window an alias is not promised a turn, so say so at INFO.
+
+    The lease-scan ceiling is already INFO; the candidate-walk ceiling reports
+    the same kind of deferral and must be visible the same way.
+    """
+    _home, agents, _project = native_tree
+    for n in range(3):
+        _legacy_alias(agents, f"{n:024x}")
+    monkeypatch.setattr(projection, "_PROJECTION_PRUNE_WORK_LIMIT", 1)
+
+    with caplog.at_level("INFO", logger=projection.logger.name):
+        candidates = list(projection._projection_prune_candidates(agents, set()))
+
+    assert len(candidates) == 1
+    assert any(
+        record.levelname == "INFO" and "deferred remaining alias pruning" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_capped_lease_scan_counts_only_fully_removed_pairs(native_tree, monkeypatch, caplog):
+    """A lease whose holder unlink fails is still half present, so it is not reclaimed.
+
+    The cap log reports how much of a backlog drained; counting a pair whose
+    ``.hold`` survived would report progress the next scan will not see.
+    """
+    _home, agents, _project = native_tree
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    for n in range(3):
+        projection.atomic_write(
+            lease_dir / f"residue-{n}.json",
+            json.dumps({"aliases": [f"kirocrew-skill-view-{n}"]}),
+            restrict_to_owner=True,
+        )
+        projection.atomic_write(lease_dir / f"residue-{n}.hold", "", restrict_to_owner=True)
+    monkeypatch.setattr(projection, "_PROJECTION_LEASE_SCAN_LIMIT", 4, raising=False)
+    real_unlink = projection._unlink_projection_lease_if_unchanged
+
+    def holder_unlink_fails(path, identity):
+        if path.name.endswith(projection._PROJECTION_LEASE_HOLDER_SUFFIX):
+            return False
+        return real_unlink(path, identity)
+
+    monkeypatch.setattr(projection, "_unlink_projection_lease_if_unchanged", holder_unlink_fails)
+
+    with caplog.at_level("INFO", logger=projection.logger.name):
+        live, uncertain = projection._scan_projection_leases(agents)
+
+    assert live == set() and uncertain is True
+    # Every holder survived its failed unlink, so each record is kept too: the
+    # pair is retried whole by the next scan and no pair counts as reclaimed.
+    assert len(list(lease_dir.glob("*.json"))) == 3
+    assert len(list(lease_dir.glob("*.hold"))) == 3
+    assert "lease scan reached its 4-entry ceiling; reclaimed 0 stale" in caplog.text
+
+
+def test_unreadable_lease_record_still_drains_validated_residue(native_tree, monkeypatch, caplog):
+    """One persistent bad record must not stop stale-lease cleanup forever.
+
+    The pass stays uncertain, so no alias is deleted, but the residue it already
+    lock-validated is reclaimed and the blocking record is reported at INFO.
+    """
+    _home, agents, _project = native_tree
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    stale = lease_dir / "a-stale.json"
+    stale_holder = lease_dir / "a-stale.hold"
+    projection.atomic_write(
+        stale, json.dumps({"aliases": ["kirocrew-skill-view-stale"]}), restrict_to_owner=True
+    )
+    projection.atomic_write(stale_holder, "", restrict_to_owner=True)
+    bad = lease_dir / "b-bad.json"
+    projection.atomic_write(bad, "not json", restrict_to_owner=True)
+    projection.atomic_write(lease_dir / "b-bad.hold", "", restrict_to_owner=True)
+    real_scandir = projection.os.scandir
+
+    def ordered_scandir(path, *args, **kwargs):
+        if Path(path) == lease_dir:
+            names = [stale.name, stale_holder.name, bad.name, "b-bad.hold"]
+
+            class Entries:
+                def __enter__(self):
+                    return iter(SimpleNamespace(name=name) for name in names)
+
+                def __exit__(self, *_args):
+                    return None
+
+            return Entries()
+        return real_scandir(path, *args, **kwargs)
+
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", ordered_scandir)
+        with caplog.at_level("INFO", logger=projection.logger.name):
+            live, uncertain = projection._scan_projection_leases(agents)
+
+    assert live == set() and uncertain is True
+    assert not stale.exists() and not stale_holder.exists()
+    assert bad.exists()
+    assert "lease record b-bad.json is unreadable; reclaimed 1 stale lease(s)" in caplog.text
+
+
+def test_unreadable_lease_record_does_not_hide_stale_leases_after_it(native_tree, monkeypatch):
+    """A bad record EARLY in directory order must not stop the walk.
+
+    Stopping at the first unreadable record left every stale lease behind it
+    unreclaimed on every stable-order scan, for as long as the bad record stayed.
+    The pass stays uncertain, so no alias is deleted, but the stale lease after
+    the bad record is reclaimed.
+    """
+    _home, agents, _project = native_tree
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    bad = lease_dir / "a-bad.json"
+    projection.atomic_write(bad, "not json", restrict_to_owner=True)
+    projection.atomic_write(lease_dir / "a-bad.hold", "", restrict_to_owner=True)
+    stale = lease_dir / "b-stale.json"
+    stale_holder = lease_dir / "b-stale.hold"
+    projection.atomic_write(
+        stale, json.dumps({"aliases": ["kirocrew-skill-view-stale"]}), restrict_to_owner=True
+    )
+    projection.atomic_write(stale_holder, "", restrict_to_owner=True)
+    real_scandir = projection.os.scandir
+
+    def ordered_scandir(path, *args, **kwargs):
+        if Path(path) == lease_dir:
+            names = [bad.name, "a-bad.hold", stale.name, stale_holder.name]
+
+            class Entries:
+                def __enter__(self):
+                    return iter(SimpleNamespace(name=name) for name in names)
+
+                def __exit__(self, *_args):
+                    return None
+
+            return Entries()
+        return real_scandir(path, *args, **kwargs)
+
+    with monkeypatch.context() as scan_patch:
+        scan_patch.setattr(projection.os, "scandir", ordered_scandir)
+        live, uncertain = projection._scan_projection_leases(agents)
+
+    assert live == set() and uncertain is True
+    assert not stale.exists() and not stale_holder.exists()
+    assert bad.exists()
+
+
+def test_record_less_holder_litter_is_reclaimed_and_cannot_pin_the_cap(native_tree, monkeypatch):
+    """A ``.hold`` whose record is gone names no alias but consumes the ceiling.
+
+    Left alone, enough of it would cap every scan and defer pruning forever, so
+    an unlocked record-less holder is reclaimed as residue. A held one is kept.
+    """
+    _home, agents, _project = native_tree
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    orphans = [lease_dir / f"{1000 + n}-{uuid.uuid4().hex}.hold" for n in range(4)]
+    for orphan in orphans:
+        projection.atomic_write(orphan, "", restrict_to_owner=True)
+    held = projection._acquire_projection_lease(agents, {"kirocrew-skill-view-live"})
+    try:
+        monkeypatch.setattr(projection, "_PROJECTION_LEASE_SCAN_LIMIT", 3, raising=False)
+        drained = 0
+        for _ in range(4):
+            live, uncertain = projection._scan_projection_leases(agents)
+            if not uncertain:
+                break
+            drained += 1
+        assert not any(orphan.exists() for orphan in orphans)
+        assert live == {"kirocrew-skill-view-live"} and uncertain is False
+        assert drained >= 1, "the ceiling was never reached, so the litter was not exercised"
+        # The live lease's own pair is untouched.
+        assert len(list(lease_dir.glob("*.json"))) == 1
+        assert len(list(lease_dir.glob("*.hold"))) == 1
+    finally:
+        held.close()
+
+
+def test_record_less_holder_reclaim_spares_files_the_writer_did_not_name(native_tree):
+    """Only a ``<pid>-<uuid4 hex>`` holder is ever reclaimed as record-less litter.
+
+    An empty ``.hold`` carries no proof that this module wrote it, so a file
+    such as an operator's ``notes.hold`` in the lease directory must survive a
+    scan; the old head unlinked every unlocked record-less ``*.hold``. A
+    writer-shaped stem with content survives too: the writer only publishes
+    empty holders, and head ``f0ecf1e46`` unlinked it on the name alone.
+    """
+    _home, agents, _project = native_tree
+    lease_dir = agents / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir()
+    foreign = [
+        lease_dir / "notes.hold",
+        lease_dir / f"{uuid.uuid4().hex}.hold",
+        lease_dir / f"12-{uuid.uuid4().hex.upper()}.hold",
+        lease_dir / f"12-{uuid.uuid4().hex}-copy.hold",
+    ]
+    # The writer's exact stem shape, but with content: the module only ever
+    # publishes EMPTY holders, so the name alone does not prove authorship.
+    foreign.append(lease_dir / f"34-{uuid.uuid4().hex}.hold")
+    for path in foreign:
+        path.write_text("operator data", encoding="utf-8")
+    ours = lease_dir / f"12-{uuid.uuid4().hex}.hold"
+    projection.atomic_write(ours, "", restrict_to_owner=True)
+
+    live, uncertain = projection._scan_projection_leases(agents)
+
+    assert live == set() and uncertain is False
+    assert not ours.exists()
+    for path in foreign:
+        assert path.read_text(encoding="utf-8") == "operator data", path.name
+
+
+def test_census_truncates_wherever_the_reclaim_lease_scan_caps(native_tree, monkeypatch):
+    """The census and the reclaim scan share one entry-level lease ceiling.
+
+    The scan charges every lease-directory entry (records AND ``.hold``
+    sidecars), so a directory of held pairs can cap it -- and defer every
+    prune -- while the record count alone is still under the census bound.
+    The census must then report ``truncated`` instead of promising a drain.
+    """
+    _home, agents, _project = native_tree
+    projection.atomic_write(
+        agents / "kirocrew-skill-view-orphan.json", "{}", restrict_to_owner=True
+    )
+    leases = [
+        projection._acquire_projection_lease(agents, {f"kirocrew-skill-view-live{n}"})
+        for n in range(3)
+    ]
+    try:
+        # Three records (under the census's own record bound) but six entries.
+        monkeypatch.setattr(projection, "_PROJECTION_LEASE_SCAN_LIMIT", 4, raising=False)
+        _live, uncertain = projection._scan_projection_leases(agents)
+        assert uncertain is True
+        census = projection.census_projected_aliases(agents)
+        assert census["truncated"] == 1
+    finally:
+        for lease in leases:
+            lease.close()
+
+
+# ── A refused unlink is reported, not swallowed ──
+
+
+_dir_fd_seam_only = pytest.mark.skipif(
+    os.name != "posix",
+    reason="these drive the dir_fd unlink seam; Windows unlinks by name and reports the "
+    "parent open instead, so the injected errno never reaches the reporter there",
+)
+
+
+def _seed_backlog(agents, count):
+    """*count* reclaimable legacy aliases, backdated past the minimum age."""
+    return [_legacy_alias(agents, f"{n:024x}") for n in range(count)]
+
+
+@_dir_fd_seam_only
+def test_a_refused_unlink_is_reported_once_per_interval_with_its_count(
+    native_tree, monkeypatch, caplog
+):
+    """Silence here is what sent an outside report after the wrong root cause.
+
+    A permission or read-only refusal answering ``False`` like a deliberate keep,
+    with nothing logged, makes an agents directory this process cannot write look
+    exactly like one with nothing to reclaim. One warning per interval,
+    carrying how many refusals it stands for -- never one line per file.
+    """
+    _home, agents, _project = native_tree
+    backlog = _seed_backlog(agents, 5)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_LAST", 0.0)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_SUPPRESSED", 0)
+    monkeypatch.setattr(projection.platform_compat, "IS_WINDOWS", False)
+
+    def refuse(*args, on_error=None, **kwargs):
+        # What pinned_fs.unlink_verified does when the OS refuses the unlink
+        # itself: report through the seam, answer False.
+        assert on_error is not None, "the prune did not ask to hear about a refusal"
+        on_error(PermissionError(13, "Permission denied"))
+        return False
+
+    monkeypatch.setattr(projection.pinned_fs, "unlink_verified", refuse)
+    monkeypatch.setattr(projection.pinned_fs, "supports_pinned_walk", lambda: True)
+    monkeypatch.setattr(projection.os, "supports_dir_fd", {projection.os.unlink})
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+        warnings = [r for r in caplog.records if "cannot remove stale alias" in r.getMessage()]
+        assert len(warnings) == 1, "a refused unlink was either silent or logged per file"
+        assert "unlink refused, EACCES (Permission denied)" in warnings[0].getMessage()
+        assert "is not writable by this process" in warnings[0].getMessage()
+        assert "0 similar refusal(s)" in warnings[0].getMessage()
+        assert all(p.exists() for p in backlog)
+
+        # Past the interval the next refusal reports again, carrying the ones it
+        # swallowed in between.
+        monkeypatch.setattr(
+            projection,
+            "_UNLINK_WARNING_LAST",
+            time.monotonic() - projection._UNLINK_WARNING_INTERVAL_SECS - 1,
+        )
+        projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+        warnings = [r for r in caplog.records if "cannot remove stale alias" in r.getMessage()]
+        assert len(warnings) == 2
+        assert "4 similar refusal(s)" in warnings[1].getMessage()
+
+
+@pytest.mark.parametrize(
+    ("exc", "code"),
+    [
+        (FileNotFoundError(errno.ENOENT, "No such file or directory"), "ENOENT"),
+        (OSError(errno.EMFILE, "Too many open files"), "EMFILE"),
+        (OSError(errno.EIO, "Input/output error"), "EIO"),
+    ],
+)
+@_dir_fd_seam_only
+def test_a_refusal_that_is_not_a_permission_problem_is_worded_neutrally(
+    native_tree, monkeypatch, caplog, exc, code
+):
+    """Only EACCES/EPERM/EROFS mean the directory is unwritable.
+
+    A prune in another process can take the file between the walk's stat and this
+    unlink (ENOENT), or the process can be out of descriptors (EMFILE); calling
+    either "the directory is not writable" sends an operator to fix a mount or an
+    owner that is fine. The line still says what failed and with which errno,
+    through the same throttle and count.
+    """
+    _home, agents, _project = native_tree
+    backlog = _seed_backlog(agents, 2)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_LAST", 0.0)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_SUPPRESSED", 0)
+    monkeypatch.setattr(projection.platform_compat, "IS_WINDOWS", False)
+
+    def refuse(*args, on_error=None, **kwargs):
+        assert on_error is not None
+        on_error(exc)
+        return False
+
+    monkeypatch.setattr(projection.pinned_fs, "unlink_verified", refuse)
+    monkeypatch.setattr(projection.pinned_fs, "supports_pinned_walk", lambda: True)
+    monkeypatch.setattr(projection.os, "supports_dir_fd", {projection.os.unlink})
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+    warnings = [r for r in caplog.records if "cannot remove stale alias" in r.getMessage()]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert f"unlink refused, {code} ({exc.strerror})" in message
+    assert str(agents) in message and "0 similar refusal(s)" in message
+    assert "not writable" not in message
+    assert projection._UNLINK_WARNING_SUPPRESSED == 1, "the second refusal was not counted"
+    assert all(p.exists() for p in backlog)
+
+
+@_dir_fd_seam_only
+@pytest.mark.parametrize("code", [errno.EPERM, errno.EROFS])
+def test_every_permission_class_errno_is_diagnosed_as_unwritable(
+    native_tree, monkeypatch, caplog, code
+):
+    _home, agents, _project = native_tree
+    _seed_backlog(agents, 1)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_LAST", 0.0)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_SUPPRESSED", 0)
+    monkeypatch.setattr(projection.platform_compat, "IS_WINDOWS", False)
+
+    def refuse(*args, on_error=None, **kwargs):
+        on_error(OSError(code, os.strerror(code)))
+        return False
+
+    monkeypatch.setattr(projection.pinned_fs, "unlink_verified", refuse)
+    monkeypatch.setattr(projection.pinned_fs, "supports_pinned_walk", lambda: True)
+    monkeypatch.setattr(projection.os, "supports_dir_fd", {projection.os.unlink})
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+    (warning,) = [r for r in caplog.records if "cannot remove stale alias" in r.getMessage()]
+    assert errno.errorcode[code] in warning.getMessage()
+    assert "is not writable by this process" in warning.getMessage()
+
+
+@_dir_fd_seam_only
+def test_a_refused_lease_unlink_reports_through_the_same_throttle(native_tree, monkeypatch, caplog):
+    """The lease and sidecar unlinks share the alias reporter, not a second one.
+
+    The same read-only or foreign-owned directory that refuses an alias unlink
+    refuses its lease record, holder and ownership sidecar, and a rule applied
+    to one of two paths is the same silence on the other. One reporter, one
+    interval, one suppressed count: a refused lease unlink is the first line,
+    the refused alias unlinks in the same interval are the count on the next.
+    """
+    _home, agents, _project = native_tree
+    backlog = _seed_backlog(agents, 3)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_LAST", 0.0)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_SUPPRESSED", 0)
+    monkeypatch.setattr(projection.platform_compat, "IS_WINDOWS", False)
+
+    def refuse(*args, on_error=None, **kwargs):
+        assert on_error is not None, "the lease unlink did not ask to hear about a refusal"
+        on_error(PermissionError(13, "Permission denied"))
+        return False
+
+    monkeypatch.setattr(projection.pinned_fs, "unlink_verified", refuse)
+    monkeypatch.setattr(projection.pinned_fs, "supports_pinned_walk", lambda: True)
+    monkeypatch.setattr(projection.os, "supports_dir_fd", {projection.os.unlink})
+    # Off the prune's walk, so the count below is exactly the alias refusals.
+    lease_dir = agents.parent / "elsewhere" / projection._PROJECTION_LEASE_DIR_NAME
+    lease_dir.mkdir(parents=True)
+    record = lease_dir / f"1-{'ab' * 16}{projection._PROJECTION_LEASE_RECORD_SUFFIX}"
+    record.write_text('{"aliases":[]}')
+    info = os.stat(record)
+    identity = (info.st_dev, info.st_ino)
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        assert (
+            projection._unlink_projection_lease_if_unchanged(
+                record, identity, what="stale lease record"
+            )
+            is False
+        )
+        warnings = [r for r in caplog.records if "cannot remove" in r.getMessage()]
+        assert len(warnings) == 1, "a refused lease unlink was silent"
+        message = warnings[0].getMessage()
+        assert "stale lease record" in message and record.name in message
+        assert "unlink refused, EACCES (Permission denied)" in message
+        assert "is not writable by this process" in message and str(lease_dir) in message
+        assert "0 similar refusal(s)" in message
+        assert record.exists()
+
+        # Within the interval the alias refusals are swallowed into the SAME count.
+        projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+        assert len([r for r in caplog.records if "cannot remove" in r.getMessage()]) == 1
+        assert all(p.exists() for p in backlog)
+        monkeypatch.setattr(
+            projection,
+            "_UNLINK_WARNING_LAST",
+            time.monotonic() - projection._UNLINK_WARNING_INTERVAL_SECS - 1,
+        )
+        assert (
+            projection._unlink_projection_lease_if_unchanged(
+                record, identity, what="stale lease record"
+            )
+            is False
+        )
+        warnings = [r for r in caplog.records if "cannot remove" in r.getMessage()]
+        assert len(warnings) == 2
+        assert "3 similar refusal(s)" in warnings[1].getMessage()
+
+    # An identity change is a deliberate keep and stays silent: no report, no count.
+    caplog.clear()
+    changed = (identity[0], identity[1] + 1)
+    with caplog.at_level("WARNING", logger=projection.logger.name):
+        assert projection._unlink_projection_lease_if_unchanged(record, changed) is False
+    assert not [r for r in caplog.records if "cannot remove" in r.getMessage()]
+    assert projection._UNLINK_WARNING_SUPPRESSED == 0
+
+
+@pytest.mark.skipif(
+    not projection.pinned_fs.supports_pinned_walk() or os.name != "posix",
+    reason="a directory without write permission is a POSIX way to refuse an unlink",
+)
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory permission bits"
+)
+def test_a_read_only_agents_directory_produces_the_refusal_warning(
+    native_tree, monkeypatch, caplog
+):
+    """End to end through the real unlink: the reported field case, with no seam.
+
+    The prune classifies the alias as reclaimable, the kernel refuses the unlink,
+    and the warning names the directory -- which is what an operator needs to
+    stop looking for a code bug and fix a mount or an owner.
+    """
+    _home, agents, _project = native_tree
+    backlog = _seed_backlog(agents, 3)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_LAST", 0.0)
+    monkeypatch.setattr(projection, "_UNLINK_WARNING_SUPPRESSED", 0)
+    original_mode = stat.S_IMODE(os.stat(agents).st_mode)
+    os.chmod(agents, original_mode & ~stat.S_IWUSR)
+    try:
+        with caplog.at_level("WARNING", logger=projection.logger.name):
+            projection._prune_stale_managed_aliases(agents, _crew_home_id(), keep=set())
+    finally:
+        os.chmod(agents, original_mode)
+    warnings = [r for r in caplog.records if "cannot remove stale alias" in r.getMessage()]
+    assert len(warnings) == 1
+    assert str(agents) in warnings[0].getMessage()
+    # The kernel's real answer is EACCES, the one case the line may diagnose as
+    # an unwritable directory.
+    assert "EACCES" in warnings[0].getMessage()
+    assert "is not writable by this process" in warnings[0].getMessage()
+    assert all(p.exists() for p in backlog)
+
+
+@pytest.mark.parametrize(
+    ("workspace", "global_value"),
+    [
+        ({}, None),
+        ({"chat.disableInheritingDefaultResources": True}, None),
+        ({}, True),
+        ({"chat.disableInheritingDefaultResources": False}, True),
+        ({"chat.disableInheritingDefaultResources": "true"}, None),
+    ],
+)
+def test_reader_agrees_with_the_projection_across_its_overlay(native_tree, workspace, global_value):
+    """Readers that mirror native loading must decode Crew's overlay as the projection wrote it.
+
+    After the projection runs, the workspace's native key reads ``true`` whatever
+    the user chose, so a reader of the raw key would see an opt-out everywhere.
+    """
+    home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    if workspace:
+        settings = project / ".kiro" / "settings" / "cli.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps(workspace), encoding="utf-8")
+    if global_value is not None:
+        settings = home / "settings" / "cli.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(
+            json.dumps({"chat.disableInheritingDefaultResources": global_value}), encoding="utf-8"
+        )
+    before = projection.inherits_default_resources(project)
+    prepared = projection.prepare_native_skill_projection(project)
+    projected = any("steering" in item for item in prepared.specs["custom"]["resources"])
+    assert before is projected
+    assert projection.inherits_default_resources(project) is projected
+
+
+def test_reader_follows_a_live_global_preference_under_the_overlay(native_tree):
+    home, agents, project = native_tree
+    (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+    settings = home / "settings" / "cli.json"
+    settings.parent.mkdir()
+    settings.write_text('{"chat.disableInheritingDefaultResources":true}', encoding="utf-8")
+    projection.prepare_native_skill_projection(project)
+    assert projection.inherits_default_resources(project) is False
+    settings.write_text('{"chat.disableInheritingDefaultResources":false}', encoding="utf-8")
+    assert projection.inherits_default_resources(project) is True

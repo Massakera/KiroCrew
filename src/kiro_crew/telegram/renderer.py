@@ -42,7 +42,7 @@ from kiro_crew.constants import (
     split_trailing_protocol_suffix,
     strip_control_comments,
 )
-from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
+from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S, adoptable_reservation
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
@@ -59,10 +59,15 @@ from kiro_crew.messaging.renderer import (
     count_redaction_tags,
     new_approval_nonce,
     redaction_notice,
+    repaired_after_a_sent_tail,
     session_provenance_tag,
     split_options_trailer,
 )
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.split import (
+    bounded_for_delivery,
+    repaired_for_delivery,
+    split_markdown_safe,
+)
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.sel import sel
 from kiro_crew.telegram.client import (
@@ -396,8 +401,17 @@ def _split_markdown(text: str, limit: int) -> list[str]:
     cut-preference ladder (paragraph break past half the budget, else line break
     past a quarter, else a hard cut) is the same one this channel used, so chunk
     boundaries are unchanged for text with no fence in it.
+
+    The cut is credential-aware, because this channel rotates: each chunk but the
+    last is sealed as its OWN message and the redaction runs per segment, so a key
+    severed by a boundary is a key neither message holds and neither redacts,
+    while the reader scrolling the two reads it whole. Passing the redactor grades
+    the boundaries as the reader sees them and moves the cut instead, which keeps
+    every character. Nothing here asks for the prefix-stable mode: a rotation
+    replaces the buffer with the retained tail, so text already sealed is never
+    part of a later cut.
     """
-    return split_markdown_safe(text, limit)
+    return split_markdown_safe(text, limit, redactor=_default_redactor)
 
 
 # Telegram renders a small HTML subset (<b>/<i>/<code>/<pre>/<a>) far more
@@ -733,15 +747,24 @@ def _split_markdown_bounded(text: str, rendered_limit: int) -> list[str]:
     the client backstop then truncates them, silently dropping content. Only at
     the floor -- where the content is genuinely indivisible -- may oversize chunks
     be returned.
+
+    Each candidate answer also goes through
+    :func:`~kiro_crew.messaging.split.bounded_for_delivery`, because a
+    credential-aware cut may DECLINE to cut: when no budget has clean boundaries
+    the splitter answers with the text whole, which is fail-closed but is one
+    chunk over the budget, and this channel's client truncates a larger payload
+    after every scan has run. The bound cuts that answer back and grades the
+    sequence it actually produced.
     """
     src_limit = max(_MIN_SPLIT_LIMIT, rendered_limit)
-    chunks = _split_markdown(text, src_limit)
     while True:
+        chunks = bounded_for_delivery(
+            _split_markdown(text, src_limit), src_limit, _default_redactor
+        )
         worst = max((_rendered_len(c) for c in chunks), default=0)
         if worst <= rendered_limit or src_limit <= _MIN_SPLIT_LIMIT:
             return chunks
         src_limit = _shrunk_limit(src_limit, rendered_limit, worst)
-        chunks = _split_markdown(text, src_limit)
 
 
 def _split_table_rows(rows: list[str], limit: int) -> list[str]:
@@ -788,6 +811,20 @@ def _split_markdown_table_aware(text: str, rendered_limit: int, rich_limit: int)
     where a fence begins and ends means reimplementing CommonMark's fence rules
     as a second parser (the same invariant ``_seal_table_fallback`` documents),
     and a pipe pattern inside a fence is not a table anyway.
+
+    The assembled sequence is graded once at the end. Each block is cut on its own
+    here, so a boundary BETWEEN two blocks -- a table run and the prose after it,
+    or two row-split pieces -- belongs to no single cut and is graded by none of
+    them, while the reader still reads those messages in order. The repair's
+    subject is ``text``, the body this function holds, never the concatenation of
+    the blocks, which is not the reply.
+
+    Every block is redacted BEFORE it enters the list, which the grade requires:
+    :func:`~kiro_crew.messaging.split._rejoins_a_key` reads the sequence as one
+    text and is sound only on chunks that are already a fixed point of that scan,
+    so an unredacted table cell holding a whole credential would fire the seam
+    repair for something no seam severed. The prose branch gets that redaction from
+    the splitter; a table run bypasses the splitter and needs it here.
     """
     if _FENCE_LINE_RE.search(text):
         return _split_markdown_bounded(text, rendered_limit)
@@ -795,13 +832,18 @@ def _split_markdown_table_aware(text: str, rendered_limit: int, rich_limit: int)
     for is_table, lines in _table_blocks(text):
         block = "\n".join(lines)
         if is_table:
-            if len(block) <= rich_limit:
-                out.append(block)
+            safe_block = _display_safe(block)
+            if len(safe_block) <= rich_limit:
+                out.append(safe_block)
             else:
-                out.extend(_split_table_rows(lines, rich_limit))
+                out.extend(_split_table_rows(safe_block.split("\n"), rich_limit))
         elif block.strip():
             out.extend(_split_markdown_bounded(block, rendered_limit))
-    return [c for c in out if c.strip()]
+    kept = [c for c in out if c.strip()]
+    repaired = repaired_for_delivery(text, kept, _default_redactor)
+    if repaired is None:
+        return kept
+    return _split_markdown_bounded(repaired, rendered_limit)
 
 
 def _strip_md(text: str) -> str:
@@ -824,6 +866,18 @@ class TelegramApprovalDecider:
     Process-global Future registry keyed by ``session_key:request_id`` so
     concurrent turns (and users) never resolve each other's prompts. Denies by
     default when the wait elapses.
+
+    The decision window opens when the nonce is armed, not when the wait starts:
+    :meth:`arm` reserves the future and ``__call__`` adopts it. So a press lands
+    inside the window from the moment the prompt is built, including across the
+    suspension points between posting it and awaiting the decision.
+
+    It closes at the decision, at the wait's timeout, or at a :meth:`retire` /
+    :meth:`refuse_undelivered` / :meth:`discard_session` for a prompt that never
+    went out or was never awaited -- NOT when the prompt stops being visible.
+    Nothing here strips a timed-out prompt's buttons, so they stay clickable in
+    the chat indefinitely; a press on them finds no nonce and is told the approval
+    expired, which by then it has.
     """
 
     _REGISTRY: dict[str, "asyncio.Future[bool]"] = {}
@@ -831,6 +885,12 @@ class TelegramApprovalDecider:
     #: nonce does not match is refused, which is what stops a button from a previous
     #: run answering a live prompt that reuses its request id.
     _NONCES: dict[str, str] = {}
+    #: Keys a wait currently OWNS -- added when ``__call__`` takes the future and
+    #: discarded in the same ``finally`` that unregisters it. The registry holds
+    #: one future per key, so the wait that added a key is the one that clears it.
+    #: :meth:`discard_session` reads this to leave an owned window alone, since a
+    #: wait under this session key need not belong to the turn running that sweep.
+    _AWAITED: set[str] = set()
 
     def __init__(self, *, session_key: str) -> None:
         self._session_key = session_key
@@ -842,26 +902,163 @@ class TelegramApprovalDecider:
         return f"{session_key}:{request_id}"
 
     @classmethod
-    def arm(cls, key: str, nonce: str) -> None:
-        """Record the nonce for the buttons the renderer is about to post."""
+    def arm(cls, key: str, nonce: str, *, detached: bool = False) -> None:
+        """Record the nonce for the buttons about to be posted, and OPEN the window.
+
+        Called by whatever is about to post the prompt, so it runs on the event
+        loop the wait will run on.
+
+        Reserving the future here, rather than in ``__call__``, is what keeps a
+        press inside the window while the prompt is being posted. ``TurnDriver``
+        dispatches ``PROMPT_CHOICE`` to the renderer and only then awaits the
+        decider, and the renderer suspends in between -- two thread hops for the
+        display-safety scan of the tool name and its arguments, then the send. A
+        press landing in that gap found the nonce armed but no future, so
+        ``resolve_global`` judged it a stale button and failed closed: the user was
+        told the approval had expired, and the request denied itself when the
+        window elapsed. A Trust press in that gap also failed ``is_pending`` and so
+        granted nothing, leaving the operator with neither the grant nor the tool.
+
+        Never replaces a LIVE future. A second arm for one key, or an arm that
+        follows the wait, keeps the object the waiter is blocked on; replacing it
+        would leave that waiter on a future nobody resolves. A DONE future IS
+        replaced, and that is the isolation bound: a decision left unawaited must
+        not be adoptable by the next request to reuse this key.
+
+        Off the event loop only the nonce is armed. A reservation is a promise to a
+        wait that runs on THIS loop, so without one there is no waiter to hold a
+        window open for -- and a caller that cannot await the decider cannot be
+        raced by a press. That keeps this callable as a pure nonce operation.
+
+        Pass *detached* when the wait this arms for runs OUTSIDE the turn whose
+        end-of-turn sweep would otherwise reach the key. ``__call__`` claims a key
+        as owned when it starts awaiting, which leaves the span from here to there
+        unowned -- and for a caller whose wait is in a task of its own that span
+        contains a network send, long enough for the originating turn to finish and
+        sweep the window away under the buttons. The press then resolves nothing
+        and the request denies at its own timeout on a refusal nobody made. The
+        claim is released by ``__call__``'s ``finally`` and by :meth:`retire`, so
+        every exit that ends the window also ends the claim. Ownership stays the
+        sweep's one predicate; this only lets the caller that knows its wait is
+        detached say so, rather than the sweep guessing from a request id's shape.
+        """
         cls._NONCES[key] = nonce
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        reserved = adoptable_reservation(cls._REGISTRY.get(key), loop)
+        if reserved is None or reserved.done():
+            cls._REGISTRY[key] = loop.create_future()
+        if detached:
+            cls._AWAITED.add(key)
 
     @classmethod
     def retire(cls, key: str) -> None:
-        """Drop an armed nonce whose prompt never went out (idempotent).
+        """Close a decision window whose prompt never went out (idempotent).
 
-        ``__call__`` retires the nonce with the prompt it waited on, but a caller
-        that ARMS then fails to post (a spawn-approval prompt Telegram rejected)
-        has no wait to run that ``finally`` — without this the stale nonce would
-        outlive the prompt that never existed.
+        ``__call__`` retires the nonce and the reservation together with the wait
+        it ran, but a caller that ARMS then fails to post (a spawn-approval prompt
+        Telegram rejected) has no wait to run that ``finally`` -- without this both
+        would outlive the prompt that never existed, and the nonce is what
+        authorizes a press.
+
+        For a caller with somewhere else to fall through to, so no wait of its own
+        runs on this key: the spawn-approval gate falls through to Slack and the
+        dashboard. A caller whose driver WILL await the decider wants
+        :meth:`refuse_undelivered` instead, because dropping the reservation there
+        only means the wait opens a fresh window and spends the whole timeout on a
+        prompt nobody can see.
+
+        Releases a detached caller's ownership claim as well, so a window that ends
+        here cannot leave the key permanently exempt from the sweep.
         """
         cls._NONCES.pop(key, None)
+        cls._REGISTRY.pop(key, None)
+        cls._AWAITED.discard(key)
+
+    @classmethod
+    def refuse_undelivered(cls, key: str) -> None:
+        """Record a denial for a prompt that never reached the chat.
+
+        The prompt is unanswerable, so the only safe verdict is a refusal -- and
+        recording it on the reservation the driver is about to adopt is what makes
+        that refusal immediate. The alternative, dropping the reservation, reaches
+        the same verdict only after the wait has spent the full decision window on
+        a prompt nobody can see, and reports that elapsed wait as an expiry.
+
+        Leaves the maps alone: the adopting ``__call__`` clears both when it
+        consumes the decision, which keeps one owner for that cleanup. A key with
+        no live reservation is left untouched, so this cannot overwrite a decision
+        the user actually made.
+        """
+        reserved = cls._REGISTRY.get(key)
+        if reserved is not None and not reserved.done():
+            reserved.set_result(False)
+
+    @classmethod
+    def discard_session(cls, session_key: str) -> None:
+        """Drop *session_key*'s unawaited reservations at the end of its turn.
+
+        ``__call__`` clears its own entry in a ``finally``, and the failed-post
+        paths above clear theirs, so this covers the one case neither can: the
+        prompt went out and the turn then ended before the driver reached the
+        decider -- a cancellation, or a failure between the two. No wait ever ran,
+        so nothing else closes that window, and the nonce left behind is what
+        authorizes a press.
+
+        Skips a key a wait OWNS, which is what keeps this a sweep of unawaited
+        windows rather than of every window a session holds. Not every wait under
+        a session key belongs to the turn that runs this sweep: a spawn-approval
+        prompt is armed under the parent session key and awaited by a detached
+        task with its own window, so sweeping it would pop the future and nonce
+        while an operator still had the buttons in front of them -- their press
+        would then resolve nothing and the spawn would deny at its timeout on a
+        refusal nobody made. Ownership is the predicate rather than the shape of
+        the request id, so a wait added later is covered without being enumerated
+        here.
+
+        Drops every reservation no wait owns, whatever state its future is in. A
+        completed one no wait adopted has no reader -- ``__call__`` for that turn
+        never ran -- so keeping it retains the future and its nonce for the life of
+        the process, once per key. The nonce is the worse half: the buttons stay in
+        the chat, so a later press still matches a prompt nothing can answer. The
+        prefix carries its own ``:`` so one session key cannot match another that
+        merely starts the same way.
+        """
+        prefix = f"{session_key}:"
+        for k in [k for k in cls._REGISTRY if k.startswith(prefix) and k not in cls._AWAITED]:
+            cls._REGISTRY.pop(k, None)
+            cls._NONCES.pop(k, None)
 
     async def __call__(self, event: Any) -> bool:
         self.last_deny_cause = ""
         k = self.key(self._session_key, getattr(event, "request_id", ""))
-        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        # Adopt the reservation opened when this prompt's nonce was armed. The
+        # press may ALREADY have landed, in the gap between the prompt going out
+        # and this wait starting, in which case the reservation holds the user's
+        # decision and there is nothing left to await. Minting a fresh future
+        # here would discard that decision and deny when the window elapsed.
+        reserved = adoptable_reservation(
+            TelegramApprovalDecider._REGISTRY.get(k), asyncio.get_running_loop()
+        )
+        if reserved is not None and reserved.done():
+            if reserved.cancelled() or reserved.exception() is not None:
+                # A torn-down reservation, not a decision. Open a fresh window
+                # rather than read it as consent or as a refusal.
+                reserved = None
+            else:
+                try:
+                    return bool(reserved.result())
+                finally:
+                    TelegramApprovalDecider._REGISTRY.pop(k, None)
+                    TelegramApprovalDecider._NONCES.pop(k, None)
+        fut: "asyncio.Future[bool]" = (
+            reserved if reserved is not None else asyncio.get_running_loop().create_future()
+        )
         TelegramApprovalDecider._REGISTRY[k] = fut
+        # This wait now owns the key, so the end-of-turn sweep must leave it be.
+        TelegramApprovalDecider._AWAITED.add(k)
         try:
             return bool(await asyncio.wait_for(fut, _APPROVAL_TIMEOUT_S))
         except asyncio.TimeoutError:
@@ -870,6 +1067,7 @@ class TelegramApprovalDecider:
             self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT
             return False  # deny-by-default on timeout
         finally:
+            TelegramApprovalDecider._AWAITED.discard(k)
             TelegramApprovalDecider._REGISTRY.pop(k, None)
             # Retire the nonce with the prompt, so a button for a request id the
             # provider later reuses cannot match a nonce that is not live.
@@ -1011,6 +1209,15 @@ class TelegramRenderer(Renderer):
         # One-slot memo for the live frame's safe body, keyed on its exact source.
         self._safe_src = "\x00"  # a value no segment can equal
         self._safe_out = ""
+        self._safe_sent = "\x00"  # the memo also depends on the sealed predecessor
+        #: The last segment SEALED as its own message, whole. A rotation replaces
+        #: the buffer with the retained tail, so text already sent leaves the
+        #: buffer and no later cut can see it -- and a boundary graded at seal time
+        #: says nothing about text that arrives afterwards. Keeping the sealed
+        #: predecessor is what lets the next thing shown be graded against what the
+        #: reader is already looking at. Bounded by one message, not by the turn:
+        #: only the message a new one sits under can rejoin anything with it.
+        self._sent_tail = ""
         # True between posting an approval prompt and the turn resuming. A turn
         # waiting on a button is blocked on the user, not stalled.
         self._awaiting_approval = False
@@ -1224,7 +1431,9 @@ class TelegramRenderer(Renderer):
                 if spans[0][0] == 0:
                     return  # the whole buffer is protected — do not rotate at all
                 held = raw[spans[0][0] :]
-                for chunk in _split_markdown_bounded(raw[: spans[0][0]], rendered_cap):
+                for chunk in await asyncio.to_thread(
+                    _split_markdown_bounded, raw[: spans[0][0]], rendered_cap
+                ):
                     self._buf = [chunk]
                     await self._seal_current(extract_uploads=False)
                     self._open_new_message()
@@ -1250,7 +1459,9 @@ class TelegramRenderer(Renderer):
             # _has_table guarantees at least two lines, so a newline exists.
             head, nl, partial = raw.rpartition("\n")
             head += nl
-            chunks = _split_markdown_table_aware(head, rendered_cap, rich_cap)
+            chunks = await asyncio.to_thread(
+                _split_markdown_table_aware, head, rendered_cap, rich_cap
+            )
             if chunks:
                 # Reattach what the line-joining splitter drops: the complete
                 # prefix's trailing newlines, then the unterminated line. The
@@ -1260,7 +1471,7 @@ class TelegramRenderer(Renderer):
             else:
                 chunks = [partial]
         else:
-            chunks = _split_markdown_bounded(raw, rendered_cap)
+            chunks = await asyncio.to_thread(_split_markdown_bounded, raw, rendered_cap)
         # Mid-stream the source fence is often still OPEN (the model has not
         # emitted its closing ``` yet). _split_markdown balances each chunk by
         # appending a synthetic closer, which is right for the chunks we seal but
@@ -1335,15 +1546,22 @@ class TelegramRenderer(Renderer):
         equality, not a heuristic — a segment that has not changed cannot have a
         different safe form.
         """
-        if seg == self._safe_src:
+        if seg == self._safe_src and self._sent_tail == self._safe_sent:
             return self._safe_out
         hide = hide_local_refs if self._uploads_enabled() else None
+        sent = self._sent_tail
 
         def _render() -> str:
-            return _display_safe(_strip_md(hide(seg) if hide else seg))
+            safe = _display_safe(_strip_md(hide(seg) if hide else seg))
+            # The frame sits directly under the message sealed before it, so the
+            # same seam applies: a key begun at the end of that message and
+            # completed here reads whole down the screen. The sealed half cannot be
+            # changed, so this half gives up the span that completes it.
+            repaired = repaired_after_a_sent_tail(sent, safe, _default_redactor)
+            return repaired if repaired is not None else safe
 
         out = await asyncio.to_thread(_render)
-        self._safe_src, self._safe_out = seg, out
+        self._safe_src, self._safe_out, self._safe_sent = seg, out, sent
         return out
 
     async def _stream_live_locked(self, *, force: bool) -> None:
@@ -1412,11 +1630,15 @@ class TelegramRenderer(Renderer):
         if len(html_text) > self._rendered_limit():
             html_text = _md_to_telegram_html(text)
             if len(html_text) > self._rendered_limit():
-                chunks = self._degraded_table_chunks(text)
+                chunks = await asyncio.to_thread(self._degraded_table_chunks, text)
                 for ch in chunks[:-1]:
                     await self._seal_chunk_html(ch)
                 if chunks:
                     text = chunks[-1]
+                # The tail sits under the last chunk this method just sealed, and
+                # that chunk did not exist when the segment's own seam was graded.
+                # So it is graded again here, against what the reader can now see.
+                text = await asyncio.to_thread(self._seam_safe, text)
                 html_text = _seal_table_fallback(text)
                 if len(html_text) > self._rendered_limit():
                     html_text = _md_to_telegram_html(text)
@@ -1572,6 +1794,37 @@ class TelegramRenderer(Renderer):
                 disable_notification=True,
             )
 
+    def _seam_safe(self, text: str) -> str:
+        """*text* display-safe, with its seam to the message above repaired.
+
+        The one place a sealed segment's text is decided, so it is the one place
+        that has to know about the message above it. Callers only seal; none of them
+        carries a seam rule of its own, which is what keeps a new sealing path from
+        shipping an open seam.
+
+        It does NOT record the predecessor. What the next segment must be graded
+        against is the message the reader can see, and text this returns has not
+        been sent yet: every send and edit path below can fail, and recording here
+        would make unsent text the predecessor, after which the next delivered
+        message gives up a leading span for a key nobody ever read. ``_record_sent``
+        is called once a delivery path confirms.
+
+        Runs on a worker thread: both the redaction and the grade scan.
+        """
+        safe = _display_safe(text)
+        repaired = repaired_after_a_sent_tail(self._sent_tail, safe, _default_redactor)
+        return repaired if repaired is not None else safe
+
+    def _record_sent(self, text: str) -> None:
+        """Remember *text* as the message the next seam is graded against.
+
+        Called only after a send or edit reports success, and with the text that
+        actually went out -- which is not always the text ``_seam_safe`` returned: a
+        degraded segment is re-split after that point, so the last chunk shown is
+        what the reader is looking at and what the next segment sits under.
+        """
+        self._sent_tail = text
+
     async def _seal_current(
         self,
         *,
@@ -1650,7 +1903,16 @@ class TelegramRenderer(Renderer):
         # budgeted against the rich cap, where this measures in the tens of
         # milliseconds — holding the frame lock across it would block the typing
         # task too, and holding the loop would block every other conversation.
-        text = await asyncio.to_thread(_display_safe, text)
+        #
+        # The seam repair and the predecessor record live HERE, in the sink, for the
+        # same reason the redaction does: five paths seal a segment as its own
+        # message, and a guard at one of them is not a guard on the channel. A
+        # segment whose tail is a credential PREFIX matches nothing, so it seals, and
+        # the characters completing the key arrive in the segment below it -- which
+        # this is. The message above cannot be recalled, so this one gives up the
+        # span that completes the key, and then becomes the predecessor the next seal
+        # is graded against.
+        text = await asyncio.to_thread(self._seam_safe, text)
         if footer:
             # A quoted line under the answer rather than a separate message: the
             # footer is metadata about the turn, and a second bubble for it would
@@ -1685,6 +1947,7 @@ class TelegramRenderer(Renderer):
                     )
                     if mid is not None:
                         self._tally_redactions(text)
+                        self._record_sent(text)
                         if self._stream_mid is not None:
                             # The rich message now carries this segment; drop the
                             # superseded plaintext bubble so the user sees one message.
@@ -1724,6 +1987,7 @@ class TelegramRenderer(Renderer):
                         )
                     if ok:
                         self._tally_redactions(text)
+                        self._record_sent(text)
                         return
                     # Both edits failed — the live message is gone (e.g. the user
                     # deleted it mid-turn). Fall through and SEND the final content so
@@ -1747,6 +2011,7 @@ class TelegramRenderer(Renderer):
                     )
                 if mid is not None:
                     self._tally_redactions(text)
+                    self._record_sent(text)
 
             finally:
                 # Retire the live message: this segment is final, so nothing
@@ -1887,7 +2152,8 @@ class TelegramRenderer(Renderer):
         self._awaiting_approval = True
         rid = str(request_id)
         nonce = new_approval_nonce()
-        TelegramApprovalDecider.arm(TelegramApprovalDecider.key(self._session_key, rid), nonce)
+        key = TelegramApprovalDecider.key(self._session_key, rid)
+        TelegramApprovalDecider.arm(key, nonce)
         # Three choices, matching Slack's ladder: approve this one, trust the rest
         # of this session, or refuse. Without Trust every tool of an agentic turn
         # costs its own round-trip, which is what pushes an operator to global YOLO,
@@ -1931,13 +2197,38 @@ class TelegramRenderer(Renderer):
             if len(detail) > _APPROVAL_INPUT_CHARS:
                 detail = detail[: _APPROVAL_INPUT_CHARS - 1].rstrip() + "…"
             body = f"{body}\n<pre>{html.escape(detail)}</pre>"
-        await self._client.send_message(
-            self._chat_id,
-            body,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-            message_thread_id=self._thread_id,
-        )
+        try:
+            posted = await self._client.send_message(
+                self._chat_id,
+                body,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                message_thread_id=self._thread_id,
+            )
+        except BaseException:
+            # The prompt never reached the chat, so nothing can be pressed and no
+            # wait will run the ``finally`` that normally closes this window.
+            # Retire it here instead of leaving a live nonce and reservation for a
+            # prompt nobody saw. Raised on, because a caller that swallowed this
+            # would leave the driver waiting out the whole window on an invisible
+            # prompt and then call that elapsed wait a decision.
+            TelegramApprovalDecider.retire(key)
+            raise
+        if not posted:
+            # This client reports a failed send by RETURNING no message id rather
+            # than by raising -- a revoked token, a chat it cannot write to, a
+            # deleted topic, a rate limit or 5xx past its retries -- so the
+            # ``except`` above does not cover it. Nothing is on screen to press,
+            # and the driver awaits the decision next, so record the refusal on the
+            # reservation it is about to adopt: it denies at once instead of
+            # spending the whole window on a prompt nobody can see and reporting
+            # that as an expiry.
+            TelegramApprovalDecider.refuse_undelivered(key)
+            logger.warning(
+                "Telegram: the approval prompt for %s was not accepted by the chat; "
+                "refusing the request rather than waiting it out",
+                rid,
+            )
 
     async def on_compaction(self, context_usage_pct: float) -> None:
         self._note_progress()
@@ -2097,7 +2388,13 @@ class TelegramRenderer(Renderer):
         so it must carry the earliest content or the reply reads out of order);
         later chunks are fresh sends. Mirrors the tail seal's degradation
         ladder: HTML edit -> plaintext edit, or HTML send -> plaintext send.
+
+        Its text goes through ``_seam_safe`` like every other sealed segment: this
+        is a separate sink from ``_seal_text``, so it carries the seam repair itself
+        rather than relying on the other one, and records the predecessor only where
+        a delivery reports success.
         """
+        chunk = await asyncio.to_thread(self._seam_safe, chunk)
         html_text = _seal_table_fallback(chunk)
         if len(html_text) > self._rendered_limit():
             html_text = _md_to_telegram_html(chunk)
@@ -2108,8 +2405,10 @@ class TelegramRenderer(Renderer):
                 self._chat_id, mid, html_text, parse_mode="HTML", retry_plain=False
             )
             if ok:
+                self._record_sent(chunk)
                 return
             if await self._client.edit_message(self._chat_id, mid, _strip_md(chunk)):
+                self._record_sent(chunk)
                 return
         mid2 = await self._client.send_message(
             self._chat_id,
@@ -2119,9 +2418,12 @@ class TelegramRenderer(Renderer):
             message_thread_id=self._thread_id,
         )
         if mid2 is None:
-            await self._client.send_message(
+            if await self._client.send_message(
                 self._chat_id, _strip_md(chunk), message_thread_id=self._thread_id
-            )
+            ):
+                self._record_sent(chunk)
+            return
+        self._record_sent(chunk)
 
     def _chip_for_seal(self, i: int) -> str | None:
         """The steer chip (a "> quote" blockquote of the USER's own words) that

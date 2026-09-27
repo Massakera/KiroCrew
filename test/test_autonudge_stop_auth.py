@@ -316,6 +316,7 @@ class _FakeSvc:
         self.get_by_slot_keys: list[str] = []
         self.removed: list[str] = []
         self.updated: list[tuple[str, dict]] = []
+        self.notes: list[tuple[str, str, str]] = []
 
     def get_by_slot(self, key):
         self.get_by_slot_keys.append(key)
@@ -324,8 +325,9 @@ class _FakeSvc:
     def list_all(self):
         return list(self._all)
 
-    async def remove(self, loop_id):
+    async def remove(self, loop_id, *, stop_reason="", stop_detail=""):
         self.removed.append(loop_id)
+        self.notes.append((loop_id, stop_reason, stop_detail))
 
     async def update(self, loop_id, **patch):
         self.updated.append((loop_id, patch))
@@ -410,7 +412,8 @@ def test_applier_ack_discloses_the_gated_cadence(monkeypatch):
             {"message": "watch https://github.com/acme/widgets/pull/42", "idle_secs": 300},
         )
     )
-    assert "only on a wake from it" in result, "the ack must state the gated cadence"
+    assert "only when the tick needs you" in result, "the ack must state the gated cadence"
+    assert "wake criteria" in result, "and say what decides a wake"
     assert "acme/widgets#42" in result, "and name the subject it is watching"
     assert "message re-injects every 300s" not in result, "not the plain promise"
 
@@ -433,7 +436,7 @@ def test_applier_ack_keeps_the_plain_promise_for_an_ungated_loop(monkeypatch):
         )
     )
     assert "re-injects every 300s" in result
-    assert "only on a wake from it" not in result
+    assert "only when the tick needs you" not in result
 
 
 def test_applier_monitor_start_arms_via_the_session_binding_key(monkeypatch):
@@ -947,6 +950,8 @@ def test_applier_autonudge_stop_removes_ordinary_monitor_loop(monkeypatch):
     assert svc.get_by_slot_keys == [binding_key_for(_SESSION)]
     assert svc.removed == ["loop-ordinary"]
     assert svc.updated == []
+    # The removal leaves no row, so the agent's reason must reach the stop record.
+    assert svc.notes == [("loop-ordinary", "autonudge_stop", "done")]
     assert "stopped" in result.lower()
 
 

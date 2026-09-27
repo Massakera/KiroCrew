@@ -9,6 +9,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from conftest import plant_day_link
 from kiro_crew.context import ContextBuilder, _neutralize_structural_markers
 from kiro_crew.hooks import ContextRule, HookManager, HooksConfig
 from kiro_crew.learn import LessonStore
@@ -16,11 +17,18 @@ from kiro_crew.memory import MemoryStore
 from kiro_crew.memory_stores import memory_store_name_defect
 from kiro_crew.skills import SkillsLoader
 
-# One xdist worker for the whole module: every test here derives from ONE module-cached
-# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
-# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
-# per full run for this file alone. Grouping keeps the cache single-copy per run.
+# One xdist worker for the whole module. The ``build_message`` call-site ratchet below
+# walks the package through the shared ``source_corpus`` (one memoised file list per
+# process, texts streamed and parsed only for the files that can match), so its cost is
+# now a second rather than the ~30s full-tree ``ast.parse`` this group was first added
+# for; the group stays so the file-list cache is paid once per run, not once per worker.
 pytestmark = pytest.mark.xdist_group(name="tree_scan_test_context")
+
+
+@pytest.fixture(autouse=True)
+def _close_skills_loaders(close_skills_loaders):
+    """Every test here builds a ``ContextBuilder``: close its ``SkillsLoader`` (``test/conftest.py``)."""
+
 
 # ---------------------------------------------------------------------------
 # Strategies
@@ -425,6 +433,40 @@ class TestContextBuilder:
         assert msg.index("[Skill: demo]") < msg.index(marker)
         assert msg.index("[THEME PERSONA]") < msg.index(marker)
         assert msg.index(marker) < msg.index(header) < msg.index(request)
+
+    def test_request_prefix_without_trailing_newline_does_not_swallow_the_next_block(
+        self, tmp_path
+    ):
+        """A ``$skill`` body arrives ``.strip()``ed (no trailing newline). The
+        assembly must still open the next block on its own line, or the context
+        breakdown books that block's bytes to the skill."""
+        from kiro_crew.context_blocks import split_blocks
+
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        request = "hi"
+        generated = "\n\n[Skill: demo]\n\nloaded procedure with no newline at the end"
+        span: list[int] = []
+        msg, _ = builder.build_message(
+            request,
+            is_new_session=False,
+            interactive=True,
+            session_key="dashboard:chat-1",
+            project="/workspace/example",
+            request_prefix_context=generated,
+            user_text_range=(0, len(request)),
+            user_span_out=span,
+        )
+        assert "\n[REPLY FORMAT RULES]" in msg
+        out = split_blocks(msg, user_span=(span[0], span[1]))
+        assert "reply_format_rules" in out
+        assert out["loaded_skill"] == len(
+            "[Skill: demo]\n\nloaded procedure with no newline at the end\n"
+        )
+        assert sum(out.values()) == len(msg)
 
     def test_dashboard_tool_nudges_require_interactive(self, tmp_path):
         """A non-interactive turn (e.g. automation) gets neither the OPTIONS
@@ -1700,6 +1742,7 @@ class TestBuildMessageOffloadedAtCallSites:
         fake_memory.vector_store = vector_store
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         vector_store.get_lessons.return_value = []
 
         with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
@@ -1716,6 +1759,7 @@ class TestBuildMessageOffloadedAtCallSites:
         fake_memory.vector_store = vector_store
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         vector_store.get_lessons.return_value = []
         vector_store.get_semantic_context.return_value = ""
 
@@ -1745,10 +1789,11 @@ class TestAsyncCallSitesUseToThread:
 
     def test_no_inline_build_message_in_async_functions(self):
         import ast
-        from pathlib import Path
+
+        from source_corpus import parsed_candidates, src_root
 
         nested_scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-        src_root = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
+        root = src_root()
         offenders: list[str] = []
 
         def _iter_frame_calls(fn: ast.AsyncFunctionDef):
@@ -1762,12 +1807,16 @@ class TestAsyncCallSitesUseToThread:
                     yield node
                 stack.extend(ast.iter_child_nodes(node))
 
-        for py in src_root.rglob("*.py"):
-            try:
-                text = py.read_text(encoding="utf-8")
-                tree = ast.parse(text)
-            except SyntaxError:
-                continue
+        # A finding is an ``ast.Attribute`` whose ``attr`` is ``build_message``, so
+        # that identifier cannot be absent from an offending file's text: the shared
+        # corpus parses only the files that carry it (a few dozen, not the whole
+        # package), one tree at a time, which is what took this gate from an
+        # 11-second full-tree parse to well under a second. ONLY that needle: the
+        # coroutine itself is found by the AST (``ast.AsyncFunctionDef``), never by
+        # a text needle -- ``async  def`` with two spaces is a valid coroutine that a
+        # literal ``"async def"`` filter would skip, and a filter that can skip a
+        # valid offender is a gate that fails open.
+        for py, text, tree in parsed_candidates(require_all=("build_message",)):
             lines = text.splitlines()
             for fn in ast.walk(tree):
                 if not isinstance(fn, ast.AsyncFunctionDef):
@@ -1783,7 +1832,7 @@ class TestAsyncCallSitesUseToThread:
                     src_line = lines[call.lineno - 1] if call.lineno <= len(lines) else ""
                     if "# loop-ok" in src_line:
                         continue
-                    offenders.append(f"{py.relative_to(src_root)}:{call.lineno} in async {fn.name}")
+                    offenders.append(f"{py.relative_to(root)}:{call.lineno} in async {fn.name}")
 
         assert not offenders, (
             "build_message called inline from async coroutine(s) — the episodic "
@@ -1793,7 +1842,8 @@ class TestAsyncCallSitesUseToThread:
 
 
 class TestMemoryGetContextQueryWiring:
-    """Startup passes the request but disables activity; explicit readers retain it."""
+    """Startup reads preferences protected (activity off) and the activity block
+    as budgeted background; explicit readers retain the combined read."""
 
     def _builder(self, tmp_path):
         return ContextBuilder(
@@ -1809,6 +1859,7 @@ class TestMemoryGetContextQueryWiring:
         fake_memory = MagicMock()
         fake_memory.get_context.return_value = ""
         fake_memory.activity_index.return_value = ""
+        fake_memory.get_activity_context.return_value = ""
         fake_memory.vector_store = None
 
         with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
@@ -1831,8 +1882,8 @@ class TestMemoryGetContextQueryWiring:
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
@@ -1852,8 +1903,8 @@ class TestMemoryGetContextQueryWiring:
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: False,
         )
@@ -1897,13 +1948,16 @@ class TestMemoryGetContextQueryWiring:
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
         msg, _ = builder.build_message("q", True, "s1")
-        assert "[EPISODIC-SENTINEL]" not in msg
+        # The protected preferences read (include_activity=False) never builds
+        # episodes; the budgeted activity block does, exactly once.
+        assert msg.count("[EPISODIC-SENTINEL]") == 1
+        assert "[EPISODIC-SENTINEL]" not in store.get_context(query="q", include_activity=False)
         assert store.get_context(query="q").count("[EPISODIC-SENTINEL]") == 1
 
     def test_episodic_query_is_the_user_message(self, tmp_path):
@@ -1919,15 +1973,157 @@ class TestMemoryGetContextQueryWiring:
 
         store._vector_store = SimpleNamespace(
             get_episodic_context=_episodic,
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: True,
         )
         builder.build_message("find my tokyo notes", True, "s2")
-        assert seen == []
-        store.get_context(query="find my tokyo notes")
         assert seen == ["find my tokyo notes"]
+        store.get_context(query="find my tokyo notes")
+        assert seen == ["find my tokyo notes", "find my tokyo notes"]
+
+    def test_activity_block_is_background_not_protected(self, tmp_path):
+        # A long history must be droppable by the admission loop, so it enters
+        # the discretionary pool and never the protected set.
+        from types import SimpleNamespace
+
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store._vector_store = SimpleNamespace(
+            get_episodic_context=lambda query_text, cap: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            has_any_lesson=lambda: True,
+        )
+        huge = "ACTIVITY-FILLER " * 10_000
+        with patch.object(type(store), "get_activity_context", return_value=huge):
+            msg, _ = builder.build_message("q", True, "s3")
+        assert "ACTIVITY-FILLER" not in msg
+        assert "omitted background context" in msg
+
+
+class TestUnreadableActivityAtSessionStart:
+    """An unreadable notebook file must not abort the session-start build.
+
+    ``build_session_context`` reads ``activity_index`` BEFORE the tolerant
+    activity sections, so a projects file that raises ``OSError`` (a directory
+    in its place, a permission denial) has to be skipped there too; a raise at
+    that call loses the protected preferences with it. A single unreadable
+    history day is skipped by the per-day read itself, and a history failure
+    that is not tied to one day file is skipped by the whole-window guard.
+    """
+
+    # The sentinels below ride in background blocks the admission loop may drop
+    # under host memory pressure, so the host's free memory is pinned off.
+    pytestmark = pytest.mark.usefixtures("ample_host_resources")
+
+    def _builder(self, tmp_path):
+        return ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+
+    def test_history_day_replaced_by_a_directory_keeps_preferences(self, tmp_path):
+        from datetime import date, timedelta
+
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        store.write_projects("PROJECT_SENTINEL")
+        store.append_history("VALID_HISTORY_SENTINEL")
+        unreadable_day = (date.today() - timedelta(days=1)).isoformat()
+        (store._history_dir / f"{unreadable_day}.md").mkdir()
+
+        ctx = builder.build_session_context()
+
+        assert "PREF_SENTINEL" in ctx
+        assert "PROJECT_SENTINEL" in ctx
+        # The per-day read skips only the poisoned day; the valid day rides.
+        assert "## Recent History" in ctx
+        assert "VALID_HISTORY_SENTINEL" in ctx
+
+    def test_history_day_link_keeps_preferences_without_target(self, tmp_path):
+        """Session startup skips a linked history day without exposing its target."""
+        from datetime import date, timedelta
+
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.txt"
+        secret.write_text("SECRET_SENTINEL", encoding="utf-8")
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        plant_day_link(store._history_dir / f"{yesterday}.md", secret)
+        store.append_history("VALID_HISTORY_SENTINEL")
+
+        ctx = builder.build_session_context()
+
+        assert "SECRET_SENTINEL" not in ctx
+        assert "PREF_SENTINEL" in ctx
+        assert "VALID_HISTORY_SENTINEL" in ctx
+
+    def test_history_window_unreadable_keeps_preferences(self, tmp_path, monkeypatch):
+        """A history failure not tied to one day file skips only history."""
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        store.write_projects("PROJECT_SENTINEL")
+        store.append_history("VALID_HISTORY_SENTINEL")
+
+        def _unreadable(*args, **kwargs):
+            raise PermissionError("history directory is unreadable")
+
+        monkeypatch.setattr(store, "_read_recent_history_uncached", _unreadable)
+
+        ctx = builder.build_session_context()
+
+        assert "PREF_SENTINEL" in ctx
+        assert "PROJECT_SENTINEL" in ctx
+        assert "## Recent History" not in ctx
+        assert "VALID_HISTORY_SENTINEL" not in ctx
+
+    def test_projects_file_replaced_by_a_directory_keeps_preferences(self, tmp_path):
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        store.append_history("HISTORY_SENTINEL")
+        store._projects_file.unlink()
+        store._projects_file.mkdir()
+
+        ctx = builder.build_session_context()
+
+        assert "PREF_SENTINEL" in ctx
+        assert "HISTORY_SENTINEL" in ctx
+        assert "## Active Projects" not in ctx
+
+    def test_projects_file_link_keeps_preferences_without_target(self, tmp_path):
+        """Session startup omits a linked ``projects.md`` without exposing its target."""
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store.init()
+        store.write_preferences("# User Preferences\n\n- PREF_SENTINEL\n")
+        store.append_history("HISTORY_SENTINEL")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.txt"
+        secret.write_text("SECRET_SENTINEL", encoding="utf-8")
+        store._projects_file.unlink()
+        plant_day_link(store._projects_file, secret)
+
+        ctx = builder.build_session_context()
+
+        assert "SECRET_SENTINEL" not in ctx
+        assert "PREF_SENTINEL" in ctx
+        assert "HISTORY_SENTINEL" in ctx
+        assert "## Active Projects" not in ctx
 
 
 class TestDurableModelVersionLessonContext:
@@ -1967,8 +2163,8 @@ class TestDurableModelVersionLessonContext:
         memory = builder.get_memory_for(None)
         memory._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
             has_any_lesson=lambda: False,
         )

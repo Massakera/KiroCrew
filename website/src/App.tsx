@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type ComponentType, type HTMLAttributes, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -10,7 +10,7 @@ import { performAgentSlotSwitch } from './lib/agentSwitch'
 // before `getBuiltinSurfaces()` is invoked below to compute `NAV_ITEMS`.
 import './surfaces/builtins'
 import { getBuiltinSurfaces, getBuiltinSurface, selectSurfaceBadgeCount, selectSurfaceActivityCount, selectAllSurfacesAttention, surfaceLabel, surfacePreviewEnabled } from './surfaces/registry'
-import { createSlot, appendSlotMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
+import { createSlot, appendSlotMessage, setAgentSwitchNotice, startLocalTurn, endLocalTurn, switchSlot, selectActiveSlotProject } from './store/chatSlice'
 import { mintSendId } from './utils/sendDelivery'
 import { queryComposerOrExpand } from './pages/chat/composerFocus'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
@@ -52,7 +52,7 @@ import { gcOrphanedStorage } from './utils/storageGc'
 import { isMetricNumber, metricNumber } from './utils/metrics'
 import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, Compass, LayoutGrid, Fullscreen, Menu, PanelLeft, SquareTerminal, Bot, Smartphone, Search as SearchIcon } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
-import { Toggle } from './components/ui'
+import { Btn, Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
 import MeetCrewmatesFlow, { MeetCrewmatesEligibilityNotice } from './components/MeetCrewmatesFlow'
 import { useMeetCrewmatesGate } from './hooks/useMeetCrewmatesGate'
@@ -97,34 +97,23 @@ import AskAgentButton from './components/AskAgentButton'
 import AppIcon from './components/AppIcon'
 import Clickable from './components/Clickable'
 import MarkdownRenderer, { Lightbox } from './components/MarkdownRenderer'
-import NotificationsPage from './pages/NotificationsPage'
 const SessionsPage = lazy(() => import('./pages/SessionsPage'))
 import NotificationDetailPanel from './components/notifications/NotificationDetailPanel'
 import NotificationFeed from './components/notifications/NotificationFeed'
 import NotificationBanner from './components/notifications/NotificationBanner'
 import LogsPage from './pages/LogsPage'
-import HooksPage from './pages/HooksPage'
-import WebhooksPage from './pages/WebhooksPage'
-import CapabilitiesPage from './pages/CapabilitiesPage'
 // Lazy: /members is a standalone surface not needed at startup, and the main
 // chunk sits at its size budget — the import() boundary keeps the page (and
 // its drawer/roster tree) out of the initial bundle.
 const MembersPage = lazy(() => import('./pages/members/MembersPage'))
-import ArtifactsPage from './pages/ArtifactsPage'
 import ArtifactDetailPage from './pages/ArtifactDetailPage'
-import RemoteArtifactDetailPage from './pages/RemoteArtifactDetailPage'
-import ArtifactDeployPage from './pages/ArtifactDeployPage'
-import SettingsPage from './pages/SettingsPage'
 import { InAppUpdateFlow } from './pages/settings/AboutPanel'
-import EmbedSettingsPage from './pages/EmbedSettingsPage'
 import KiroCrewNavBridge from './components/KiroCrewNavBridge'
 import InstanceTabBar from './components/InstanceTabBar'
 import InstancesViewport from './components/InstancesViewport'
 import EmbeddedHostBridge from './components/EmbeddedHostBridge'
 import EmbeddedDragRegionReporter from './components/EmbeddedDragRegionReporter'
 import EmbedTabStrip from './components/EmbedTabStrip'
-import DeveloperPage from './pages/DeveloperPage'
-import SchedulePage from './pages/SchedulePage'
 import { useUpdateSubscription, type UpdateState } from './hooks/useUpdateSubscription'
 import UpdateModal from './components/UpdateModal'
 
@@ -132,13 +121,11 @@ import ComputerUseLiveView from './components/ComputerUseLiveView'
 import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTerminalPanel'
 import { confirmRestoredTabs, reconcileRestoredTabs, toggleBottomTerminal, useBottomTerminalOpen, useTerminalPosition } from './hooks/useBottomTerminal'
 import { RUN_IN_TERMINAL_OPENING_GRACE_MS } from './utils/fenceShell'
+import { confirmRestoredPanelTerminals, reconcileRestoredPanelTerminals } from './hooks/usePanelTabs'
 import { withDeadline } from './lib/withDeadline'
 import { toggleTerminalByChord } from './lib/terminalChordFocus'
 import { useTerminalPoppedOut, focusPopout as focusTerminalPopout } from './utils/terminalPopout'
 import { setTerminalEnabledFlag } from './utils/terminalRegistry'
-import AppPage from './pages/AppPage'
-import AppDetailPage from './pages/AppDetailPage'
-import MigrationPage from './pages/MigrationPage'
 import MigrationCheck from './components/MigrationCheck'
 import CrashReportNotice from './components/CrashReportNotice'
 import BuiltinAppRoute from './apps/BuiltinAppRoute'
@@ -207,6 +194,80 @@ const UpdatePill = lazy(() => import('./components/UpdatePill'))
 // chunk -- each rides its own on-demand chunk fetched on first navigation.
 const DiscoverPage = lazy(() => import('./pages/apps/DiscoverPage'))
 const LibraryPage = lazy(() => import('./pages/apps/LibraryPage'))
+/**
+ * A route page loaded on first navigation, rendering nothing until its chunk
+ * arrives. The Suspense boundary lives inside the returned component, so the
+ * `<Route>` entries that mount these pages read the same as for an eager page.
+ *
+ * The chunk fetch can reject (gateway unreachable, stale chunk after a rebuild
+ * once main.tsx's `vite:preloadError` reload guard has bailed). React surfaces
+ * a rejected lazy import as a render throw, and an eager page could never
+ * fail that way -- so the page carries its own route-scoped ErrorBoundary:
+ * the route area shows the recoverable error card while the shell (rail,
+ * top bar, other routes) stays mounted instead of the throw reaching the
+ * root `app-shell` boundary in main.tsx and replacing the whole dashboard.
+ */
+function lazyPage(load: () => Promise<{ default: ComponentType }>): ComponentType {
+  // Shared by every mount, so a page whose chunk already loaded renders on the
+  // next visit without suspending again. Replaced only by a retry.
+  let shared = lazy(load)
+  function LazyPage() {
+    const [{ Page, attempt }, setLoadState] = useState(() => ({ Page: shared, attempt: 0 }))
+    // React.lazy caches a rejected loader. A new wrapper per attempt makes the
+    // retry perform another import instead of rendering the cached rejection.
+    return (
+      <ErrorBoundary
+        key={attempt}
+        scope="lazy-route"
+        fallback={(error) => (
+          <div className="flex h-full items-center justify-center p-8">
+            <ErrorNotice
+              title={i18nT('components.errorBoundary.lazy_page_load_failed')}
+              message={error.message}
+              askAgent
+              footer={(
+                <div className="flex items-center gap-2">
+                  <Btn onClick={() => {
+                    shared = lazy(load)
+                    setLoadState(current => ({ Page: shared, attempt: current.attempt + 1 }))
+                  }}>
+                    {i18nT('components.errorBoundary.try_again')}
+                  </Btn>
+                  <Btn onClick={() => window.location.reload()}>
+                    {i18nT('components.errorBoundary.reload_page')}
+                  </Btn>
+                </div>
+              )}
+            />
+          </div>
+        )}
+      >
+        <Suspense fallback={null}><Page /></Suspense>
+      </ErrorBoundary>
+    )
+  }
+  return LazyPage
+}
+
+// Every page below is reached only through its own route, so each rides an
+// on-demand chunk instead of the app-core chunk the chat route has to parse on
+// first load. Pages another eager module imports statically stay eager above
+// (LogsPage via the chat ActivityViewer, ArtifactDetailPage via the artifact
+// popout frame): a lazy boundary there would not move their code.
+const NotificationsPage = lazyPage(() => import('./pages/NotificationsPage'))
+const WebhooksPage = lazyPage(() => import('./pages/WebhooksPage'))
+const CapabilitiesPage = lazyPage(() => import('./pages/CapabilitiesPage'))
+const ArtifactsPage = lazyPage(() => import('./pages/ArtifactsPage'))
+const RemoteArtifactDetailPage = lazyPage(() => import('./pages/RemoteArtifactDetailPage'))
+const ArtifactDeployPage = lazyPage(() => import('./pages/ArtifactDeployPage'))
+const SettingsPage = lazyPage(() => import('./pages/SettingsPage'))
+const EmbedSettingsPage = lazyPage(() => import('./pages/EmbedSettingsPage'))
+const DeveloperPage = lazyPage(() => import('./pages/DeveloperPage'))
+const SchedulePage = lazyPage(() => import('./pages/SchedulePage'))
+const AppPage = lazyPage(() => import('./pages/AppPage'))
+const AppDetailPage = lazyPage(() => import('./pages/AppDetailPage'))
+const MigrationPage = lazyPage(() => import('./pages/MigrationPage'))
+const HooksPage = lazyPage(() => import('./pages/HooksPage'))
 
 type LogSubscribeFn = (cb: ((data: { level: string; msg: string }) => void) | null) => void
 
@@ -594,7 +655,7 @@ function ActivityIndicator({ count, collapsed, label }: { count: number; collaps
         glyph depicts is a question about the rail's iconography rather than about
         the overlap, so it is left to the follow-up rather than guessed at here.
         The `title` carries the naming for a user who hovers. */}
-    <Bot size={11} className="animate-pulse" aria-hidden />
+    <Bot size={11} aria-hidden />
     {count}
   </span>
 }
@@ -1673,7 +1734,9 @@ export default function App() {
   // that, so the query's later refetches change nothing.
   useEffect(() => {
     if (terminalConfig === undefined && !terminalProbeFailed) return
-    const suspects = reconcileRestoredTabs(terminalProbeFailed ? null : terminalConfig)
+    const first = terminalProbeFailed ? null : terminalConfig
+    // The side-panel strip's restored terminals take the same two looks.
+    const suspects = [...reconcileRestoredTabs(first), ...reconcileRestoredPanelTerminals(first)]
     if (suspects.length === 0) return
     void (async () => {
       await new Promise(resolve => setTimeout(resolve, RUN_IN_TERMINAL_OPENING_GRACE_MS))
@@ -1684,6 +1747,7 @@ export default function App() {
         if (r.ok) second = await r.json()
       } catch { /* null: the confirm look could not rule, so every suspect stays */ }
       confirmRestoredTabs(second)
+      confirmRestoredPanelTerminals(second)
     })()
   }, [terminalConfig, terminalProbeFailed])
   // True while the terminal panel lives in its own popped-out window: the
@@ -2408,13 +2472,39 @@ export default function App() {
   const appNavGenRef = useRef(0)
   const [slotOwners, setSlotOwners] = useState<SlotOwners>({})
   const queryClient = useQueryClient()
-  const refreshAppNav = useCallback((attempt = 0) => {
+  const refreshAppNav = useCallback((attempt = 0, joinPending = false) => {
     // Cancel any pending retry up-front so external triggers (the reconnect
     // effect, the mc:apps-changed handler) or a just-fired retry can never run
     // overlapping fetch chains — exactly one chain is ever active.
     if (appNavRetryRef.current) { clearTimeout(appNavRetryRef.current); appNavRetryRef.current = null }
     const gen = ++appNavGenRef.current
-    api.listApps()
+    // The mount read goes through the shared ['apps'] query so it joins the GET
+    // an ['apps'] observer mounted in the same commit (the panel-tab registry,
+    // the composer's session controls) has already started, instead of sending
+    // a second identical one. staleTime 0 still fetches when nothing is in
+    // flight; retry stays false because the backoff below owns retries.
+    //
+    // A refresh after a change or reconnect first cancels that shared boot
+    // query. Its request may still finish at the transport, but React Query no
+    // longer accepts its result, so it cannot overwrite the newer direct read.
+    // The direct read then publishes one response to both the nav and cache.
+    //
+    // Both the cancel and the re-mark are `exact`: query filters match by key
+    // PREFIX, so a bare ['apps'] filter would also cancel MigrationPage's
+    // in-flight ['apps', 'migration', <name>] first load and revert it to
+    // pending with no data, and would mark other ['apps', ...] queries stale
+    // that this refresh does not refetch. Only the shared list query is ours.
+    const read: Promise<AppListEntry[]> = joinPending
+      ? queryClient.fetchQuery({ queryKey: ['apps'], queryFn: () => api.listApps(), staleTime: 0, retry: false })
+      : queryClient.cancelQueries({ queryKey: ['apps'], exact: true }).then(() => {
+        // Cancelling reverts the query to its state from before the cancelled
+        // fetch started, which can drop a stale mark set since then (the
+        // mc:apps-changed handler's). Re-mark it so a failed read below still
+        // leaves the cache stale rather than fresh.
+        queryClient.invalidateQueries({ queryKey: ['apps'], exact: true, refetchType: 'none' })
+        return api.listApps()
+      })
+    read
       .then((apps: AppListEntry[]) => {
         if (gen !== appNavGenRef.current) return
         const items = apps
@@ -2485,7 +2575,7 @@ export default function App() {
       })
   }, [dispatch, queryClient])
   useEffect(() => {
-    refreshAppNav()
+    refreshAppNav(0, true)
     return () => { if (appNavRetryRef.current) clearTimeout(appNavRetryRef.current) }
   }, [refreshAppNav])
   useEffect(() => {
@@ -2981,6 +3071,30 @@ export default function App() {
     capsulePulseTimer.current = setTimeout(() => setCapsuleLayoutPulse(false), 350)
   }, [])
   useEffect(() => () => clearTimeout(capsulePulseTimer.current), [])
+  // Hovering the metrics control previews the same card the click-pinned
+  // popover shows, in every desktop form of the control: the bare icon, the
+  // narrow-band popover trigger, and the expanded inline readout (which shows
+  // percentages only, so the absolute GB figures live in the card). A pinned
+  // popover owns the card while it is open, so the hover path is disabled then.
+  const metricsHover = useHoverIntent({
+    enabled: !isMobile && !capsuleCollapsed && !metricsPopoverOpen,
+    triggerRef: metricsBtnRef,
+    surfaceRef: metricsPopoverRef,
+  })
+  const [metricsHoverAnchor, setMetricsHoverAnchor] = useState<{ top: number; right: number } | null>(null)
+  useEffect(() => {
+    if (!metricsHover.open) { setMetricsHoverAnchor(null); return }
+    const r = metricsBtnRef.current?.getBoundingClientRect()
+    setMetricsHoverAnchor(r ? { top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) } : null)
+    // The anchor is measured once, so a resize or zoom would strand the card
+    // away from its trigger. Close it instead, as the pinned card does.
+    const close = metricsHover.close
+    window.addEventListener('resize', close)
+    return () => window.removeEventListener('resize', close)
+  }, [metricsHover.open, metricsHover.close])
+  const metricsCardAnchor = metricsPopoverAnchor ?? metricsHoverAnchor
+  const metricsCardOpen = metricsCardAnchor !== null
+  const metricsCardId = 'topbar-metrics-card'
   // macOS fullscreen hides the native traffic lights, so the header's 84px
   // clearance inset drops while fullscreen (mac-fullscreen class on the root).
   const [macFullscreen, setMacFullscreen] = useState(false)
@@ -2993,16 +3107,23 @@ export default function App() {
   // separate strip inset to relay to Electron — positionTrafficLights centers on
   // the header height directly. Remote panes get their own inset via `macInset`.
   const macInset = isMacElectron && !macFullscreen
-  const { data: sysMetrics, isError: sysMetricsError, dataUpdatedAt: sysMetricsUpdatedAt } = useQuery({ queryKey: ['system-metrics'], queryFn: () => api.system().then((d): SysMetricsFrame => ({ memUsed: d.mem_used_gb, memTotal: d.mem_total_gb, cpuPct: d.cpu_pct, diskTotal: d.disk_total_gb, diskFree: d.disk_free_gb, posture: d.resource_posture as 'ample' | 'tight' | 'critical' | 'unknown' | undefined, availableGb: d.resource_available_gb as number | undefined, subagentCap: d.subagent_cap as number | undefined })), refetchInterval: metricsOpen || metricsPopoverOpen ? 30_000 : 60_000, enabled: true })
+  const { data: sysMetrics, isError: sysMetricsError, dataUpdatedAt: sysMetricsUpdatedAt } = useQuery({ queryKey: ['system-metrics'], queryFn: () => api.system().then((d): SysMetricsFrame => ({ memUsed: d.mem_used_gb, memTotal: d.mem_total_gb, cpuPct: d.cpu_pct, diskTotal: d.disk_total_gb, diskFree: d.disk_free_gb, posture: d.resource_posture as 'ample' | 'tight' | 'critical' | 'unknown' | undefined, availableGb: d.resource_available_gb as number | undefined, subagentCap: d.subagent_cap as number | undefined })), refetchInterval: metricsOpen || metricsCardOpen ? 30_000 : 60_000, enabled: true })
   // Tick every 10s while widget is open so `sysMetricsStale` re-evaluates even when the query stops refetching (backgrounded tab, network drop).
   const [, setStaleTick] = useState(0)
   useEffect(() => {
-    if (!metricsOpen && !metricsPopoverOpen) return
+    if (!metricsOpen && !metricsCardOpen) return
     const id = setInterval(() => setStaleTick(t => t + 1), 10_000)
     return () => clearInterval(id)
-  }, [metricsOpen, metricsPopoverOpen])
+  }, [metricsOpen, metricsCardOpen])
   // Consider metrics stale if last successful fetch was > 90s ago (3x the 30s poll interval) while the widget is open.
-  const sysMetricsStale = (metricsOpen || metricsPopoverOpen) && (sysMetricsError || (sysMetricsUpdatedAt > 0 && Date.now() - sysMetricsUpdatedAt > 90_000))
+  const sysMetricsStale = (metricsOpen || metricsCardOpen) && (sysMetricsError || (sysMetricsUpdatedAt > 0 && Date.now() - sysMetricsUpdatedAt > 90_000))
+  // A pinned card is a dialog; a hover preview is a tooltip unless the stale
+  // fetch notice makes it interactive, which promotes it to a dialog too.
+  const metricsCardRole: 'dialog' | 'tooltip' = metricsPopoverOpen || (metricsCardOpen && sysMetricsError) ? 'dialog' : 'tooltip'
+  // Only the tooltip form describes the trigger. The dialog form carries its
+  // own aria-label, so describing the trigger with it would announce
+  // "System metrics" twice.
+  const metricsDescribedBy = metricsHoverAnchor && metricsCardRole === 'tooltip' ? metricsCardId : undefined
   // Re-read the rung's verdict on any resize of the group -- its width is what
   // the container query measures -- and whenever the update pill mounts or
   // unmounts, which moves the rung without resizing anything.
@@ -3355,9 +3476,19 @@ export default function App() {
     // new slot is registered but never activated — an active-slot append would
     // put the bubble in an unrelated session's transcript, and an
     // unconditional running flag would mark that session busy for a turn it
-    // never started (review finding on #4198).
+    // never started (review finding on #4198). The running flag goes through
+    // `startLocalTurn`, the same mark a composer send leaves: it flips the
+    // visible footer and records the send as UNCONFIRMED, so a switch away
+    // while the POST is in flight parks the slot idle rather than busy -- a
+    // refused receipt after that switch has no active mirror left to clear.
+    // The mark is dispatched only while the created slot is still ACTIVE:
+    // `pendingTurnSlot` is one field for the whole store, so marking a slot
+    // the user already left would overwrite the guard of whatever slot they
+    // are sending from now, and a stale idle snapshot could unlock that
+    // composer mid-send. A slot the user left before the create settled
+    // simply gets no optimistic running flag, exactly as before.
     dispatch(appendSlotMessage({ slot, message: { role: 'user', content: visibleMessage, cls: '', ts: new Date().toISOString(), meta } }))
-    if (appStore.getState().chat.activeSlot === slot) dispatch(setSlotRunning(true))
+    if (appStore.getState().chat.activeSlot === slot) dispatch(startLocalTurn(slot))
     // A send the server never accepted has to say so where the request landed
     // (#4198): an HTTP 4xx/5xx RESOLVES rather than rejecting, so the catch
     // alone never saw the errors that matter — a refused send left the
@@ -3370,7 +3501,10 @@ export default function App() {
     // indicator (a stale flag on this slot self-heals from the server snapshot
     // on the next switch-back). The payload is a canned constant, so unlike
     // the chat composers there is no typed text to hand back — the retry
-    // affordance is the feedback pill itself.
+    // affordance is the feedback pill itself. `endLocalTurn` is the inverse of
+    // the mark above: slot-keyed, it drops the unconfirmed mark only if it is
+    // still THIS slot's and touches the footer only while this slot is on
+    // screen, so it is safe to dispatch whether or not the mark was set.
     const reportFailedSend = (reason?: string) => {
       // FRAMED, not bare: a raw backend reason ("slot agent mismatch") reads
       // as the agent erroring mid-work, not as "your request never went out".
@@ -3384,7 +3518,7 @@ export default function App() {
           cls: '',
         },
       }))
-      if (appStore.getState().chat.activeSlot === slot) dispatch(setSlotRunning(false))
+      dispatch(endLocalTurn(slot))
     }
     try {
       // maxAge bounds the seed's lifetime: if the visible send below fails,
@@ -3953,7 +4087,7 @@ export default function App() {
                 aria-label={capsuleActionMsg}
                 aria-expanded={!capsuleCollapsed}
               >
-                <span aria-hidden="true" className={`w-1.5 h-1.5 rounded-full transition-colors duration-300 ${offline ? 'bg-danger animate-pulse motion-reduce:animate-none' : 'bg-ok shadow-[0_0_8px_rgba(34,197,94,.4)]'}`} />
+                <span aria-hidden="true" className={`w-1.5 h-1.5 rounded-full transition-colors duration-300 ${offline ? 'bg-danger animate-pulse [animation-iteration-count:3]! motion-reduce:animate-none' : 'bg-ok shadow-[0_0_8px_rgba(34,197,94,.4)]'}`} />
                 {/* Live-region announcement lives in its own hidden span:
                     role="status" on the button itself would override its
                     implicit button role for screen readers. */}
@@ -3970,7 +4104,7 @@ export default function App() {
                     ? i18nT('app.resource_posture_tooltip_critical', { gb: sysMetrics.availableGb?.toFixed(1) ?? '?' })
                     : i18nT('app.resource_posture_tooltip_tight', { gb: sysMetrics.availableGb?.toFixed(1) ?? '?' })}
                 >
-                  <span aria-hidden="true" className={`inline-block w-2 h-2 rounded-full animate-pulse motion-reduce:animate-none ${sysMetrics.posture === 'critical' ? 'bg-danger' : 'bg-warn'}`} />
+                  <span aria-hidden="true" className={`inline-block w-2 h-2 rounded-full ${sysMetrics.posture === 'critical' ? 'bg-danger animate-pulse [animation-iteration-count:3]! motion-reduce:animate-none' : 'bg-warn'}`} />
                   {!isMobile && <span className="font-medium">{sysMetrics.posture === 'critical' ? i18nT('app.resource_critical') : i18nT('app.resource_tight')}</span>}
                   {!isMobile && sysMetrics.subagentCap != null && <span className="text-muted text-[10px]">· {i18nT('app.subagent_cap', { cap: String(sysMetrics.subagentCap) })}</span>}
                 </span>
@@ -3982,9 +4116,9 @@ export default function App() {
                 // No room for the inline readings here, so the click opens the
                 // popover and the stored preference is left untouched -- it still
                 // describes what to do once the readings fit again.
-                segments.push(<button key="metrics" ref={metricsBtnRef} className={`${seg} ${metricsPopoverOpen ? 'text-accent' : 'text-muted hover:text-text'}`} title={i18nT('app.system_metrics')} aria-label={i18nT('app.system_metrics')} aria-haspopup="dialog" aria-expanded={metricsPopoverOpen} onClick={toggleMetricsPopover}><AudioWaveform size={12} /></button>)
+                segments.push(<button key="metrics" ref={metricsBtnRef} {...metricsHover.triggerProps} aria-describedby={metricsDescribedBy} className={`${seg} ${metricsPopoverOpen ? 'text-accent' : 'text-muted hover:text-text'}`} aria-label={i18nT('app.system_metrics')} aria-haspopup="dialog" aria-expanded={metricsPopoverOpen} onClick={toggleMetricsPopover}><AudioWaveform size={12} /></button>)
               } else if (!metricsOpen) {
-                segments.push(<button key="metrics" className={`${seg} text-muted hover:text-text`} onClick={() => { setMetricsOpen(true); safeSetItem('mc-topbar-metrics', '1') }} title={i18nT('app.system_metrics')} aria-label={i18nT('app.system_metrics')} aria-pressed={false}><AudioWaveform size={12} /></button>)
+                segments.push(<button key="metrics" ref={metricsBtnRef} {...metricsHover.triggerProps} aria-describedby={metricsDescribedBy} className={`${seg} text-muted hover:text-text`} onClick={() => { metricsHover.close(); setMetricsOpen(true); safeSetItem('mc-topbar-metrics', '1') }} aria-label={i18nT('app.system_metrics')} aria-pressed={false}><AudioWaveform size={12} /></button>)
               } else if (!sysMetrics) {
                 // Every OPEN state pushes a toggle. This branch is reached
                 // whenever the query has produced no frame, which is the whole
@@ -4038,21 +4172,12 @@ export default function App() {
                 const memPct = memValid ? m.memUsed / m.memTotal : 0
                 const dskUsed = m.diskTotal - m.diskFree
                 const dskPct = dskValid ? dskUsed / m.diskTotal : 0
-                const staleTitle = sysMetricsStale ? ` ${i18nT('app.stale_fetch_failing')}` : ''
-                // The container query can collapse this button to a bare icon, and
-                // the per-value tooltips ride on the spans it hides — so the
-                // readings have to live on the BUTTON's own title or they become
-                // unreachable on any window narrow enough to trip the rung.
-                // fmtPercent localizes the digits and the unit, and already
-                // renders a non-finite ratio as an em dash, which is what the
-                // invalid branches would otherwise hand-write.
-                const readings = [
-                  `${i18nT('app.cpu')} ${fmtPercent(cpuValid ? m.cpuPct / 100 : NaN)}`,
-                  `${i18nT('app.mem')} ${fmtPercent(memValid ? memPct : NaN)}`,
-                  `${i18nT('app.dsk')} ${fmtPercent(dskValid ? dskPct : NaN)}`,
-                ].join(' · ')
-                const metricsHint = sysMetricsStale ? i18nT('app.metrics_are_stale_latest_fetch_failed') : i18nT('app.click_to_hide')
-                segments.push(<button key="metrics" className={`${seg} gap-2 text-[11px] font-mono ${sysMetricsStale ? 'opacity-60' : ''}`} title={`${readings} — ${metricsHint}`} aria-pressed={true} onClick={() => { setMetricsOpen(false); safeSetItem('mc-topbar-metrics', '0') }}>
+                // No title tooltip on this button or its readings: the hover card
+                // carries the absolute figures, the stale note and the
+                // click-to-hide hint, and a native title would pop up on top of
+                // it. The readings are visible text here, so they are already in
+                // the button's accessible name.
+                segments.push(<button key="metrics" ref={metricsBtnRef} {...metricsHover.triggerProps} aria-describedby={metricsDescribedBy} className={`${seg} gap-2 text-[11px] font-mono ${sysMetricsStale ? 'opacity-60' : ''}`} aria-pressed={true} onClick={() => { metricsHover.close(); setMetricsOpen(false); safeSetItem('mc-topbar-metrics', '0') }}>
                   {/* Both forms are rendered and the container query picks one:
                       the rung has to fire on the GROUP's width, which no JS
                       branch here can see. Collapsing to the icon (rather than
@@ -4070,9 +4195,9 @@ export default function App() {
                       carries the same distinction to assistive tech. */}
                   <AudioWaveform size={12} className="tb-narrow-only text-accent" />
                   <span className="tb-drop-metrics flex items-center gap-2">
-                  <span className={cpuValid ? metricColor(m.cpuPct / 100) : 'text-muted'} title={cpuValid ? `CPU: ${m.cpuPct.toFixed(0)}%${staleTitle}` : i18nT('app.cpu_unavailable')}>{i18nT('app.cpu')} {cpuValid ? `${m.cpuPct.toFixed(0)}%` : '—'}</span>
-                  <span className={memValid ? metricColor(memPct) : 'text-muted'} title={memValid ? `Memory: ${m.memUsed.toFixed(1)}/${m.memTotal.toFixed(1)} GB${staleTitle}` : i18nT('app.memory_unavailable')}>{i18nT('app.mem')} {memValid ? `${(memPct * 100).toFixed(0)}%` : '—'}</span>
-                  <span className={dskValid ? metricColor(dskPct) : 'text-muted'} title={dskValid ? `Disk: ${dskUsed.toFixed(0)}/${m.diskTotal.toFixed(0)} GB${staleTitle}` : i18nT('app.disk_unavailable')}>{i18nT('app.dsk')} {dskValid ? `${(dskPct * 100).toFixed(0)}%` : '—'}</span>
+                  <span className={cpuValid ? metricColor(m.cpuPct / 100) : 'text-muted'}>{i18nT('app.cpu')} {cpuValid ? fmtPercent(m.cpuPct / 100) : '—'}</span>
+                  <span className={memValid ? metricColor(memPct) : 'text-muted'}>{i18nT('app.mem')} {memValid ? fmtPercent(memPct) : '—'}</span>
+                  <span className={dskValid ? metricColor(dskPct) : 'text-muted'}>{i18nT('app.dsk')} {dskValid ? fmtPercent(dskPct) : '—'}</span>
                   </span>
                 </button>)
               }
@@ -4699,7 +4824,7 @@ export default function App() {
                   active={activePath === devPath}
                   collapsed={effectiveCollapsed}
                   onClick={closeMobileNav}
-                  badge={!devPageSeen && activePath !== devPath ? <span className={dotClass} /> : undefined}
+                  badge={!devPageSeen && activePath !== devPath ? <span className={`${dotClass} [animation-iteration-count:3]!`} /> : undefined}
                 />
                 )
               })()}
@@ -5009,17 +5134,27 @@ export default function App() {
     )}
     </WsContext.Provider>
     {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
-    {metricsPopoverAnchor && createPortal(
+    {metricsCardAnchor && createPortal(
+      // One card, two ways in: a click pins it as a dialog (the narrow band),
+      // and a hover previews it over any desktop form of the control. A clean
+      // hover preview is a tooltip; a stale-fetch hand-off is interactive, so
+      // that hover form is a non-modal dialog without moving focus into it.
       <div
         ref={metricsPopoverRef}
-        role="dialog"
-        aria-label={i18nT('app.system_metrics')}
+        id={metricsCardId}
+        {...(metricsPopoverOpen ? {} : metricsHover.surfaceProps)}
+        role={metricsCardRole}
+        // Only the dialog form carries a name. The tooltip is what the
+        // trigger's aria-describedby resolves to, and an aria-label there
+        // would replace the card's text (the readout rows) with a second
+        // copy of the trigger's own name.
+        {...(metricsCardRole === 'dialog' ? { 'aria-label': i18nT('app.system_metrics') } : {})}
         // Programmatically focusable so the open effect above can move the
         // caret here; -1 keeps it out of the tab ring, which is right for a
         // transient readout.
         tabIndex={-1}
         className="fixed z-[70] min-w-[176px] rounded-xl bg-card border border-border shadow-xl px-3 py-2.5 flex flex-col gap-1.5"
-        style={{ top: metricsPopoverAnchor.top, right: metricsPopoverAnchor.right }}
+        style={{ top: metricsCardAnchor.top, right: metricsCardAnchor.right }}
       >
         <div className="text-[11px] font-semibold text-text-strong">{i18nT('app.system_metrics')}</div>
         {(() => {
@@ -5029,14 +5164,16 @@ export default function App() {
           if (!sysMetrics) return <div className="text-[11px] text-muted">{i18nT('app.metrics_unavailable')}</div>
           const { cpuValid, memValid, dskValid, m } = readMetricsFrame(sysMetrics)
           const dskUsed = m.diskTotal - m.diskFree
+          // An invalid reading renders a dash for its percentage; the detail
+          // slot then names the reason, so the row never reads as a bare dash.
           const rows = [
-            { label: i18nT('app.cpu'), valid: cpuValid, pct: cpuValid ? m.cpuPct / 100 : NaN, detail: '' },
+            { label: i18nT('app.cpu'), valid: cpuValid, pct: cpuValid ? m.cpuPct / 100 : NaN, detail: cpuValid ? '' : i18nT('app.cpu_unavailable') },
             // used/total carries the unit ONCE, on the total: fmtUnit localizes
             // the digits and the unit and glues them with a non-breaking space,
             // while the used side is a bare localized number so the pair reads as
             // one quantity instead of repeating the unit.
-            { label: i18nT('app.mem'), valid: memValid, pct: memValid ? m.memUsed / m.memTotal : NaN, detail: memValid ? `${fmtNumber(m.memUsed, { maximumFractionDigits: 1 })}/${fmtUnit(m.memTotal, 'gigabyte', { maximumFractionDigits: 1 })}` : '' },
-            { label: i18nT('app.dsk'), valid: dskValid, pct: dskValid ? dskUsed / m.diskTotal : NaN, detail: dskValid ? `${fmtNumber(dskUsed, { maximumFractionDigits: 0 })}/${fmtUnit(m.diskTotal, 'gigabyte', { maximumFractionDigits: 0 })}` : '' },
+            { label: i18nT('app.mem'), valid: memValid, pct: memValid ? m.memUsed / m.memTotal : NaN, detail: memValid ? `${fmtNumber(m.memUsed, { maximumFractionDigits: 1 })}/${fmtUnit(m.memTotal, 'gigabyte', { maximumFractionDigits: 1 })}` : i18nT('app.memory_unavailable') },
+            { label: i18nT('app.dsk'), valid: dskValid, pct: dskValid ? dskUsed / m.diskTotal : NaN, detail: dskValid ? `${fmtNumber(dskUsed, { maximumFractionDigits: 0 })}/${fmtUnit(m.diskTotal, 'gigabyte', { maximumFractionDigits: 0 })}` : i18nT('app.disk_unavailable') },
           ]
           return (
             <>
@@ -5049,10 +5186,23 @@ export default function App() {
                   </span>
                 </div>
               ))}
-              {sysMetricsStale && <div className="text-[10px] text-warn">{i18nT('app.metrics_are_stale_latest_fetch_failed')}</div>}
+              {/* The expanded readout's click hides it; the hover card is where
+                  that affordance is announced now that the button carries no
+                  title tooltip. */}
+              {!metricsPopoverOpen && metricsOpen && metricsInlineFits && <div className="text-[10px] text-muted">{i18nT('app.click_to_hide')}</div>}
+              {/* Old data with no failed fetch is not an error, so it gets a
+                  muted note that explains the dimmed readout. */}
+              {sysMetricsStale && !sysMetricsError && <div className="text-[10px] text-muted">{i18nT('app.metrics_card_old_data')}</div>}
             </>
           )
         })()}
+        {metricsCardOpen && sysMetricsError && (
+          <ErrorNotice
+            variant="inline"
+            askAgent
+            message={i18nT('app.metrics_card_fetch_failed')}
+          />
+        )}
       </div>,
       document.body
     )}

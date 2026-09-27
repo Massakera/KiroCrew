@@ -39,6 +39,7 @@ from typing import (
     Any,
     AsyncGenerator,
     AsyncIterator,
+    Awaitable,
     Callable,
     Collection,
     Mapping,
@@ -63,6 +64,7 @@ from kiro_crew.acp._dispatch import (
     DRAIN_YIELD_AFTER_S,
     GateBridgeIdentity,
     _dumps_degraded,
+    _loggable_request_id,
     _measure_tool_output,
     agent_version_from_init,
     build_permission_event,
@@ -106,6 +108,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_DROID,
     ACP_BACKEND_GOOSE,
+    ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
@@ -143,6 +146,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_RESULT,
     JSONRPC_METHOD_NOT_FOUND,
     KNOWN_SESSION_UPDATES,
+    MCP_ROSTER_COMPLETE_NOTE,
     METHOD_AGENT_SWITCHED,
     METHOD_CANCEL,
     METHOD_CLEAR_STATUS,
@@ -202,6 +206,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_PROCESS_NAMES,
     NODE_ADAPTER_ENTRY_SEGMENTS,
     launch_for,
+    model_refusal_phrase,
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
@@ -268,6 +273,7 @@ from kiro_crew.sandbox import (
     wrapped_by_crew_sandbox,
 )
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.security.credential_sources import tool_output_fingerprints
 from kiro_crew.sel import sel
 from kiro_crew.session_token_sig import schedule_session_token_publish
 from kiro_crew.skill_usage import get_global_skill_read_observer
@@ -565,6 +571,20 @@ PI_ACP_VERIFIED_VERSION = "0.0.33"
 # Versions already named this process, so a gateway on a newer adapter says so
 # once, not on every session.
 _pi_adapter_versions_noted: set[str] = set()
+# The oldest ``pi`` the adapter can drive. pi-acp sends RPC commands that older
+# releases do not have, and it does not check the version itself. Driven against
+# a local model: pi-acp 0.0.34 fails ``session/new`` on pi 0.80.x ("Unknown
+# command: get_available_thinking_levels") and waits forever on 0.73.1, and
+# pi-acp 0.0.33 never ends a turn on pi 0.80.3 or older. Both drive 0.81.0,
+# which is the floor pi-acp 0.0.34 documents. Without this check the chat just
+# spins, because nothing below names the version as the cause.
+PI_MIN_VERSION = (0, 81, 0)
+# Every npm name pi has shipped under. The old one stopped at 0.73.1, so an
+# install made under it is always below the floor; it is named so that install
+# is recognised and refused rather than read as "version unknown".
+_PI_NPM_PACKAGE_NAMES = frozenset({PI_NPM_PKG, "@mariozechner/pi-coding-agent"})
+# How far up from the resolved executable to look for pi's package.json.
+_PI_MANIFEST_SEARCH_DEPTH = 4
 # goose's VERIFIED RANGE (the note beside ``ACP_BACKEND_GOOSE`` in
 # ``agent_sdk/backends.py``) is 1.50.x. Of the three wire facts it names, the
 # ``current_mode_update`` emission the mid-session tripwire rests on is the one that
@@ -920,8 +940,8 @@ def kiro_cli_not_found_message(
     return (
         f"{KIRO_CLI_BIN} not found "
         f"({describe_search_path(os.pathsep.join(searched_dirs))}). "
-        f"Kiro CLI is a separate prerequisite Kiro Crew does not bundle: install it "
-        f"from {OFFICIAL_INSTALL_DOCS_URL}, or point KIROCREW_KIRO_BIN at the binary."
+        f"Install it from {OFFICIAL_INSTALL_DOCS_URL}, or point KIROCREW_KIRO_BIN "
+        f"at the binary."
     )
 
 
@@ -1278,6 +1298,68 @@ def _resolve_pi_bin() -> tuple[str | None, str]:
         return _normalize_exe_casing(on_path) or on_path, search_path
 
     return None, search_path
+
+
+def _pi_installed_version(pi_bin: str) -> tuple[tuple[int, ...], str] | None:
+    """``(version, npm package name)`` of the pi install *pi_bin* runs, or ``None``.
+
+    Read from the npm package's own ``package.json`` rather than by running
+    ``pi --version``: a few small file reads instead of a second child
+    process on every spawn. On POSIX the npm bin link resolves into the package,
+    so the manifest is a few directories above it. On Windows the bin is a
+    ``pi.cmd`` shim: a global one sits in the npm prefix, with the package under
+    that directory's ``node_modules``, and a project-local one sits in
+    ``node_modules/.bin``, beside the package. Only a manifest carrying one of pi's own
+    package names counts. Anything else (a wrapper script, a standalone
+    build) answers ``None``, and the caller lets that through.
+
+    Blocking (reads files); callers run it off the loop.
+    """
+    try:
+        here = Path(os.path.realpath(pi_bin)).parent
+    except (OSError, ValueError):
+        return None
+    shim_roots = [here / "node_modules"]
+    if here.name == ".bin":
+        shim_roots.append(here.parent)
+    candidates = [
+        root / name / "package.json" for root in shim_roots for name in _PI_NPM_PACKAGE_NAMES
+    ]
+    for directory in [here, *here.parents][:_PI_MANIFEST_SEARCH_DEPTH]:
+        candidates.append(directory / "package.json")
+    for manifest in candidates:
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("name") not in _PI_NPM_PACKAGE_NAMES:
+            continue
+        match = re.match(r"(\d+)\.(\d+)\.(\d+)", str(data.get("version") or ""))
+        if not match:
+            return None
+        return tuple(int(part) for part in match.groups()), str(data["name"])
+    return None
+
+
+def _pi_version_issue(pi_bin: str) -> str:
+    """Why *pi_bin* is too old for the adapter, or ``""`` when it is not known to be.
+
+    Blocking (see :func:`_pi_installed_version`); callers run it off the loop.
+    """
+    installed = _pi_installed_version(pi_bin)
+    if installed is None or installed[0] >= PI_MIN_VERSION:
+        return ""
+    version, package = installed
+    found = ".".join(str(part) for part in version)
+    floor = ".".join(str(part) for part in PI_MIN_VERSION)
+    # The two names both install a ``pi`` bin, so npm refuses the new one while
+    # the old one is still there ("File exists"). Removing it comes first.
+    remove = f"'npm rm -g {package}', then " if package != PI_NPM_PKG else ""
+    return (
+        f"{PI_BIN} {found} at {pi_bin} is too old for the {PI_ACP_BIN} adapter, which "
+        f"needs {PI_BIN} {floor} or newer: on older releases a chat fails or never answers. "
+        f"Update it: run {remove}'npm i -g {PI_NPM_PKG}', then start a new chat."
+    )
 
 
 def pi_gate_extension_path() -> str:
@@ -1826,9 +1908,22 @@ def _opencode_uniform_permission(raw: object) -> object:
 
     The harness normalizes a bare ``"ask"`` into a rule map (``{"*": "ask"}``), so
     the read-back has to compare shapes rather than strings. A map whose every rule
-    carries the same value IS that value. A MIXED map is not reduced and not
-    accepted: one tool left permissive is one tool whose calls never reach the host
-    gate, so it is returned as its own JSON spelling for the refusal to name.
+    carries the same value IS that value.
+
+    The harness also checks its rules in order and lets the LAST match win, and a
+    ``"*"`` key matches every tool and every pattern. So a map whose last entry is
+    ``"*": "ask"`` asks for every call, whatever the entries before it say. That is
+    the shape the seed produces over a lower source's per-tool rule: the sources are
+    merged key by key, so ``"bash": "allow"`` from the operator's global config keeps
+    its place and the seed's ``"*"`` is appended after it -- measured on opencode
+    1.18.30 and 1.18.32, where such a session asks before running ``bash``. It is
+    accepted ONLY when no entry before it denies anything: a ``deny`` the trailing
+    ``"*"`` outranks is a rule the operator wrote that would silently stop holding,
+    so that map stays refused.
+
+    Any other MIXED map is not reduced and not accepted: one tool left permissive is
+    one tool whose calls never reach the host gate, so it is returned as its own JSON
+    spelling for the refusal to name.
 
     ``None`` for anything else, which the gate reads as "the setting is not there".
     """
@@ -1840,8 +1935,21 @@ def _opencode_uniform_permission(raw: object) -> object:
             [value for value in raw.values() if isinstance(value, str)]
         ):
             return values.pop()
+        last_key, last_value = list(raw.items())[-1]
+        if last_key == "*" and last_value == "ask" and not _opencode_rules_deny(raw):
+            return "ask"
         return json.dumps(raw, sort_keys=True)
     return None
+
+
+def _opencode_rules_deny(raw: dict) -> bool:
+    """True when any rule in *raw* -- top level or one tool's pattern map -- denies."""
+    for value in raw.values():
+        if value == "deny":
+            return True
+        if isinstance(value, dict) and "deny" in value.values():
+            return True
+    return False
 
 
 #: How much of a refused read-back child's stderr is examined at all.
@@ -2916,6 +3024,282 @@ _WAIT_RESPONSE_MAX_TIMEOUT = 600.0  # 10 min absolute ceiling
 # and must never gate tool dispatch, so a wedged SEL backend is abandoned (the
 # worker thread may leak, which is survivable) after this timeout.
 _SEL_AUDIT_TIMEOUT_SECONDS = 5.0
+# No-progress bound on delivering a response or error frame to the backend's
+# stdin (permission answers, unknown-method errors). ``StreamWriter.drain()``
+# returns at once while the pipe has room; it only parks when the writer is
+# flow-control paused -- the kernel pipe buffer is full and the transport's
+# own buffer is past its high-water mark. That is what a backend that has
+# stopped reading stdin looks like once frames have backed up behind it, but
+# it is ALSO what a healthy backend looks like while it consumes a multi-MB
+# prompt frame queued ahead of the response on the same writer (the shared
+# runtime multiplexes sessions on one stdin). The two are told apart by
+# progress, not by elapsed time: the bound is the longest the transport's
+# write buffer may go without shrinking. A reader that is consuming, however
+# slowly, keeps the wait alive; a reader that consumed nothing for this long
+# is gone, and the write is raised as the process death it is (AcpProcessDied
+# / AcpRuntimeDead) so the caller takes the same session-reset + bounded-
+# requeue recovery the broken-pipe case already uses. The bound cannot observe
+# delivery of a frame the pipe accepted (the protocol gives no ack for a
+# response); it bounds the wait on a paused writer. Sized like chat_runner's
+# _STEER_NOTICE_BOUND_SECS: far below the turn deadline.
+_RESPONSE_WRITE_BOUND_SECS = 5.0
+# The least the write-buffer level must DROP within one window for the drop
+# to count as the reader consuming. Without a floor, a reader that takes one
+# byte per window extends the wait forever; with a flat elapsed cap instead, a
+# healthy-but-slow reader draining a co-tenant's multi-MB frame would be
+# killed by the cap -- the very failure the progress bound exists to avoid.
+# 4 KiB per 5s window is under 1 KB/s: a reader that slow would need hours
+# for a single image frame, which is dead for every practical purpose.
+_RESPONSE_WRITE_MIN_PROGRESS_BYTES = 4096
+# The wait is bounded in TOTAL by construction, not by a flat figure: no fixed
+# ceiling can be right when the largest frame is unbounded (a prompt may carry
+# any number of 5 MiB image blocks) -- a fixed one either kills a live reader
+# on a valid large frame or lets a trickling one run long. Instead: the write
+# buffer's level is finite and non-negative, and every window that continues
+# the wait removed at least the floor from it, so a wait on a backlog of B
+# bytes lasts at most B / _RESPONSE_WRITE_MIN_PROGRESS_BYTES + 1 windows (plus
+# the same for any frame a sibling writer appends meanwhile). That is the
+# derived ceiling -- backlog over the minimum accepted rate -- and it needs no
+# constant of its own.
+# Window used when the transport cannot show progress at all. Windows's
+# proactor pipe transport reports ``get_write_buffer_size()`` as the whole
+# in-flight overlapped write until that write completes, so its level is flat
+# for the entire time a healthy reader consumes a large frame -- flatness is
+# not a stall there, and the only signal left is elapsed time. With no backlog
+# to derive from, this is the one place a fixed figure remains, sized for the
+# largest frame a healthy local reader plausibly drains: ~30 MiB at ~40 KiB/s
+# (test-pinned). Platform-limited, like the Windows watchdog: a dead reader is
+# detected in 15 minutes there instead of 5 seconds.
+_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS = 900.0
+
+
+def _is_proactor_loop(loop: asyncio.AbstractEventLoop) -> bool:
+    """Whether ``loop`` is Windows's proactor loop (the only loop that drives
+    subprocess pipes through overlapped I/O). Keyed to the public
+    ``asyncio.ProactorEventLoop`` class the platform owns, which exists only
+    on Windows, rather than to a private transport class name."""
+    proactor = getattr(asyncio, "ProactorEventLoop", None)
+    return proactor is not None and isinstance(loop, proactor)
+
+
+def _level_is_progress_signal(transport: object) -> bool:
+    """Whether a transport's write-buffer level moves as the reader consumes.
+
+    True under the selector loops (the pipe transport trims its buffer per
+    readiness callback). False under the proactor loop Windows uses for
+    subprocess pipes: the level is the whole in-flight overlapped write until
+    it completes, so it is flat while a live reader consumes a large frame.
+    Decided from the running loop, not the transport's class name.
+    """
+    return not _is_proactor_loop(asyncio.get_running_loop())
+
+
+def _pending_write_bytes(stdin: asyncio.StreamWriter) -> int | None:
+    """Bytes the writer still holds for the pipe, or ``None`` when that level
+    is not a progress signal.
+
+    ``None`` -- a transport without ``get_write_buffer_size`` (a test double),
+    or one whose level does not move mid-frame (``_level_is_progress_signal``)
+    -- means progress cannot be observed; the bounded wait then falls back to
+    the platform-limited elapsed window, ``_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS``.
+    """
+    transport = getattr(stdin, "transport", None)
+    size = getattr(transport, "get_write_buffer_size", None)
+    if not callable(size) or not _level_is_progress_signal(transport):
+        return None
+    value = size()
+    return value if isinstance(value, int) else None
+
+
+async def await_under_no_progress_bound(
+    aw: Awaitable[Any],
+    stdin: asyncio.StreamWriter,
+    *,
+    bound_secs: float,
+) -> bool:
+    """Await ``aw`` while the writer behind ``stdin`` keeps showing activity.
+
+    Returns ``True`` when ``aw`` completed (its exception, if any, propagates).
+    Returns ``False`` -- after cancelling ``aw`` -- when the transport's write
+    buffer showed no activity for ``bound_secs``. The total wait is bounded by
+    construction -- each continued window removed at least the floor from a
+    finite, non-negative level, so a backlog of B bytes is waited on for at
+    most B / floor + 1 windows (plus the same for any frame a sibling writer
+    appends meanwhile). Activity at a window's end
+    is either a DROP of at least ``_RESPONSE_WRITE_MIN_PROGRESS_BYTES`` (the reader consumed a
+    real amount; a large frame ahead of this one is being drained) or a RISE
+    (a frame from a writer the lock woke ahead of this caller landed on the
+    pipe); both continue the wait, measured again from the new level. A level
+    that held still, or dropped by less than the floor, is a reader that is
+    gone -- the floor is what keeps a byte-per-window trickle from extending
+    the wait forever without capping a genuinely draining frame.
+
+    When the level is not a progress signal at all (``_pending_write_bytes``
+    returns ``None``: a proactor transport, or a test double without one) the
+    single window is ``_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS`` and elapsed
+    time alone decides
+    -- platform-limited, never extended, since nothing can be observed to
+    extend it on.
+
+    ``aw`` is shielded from the caller's cancellation so a window closing does
+    not abort it; an awaitable found complete when a window closes counts as
+    completed, never as a stall. On a stall verdict or a cancellation it is
+    cancelled if still pending. An awaitable that completed in the meantime is
+    NOT undone here -- a caller whose awaitable acquires something must release
+    it on those paths (see ``write_response_frame_bounded`` /
+    ``_release_if_acquired``).
+
+    The level measurement needs one writer in flight at a time to mean
+    anything, which is why every stdin write on a transport goes through that
+    transport's write lock. Without it, concurrent appends interleave with the
+    reader's consumption and a level that merely looks flat could hide both.
+    """
+    task = asyncio.ensure_future(aw)
+    last = _pending_write_bytes(stdin)
+    window = _RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS if last is None else bound_secs
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=window)
+            except asyncio.TimeoutError:
+                if task.done():
+                    task.result()  # completed as the window closed; re-raise its error
+                    return True
+                now = _pending_write_bytes(stdin)
+                if now is not None and last is not None:
+                    if now > last or last - now >= _RESPONSE_WRITE_MIN_PROGRESS_BYTES:
+                        last = now  # the level moved: activity, measure again from here
+                        continue
+                task.cancel()
+                return False
+            return True
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+def _release_if_acquired(lock: asyncio.Lock, acquire: "asyncio.Future[bool]") -> None:
+    """Undo a ``lock.acquire()`` whose caller has given up on it.
+
+    ``await_under_no_progress_bound`` shields the acquire task, so an outer
+    cancellation (or a stall verdict) can land AFTER the acquire completed and
+    the task holds the lock with nobody left to release it -- and this lock is
+    the one every stdin write on the transport waits for. If the acquire is
+    done and succeeded, release now; otherwise cancel it and release from its
+    done callback should it still complete with the lock.
+    """
+
+    def _done(task: "asyncio.Future[bool]") -> None:
+        if not task.cancelled() and task.exception() is None and task.result():
+            lock.release()
+
+    if acquire.done():
+        _done(acquire)
+    else:
+        acquire.cancel()
+        acquire.add_done_callback(_done)
+
+
+async def write_response_frame_bounded(
+    stdin: asyncio.StreamWriter,
+    lock: asyncio.Lock,
+    data: bytes,
+    *,
+    bound_secs: float,
+    before_write: Callable[[], None] | None = None,
+) -> bool:
+    """Write one response/error frame under the transport's write lock and a
+    no-progress bound on BOTH waits -- for the lock and for the drain.
+
+    ``before_write`` runs under the lock, just before the frame is written, and
+    may raise to abort the write -- the shared runtime uses it to re-check that
+    it was not marked dead while this caller waited for the lock, so no frame
+    is written into a pipe whose owner has already been torn down.
+
+    Waiting for the lock is waiting for the previous frame's drain: a
+    flow-control-paused writer holding a multi-MB prompt is a live reader as
+    long as its buffer level moves, and a dead one when it does not. Returns
+    ``False`` on a stall in either phase without writing (lock phase) or after
+    cancelling the drain (drain phase); the caller maps that to its own
+    process-death exception. Pipe errors from ``drain()`` propagate. The lock
+    is never left held: a stall verdict or a cancellation that lands after the
+    shielded acquire completed releases it (``_release_if_acquired``).
+    """
+    acquire: asyncio.Future[bool] = asyncio.ensure_future(lock.acquire())
+    try:
+        acquired = await await_under_no_progress_bound(acquire, stdin, bound_secs=bound_secs)
+    except BaseException:
+        _release_if_acquired(lock, acquire)
+        raise
+    if not acquired:
+        _release_if_acquired(lock, acquire)
+        return False
+    try:
+        if before_write is not None:
+            before_write()
+        stdin.write(data)
+        return await await_under_no_progress_bound(stdin.drain(), stdin, bound_secs=bound_secs)
+    finally:
+        lock.release()
+
+
+def response_write_window_secs(stdin: asyncio.StreamWriter, bound_secs: float) -> float:
+    """The no-progress window ``await_under_no_progress_bound`` applies to this
+    writer -- ``bound_secs`` when its level is a progress signal, the
+    platform-limited window when it is not -- so a stall log line states the
+    window that was actually measured."""
+    return (
+        bound_secs
+        if _pending_write_bytes(stdin) is not None
+        else _RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS
+    )
+
+
+async def write_notification_best_effort(
+    stdin: asyncio.StreamWriter,
+    lock: asyncio.Lock,
+    data: bytes,
+    *,
+    bound_secs: float,
+    before_write: Callable[[], None] | None = None,
+) -> str:
+    """Write a fire-and-forget notification (``session/cancel``) without letting
+    the write lock swallow it.
+
+    A cancel is the one cooperative signal that can end a wedged turn, so it
+    must not queue forever behind a holder parked on a reader that stopped. Wait
+    for the lock under the no-progress bound; if the lock does not come, append
+    the frame UNLOCKED (no drain) so the transport enqueues it the moment the
+    pipe has room -- a single extra append the lock-holder's measurement reads
+    as activity for one window, which is the price of delivering the cancel.
+    Under the lock the drain is bounded the same way. Returns what happened, for
+    the caller's log line: ``"drained"`` (written and drained under the lock),
+    ``"appended_unlocked"`` (the lock did not come; the frame sits in the
+    transport's buffer with no drain observed), or ``"stalled"`` (the locked
+    drain made no progress). Pipe errors propagate.
+    """
+    acquire: asyncio.Future[bool] = asyncio.ensure_future(lock.acquire())
+    try:
+        acquired = await await_under_no_progress_bound(acquire, stdin, bound_secs=bound_secs)
+    except BaseException:
+        _release_if_acquired(lock, acquire)
+        raise
+    if not acquired:
+        _release_if_acquired(lock, acquire)
+        if before_write is not None:
+            before_write()
+        stdin.write(data)
+        return "appended_unlocked"
+    try:
+        if before_write is not None:
+            before_write()
+        stdin.write(data)
+        drained = await await_under_no_progress_bound(stdin.drain(), stdin, bound_secs=bound_secs)
+        return "drained" if drained else "stalled"
+    finally:
+        lock.release()
+
+
 # Canonical ACP tool-kind value for shell/exec tools. kiro-cli and
 # claude-agent-acp both report shell commands with kind="execute", and so does
 # codex-acp -- for its MCP tool calls too. _is_shell_kind() is therefore only
@@ -4181,6 +4565,33 @@ def resolve_pin_spelling(model_id: str, advertised: Sequence[str] | None) -> str
     return model_registry.preferred_advertised_spelling(folded)
 
 
+def catalog_row_would_drop(model_id: str, advertised: Sequence[str] | None) -> bool:
+    """True when the picker filter drops catalog row *model_id* against *advertised*.
+
+    The one keep/drop verdict the dashboard model picker applies to a
+    ``--list-models`` row, shared with the read-path revalidation that decides
+    whether a snapshot is worth probing, so the two cannot disagree about which
+    rows a snapshot hides. A row is KEPT when it is the ``auto`` sentinel
+    (``auto`` or ``default``), when *advertised* lists it
+    (:func:`model_is_unusable` is False — which includes an unknown/empty
+    advertised set), or when :func:`resolve_pin_spelling` folds it onto an
+    advertised spelling (a ``<namespace>::<bare-id>`` row the picker rewrites
+    to the bare id). Every other row — an empty id included — drops.
+
+    This is the per-row verdict only. The picker additionally de-duplicates
+    rows that resolve to one advertised spelling, and shows the whole catalog
+    when no non-``auto`` row survives against a set that does not advertise
+    ``auto`` (a namespace mismatch); those are decisions about the list, made
+    by the caller.
+    """
+    wanted = (model_id or "").strip().lower()
+    if wanted in ("auto", "default"):
+        return False
+    if not model_is_unusable(model_id or "", advertised):
+        return False
+    return not resolve_pin_spelling(model_id or "", advertised)
+
+
 def resolve_usable_model(preferred: str, advertised: Sequence[str] | None) -> str:
     """Resolve a SUBSTITUTE (non-explicit) model choice to what the account can
     run, mirroring the interactive path's reset-to-default (``_wire_model_id``).
@@ -4318,14 +4729,17 @@ def _jsonrpc_error_code(error: object) -> int | None:
 _JSONRPC_INVALID_PARAMS = -32602
 
 
-def _is_config_value_rejection(exc: AcpError, config_id: str) -> bool:
+def _is_config_value_rejection(exc: AcpError, config_id: str, backend: str = "") -> bool:
     """Whether *exc* is the adapter refusing a config option VALUE.
 
-    Two shapes count. claude-agent-acp names the option in its message
+    Three shapes count. claude-agent-acp names the option in its message
     (``Invalid value for config option <id>: ...``); codex-acp answers with a
     bare JSON-RPC ``-32602`` and no detail -- the request shape is fixed, so the
-    code is the verdict on the value. ``unknown config option`` is NOT a value
-    rejection (the option itself is missing) and is left to the caller.
+    code is the verdict on the value; and a harness that declares its own model
+    refusal text (``agent_sdk.backends.model_refusal_phrase``) is read by that
+    text, for the ``model`` option of that *backend* only. ``unknown config
+    option`` is NOT a value rejection (the option itself is missing) and is left
+    to the caller.
 
     The bare-code half rests on "the request shape is fixed, so only the value can
     be invalid", which is a per-adapter fact and not a protocol guarantee. A
@@ -4337,9 +4751,11 @@ def _is_config_value_rejection(exc: AcpError, config_id: str) -> bool:
     classifier -- do not widen it -- when a member does not fit.
     """
     lowered = str(exc).lower()
+    phrase = model_refusal_phrase(backend) if config_id == MODEL_CONFIG_ID else ""
     return (
         f"config option {config_id}" in lowered
         or getattr(exc, "code", None) == _JSONRPC_INVALID_PARAMS
+        or (bool(phrase) and phrase.lower() in lowered)
     )
 
 
@@ -4718,6 +5134,12 @@ def _format_acp_error(
                 "and try again; it clears on its own once the stale turn "
                 "expires. If it persists, start a new conversation."
             )
+        elif host_auth.reports_signed_out(backend, haystack):
+            # The harness's OWN words for "no provider / no key", declared per
+            # harness in ``host_auth``. Without this the answer fell through to the
+            # branch below and reached the user as a raw -32603 frame that names
+            # no fix; the declared message names the one that works.
+            formatted = f"{host_auth.signed_out_message(backend)}{req_id_suffix}"
         else:
             # Unrecognised failure mode. Show the PROVIDER'S OWN message when
             # there is one — it is the true error, and the same words the CLI
@@ -5551,6 +5973,10 @@ class AcpClient:
         self._spawn_work_dir = str(self._work_dir)
         self._process: asyncio.subprocess.Process | None = None
         self._pid: int | None = None
+        # False until shutdown confirms both the root's exit and every tracked
+        # descendant's exit. A work-directory reclaim reads this fail-closed
+        # verdict after shutdown.
+        self._process_tree_confirmed_dead = False
         self._start_time: str | None = None  # start identity for PID-recycle detection
         # Names THIS spawn of the child, not the session it serves: a resume
         # re-uses the session id on a brand-new process (see ensure_ready's
@@ -5734,6 +6160,7 @@ class AcpClient:
         # single progress frame.  Gates the _TOOL_STALL_TIMEOUT watchdog so a
         # dispatched-but-never-resolved tool can't hang the whole turn.
         self._tool_dispatched: bool = False
+        self._active_tool_calls: set[str] = set()
         # Armed by _handle_compaction_status on a `failed` status and cleared at
         # turn start: gates the _COMPACTION_FAILED_TURN_BUDGET check in
         # _prompt_loop. _compaction_failed_turn records that the check fired, so
@@ -7506,6 +7933,11 @@ class AcpClient:
         return self._is_process_alive()
 
     @property
+    def process_tree_confirmed_dead(self) -> bool:
+        """Whether shutdown confirmed the root and every tracked child exited."""
+        return self._process_tree_confirmed_dead is True
+
+    @property
     def process_instance(self) -> str:
         """Identity of the CURRENT child process instance (``""`` when none).
 
@@ -7901,7 +8333,7 @@ class AcpClient:
                         raise
                     logger.debug("adapter exposes no 'model' config option; skipping model push")
                     return ""
-                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID):
+                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID, self.backend):
                     raise  # transport/protocol failure — not a value rejection
                 last_exc = exc
                 continue
@@ -8794,6 +9226,13 @@ class AcpClient:
                     f"install it with 'npm i -g {PI_NPM_PKG}', or set "
                     f"{_ENV_PI_ACP_PI_COMMAND} to the executable."
                 )
+            # Refused here, before any child starts, because a too-old pi is not
+            # refused by anything later: the gate read-back passes on it, and then
+            # the adapter either fails session/new with a bare "Unknown command"
+            # or waits forever, so the chat spins with no cause named.
+            pi_version_issue = await asyncio.to_thread(_pi_version_issue, pi_bin)
+            if pi_version_issue:
+                raise AcpError(pi_version_issue)
             argv = pi_acp_argv
             spawn_label = _adapter_spawn_label(
                 argv, PI_ACP_BIN, pkg_entry=_PI_ACP_PKG_ENTRY, override_env=_ENV_PI_ACP_BIN
@@ -9142,8 +9581,14 @@ class AcpClient:
                 raise AcpError(overlap)
             from kiro_crew.acp.skill_projection import prepare_native_skill_projection
 
+            # One process, one session: the identity rides the process environment
+            # (``_apply_session_identity_env``) and kiro-cli mounts ``kirocrew-core``
+            # natively from the view, restrictions included, so no per-session
+            # element replaces the declaration here -- the shared runtime's
+            # element-withholding question does not arise, and a ``disabledTools``
+            # naming other tools must not refuse this agent's view.
             self._native_skill_projection = await asyncio.to_thread(
-                prepare_native_skill_projection, self._work_dir
+                prepare_native_skill_projection, self._work_dir, per_session_element=False
             )
             argv = [
                 kiro_bin,
@@ -9484,6 +9929,7 @@ class AcpClient:
             self._discard_sandbox_cleanup()
             raise
         self._pid = self._process.pid
+        self._process_tree_confirmed_dead = False
         # Minted with the process it names, random rather than pid-derived: a
         # pid can be reused by the OS, and the start-time disambiguator is not
         # readable on every platform, so equality on a fresh random id is the
@@ -10003,7 +10449,10 @@ class AcpClient:
         # what the next session's guard judges, not this one's.
         self._mcp_ref_spec = None
         self._spec_denied_tools = frozenset()
-        # Save PIDs before clearing state — needed for untracking
+        # Save PID state before clearing it. A root is confirmed exited only
+        # when its own Process reports a reaped return code; a missing or
+        # unreadable PID is not enough to reclaim its working directory.
+        root_confirmed_dead = bool(self._process and self._process.returncode is not None)
         saved_pid = None if platform_compat.IS_WINDOWS else self._pid
         saved_child_pids = self._child_pids
         self._process = None
@@ -10068,6 +10517,7 @@ class AcpClient:
         from kiro_crew.session import _untrack_child_pids, _untrack_pid, _untrack_session_pid
         from kiro_crew.session_pid import _pid_gone_or_unmanaged
 
+        survivors: list[int] = []
         if saved_child_pids:
             dead_children = {
                 pid: rec for pid, rec in saved_child_pids.items() if _pid_gone_or_unmanaged(pid)
@@ -10105,6 +10555,7 @@ class AcpClient:
                     saved_pid,
                 )
         self._child_pids = {}
+        self._process_tree_confirmed_dead = root_confirmed_dead and not survivors
 
     async def _new_session_following_substitution(self) -> dict:
         """Issue ``session/new``; if the gateway substitutes the model, adopt it
@@ -10635,6 +11086,23 @@ class AcpClient:
                         await self._cleanup_failed_live_spawn()
                         self._reset_state()
                         raise sandbox_failure from exc
+                    # The harness answered with its OWN "no provider / not signed
+                    # in" words (declared in ``host_auth``). Deterministic like the
+                    # sandbox refusal above: a fresh process reads the same missing
+                    # configuration, so fail fast with the message that names the
+                    # fix instead of a retry and then a raw JSON-RPC frame. A plain
+                    # non-transient ``AcpError`` rather than ``AcpAuthRequired``: the
+                    # dashboard reads that type as "Kiro is signed out" and would
+                    # mark a valid kiro-cli login as not ready.
+                    if isinstance(exc, AcpError) and host_auth.reports_signed_out(
+                        self.backend, str(exc)
+                    ):
+                        _startup_outcome = "auth_required"
+                        await self._cleanup_failed_live_spawn()
+                        self._reset_state()
+                        raise AcpError(
+                            host_auth.signed_out_message(self.backend), transient=False
+                        ) from exc
                     if attempt == 0:
                         logger.warning("ACP init failed (%s), retrying with fresh process...", exc)
                         await self._cleanup_failed_live_spawn()
@@ -10649,8 +11117,8 @@ class AcpClient:
                         _throttled = await self._registration_throttle_line()
                         # AcpAuthRequired subclasses AcpError; label it distinctly
                         # so a not-logged-in exit is never counted as a generic
-                        # startup error. (The fork has no separate auth fail-fast
-                        # branch — retry semantics stay unchanged.)
+                        # startup error. (Only a harness's declared signed-out
+                        # phrase fails fast, above; other auth answers keep the retry.)
                         if isinstance(exc, AcpAuthRequired):
                             _startup_outcome = "auth_required"
                         elif _throttled is not None:
@@ -10771,6 +11239,7 @@ class AcpClient:
 
     async def shutdown(self) -> None:
         """Gracefully stop the ACP process."""
+        self._process_tree_confirmed_dead = False
         # `_reset_state` in a `finally`, because `_kill_process` can leave
         # through several doors: it awaits four `run_in_executor` calls (child
         # scan, record capture, escaped-child sweep) that are not individually
@@ -10814,12 +11283,60 @@ class AcpClient:
         req = JsonRpcRequest(method=method, params=params, id=req_id)
         data = json.dumps(req.to_dict()) + "\n"
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            # Under the write lock so a response frame waiting behind this
+            # (caller-sized, deliberately unbounded) frame measures the
+            # reader's progress exactly; see await_under_no_progress_bound.
+            async with self._stdin_write_lock():
+                self._process.stdin.write(data.encode())
+                await self._process.stdin.drain()
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
         self._last_activity = time.monotonic()
         return req_id
+
+    def _stdin_write_lock(self) -> asyncio.Lock:
+        """The one lock every stdin write on this client takes (see
+        ``await_under_no_progress_bound`` for why the bound needs it). Created on
+        first use so a client built without ``__init__`` (test doubles) has one."""
+        lock = getattr(self, "_stdin_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._stdin_lock = lock
+        return lock
+
+    async def _write_response_bounded(self, data: bytes, request_id: str | int) -> None:
+        """Write a response/error frame under the write lock and a no-progress bound.
+
+        Left alone, a deny path answering a permission request would sit on a
+        flow-control-paused writer until the turn deadline. A writer whose
+        buffer stops shrinking for ``_RESPONSE_WRITE_BOUND_SECS`` -- while
+        waiting for the lock or while draining -- is the same undeliverable-
+        response condition a closed pipe reports as an error, so it is mapped to
+        the same exception: ``AcpProcessDied`` sends the caller down the existing
+        session-reset + bounded-requeue recovery instead of hanging. The request
+        id appears only through ``_loggable_request_id``.
+        """
+        assert self._process is not None and self._process.stdin is not None
+        if await write_response_frame_bounded(
+            self._process.stdin,
+            self._stdin_write_lock(),
+            data,
+            bound_secs=_RESPONSE_WRITE_BOUND_SECS,
+        ):
+            return
+        safe_id = _loggable_request_id(request_id)
+        window = response_write_window_secs(self._process.stdin, _RESPONSE_WRITE_BOUND_SECS)
+        logger.warning(
+            "ACP stdin stalled: no write progress for %gs (floor %d bytes/window) while "
+            "delivering response to req=%s; treating the backend as dead",
+            window,
+            _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
+            safe_id,
+        )
+        raise AcpProcessDied(
+            f"ACP stdin stalled: no write progress for {window:g}s while "
+            f"delivering response to req={safe_id}"
+        )
 
     async def _send_response(self, request_id: str | int, result: dict) -> None:
         if not self._process or not self._process.stdin:
@@ -10828,8 +11345,7 @@ class AcpClient:
         msg = {"jsonrpc": "2.0", "id": request_id, "result": result}
         data = json.dumps(msg) + "\n"
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            await self._write_response_bounded(data.encode(), request_id)
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
         self._last_activity = time.monotonic()
@@ -10847,8 +11363,7 @@ class AcpClient:
         msg = {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
         data = json.dumps(msg) + "\n"
         try:
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
+            await self._write_response_bounded(data.encode(), request_id)
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
         self._last_activity = time.monotonic()
@@ -11058,13 +11573,15 @@ class AcpClient:
             if msg.method:
                 logger.debug(
                     "Deferring inbound server request: method=%s id=%s (waiting for %d)",
-                    msg.method,
-                    msg.id,
+                    _loggable_request_id(msg.method),
+                    _loggable_request_id(msg.id),
                     req_id,
                 )
             else:
                 logger.debug(
-                    "Deferring non-matching response: id=%s (waiting for %d)", msg.id, req_id
+                    "Deferring non-matching response: id=%s (waiting for %d)",
+                    _loggable_request_id(msg.id),
+                    req_id,
                 )
             deferred.append(msg)
 
@@ -11123,14 +11640,21 @@ class AcpClient:
             return ", ".join(head) + suffix
 
         reported = ready | set(failed)
+        # "session-injected", and a note once the roster is complete: the same
+        # wording as AcpRuntime._mcp_init_progress, for the same reason -- a bare
+        # ``N/N MCP server(s) reported`` read as an MCP verdict it never was.
         parts = (
-            [f"{len(reported & set(roster))}/{len(roster)} MCP server(s) reported"]
+            [f"{len(reported & set(roster))}/{len(roster)} session-injected MCP server(s) reported"]
             if roster
             else []
         )
         missing = [name for name in roster if name not in reported]
         if missing:
             parts.append(f"no report from {names(missing)}")
+        elif roster and not set(failed) & set(roster):
+            # Same rule as the runtime: the verdict is withheld when a roster
+            # member reported an init failure, which the ``failed:`` bucket names.
+            parts.append(MCP_ROSTER_COMPLETE_NOTE)
         if failed:
             parts.append(
                 "failed: "
@@ -11865,12 +12389,18 @@ class AcpClient:
         self._permission_options.clear()
         self._stale_eligible = False
         self._tool_dispatched = False
+        self._active_tool_calls.clear()
         got_complete = False
         saw_agent_switch = False
 
         async for action, msg in self._prompt_loop(req_id, timeout):
             if action != "update":
-                logger.debug("ACP event: method=%s id=%s action=%s", msg.method, msg.id, action)
+                logger.debug(
+                    "ACP event: method=%s id=%s action=%s",
+                    _loggable_request_id(msg.method),
+                    _loggable_request_id(msg.id),
+                    action,
+                )
 
             # Reset staleness only on events that indicate active work.
             # Passive updates (usage_update, tool_call_update after completion,
@@ -11903,7 +12433,7 @@ class AcpClient:
                             if name:
                                 yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=name)
                 # Flush any remaining tool results before completing
-                for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                for tr_event in await self._read_new_tool_results():
                     yield tr_event
                 # An automatic claude compaction never sends its own terminal —
                 # close it out here, BEFORE EVENT_COMPLETE, so a consumer that
@@ -11940,7 +12470,7 @@ class AcpClient:
                     # the filtered inference would otherwise have its result
                     # dropped, or emitted into the NEXT turn.
                     reason, _refusal = self.last_prompt_stats.terminal_refusal("")
-                    for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                    for tr_event in await self._read_new_tool_results():
                         yield tr_event
                     self._tool_dispatched = False
                     self._last_stop_reason = reason
@@ -11992,12 +12522,12 @@ class AcpClient:
                         _notice_chunk = True
                 if chunk:
                     # Before yielding text, check for tool results from JSONL
-                    for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                    for tr_event in await self._read_new_tool_results():
                         yield tr_event
                     kind = EVENT_THINKING_CHUNK if is_thinking else EVENT_TEXT_CHUNK
                     if not is_thinking:
                         self.last_prompt_stats.text_chunks += 1
-                        self._stale_eligible = True
+                        self._stale_eligible = not self._active_tool_calls
                         self._prompt_or_tool_seen = True
                     yield AcpEvent(kind=kind, text=chunk, control_notice=_notice_chunk)
                     if not is_thinking and _is_tool_interrupted_marker(chunk):
@@ -12007,7 +12537,7 @@ class AcpClient:
                         # (_emit_tool_interrupted_sel logs + audits the cancellation.)
                         self._emit_tool_interrupted_sel("_dispatch_events")
                         got_complete = True
-                        for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                        for tr_event in await self._read_new_tool_results():
                             yield tr_event
                         yield AcpEvent(
                             kind=EVENT_COMPLETE,
@@ -12021,6 +12551,7 @@ class AcpClient:
                     # Arm the tool-stall watchdog: if no further data arrives
                     # within _TOOL_STALL_TIMEOUT, _prompt_loop treats the turn
                     # as dead instead of hanging to the full prompt timeout.
+                    self._active_tool_calls.add(tool_event.tool_call_id or "")
                     self._tool_dispatched = True
                     # Record every observed tool_call so PostToolUse can recover
                     # tool_name from _observed_tool_calls (see
@@ -12031,7 +12562,7 @@ class AcpClient:
                             tool_event.tool_kind or "",
                         )
                     # Check for results from previous tool before yielding new tool_call
-                    for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
+                    for tr_event in await self._read_new_tool_results():
                         yield tr_event
                     # ACP-layer tool audit for clients with no external audit
                     # loop (e.g. app worker pools). No-op unless audit_source is set.
@@ -12054,11 +12585,10 @@ class AcpClient:
                 await self._tripwire_goose_mode(msg)
                 tool_result_event = self._extract_tool_call_update(msg)
                 if tool_result_event:
-                    # The dispatched tool produced a result — disarm the stall
-                    # watchdog.  (Cleared here, not on every inbound frame, so a
-                    # tool that streams progress then silently stalls is still
-                    # caught.)
-                    self._tool_dispatched = False
+                    if tool_result_event.tool_status in TERMINAL_TOOL_STATUSES:
+                        self._active_tool_calls.discard(tool_result_event.tool_call_id or "")
+                        self._tool_dispatched = bool(self._active_tool_calls)
+                        self._stale_eligible = not self._active_tool_calls
                     # Fire the PostToolUse HOOK ENGINE now that the tool RESULT
                     # (and its output) exists — the Pre-vs-Post split is required
                     # because fire_tool_hooks above is PreToolUse-only. No-op
@@ -12343,7 +12873,7 @@ class AcpClient:
                 "reject_tool: no deny option advertised for req=%s; answering "
                 "'cancelled', which the backend may treat as cancelling the "
                 "remainder of the turn's tool calls",
-                request_id,
+                _loggable_request_id(request_id),
             )
             await self._send_response(request_id, {"outcome": {"outcome": OUTCOME_CANCELLED}})
 
@@ -12464,10 +12994,21 @@ class AcpClient:
                 "params": {"sessionId": self._session_id},
             }
             data = json.dumps(notification) + "\n"
-            self._process.stdin.write(data.encode())
-            await self._process.stdin.drain()
-            self._last_activity = time.monotonic()
-            logger.debug("cancel_session: wrote session/cancel notification")
+            # Best effort, never swallowed by the write lock: a cancel is the
+            # one signal that can end a wedged turn, so it is appended unlocked
+            # if the lock does not come within the no-progress bound.
+            outcome = await write_notification_best_effort(
+                self._process.stdin,
+                self._stdin_write_lock(),
+                data.encode(),
+                bound_secs=_RESPONSE_WRITE_BOUND_SECS,
+            )
+            # Only a drained frame is evidence the backend moved: an unlocked
+            # append or a stall must not refresh the activity clock the
+            # wedged-turn probes read.
+            if outcome == "drained":
+                self._last_activity = time.monotonic()
+            logger.debug("cancel_session: wrote session/cancel notification (%s)", outcome)
         except Exception:
             logger.debug("Cancel notification failed", exc_info=True)
 
@@ -13200,7 +13741,11 @@ class AcpClient:
         """
         if msg.id is None:
             return
-        logger.warning("ACP: rejecting unknown server request: method=%s id=%s", msg.method, msg.id)
+        logger.warning(
+            "ACP: rejecting unknown server request: method=%s id=%s",
+            _loggable_request_id(msg.method),
+            _loggable_request_id(msg.id),
+        )
         await self._send_error(msg.id, JSONRPC_METHOD_NOT_FOUND, f"Method not found: {msg.method}")
 
     def _extract_text_chunk(self, msg: JsonRpcMessage) -> tuple[str | None, bool]:
@@ -13831,14 +14376,14 @@ class AcpClient:
                 tool_status=tool_status,
             )
 
-        final_output = "\n".join(output_parts)
+        final_joined = "\n".join(output_parts)
         # Redact the WHOLE join, then bound -- never the reverse. Bounding first
         # can split a credential across the cut into fragments no pattern
         # matches: with a connection URI whose "@" lands on byte 8000, the head
         # slice keeps "://user:password" and drops the "@" the prefilter needs,
         # so the password reaches the dashboard in clear text. Same ordering as
         # `_dispatch._build_tool_result_event` and as `_compaction_detail` below.
-        _redacted = redact_text(final_output)
+        _redacted = redact_text(final_joined)
         tool_output_digest, tool_output_bytes = _measure_tool_output(_redacted)
         final_output = _redacted[:8000]
         return AcpEvent(
@@ -13847,6 +14392,11 @@ class AcpClient:
             tool_output=final_output,
             tool_output_digest=tool_output_digest,
             tool_output_bytes=tool_output_bytes,
+            # Same contract as `_dispatch._build_tool_result_event`: only a
+            # result the redactor changed can hold a credential to trace.
+            tool_output_credentials=(
+                tool_output_fingerprints(final_joined) if _redacted != final_joined else ()
+            ),
             tool_final=update.get("status") == "completed",
             tool_status=str(update.get("status") or ""),
         )
@@ -13974,6 +14524,14 @@ class AcpClient:
             diff_path=_diff_path,
         )
 
+    async def _read_new_tool_results(self) -> list[AcpEvent]:
+        results = await asyncio.to_thread(self._read_new_tool_results_sync)
+        if results:
+            self._active_tool_calls.difference_update(event.tool_call_id or "" for event in results)
+            self._tool_dispatched = bool(self._active_tool_calls)
+            self._stale_eligible = not self._active_tool_calls
+        return results
+
     def _read_new_tool_results_sync(self) -> list[AcpEvent]:
         """Read new ToolResults entries from the kiro-cli session JSONL file."""
         if not self._session_id:
@@ -14028,11 +14586,15 @@ class AcpClient:
                             elif rc.get("kind") == "text":
                                 output_parts.append(str(rc.get("data", ""))[:4000])
                         if output_parts:
+                            joined = "\n".join(output_parts)
                             results.append(
                                 AcpEvent(
                                     kind=EVENT_TOOL_RESULT,
                                     tool_call_id=tool_use_id,
-                                    tool_output="\n".join(output_parts)[:8000],
+                                    tool_output=joined[:8000],
+                                    # A kiro-cli result read back from its session
+                                    # file traces credentials like a streamed one.
+                                    tool_output_credentials=tool_output_fingerprints(joined),
                                 )
                             )
         except Exception:
@@ -14132,11 +14694,16 @@ class AcpClient:
             gate_envelope_nonce=_gate_nonce or None,
             # Same compatibility shape: no bridge identity, no bridged MCP identity.
             gate_bridge=getattr(self, "_pi_bridge_identity", None) if _gate_nonce else None,
+            kas_consent_meta=self.backend == ACP_BACKEND_KAS,
         )
         if recorded is not None:
             self._permission_options[event.request_id] = recorded
         self._note_pi_gate_asked(msg)
-        logger.info("Permission requested for tool: %s (req=%s)", event.title, event.request_id)
+        logger.info(
+            "Permission requested for tool: %s (req=%s)",
+            event.title,
+            _loggable_request_id(event.request_id),
+        )
         if logger.isEnabledFor(logging.DEBUG):
             params = msg.params if isinstance(msg.params, dict) else {}
             tool_call = params.get("toolCall", {})

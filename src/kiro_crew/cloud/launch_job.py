@@ -200,6 +200,8 @@ class LaunchJob:
     #: read is answered by reading them. Kept off ``error`` because the retry
     #: worker clears that field as routine state, which would drop the guard.
     target_unreadable: bool = False
+    # Explicit EC2 subnet (the VPC follows from it); empty = network auto-discovery.
+    subnet_id: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -228,6 +230,7 @@ class LaunchJob:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "login_target": self.login_target.to_dict(),
+            "subnet_id": self.subnet_id,
         }
 
     @classmethod
@@ -271,6 +274,7 @@ class LaunchJob:
             provider_id=str(d.get("provider_id") or BUILTIN_PROVISIONER_ID),
             login_target=login_target,
             target_unreadable=target_unreadable,
+            subnet_id=str(d.get("subnet_id") or ""),
         )
 
 
@@ -345,6 +349,7 @@ class LaunchJobStore:
         provider_id: str = BUILTIN_PROVISIONER_ID,
         step_labels: Optional[Mapping[str, str]] = None,
         login_target: Optional[KiroLoginTarget] = None,
+        subnet_id: str = "",
     ) -> LaunchJob:
         """Build + persist a fresh PENDING job.
 
@@ -368,6 +373,7 @@ class LaunchJobStore:
             provider_id=provider_id,
             steps=default_steps(step_labels),
             login_target=login_target or KiroLoginTarget(),
+            subnet_id=subnet_id,
         )
         # Claim ownership BEFORE the file exists. `reap_orphans` spares only jobs this
         # process owns, and it runs off the event loop: a reap already in flight can
@@ -751,10 +757,10 @@ def mark_signed_in(job: "LaunchJob", detail: str = "Signed in.") -> None:
     Three paths confirm one: the retry's own wait, its already-signed-in answer,
     and the dashboard's re-probe of a preserved code. Setting ``signin_detected``
     alone leaves the rest of the job saying the opposite -- an "Interrupted"
-    error from a restart, a connect step still reading "Finish the Kiro sign-in
-    before connecting." A card that says signed
-    in and not signed in at once is the state this feature exists to remove, so
-    the normalisation lives in one place.
+    error from a restart, a connect step still reading "Sign in to Kiro on the
+    crew after you connect." A card that says signed in and not signed in at
+    once is the state this feature exists to remove, so the normalisation lives
+    in one place.
     """
     job.signin_detected = True
     job.signin = None
@@ -964,8 +970,10 @@ def run_launch(
         # 2) Provision (create instance + install; blocks until healthy)
         _check_cancel()
         s = _activate(STEP_PROVISION)
+        # Only the built-in EC2 engine takes a subnet; the handler refuses it elsewhere.
+        subnet = {"subnet_id": job.subnet_id} if job.subnet_id else {}
         job.instance_id = engine.provision(
-            tag=job.tag, size_key=job.size_key, profile=job.profile, region=job.region
+            tag=job.tag, size_key=job.size_key, profile=job.profile, region=job.region, **subnet
         )
         s.detail = job.instance_id
         s.state = STEP_DONE
@@ -1066,7 +1074,7 @@ def run_launch(
             s.detail = (
                 "Added to Your crews."
                 if job.signin_detected
-                else "Added to Your crews. Finish the Kiro sign-in before connecting."
+                else "Added to Your crews. Sign in to Kiro on the crew after you connect."
             )
             store.save(job)
 

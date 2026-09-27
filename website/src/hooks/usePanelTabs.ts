@@ -3,6 +3,7 @@ import type { Artifact } from '../types'
 import { i18nT } from '../i18n/t'
 import { safeSetItem } from '../utils/safeStorage'
 import { secureRandomId } from '../utils/secureId'
+import { createTerminalHydrateRuling } from '../utils/terminalHydrateRuling'
 import {
   isPanelTabKind,
   panelTabDescriptor,
@@ -116,6 +117,15 @@ export interface PanelTab {
    *  `content` whose absence it explains, and re-established by the same
    *  hydration read that refills the buffer. */
   binary?: boolean
+  /** The read that filled this buffer did not hand over the whole file: the
+   *  gateway cut it at its cap (`X-Truncated`) or rewrote credentials in it
+   *  (`X-Redacted`). Owned HERE, not derived from the body, so it survives a
+   *  panel remount and a file deleted meanwhile is offered for download as
+   *  the partial copy it is, never under the file's own name as if whole.
+   *  TRANSIENT like `binary`: stripped in `serializeBucket`, re-established by
+   *  the hydration read that refills the buffer, and moved by every
+   *  disk-originated refresh alongside `content`. */
+  partial?: boolean
   original?: string
   modified?: string
   /** Last selected working-tree diff view for file tabs. Persisted with the
@@ -271,8 +281,8 @@ const EMPTY_BUCKET: Bucket = { tabs: [], activeId: null }
  * route element), AND page reloads. Component-local useState would not survive
  * that, so the per-slot buckets live here at module scope (read via
  * useSyncExternalStore) and are mirrored to localStorage. On reload the strip
- * is rehydrated; terminal tabs reconnect to the still-live PTY (backend orphan
- * window) and document tabs re-fetch their content lazily (see below). */
+ * is rehydrated; terminal tabs wait for the backend's liveness ruling and
+ * document tabs re-fetch their content lazily (see below). */
 
 const KEY_PREFIX = 'mc-panel-tabs:'          // one key per slot: mc-panel-tabs:<slot>
 const PERSIST_DEBOUNCE_MS = 300
@@ -415,6 +425,33 @@ function mutateSlot(key: string, fn: (b: Bucket) => Bucket): void {
   schedulePersist(key)
 }
 
+/* Hydrate-time ruling on restored terminal tabs: the dock store's two-look
+ * protocol (see useBottomTerminal), keyed by `sessionId` across every slot. */
+const terminalSessionIds = (): string[] => Object.values(store).flatMap(
+  b => b.tabs.flatMap(t => (t?.kind === 'terminal' && t.sessionId ? [t.sessionId] : [])))
+function dropTerminalTabs(ids: ReadonlySet<string>): void {
+  for (const key of Object.keys(store)) {
+    mutateSlot(key, b => {
+      const gone = (t: PanelTab) => t?.kind === 'terminal' && !!t.sessionId && ids.has(t.sessionId)
+      if (!b.tabs.some(gone)) return b
+      const tabs = b.tabs.filter(t => !gone(t))
+      // Refocus only if the focused tab was dropped; a host leading-tab focus stays.
+      const lostFocus = b.tabs.some(t => t.id === b.activeId && gone(t))
+      return { tabs, activeId: lostFocus ? (tabs[0]?.id ?? null) : b.activeId }
+    })
+  }
+}
+const newTerminalRuling = (restored: ReadonlySet<string>) => createTerminalHydrateRuling(
+  restored, terminalSessionIds, dropTerminalTabs, () => { for (const cb of listeners) cb() })
+let terminalRuling = newTerminalRuling(new Set(terminalSessionIds()))
+export function reconcileRestoredPanelTerminals(payload: unknown): string[] { return terminalRuling.reconcile(payload) }
+export function confirmRestoredPanelTerminals(payload: unknown): string[] { return terminalRuling.confirm(payload) }
+const getTerminalsPendingSnapshot = (): boolean => terminalRuling.isPending()
+/** True until the restored terminal tabs are ruled on; mount no CliPanel meanwhile. */
+export function usePanelTerminalsPending(): boolean {
+  return useSyncExternalStore(subscribe, getTerminalsPendingSnapshot, getTerminalsPendingSnapshot)
+}
+
 /** Add tab if its id is absent, otherwise merge patch into the existing tab;
  *  either way focus it. When `replaceId` is given (e.g. a file opened FROM the
  *  Files tab replaces that Files tab), the new tab takes the replaced tab's
@@ -452,6 +489,88 @@ export function openPanelView(slotKey: string | null, kind: ViewKind): void {
   mutateSlot(bucketKey(slotKey), b => upsertInBucket(b, { id: kind, kind, title: viewTitle(kind) }))
 }
 
+/** Drop every document body the panel holds in memory, in EVERY slot, so the
+ *  next look at a tab re-reads the file through `/api/file-read` under whatever
+ *  redaction pass is in force NOW. The owner's credential-redaction switch calls
+ *  this when it changes: a file opened while the switch was off holds raw
+ *  credentials in its tab body, and a react-query purge alone leaves that copy on
+ *  screen after redaction is back on.
+ *
+ *  A CLEAN file tab loses only `content`/`savedContent` and becomes the same
+ *  self-hydrating reference a reload restores (`HydratingFileTab`). A DIRTY tab
+ *  (edits the owner has not saved) is kept whole: discarding it would destroy
+ *  work silently, and its buffer is the owner's own typing, not a fresh read.
+ *  Diff tabs are closed: their bodies are not re-fetchable by shape (the persist
+ *  path drops them for the same reason). Returns how many tabs were touched. */
+/** Bumped by every `evictDocumentBodies`. A DIRECT file read -- `MarkdownPanel`'s
+ *  refresh / watch re-read, which bypasses react-query -- captures it before the
+ *  fetch and discards its result if it moved: a read that STARTED while the
+ *  owner's redaction switch was off can otherwise complete after the switch is
+ *  back on and write raw credentials into a tab the purge had just emptied. The
+ *  react-query reads (a chip click's `fetchQuery`, a hydrating tab, the cold-tab
+ *  queries) need no epoch: `purgeDocumentBodiesForRedactionChange` resets their
+ *  queries, which CANCELS an in-flight fetch, so a straddling read rejects and
+ *  never becomes a body (covered by usePanelDocumentActions.redactionEpoch.test). */
+let documentBodyEpoch = 0
+export function documentBodyEpochNow(): number { return documentBodyEpoch }
+
+export function evictDocumentBodies(): number {
+  documentBodyEpoch++
+  let touched = 0
+  for (const key of Object.keys(store)) {
+    mutateSlot(key, b => {
+      let changed = false
+      const tabs: PanelTab[] = []
+      for (const t of b.tabs) {
+        if (t.kind === 'diff') { changed = true; touched++; continue }
+        const dirty = t.kind === 'file' && t.content !== undefined && t.savedContent !== undefined && t.content !== t.savedContent
+        if (t.kind === 'file' && t.content !== undefined && !dirty) {
+          const copy = { ...t }; delete copy.content; delete copy.savedContent
+          tabs.push(copy); changed = true; touched++
+          continue
+        }
+        tabs.push(t)
+      }
+      if (!changed) return b
+      // Refocus ONLY when the focused tab was one of the dropped diff tabs. A
+      // focus that names no bucket tab at all is one of the host's leading tabs
+      // (`usePanelTabs(…, { leadingIds })` -- the Crewmates page's Notes / Work
+      // log / Dashboard), which live outside the bucket by design and must keep
+      // the focus -- the same `droppedFocus` rule `serializeBucket` applies.
+      const droppedFocus = b.activeId !== null
+        && b.tabs.some(t => t.id === b.activeId)
+        && !tabs.some(t => t.id === b.activeId)
+      const activeId = droppedFocus
+        ? (tabs.length ? tabs[tabs.length - 1].id : null)
+        : b.activeId
+      return { tabs, activeId }
+    })
+  }
+  return touched
+}
+
+/** Everything a change of the owner's credential-redaction switch must drop in
+ *  THIS document: the react-query file bodies (`['file-read', path]` and the
+ *  `['file-diff', path]` the panel compares them against) and the open tab
+ *  bodies (`evictDocumentBodies`). The queries are RESET, not removed and not
+ *  invalidated: an invalidate keeps the raw body on screen while revalidating,
+ *  and a remove drops the cache entry but leaves a MOUNTED observer (the
+ *  Library's `SessionDocPreview`, a `useQuery` on the same key) holding its
+ *  last result with nothing to re-render it, so the plaintext stays rendered
+ *  until an unrelated re-render happens to rebuild the query. A reset puts every
+ *  matching query back to its initial state -- observers see `data: undefined`
+ *  at once and re-render -- cancels an in-flight fetch exactly as a remove did,
+ *  and refetches the ACTIVE ones, so a mounted preview re-reads under the pass
+ *  now in force while an inactive entry is simply emptied. Called by the
+ *  Settings card that made the change AND by the WebSocket handler for
+ *  `credential_redaction_changed`, so a second browser tab purges too -- the
+ *  two callers share one list on purpose. */
+export function purgeDocumentBodiesForRedactionChange(qc: { resetQueries: (f: { queryKey: unknown[] }) => unknown }): void {
+  void qc.resetQueries({ queryKey: ['file-read'] })
+  void qc.resetQueries({ queryKey: ['file-diff'] })
+  evictDocumentBodies()
+}
+
 /** Strip heavy bodies (file/diff/artifact content) before persisting — those
  *  can be MBs and blow the localStorage quota. Terminal + view tabs and all
  *  tab METADATA (path / slug / sessionId / cwd / order / focus) are kept, so
@@ -471,7 +590,7 @@ export function openPanelView(slotKey: string | null, kind: ViewKind): void {
 function serializeBucket(b: Bucket): string {
   const tabs = b.tabs
     .filter(t => t.kind !== 'diff' && t.kind !== 'app')
-    .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.binary; delete copy.revealLine; return copy })
+    .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.binary; delete copy.partial; delete copy.revealLine; return copy })
   // If the focused tab was a DROPPED diff/app tab, refocus a surviving tab.
   // Only then: a focus that names no stored tab at all is one of the host's
   // leading tabs (`usePanelTabs(…, { leadingIds })` — the Crewmates page's Notes /
@@ -542,6 +661,7 @@ function flushPersist(): void {
  *  renderHook calls in a suite. */
 export function __resetPanelTabs(): void {
   store = {}
+  terminalRuling = newTerminalRuling(new Set())
   inlineDrafts.clear()
   autoOpenedApps.clear()
   clearTimeout(persistTimer)
@@ -716,7 +836,7 @@ export function usePanelTabs(
     })
   }, [update, leadingIds, defaultLeadingId])
 
-  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; binary?: boolean }) => {
+  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; binary?: boolean; partial?: boolean }) => {
     // `revealLine` is always present in the object, `undefined` when absent:
     // `upsert` merges onto an existing tab with a spread, which only overwrites
     // keys the incoming object HAS. Omitting it would leave a previous chip's
@@ -753,6 +873,7 @@ export function usePanelTabs(
         // existing tab, so omitting it would leave a previous read's verdict on
         // a tab whose file has since been replaced by a text one.
         binary: opts?.binary,
+        partial: opts?.partial,
         revealLine: reveal,
         ...(opts?.diffMode != null ? { diffMode: opts.diffMode } : {}),
       }, opts?.replaceId)

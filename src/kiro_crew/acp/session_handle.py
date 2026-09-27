@@ -63,8 +63,11 @@ from kiro_crew.acp.client import (
     _is_safe_oauth_url,
     _is_tool_interrupted_marker,
     _jsonrpc_error_code,
+    _loggable_request_id,
     _push_model_via_effort_split,
     _raise_acp_error,
+    advertised_model_ids,
+    catalog_row_would_drop,
     compaction_failure_detail,
     compaction_failure_is_transient,
     format_command_result,
@@ -148,6 +151,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_REFUSAL,
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
+    TERMINAL_TOOL_STATUSES,
     UPDATE_AGENT_MESSAGE_CHUNK,
     UPDATE_AGENT_THOUGHT_CHUNK,
     UPDATE_CURRENT_MODE,
@@ -160,6 +164,7 @@ from kiro_crew.acp.types import (
     effort_config_option_id,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
+from kiro_crew.agent_sdk.drivers.acp import EntitlementRevalidating  # noqa: F401 - raised here
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import subprocess_executor
@@ -189,6 +194,33 @@ _KAS_HOOKS_METHODS = frozenset(
 )
 
 # ── Constants ──
+
+# Read-path entitlement revalidation (see
+# ``AcpSessionHandle.maybe_refresh_available_models``). These bound how eagerly
+# the dashboard picker re-asks the backend what the account can run; they are a
+# scheduling policy, never an entitlement decision.
+#
+# A session-init snapshot captured within this many seconds of the runtime's
+# spawn fell inside the startup window where the degraded (free-tier default)
+# answer is resolved, so it is treated as suspect and revalidated.
+_READ_PATH_SPAWN_RACE_SECS = 90.0
+# A session probes on the read path at most once per this interval, so a hot
+# dashboard poll does not re-probe on every runtime-probe TTL expiry forever.
+# The interval binds a probe-CONFIRMED snapshot and every non-auto-only
+# snapshot; an UNCONFIRMED auto-only snapshot may re-probe (it always earns a
+# probe), bounded by the runtime's own single-flight probe TTL — which now
+# covers the failure/empty path too, so even a failing probe is re-asked at
+# most once per that TTL, not on every read.
+_READ_PATH_REPROBE_MIN_INTERVAL_SECS = 300.0
+# The picker read path awaits the probe at most this long, then raises
+# EntitlementRevalidating so the endpoint returns its degraded (503) response
+# and the frontend keeps its last-good list and polls again; the shielded probe
+# keeps running and the next read serves its landed result. Kept under the
+# remote-hub cold-path budget (DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS in
+# instances/constants.py: 5 + 10 + 3 < 20) so proxied /api/models never times
+# out mid-revalidation.
+_READ_PATH_PROBE_DEADLINE_SECS = 3.0
+
 
 # The stopReason values the pre-turn drain may NAME in its warning: the closed
 # protocol values (``types.STOP_REASON_*``) only. A discarded terminal whose
@@ -743,6 +775,27 @@ class AcpRuntimeProtocol(Protocol):
         ...
 
     @property
+    def spawn_monotonic(self) -> float | None:
+        """Monotonic time the process was spawned, or ``None`` before spawn.
+
+        The read-path entitlement revalidation uses it to tell a snapshot
+        captured inside the startup race window (when the degraded free-tier
+        answer is resolved) from one captured well after the process settled.
+        """
+        ...
+
+    @property
+    def entitlement_probe_result_at(self) -> float:
+        """Monotonic time the stored probe answer arrived (0.0 before any).
+
+        Whether :meth:`probe_advertised_models` served a fresh answer or replayed
+        the stored one, the answer is dated by this clock; the handle dates the
+        snapshot it stores from here so its own freshness floor never rises above
+        the data it holds.
+        """
+        ...
+
+    @property
     def acp_backend(self) -> str:
         """Which ACP backend the process speaks.
 
@@ -773,9 +826,16 @@ class AcpRuntimeProtocol(Protocol):
 
     async def send_request(self, method: str, params: dict[str, Any]) -> int: ...
 
-    async def probe_advertised_models(self) -> list[dict[str, str]]:
+    async def probe_advertised_models(
+        self, *, force: bool = False, not_before: float = 0.0
+    ) -> list[dict[str, str]]:
         """Fresh advertised-model snapshot from a throwaway ``session/new``
-        (``[]`` = probe failed / advertised nothing — never evidence)."""
+        (``[]`` = probe failed / advertised nothing — never evidence).
+
+        ``force=True`` skips the failed/empty attempt-clock replay (a user action
+        earns a fresh probe); a recent non-empty success is still replayed.
+        ``not_before`` is the monotonic capture time of the caller's snapshot: a
+        replayed result is served only if it is at least as new as that."""
         ...
 
     async def send_notification(self, method: str, params: dict[str, Any]) -> None: ...
@@ -874,9 +934,11 @@ class AcpSessionHandle:
         # submitting a second job, so a wedged walk cannot stack blocked workers
         # in the shared subprocess_executor().
         self._consult_future: asyncio.Future[tuple[str, str]] | None = None
-        # Snapshot of the most recent EVENT_TOOL_CALL (title/redacted input/
-        # dispatch time/shell flag) — the oracle's attribution key. Cleared on
-        # EVENT_TOOL_RESULT alongside _tool_dispatched.
+        # Parallel calls can finish in either order; retain each attribution
+        # until its terminal result so the oracle never inspects a finished call.
+        self._active_tool_calls: dict[
+            str, tuple[ToolCallState, InteractiveClassification | None]
+        ] = {}
         self._inflight_tool: ToolCallState | None = None
         # Pre-dispatch interactive classification of the in-flight SHELL tool
         # (``classify_interactive_command``); ``None`` when no shell tool is in
@@ -1074,6 +1136,29 @@ class AcpSessionHandle:
         self._resolved_model_id: str = ""
         self._config_options: list[dict[str, Any]] = []
         self._available_models: list[dict[str, str]] = []
+        # Read-path revalidation bookkeeping (see maybe_refresh_available_models).
+        # The session-init snapshot is one unconfirmed answer captured at one
+        # instant, and the read path (the dashboard picker filter) has no
+        # explicit-pick refusal to trigger the refresh-before-refuse path — so it
+        # must decide for itself whether a snapshot that would NARROW the catalog
+        # is trustworthy. These three fields are the staleness signals it reads;
+        # each is a monotonic timestamp or a confirmation flag, never entitlement
+        # evidence (the keep/drop verdict stays with ``catalog_row_would_drop``).
+        # 0.0 = never captured (no session/new stored a list yet).
+        self._available_models_captured_at: float = 0.0
+        # True once a probe (refresh_available_models) has confirmed the snapshot
+        # against the live backend — the strongest "trust it" signal.
+        self._available_models_probe_confirmed: bool = False
+        # Monotonic time the read-path heuristic last kicked a probe for THIS
+        # session, so a hot dashboard poll cannot re-probe every TTL expiry
+        # forever once a legitimately-narrow snapshot has been confirmed.
+        self._available_models_read_probe_at: float = 0.0
+        # Single in-flight read-path refresh task per handle. The read path
+        # shields it, so a deadline miss raises EntitlementRevalidating (the
+        # endpoint answers 503 and the client re-polls) WITHOUT cancelling the
+        # probe — the task keeps running to completion so its throwaway session
+        # is cleaned up and the next read serves its result.
+        self._read_refresh_task: asyncio.Task[list[dict[str, str]]] | None = None
         # Last KAS mode id seen on a current_mode_update, so a re-assert of the
         # already-current mode does not surface a spurious agent-switch echo
         # (kiro-cli only emits on a real _kiro.dev/agent/switched). None = unseen.
@@ -1321,6 +1406,7 @@ class AcpSessionHandle:
         # A new turn starts with no infrastructure verdict carried over.
         self.last_infra_error = None
         self._tool_dispatched = False
+        self._active_tool_calls.clear()
         self._inflight_tool = None
         self._inflight_interactive = None
         self._inflight_tool_call_id = ""
@@ -1456,6 +1542,15 @@ class AcpSessionHandle:
                 for _owed in _stale_owed:
                     self._queue.put_nowait(_owed)
                 _stale_owed.clear()
+                # Audit FIRST (off-loop, so it never delays the answer): the
+                # reject below is a bounded wire write that can fail, and a
+                # permission decision must leave its SEL record either way.
+                self._audit_handle_reject(
+                    stale.id,
+                    str(_stale_title),
+                    "stranded_request_pre_turn_drain",
+                    sub_session_id=(_stale_sid if _stale_sid != self._session_id else ""),
+                )
                 try:
                     await self.reject_tool(stale.id)
                 except asyncio.CancelledError:
@@ -1484,7 +1579,7 @@ class AcpSessionHandle:
                     "rejected permission request id=%s stranded in the "
                     "pre-turn drain (abandoned turn or between-turns child "
                     "frame) — answering so the backend cannot hang",
-                    stale.id,
+                    _loggable_request_id(stale.id),
                 )
                 # Crew-card notice ONLY for a child-origin strand: the card
                 # keys on sub_session_id, so the parent's own session id (an
@@ -1493,12 +1588,6 @@ class AcpSessionHandle:
                 # covered by the WARNING + SEL record.
                 if _stale_sid and _stale_sid != self._session_id:
                     self._pending_reject_notices.append((_stale_sid, str(_stale_title)))
-                self._audit_handle_reject(
-                    stale.id,
-                    str(_stale_title),
-                    "stranded_request_pre_turn_drain",
-                    sub_session_id=(_stale_sid if _stale_sid != self._session_id else ""),
-                )
             else:
                 # Everything that is not a permission request is DISCARDED, which
                 # is correct (it belongs to a turn nobody is reading any more) but
@@ -1853,7 +1942,7 @@ class AcpSessionHandle:
                 "reject_tool: no deny option advertised for req=%s; answering "
                 "'cancelled', which the backend may treat as cancelling the "
                 "remainder of the turn's tool calls",
-                request_id,
+                _loggable_request_id(request_id),
             )
             await self._runtime.send_response(
                 request_id,
@@ -1881,8 +1970,8 @@ class AcpSessionHandle:
         would answer it without a human, and a human offered the choice is being
         asked to re-decide something the spec already settled.
 
-        The reject is sent before the audit, and the audit runs off the loop, so an
-        audit failure cannot undo or delay the refusal.
+        The audit is recorded first and runs off the loop, so it can neither delay
+        the refusal nor be lost when the (bounded) reject write fails.
         """
         if not self.spec_denied_tools:
             return False
@@ -1898,13 +1987,13 @@ class AcpSessionHandle:
             server,
             self._session_id,
         )
-        await self.reject_tool(event.request_id)
         self._audit_handle_reject(
             event.request_id,
             f"mcp__{server}__{tool}",
             "spec_disabled_tool",
             sub_session_id=event.sub_session_id or "",
         )
+        await self.reject_tool(event.request_id)
         return True
 
     def _tripwire_spec_disabled_tool(self, result: AcpEvent, msg: JsonRpcMessage) -> None:
@@ -1990,13 +2079,13 @@ class AcpSessionHandle:
             "checked against that, while a consumer may auto-approve it [session=%s]",
             self._session_id,
         )
-        await self.reject_tool(event.request_id)
         self._audit_handle_reject(
             event.request_id,
             "mcp__unidentified",
             "spec_disabled_tool_unidentified_call",
             sub_session_id=event.sub_session_id or "",
         )
+        await self.reject_tool(event.request_id)
         return True
 
     def _audit_handle_reject(
@@ -2019,10 +2108,13 @@ class AcpSessionHandle:
         that never reach a consumer, so no consumer-side audit fires — every
         permission decision must still leave a SEL record (repo convention;
         the runtime's unregistered-session auto-reject does the same).
-        Off-loop (``asyncio.to_thread``) and AFTER the reject was sent: sel()
-        may do blocking filesystem work on first use, and an audit failure
-        must not undo or delay the already-made decision. Title is
-        backend/LLM-authored: bounded then redacted before it is stored.
+        Off-loop (``asyncio.to_thread``) and BEFORE the reject goes on the
+        wire: sel() may do blocking filesystem work on first use, so the audit
+        never delays the answer, and the reject is a bounded write that can
+        fail -- the decision must leave its SEL record whether or not the wire
+        accepted it (the same audit-first ordering chat_runner's deny paths
+        keep). Title is backend/LLM-authored: bounded then redacted before it
+        is stored.
         """
         safe_title = redact_text(str(title)[:4096])[:120] if title else "<unknown>"
         rid = request_id if isinstance(request_id, (str, int)) else ""
@@ -2187,7 +2279,7 @@ class AcpSessionHandle:
                         MODEL_CONFIG_ID,
                     )
                     return ""
-                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID):
+                if not _is_config_value_rejection(exc, MODEL_CONFIG_ID, self._runtime.acp_backend):
                     raise
                 last_exc = exc
                 continue
@@ -2864,6 +2956,7 @@ class AcpSessionHandle:
                 self._available_models = parse_advertised_models(
                     {"models": {"availableModels": avail}}
                 )
+                self._mark_available_models_captured()
             # A backend may advertise its model list without echoing
             # ``currentModelId`` (it is best-effort in the ACP shape). When it
             # names exactly one model that IS the served model unambiguously, so
@@ -2877,6 +2970,7 @@ class AcpSessionHandle:
                 self._resolved_model_id = self._available_models[0]["modelId"]
         elif isinstance(models, list):
             self._available_models = parse_advertised_models({"availableModels": models})
+            self._mark_available_models_captured()
 
     async def ensure_served_default(self) -> None:
         """Move an inheriting pooled session off a backend default it cannot run.
@@ -2951,7 +3045,7 @@ class AcpSessionHandle:
             )
         return captured
 
-    async def refresh_available_models(self) -> list[dict[str, str]]:
+    async def refresh_available_models(self, *, force: bool = False) -> list[dict[str, str]]:
         """Re-resolve the advertised-model snapshot against the live backend.
 
         ``_available_models`` is otherwise written once, from this session's own
@@ -2967,11 +3061,191 @@ class AcpSessionHandle:
         empty probe is not evidence about entitlement, so the prior snapshot is
         kept. Returns the probe result either way, so callers can distinguish
         "revalidated" from "could not revalidate".
+
+        ``force`` is forwarded to the runtime probe: a user action (the
+        explicit-pick refusal heal, the spawn-time pin withhold) passes
+        ``force=True`` so it earns a fresh probe instead of being refused on a
+        recent no-evidence failure replay. The read path leaves it False.
         """
-        fresh = await self._runtime.probe_advertised_models()
+        # The floor is this snapshot's capture time, so a non-empty return is
+        # always at least as new as the snapshot it replaces: a broader answer
+        # cached on the shared runtime before this session captured a narrower
+        # one is never replayed over it. The stored snapshot is then dated by the
+        # ANSWER's own clock (the runtime's result clock, which is the arrival
+        # time of a fresh answer and the original arrival time of a replayed
+        # one), never by this call's time: dating a replay by the call would
+        # raise this handle's floor above the data it holds, so its next refresh
+        # within the TTL would open a real session/new instead of replaying, and
+        # a replay captured inside the spawn-race window would be re-dated past
+        # it and marked confirmed, disabling the read-path heal for this handle.
+        asked_at = time.monotonic()
+        fresh = await self._runtime.probe_advertised_models(
+            force=force, not_before=self._available_models_captured_at
+        )
         if fresh:
+            served_at = self._runtime.entitlement_probe_result_at
             self._available_models = list(fresh)
+            # A runtime that answered without stamping its result clock (a probe
+            # seam that bypasses the store) is dated by the call instead, which
+            # is still never later than the answer.
+            self._available_models_captured_at = served_at if served_at > 0.0 else asked_at
+            self._available_models_probe_confirmed = True
         return fresh
+
+    def _mark_available_models_captured(self) -> None:
+        """Stamp the session-init snapshot's capture time (an unconfirmed
+        answer). A snapshot written from ``session/new`` is NOT probe-confirmed:
+        only :meth:`refresh_available_models` sets that flag, because only a live
+        re-probe proves the answer is not the startup-race default."""
+        self._available_models_captured_at = time.monotonic()
+        self._available_models_probe_confirmed = False
+
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the snapshot on the READ path when it would narrow the catalog.
+
+        The dashboard picker filter narrows the ``--list-models`` catalog through
+        the newest live session's ``availableModels`` snapshot. When that snapshot
+        is the startup-race default (an entitlement lookup racing a token refresh
+        answered with the free tier), the picker hides models the account has and
+        ``auto`` chats silently inherit the degraded default — and because no
+        explicit pick is ever refused, the refresh-before-refuse path never fires.
+        This is the read-path counterpart: revalidate the snapshot BEFORE the
+        picker trusts it to hide anything.
+
+        ``catalog_ids`` is the full ``--list-models`` catalog (the ids the picker
+        would offer unfiltered). The verdict of what to keep/drop is NOT decided
+        here — it is :func:`catalog_row_would_drop`, the same per-row verdict the
+        picker endpoint applies, built on ``model_is_unusable`` (the single
+        spelling of "what this account can run") and ``resolve_pin_spelling``.
+        This method only decides WHETHER
+        the snapshot is trustworthy enough to narrow with, and reuses the existing
+        :meth:`refresh_available_models` heal path when it is not (no second
+        probe, no second parser).
+
+        Staleness heuristic (a scheduling decision, never an entitlement one):
+        probe only when the snapshot would actually narrow the catalog (some row
+        drops and the endpoint does not fail open to the full catalog) AND one of
+
+        * it was never probe-confirmed, or
+        * it was captured within ``_READ_PATH_SPAWN_RACE_SECS`` of runtime spawn
+          (the exact window the degraded answer is resolved in), or
+        * it advertises only ``auto`` against a richer catalog — the strongest
+          staleness signal.
+
+        Rate limit: a probe is skipped when this session probed on the read path
+        within ``_READ_PATH_REPROBE_MIN_INTERVAL_SECS`` AND the snapshot is either
+        probe-confirmed or not auto-only, so a hot poll does not re-probe on every
+        runtime TTL expiry forever. An UNCONFIRMED auto-only snapshot is exempt
+        from the interval — it always gets to probe — while a probe-CONFIRMED
+        auto-only snapshot (a genuine free-tier account really is ``auto``-only)
+        honours the interval like any other rather than re-probing forever. The
+        runtime's own single-flight probe TTL bounds the cost of the exempt case.
+
+        Fast path: the probe runs as a single in-flight task per handle, shielded
+        under ``_READ_PATH_PROBE_DEADLINE_SECS``. On deadline expiry this RAISES
+        :class:`EntitlementRevalidating` while the task KEEPS RUNNING to
+        completion — so its throwaway probe session is cleaned up and a later
+        read serves the corrected list, and the endpoint returns its degraded
+        response (rather than serving the un-revalidated snapshot as a live 200
+        the frontend caches). A subsequent read while the same task is still in
+        flight awaits it too, so it never bypasses the raise. A probe FAILURE
+        (as opposed to a timeout) NEVER makes the picker worse: the current
+        snapshot is returned unchanged (fail open).
+        """
+        snapshot = list(self._available_models)
+        advertised = advertised_model_ids(snapshot)
+        if not advertised:
+            # No live list to narrow with — nothing to revalidate, fail open.
+            return snapshot
+        # Count only rows the picker would actually hide AND a fresher snapshot
+        # could restore, using the endpoint's own per-row verdict
+        # (``catalog_row_would_drop``): ``auto`` is always kept, an advertised or
+        # ``ns::``-foldable row is kept, and an empty id drops against every
+        # snapshot, so none of those can justify a probe.
+        dropped = [
+            cid for cid in catalog_ids if cid.strip() and catalog_row_would_drop(cid, advertised)
+        ]
+        survivors = [
+            cid
+            for cid in catalog_ids
+            if cid.strip()
+            and cid.strip().lower() not in ("auto", "default")
+            and not catalog_row_would_drop(cid, advertised)
+        ]
+        advertises_auto = any(a.strip().lower() in ("auto", "default") for a in advertised)
+        # The endpoint FAILS OPEN — serves the whole catalog unfiltered — when the
+        # snapshot does not advertise ``auto`` and no non-``auto`` row survives
+        # (a namespace mismatch rather than an entitlement answer). A snapshot in
+        # that state hides nothing, so it is not narrowing either.
+        fails_open = not advertises_auto and not survivors
+        would_narrow = bool(dropped) and not fails_open
+        if not would_narrow:
+            # The snapshot keeps the whole catalog, so a stale snapshot cannot
+            # currently hide anything — do not spend a probe.
+            return snapshot
+        auto_only = len(advertised) == 1 and advertised[0].strip().lower() == "auto"
+        now = time.monotonic()
+        spawn_at = self._runtime.spawn_monotonic
+        within_spawn_race = (
+            spawn_at is not None
+            and self._available_models_captured_at > 0.0
+            and (self._available_models_captured_at - spawn_at) <= _READ_PATH_SPAWN_RACE_SECS
+        )
+        suspect = not self._available_models_probe_confirmed or within_spawn_race or auto_only
+        if not suspect:
+            return snapshot
+        # An in-flight probe from an earlier read (its deadline expired but the
+        # shielded task kept running) MUST be awaited, not bypassed: on the
+        # frontend's degraded re-poll the interval gate below would otherwise
+        # return the un-revalidated snapshot as a normal answer, the endpoint
+        # would serve it as a live 200, and the corrected list this very probe is
+        # fetching would never reach the picker. So when a task is still running,
+        # skip the interval gate and fall through to await it — the poll gets the
+        # landed result or raises EntitlementRevalidating again.
+        task = self._read_refresh_task
+        in_flight = task is not None and not task.done()
+        if not in_flight:
+            recently_probed = (
+                self._available_models_read_probe_at > 0.0
+                and (now - self._available_models_read_probe_at)
+                < _READ_PATH_REPROBE_MIN_INTERVAL_SECS
+            )
+            # The interval applies to a probe-CONFIRMED snapshot and to every
+            # non-auto-only snapshot: a genuine free-tier account is legitimately
+            # auto-only, so once confirmed it must not re-probe on every poll. An
+            # UNCONFIRMED auto-only snapshot is exempt from the interval — it
+            # always gets to probe (its docstring promise), and the runtime's own
+            # single-flight probe TTL still bounds the cost of a burst.
+            if recently_probed and (self._available_models_probe_confirmed or not auto_only):
+                return snapshot
+            self._available_models_read_probe_at = now
+            task = asyncio.ensure_future(self.refresh_available_models())
+            self._read_refresh_task = task
+        # Non-None in both branches: in-flight reused an existing task, else one
+        # was just started above.
+        assert task is not None
+        try:
+            # Shield so a timeout leaves the task RUNNING (it finishes the probe
+            # and cleans up its throwaway session); we just stop waiting on it.
+            await asyncio.wait_for(asyncio.shield(task), timeout=_READ_PATH_PROBE_DEADLINE_SECS)
+        except (TimeoutError, asyncio.TimeoutError):
+            # The probe did not land inside the deadline and is STILL RUNNING.
+            # We must not return the un-revalidated snapshot as a normal answer:
+            # the picker endpoint serves that as a live HTTP 200 that the
+            # frontend caches with no refetch, so the corrected list this probe
+            # is fetching would never be served. Signal "revalidation in flight"
+            # so the endpoint returns its degraded response and the frontend
+            # keeps its last-good list and polls again; the next read (once the
+            # task has landed) serves the corrected list.
+            raise EntitlementRevalidating from None
+        except Exception:
+            # Fail open exactly as today: no evidence never worsens the picker.
+            logger.debug("read-path entitlement revalidation failed", exc_info=True)
+            return list(self._available_models)
+        # refresh_available_models already replaced the snapshot in place on a
+        # non-empty probe and kept it on an empty one; either way the live
+        # snapshot is the answer to narrow with.
+        return list(self._available_models)
 
     def _sync_effort_levels(self) -> None:
         """Push ACP-reported effort levels to the global validation set (parity
@@ -3712,7 +3986,10 @@ class AcpSessionHandle:
                         self._queue.put_nowait(msg)
                         await asyncio.sleep(0)
                     else:
-                        logger.debug("Dropping stray response frame id=%s (no waiter)", msg.id)
+                        logger.debug(
+                            "Dropping stray response frame id=%s (no waiter)",
+                            _loggable_request_id(msg.id),
+                        )
                     continue
 
                 # The backend's hooks requests, answered here rather
@@ -3755,16 +4032,16 @@ class AcpSessionHandle:
                         logger.warning(
                             "rejecting low-fidelity child permission request "
                             "id=%s for fidelity-unaware consumer (child=%s)",
-                            _perm_event.request_id,
-                            _perm_event.sub_session_id,
+                            _loggable_request_id(_perm_event.request_id),
+                            _loggable_request_id(_perm_event.sub_session_id),
                         )
-                        await self.reject_tool(_perm_event.request_id)
                         self._audit_handle_reject(
                             _perm_event.request_id,
                             _perm_event.title or "",
                             "child_low_fidelity_unaware_consumer",
                             sub_session_id=_perm_event.sub_session_id or "",
                         )
+                        await self.reject_tool(_perm_event.request_id)
                         yield AcpEvent(
                             kind=EVENT_SUBAGENT_ACTIVITY,
                             sub_session_id=_perm_event.sub_session_id,
@@ -3829,12 +4106,19 @@ class AcpSessionHandle:
                     _upd = _upd if isinstance(_upd, dict) else {}
                     _disc = str(_upd.get("sessionUpdate") or "")
                     _text = redact_text(str(_upd.get("content") or _upd.get("message") or ""))
+                    # An echo that named no session and was fanned out to
+                    # co-tenants is not this session's own (``runtime_global``).
+                    _ownerless = msg.fanout_no_owner
                     if _disc in ("steering_queued", "AgentExecutionUserMessageQueued"):
-                        yield AcpEvent(kind=EVENT_STEER_QUEUED, text=_text)
+                        yield AcpEvent(
+                            kind=EVENT_STEER_QUEUED, text=_text, runtime_global=_ownerless
+                        )
                     elif _disc in ("steering_consumed", "AgentExecutionSteeringInjected"):
-                        yield AcpEvent(kind=EVENT_STEER_CONSUMED, text=_text)
+                        yield AcpEvent(
+                            kind=EVENT_STEER_CONSUMED, text=_text, runtime_global=_ownerless
+                        )
                     elif _disc == "steering_cleared":
-                        yield AcpEvent(kind=EVENT_STEER_CLEARED)
+                        yield AcpEvent(kind=EVENT_STEER_CLEARED, runtime_global=_ownerless)
                 elif action == "metadata":
                     self._track_metadata(msg)
                 elif action == "compaction":
@@ -3858,7 +4142,9 @@ class AcpSessionHandle:
                     # the subagent roster already draws (runtime_global=).  A lone
                     # session's frame is left unmarked and genuinely is its own,
                     # so a single-session run is unaffected.  The event still
-                    # surfaces either way — only the mutations are gated.
+                    # surfaces either way, carrying that provenance
+                    # (``runtime_global``) so a consumer measuring this session's
+                    # own activity can tell; only the mutations are gated.
                     owns_frame = not msg.fanout_no_owner
                     if status_type == "completed" and owns_frame:
                         # The pre-compaction counts (and their authoritative
@@ -3881,15 +4167,27 @@ class AcpSessionHandle:
                             self._compaction_failed_at = time.monotonic()
                             self.last_compaction_transient = compaction_failure_is_transient(params)
                         summary = compaction_failure_detail(params)
-                    yield AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)
+                    yield AcpEvent(
+                        kind=EVENT_COMPACTION_STATUS,
+                        text=status_type,
+                        title=summary,
+                        runtime_global=not owns_frame,
+                    )
                 elif action == "clear":
-                    yield AcpEvent(kind=EVENT_CLEAR_STATUS)
+                    # Same provenance as the compaction notice: one that named
+                    # no session and was fanned out to co-tenants is not this
+                    # session's own.
+                    yield AcpEvent(kind=EVENT_CLEAR_STATUS, runtime_global=msg.fanout_no_owner)
                 elif action == "agent_switched":
                     saw_agent_switch = True
                     params = msg.params or {}
                     name = params.get("agentName", "")
                     self.active_agent = name if isinstance(name, str) else ""
-                    yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=params.get("agentName", ""))
+                    yield AcpEvent(
+                        kind=EVENT_AGENT_SWITCHED,
+                        text=params.get("agentName", ""),
+                        runtime_global=msg.fanout_no_owner,
+                    )
                 elif action == "subagent_list":
                     params = msg.params or {}
                     subs = params.get("subagents")
@@ -4783,6 +5081,7 @@ class AcpSessionHandle:
             # parent toolCallId to inherit trusted params for a different
             # operation, while same-origin repeat frames still resolve.
             cache_scope=str(_perm_params.get("sessionId") or self._session_id),
+            kas_consent_meta=self._runtime.acp_backend == ACP_BACKEND_KAS,
         )
         if recorded is not None and event.request_id != "":
             self._permission_options[event.request_id] = recorded
@@ -5298,7 +5597,7 @@ class AcpSessionHandle:
             filtered_events.append(ev)
             if ev.kind == EVENT_TEXT_CHUNK:
                 self.last_prompt_stats.text_chunks += 1
-                self._stale_eligible = True
+                self._stale_eligible = not self._active_tool_calls
                 self._prompt_or_tool_seen = True
             elif ev.kind == EVENT_TOOL_CALL:
                 self._stale_eligible = False
@@ -5354,16 +5653,32 @@ class AcpSessionHandle:
                     tool_name=ev.tool_name,
                     interactive_risk=(interactive.risk if interactive else INTERACTIVE_NONE),
                 )
+                self._active_tool_calls[self._inflight_tool_call_id] = (
+                    self._inflight_tool,
+                    interactive,
+                )
                 self._retire_liveness_state()
             elif ev.kind == EVENT_TOOL_RESULT:
                 if not ev.tool_final and ev.tool_call_id:
                     # Streamed partial output: the command has acted, so any
                     # later non-interactive retry of it is not a safe replay.
                     self._tool_output_seen.add(ev.tool_call_id)
-                self._tool_dispatched = False
-                self._inflight_tool = None
-                self._inflight_interactive = None
-                self._inflight_tool_call_id = ""
+                if ev.tool_status in TERMINAL_TOOL_STATUSES:
+                    self._active_tool_calls.pop(ev.tool_call_id or "", None)
+                    self._tool_dispatched = bool(self._active_tool_calls)
+                    self._stale_eligible = not self._active_tool_calls
+                    if self._inflight_tool_call_id not in self._active_tool_calls:
+                        if self._active_tool_calls:
+                            self._inflight_tool_call_id = next(reversed(self._active_tool_calls))
+                            self._inflight_tool, self._inflight_interactive = (
+                                self._active_tool_calls[self._inflight_tool_call_id]
+                            )
+                        else:
+                            self._inflight_tool = None
+                            self._inflight_interactive = None
+                            self._inflight_tool_call_id = ""
+                        self._input_wait_emitted = False
+                        self._retire_liveness_state()
                 # L1 of the recovery ladder: classify the result text ONCE, at
                 # the layer that owns the protocol. A ``-32001 capacity``
                 # refusal from the MCP stub or a gateway ``recoverable_infra``

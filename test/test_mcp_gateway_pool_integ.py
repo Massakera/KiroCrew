@@ -39,11 +39,13 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from fake_pool_mcp_server import recorded
 
+from kiro_crew import code_fingerprint as cf
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import transport
@@ -55,6 +57,27 @@ _FAKE_SERVER = Path(__file__).with_name("fake_pool_mcp_server.py")
 #: named-pipe round trip is far slower than a unix socket, and a flaky timeout
 #: here would read as "pooling broke".
 _REPLY_TIMEOUT = 60.0
+
+
+@pytest.fixture(autouse=True)
+def _no_git_fingerprint(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """``run_gatewayd`` warms ``code_fingerprint()`` in-process without a git spawn.
+
+    The daemon these tests drive calls ``warm_code_fingerprint()`` at start, and
+    the cached fingerprint is of ``_PACKAGE_ROOT`` -- THIS checkout -- so a cold
+    read runs ``git -C <checkout> rev-parse HEAD`` and ``git diff HEAD`` on the
+    developer's own repository with the worker's cwd inherited; which test pays
+    depends on run order. Nothing here reads the value (the stubs' target is the
+    fake server, not a Kiro Crew subcommand, so no stub folds it into its pool
+    key), so the trusted-git resolver is pinned to "absent" -- the product's own
+    no-spawn arm, the mtime rule -- exactly as ``test_mcp_gateway_daemon_lifecycle.py``
+    does. The cache is cleared on both sides so the pinned value neither reuses
+    a real one nor leaks to a module that must match a child daemon's.
+    """
+    monkeypatch.setattr(cf, "trusted_git_bin", lambda: None)
+    cf.code_fingerprint.cache_clear()
+    yield
+    cf.code_fingerprint.cache_clear()
 
 
 def _endpoint_dir() -> str | None:
@@ -537,6 +560,7 @@ async def test_real_stubs_without_poolable_get_their_own_backend(
         )
     )
     procs: list[asyncio.subprocess.Process] = []
+    backend_pids: list[int] = []
     try:
         for _ in range(100):
             if transport.endpoint_exists(sock):
@@ -566,6 +590,10 @@ async def test_real_stubs_without_poolable_get_their_own_backend(
             f"through the gateway, so it has no callback address: "
             f"{fallback.read_text()}"
         )
+        # The fake server records under ``<log>.d/<pid>.txt``, so the file names
+        # are the backend pids the daemon is answerable for.
+        backend_pids = [int(p.stem) for p in Path(f"{launch_log}.d").iterdir()]
+        assert len(backend_pids) == 3
     finally:
         await _reap(procs)
         stop.set()
@@ -573,6 +601,19 @@ async def test_real_stubs_without_poolable_get_their_own_backend(
             await asyncio.wait_for(daemon, timeout=30)
         except asyncio.TimeoutError:  # pragma: no cover - daemon shutdown hang
             daemon.cancel()
+    # A private backend's reap belongs to the pool, and ``shutdown_all`` joins it:
+    # by the time ``run_gatewayd`` has returned every one of them has been
+    # terminated AND waited for. The inline ``await orphan.shutdown()`` this
+    # replaced was cancelled by the daemon's own teardown after
+    # ``release_exclusive`` had already dropped the backend from the exclusive
+    # map, so the child was outside ``shutdown_all`` and outlived the daemon --
+    # a zombie or a live process here, and its pipe transports still finalizing
+    # after the test's loop closed.
+    survivors = [pid for pid in backend_pids if pc.pid_exists(pid)]
+    assert not survivors, (
+        f"private backends {survivors} outlived run_gatewayd: their reap was not "
+        "joined by shutdown_all"
+    )
 
 
 def _windows_collect_ignore() -> list[str]:

@@ -18,11 +18,20 @@ from kiro_crew.apps.builtins import BUILTIN_NAMES
 from kiro_crew.apps.routes import register_app_routes
 from kiro_crew.constants import env_flag_enabled
 from kiro_crew.dashboard import handlers
+from kiro_crew.dashboard.handlers import redaction as redaction_handlers
 from kiro_crew.dashboard.handlers.tunnel import api_tunnel_status
 
 
 def register(app: web.Application) -> None:
     """Register the system routes on *app*."""
+    # Redaction cards: allowed hosts (Settings -> Security).
+    app.router.add_get(
+        "/api/redaction/allowed-hosts", redaction_handlers.api_redaction_allowed_hosts
+    )
+    app.router.add_post("/api/redaction/allowed-hosts", redaction_handlers.api_redaction_allow_host)
+    app.router.add_delete(
+        "/api/redaction/allowed-hosts", redaction_handlers.api_redaction_revoke_host
+    )
     # Misc (notifications GET/clear and send-message via _register_mcp_routes)
     app.router.add_get("/api/notifications", handlers.api_notifications)
     app.router.add_delete("/api/notifications", handlers.api_notification_delete)
@@ -173,6 +182,10 @@ def register(app: web.Application) -> None:
         "/api/file-delivery/consent/approve", handlers.api_file_delivery_consent_approve
     )
     app.router.add_delete("/api/file-delivery/consent", handlers.api_file_delivery_consent_delete)
+    # Credential-redaction switch. Owner-gated in the handler, like the consent
+    # routes above: its only legitimate caller is the owner's browser.
+    app.router.add_get("/api/security/credential-redaction", handlers.api_credential_redaction_get)
+    app.router.add_put("/api/security/credential-redaction", handlers.api_credential_redaction_put)
     app.router.add_get("/api/approvals", handlers.api_approvals)
     app.router.add_post("/api/approvals/{id}/{action}", handlers.api_approval_resolve)
 

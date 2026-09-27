@@ -1,7 +1,7 @@
 import type React from 'react'
 import { Folder, Check, ChevronRight } from 'lucide-react'
 import type { ChatFolder } from '../types'
-import { orderFoldersWithPaths } from '../utils/folderTree'
+import { orderFoldersWithPaths, type FolderSortMode } from '../utils/folderTree'
 import {
   DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent, DropdownMenuItem,
 } from './ui/dropdown-menu'
@@ -21,6 +21,14 @@ interface FolderMoveSubmenuProps {
   readonly label?: string
   /** Label for the "no folder (root)" entry. */
   readonly rootLabel?: string
+  /**
+   * Sibling order of the listed folders. A CHAT-folder caller passes the
+   * person's `dashboard.folder_sort` (`useFolderSortMode`) so the picker lists
+   * the tree in the order the sidebar beside it draws. The artifact-library
+   * callers leave the default: that preference is the chat sidebar's, and
+   * artifact folders keep their own stored order.
+   */
+  readonly sortMode?: FolderSortMode
 }
 
 /**
@@ -45,15 +53,21 @@ interface FolderMoveSubmenuProps {
  *). `Item` is the Radix menu-item primitive of the hosting menu
  * family — items must match their parent menu's family.
  */
-export function FolderPickerItems({ folders, onPick, currentFolderId, rootLabel = 'No folder (root)', Item }: {
+export function FolderPickerItems({ folders, onPick, currentFolderId, rootLabel = 'No folder (root)', Item, sortMode = 'custom' }: {
   readonly folders: readonly ChatFolder[]
+  /** The sidebar's folder sort mode, so a CHAT-folder picker lists the tree in
+   *  the order the sidebar draws. A prop rather than a hook read here because
+   *  the artifact detail page reuses these rows for ARTIFACT folders, which have
+   *  their own ordering and must not follow the chat sidebar's mode; only the
+   *  chat-folder callers pass it. */
+  readonly sortMode?: FolderSortMode
   readonly onPick: (folderId: string | null) => void
   readonly currentFolderId?: string | null
   readonly rootLabel?: string
   readonly Item: React.ComponentType<{ title?: string; style?: React.CSSProperties; onSelect?: (event: Event) => void; children?: React.ReactNode }>
 }) {
   const atRoot = currentFolderId == null || currentFolderId === ''
-  const ordered = orderFoldersWithPaths(folders)
+  const ordered = orderFoldersWithPaths(folders, sortMode)
   return (
     <>
       <Item title={rootLabel} onSelect={() => onPick(null)}>
@@ -64,7 +78,16 @@ export function FolderPickerItems({ folders, onPick, currentFolderId, rootLabel 
       {ordered.map(({ folder: f, depth, path }) => (
         <Item key={f.id} title={path} style={depth > 0 ? { paddingLeft: `${12 + depth * 16}px` } : undefined} onSelect={() => onPick(f.id)}>
           <Folder size={13} className="text-accent shrink-0" />
-          <span className="truncate">{f.name}</span>
+          {/* Two nested folders can share a name, and the indent that tells them
+              apart is visual only. `title` shows the full path on pointer hover,
+              which no browser opens on keyboard focus, so the path rides along
+              as visually-hidden text and becomes part of the item's name. Only
+              when it says something the name does not -- and then the visible
+              name is aria-hidden, so the item is spoken as its path once rather
+              than as the leaf name followed by a path ending in that same name.
+              `select-none` keeps the hidden path out of a copied selection. */}
+          <span className="truncate" aria-hidden={path !== f.name || undefined}>{f.name}</span>
+          {path !== f.name && <span className="sr-only select-none">{path}</span>}
           {currentFolderId === f.id && <Check size={13} className="ml-auto text-accent shrink-0" />}
         </Item>
       ))}
@@ -79,6 +102,7 @@ export default function FolderMoveSubmenu({
   variant,
   label = 'Move to folder',
   rootLabel = 'No folder (root)',
+  sortMode = 'custom',
 }: FolderMoveSubmenuProps) {
   // Pick the primitive family for this surface. Both families share the same
   // props shape, so the body below is identical regardless of variant.
@@ -95,7 +119,7 @@ export default function FolderMoveSubmenu({
         <ChevronRight size={12} className="text-muted" />
       </SubTrigger>
       <SubContent className="min-w-[170px] max-h-[280px] overflow-y-auto">
-        <FolderPickerItems folders={folders} onPick={onPick} currentFolderId={currentFolderId} rootLabel={rootLabel} Item={Item} />
+        <FolderPickerItems folders={folders} onPick={onPick} currentFolderId={currentFolderId} rootLabel={rootLabel} Item={Item} sortMode={sortMode} />
       </SubContent>
     </Sub>
   )

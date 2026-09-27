@@ -5612,14 +5612,18 @@ def test_every_slot_allocation_site_latches_the_predecessor_first():
 
 
 def test_the_turn_path_reads_the_predecessor_through_the_non_pruning_accessor():
-    """A source ratchet, because the two accessors are one identifier apart.
+    """A source ratchet, because the sources are one identifier apart.
 
-    `mapped_sid` and `resumable_sid` differ by a filesystem stat and a prune, and
-    at this call site that difference is a sync store read on the gateway loop
-    plus the loss of the very edge being recorded. Both spellings type-check, both
-    return the id on the happy path, and every behavioural test of the emitter
-    passes either way, because the emitter is handed the value rather than
-    choosing it. So the choice is pinned where it is made.
+    Three spellings type-check here and only one is right. `mapped_sid` and
+    `resumable_sid` differ by a filesystem stat and a prune, and at this call site
+    that difference is a sync store read on the gateway loop plus the loss of the
+    very edge being recorded. Feeding the latch from the mapping ALONE type-checks
+    too, and is the defect this edge was moved off: the mapping is deliberately a
+    generation behind while an allocation's replay is pending, so a gateway that
+    restarts inside that window cites a generation back and the store between is
+    cited by nobody. Every behavioural test of the emitter passes on any of the
+    three, because the emitter is handed the value rather than choosing it. So the
+    choice is pinned where it is made.
 
     It is pinned at EVERY site, not one: the slot has two allocation sites -- the
     eager prefetch and the first real turn -- and a spelling that is right at one
@@ -5627,29 +5631,88 @@ def test_the_turn_path_reads_the_predecessor_through_the_non_pruning_accessor():
     edge, which is the shape that shipped broken once already. A site added later
     that feeds the latch from anything else reds this.
 
-    Mutation guard: swapping either call site to `resumable_sid`, or feeding the
-    latch from any other source, reds this.
+    Mutation guard: feeding either latch from `mapped_sid` directly, or swapping the
+    resolver's own fallback to `resumable_sid`, reds this.
     """
     runner = Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard" / "chat_runner.py"
     source = runner.read_text(encoding="utf-8")
     # Joined because the call can be wrapped across lines; the whole expression is
     # what this pins, so a line-at-a-time read could not see it.
     flat = " ".join(source.split())
-    latches = re.findall(r"slot\.latch_crew_log_previous\([^)]*\)[^)]*\)", flat)
-    # Both allocation sites, each reading the mapping through the non-pruning
-    # accessor under the session key. The `sessions` receiver differs because the
-    # prefetch is handed the boundary directly and the turn reaches it through
-    # `state`.
+    found = re.findall(r"slot\.latch_crew_log_previous\([^)]*\)", flat)
+    # Paren-adjacent spaces dropped, because whether a call fits on one line is the
+    # formatter's business and this ratchet is about what feeds the latch.
+    latches = [call.replace("( ", "(").replace(" )", ")") for call in found]
+    # Both allocation sites, each latching ALL THREE parts of what the one resolver
+    # answered. A site that passed only the sid would latch a slot with an
+    # undetermined predecessor as one that has none; a site that dropped
+    # `from_mapping` would cite the mapping inside the window where it is knowingly a
+    # generation behind, because the slot cannot otherwise tell a mapped id from its
+    # own record.
     assert latches == [
-        "slot.latch_crew_log_previous(sessions.mapped_sid(session_key))",
-        "slot.latch_crew_log_previous(state.sessions.mapped_sid(session_key))",
+        "slot.latch_crew_log_previous(_previous.sid, undecided=_previous.undecided, "
+        "from_mapping=_previous.from_mapping,)",
+        "slot.latch_crew_log_previous(_previous.sid, undecided=_previous.undecided, "
+        "from_mapping=_previous.from_mapping,)",
     ], f"the predecessor is latched somewhere unexpected: {latches}"
-    # Spent exactly once, at the emitter call. A second consumer would hand the
-    # same edge to two entries; none would leave it for the slot's next store.
-    takes = [line.strip() for line in source.splitlines() if "take_crew_log_previous(" in line]
+    # Each of those reads its pair from the one helper that consults the store first.
+    # The `sessions` receiver differs because the prefetch is handed the boundary
+    # directly and the turn reaches it through `state`.
+    resolutions = re.findall(r"_previous = await _slot_predecessor_store\([^)]*\)", flat)
+    assert resolutions == [
+        "_previous = await _slot_predecessor_store(sessions, slot, session_key)",
+        "_previous = await _slot_predecessor_store(state.sessions, slot, session_key)",
+    ], f"the predecessor is resolved somewhere unexpected: {resolutions}"
+    # The store is the authority and the mapping is the fallback, read non-pruning,
+    # inside that one helper -- so this ratchet pins one resolution rather than one
+    # per call site.
+    resolver = source[source.index("async def _slot_predecessor_store(") :]
+    resolver = resolver[: resolver.index("\ndef ")]
+    assert "await asyncio.to_thread( crew_log_emit.slot_previous_store, slot.key )" in " ".join(
+        resolver.split()
+    )
+    # The mapping serves a DECIDED empty only, and comes back FLAGGED rather than
+    # cited: whether allocation is holding the prior resumable id back cannot be read
+    # here, because the marker belongs to a session this runs before. The undecided
+    # case names no store while SAYING so, rather than citing the source the store read
+    # was preferred over or passing for a log that has no predecessor at all. And the
+    # absence is STATED only when the store's answer is complete -- units it could not
+    # rank make an empty mapping no finding about this slot.
+    assert "undecided=False if complete else None," in resolver
+    assert 'return CrewLogPrevious(sid="", undecided=True)' in resolver
+    assert "provider_switch_replay_pending" not in resolver, (
+        "the replay window is decided in the resolver again, which runs before this "
+        "turn's session exists -- so a cold start reads 'no replay owed' from there "
+        "being nobody to ask, and cites the generation the mapping is holding"
+    )
+    # Spent exactly once, at the emitter call, which is also where the slot is told
+    # which store it is now on. A second consumer would hand the same edge to two
+    # entries; none would leave it for the slot's next store. The record is what names
+    # a store whose unit is still queued to the writer thread, so dropping it here
+    # reopens that window.
+    #
+    # Read off the FLATTENED source for the same reason the latches are: whether the
+    # call fits on one line is the formatter's business.
+    takes = [
+        call.replace("( ", "(").replace(" )", ")")
+        for call in re.findall(r"slot\.take_crew_log_previous\([^)]*\)", flat)
+    ]
     assert takes == [
-        "previous_sid=slot.take_crew_log_previous(),"
+        "slot.take_crew_log_previous(now_writing=_crew_log_sid, "
+        "replay_pending=_crew_log_replay_owed)"
     ], f"the predecessor edge is consumed somewhere unexpected: {takes}"
+    # The window is asked about HERE, where a session exists to answer. Asked at the
+    # latch instead, a cold start is told "no replay owed" by the absence of anybody to
+    # ask, and that is the case where the mapping is most likely a generation behind.
+    assert (
+        "_crew_log_replay_owed = state.sessions.provider_switch_replay_pending(session_key) "
+        "is True" in flat
+    )
+    # BOTH halves reach the entry from that one handover. Feeding the emitter the sid
+    # alone would write a log that claims to start the slot's chain while its
+    # predecessor was merely undetermined.
+    assert "previous_sid=_crew_log_edge.sid," in source
+    assert "previous_undecided=_crew_log_edge.undecided," in source
 
 
 def test_the_predecessor_is_read_without_pruning_the_mapping():
@@ -5719,3 +5782,184 @@ def test_a_store_whose_front_retention_removed_reports_no_edge():
     folded = crew_log_projection.read_projection(SUCCESSOR, "status").value
     assert folded["previous"] is None
     assert folded["lifecycle"] == "unknown", "and the fold says it could not read an opener"
+
+
+# --- the failure warning budget -------------------------------------------
+
+
+def _warnings(caplog) -> list[str]:
+    """The messages a DEFAULT-level operator actually sees."""
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def _age_budget(seconds: float) -> None:
+    """Move every held budget *seconds* into the past.
+
+    Drives the re-arm without a sleep and without patching the clock: the window
+    is state, so the test states it.
+    """
+    with emit._lock:
+        for key, (warned_at, swallowed) in list(emit._warn_budget.items()):
+            emit._warn_budget[key] = (warned_at - seconds, swallowed)
+
+
+def test_a_second_kind_of_failure_is_named_even_after_an_earlier_one(caplog):
+    """A spent slot must not hide a DIFFERENT failure.
+
+    The budget exists so a failing store cannot flood the log, and that intent is
+    sound; the granularity is what has to distinguish "the same failure repeating"
+    from "a different failure happening once". A disk refusing an append for
+    ENOSPC, the same disk then failing for EIO, and a lost write lease are three
+    different facts about the host, and an operator who is told only the first
+    learns nothing about the two that follow.
+    """
+    full = OSError(28, "No space left on device")
+    broken = OSError(5, "Input/output error")
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        emit._report("growth listener", RuntimeError("listener blew up"), op="growth-listener")
+        emit._report("appending an entry", full, op="crew-append")
+        emit._report("appending an entry", broken, op="crew-append")
+        emit._report("opening the crew log", RuntimeError("lease lost"), op="crew-log-open")
+    seen = _warnings(caplog)
+    assert len(seen) == 4, f"four distinct failures, {len(seen)} named: {seen}"
+    # Each one names its own operation, so the lines are told apart by a reader.
+    assert any("growth listener" in m for m in seen)
+    assert any("No space left" in m for m in seen)
+    assert any("Input/output error" in m for m in seen)
+    assert any("lease lost" in m for m in seen)
+
+
+def test_one_kind_repeating_is_named_once_not_once_per_failure(caplog):
+    """The reverse direction: the flood the budget exists to prevent.
+
+    Without this, an implementation that simply deleted the budget would satisfy
+    the test above and log a line per failed append -- which is the behaviour the
+    suppression was written for in the first place.
+    """
+    full = OSError(28, "No space left on device")
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        for _ in range(25):
+            emit._report("appending an entry", full, op="crew-append")
+    seen = _warnings(caplog)
+    assert len(seen) == 1, f"25 failures of one kind named {len(seen)} times: {seen}"
+
+
+def test_many_units_failing_at_once_are_named_once_not_once_per_unit(caplog):
+    """The other flood: one cause reaching many stores is still one cause.
+
+    A disk that fills up fails every store on it. The key holds the operation and
+    the error, never the unit, so a full disk is one warning rather than one per
+    crew log -- the unit is in the message for the reader, not in the budget.
+    """
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        for n in range(40):
+            emit._report(
+                f"appending crew_report for crew 'store-{n}'",
+                OSError(28, "No space left on device"),
+                op="crew-report-append",
+            )
+    seen = _warnings(caplog)
+    assert len(seen) == 1, f"one cause across 40 stores named {len(seen)} times: {seen}"
+
+
+def test_a_spent_budget_says_how_many_failures_it_swallowed(caplog):
+    """A budget that ran out has to say so.
+
+    A slot that is spent and then never speaks again is the original defect scoped
+    down: an ongoing failure stays invisible at default level. So the swallowed
+    failures are counted, and the count rides on the next warning for that kind
+    once the window has passed.
+    """
+    full = OSError(28, "No space left on device")
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        for _ in range(7):
+            emit._report("appending an entry", full, op="crew-append")
+        assert len(_warnings(caplog)) == 1, "the window had not passed yet"
+        _age_budget(emit._WARN_REARM_SECONDS + 1.0)
+        emit._report("appending an entry", full, op="crew-append")
+    seen = _warnings(caplog)
+    assert len(seen) == 2, f"the re-armed window did not report: {seen}"
+    assert (
+        "6 more went unreported" in seen[1]
+    ), f"the spent budget did not say how many it swallowed: {seen[1]}"
+
+
+def test_the_first_warning_scopes_its_own_promise_to_this_kind(caplog):
+    """The disclosure has to match what actually happens next.
+
+    The line is the only thing telling an operator what the log will and will not
+    carry from here, so it may not promise silence for failures that are in fact
+    still reported.
+    """
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        emit._report("appending an entry", OSError(28, "full"), op="crew-append")
+    (line,) = _warnings(caplog)
+    assert "of this kind" in line, f"the promise is not scoped to the kind: {line}"
+
+
+def test_the_budget_map_is_bounded(caplog):
+    """Keys are program constants, and the map is capped even so."""
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        for n in range(emit._MAX_WARN_KINDS * 3):
+            emit._report("appending an entry", OSError(n, f"errno {n}"), op="crew-append")
+    assert (
+        len(emit._warn_budget) <= emit._MAX_WARN_KINDS
+    ), f"budget map grew to {len(emit._warn_budget)}, cap is {emit._MAX_WARN_KINDS}"
+
+
+def test_every_report_call_site_names_a_literal_operation():
+    """Enumerated from the source, so a new call site is covered by existing.
+
+    ``op`` is the only part of a call that reaches the budget key, which is what
+    keeps the map bounded and keeps one cause across many stores to one warning. A
+    site passing an f-string or a variable there would put a store name, a session
+    id or an entry type into the key and hand every unit its own warning. The
+    population is read out of the module rather than listed here, because a listed
+    set of sites goes stale the moment someone adds one.
+    """
+    import ast
+
+    tree = ast.parse(Path(emit.__file__).read_text(encoding="utf-8"))
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_report"
+    ]
+    assert sites, "no _report call sites found -- the check would pass vacuously"
+    offenders = []
+    for node in sites:
+        passed = {kw.arg: kw.value for kw in node.keywords}
+        op = passed.get("op")
+        if not isinstance(op, ast.Constant) or not isinstance(op.value, str) or not op.value:
+            offenders.append((node.lineno, ast.unparse(node)[:90]))
+    assert (
+        not offenders
+    ), f"{len(offenders)} of {len(sites)} _report sites do not name a literal op: {offenders}"
+
+
+def test_the_budget_is_keyed_and_not_a_single_process_flag():
+    """The structural pin: no one module-level boolean governs the reports.
+
+    A budget that is one flag cannot tell which failure it already named, so it
+    downgrades every later one whatever it was about. Reverting any part of the key
+    to a process-wide flag has to fail here as well as behaviourally.
+    """
+    assert isinstance(
+        emit._warn_budget, dict
+    ), f"the budget is not a keyed map but a {type(emit._warn_budget).__name__}"
+    assert not isinstance(emit._warn_budget, bool)
+    key = emit._failure_kind("crew-append", OSError(28, "full"))
+    other = emit._failure_kind("crew-log-open", OSError(28, "full"))
+    same = emit._failure_kind("crew-append", OSError(28, "full"))
+    assert key != other, "the operation does not reach the key"
+    assert key == same, "the key is not stable for one kind"
+    assert (
+        emit._failure_kind("crew-append", OSError(5, "io")) != key
+    ), "the error code does not reach the key"
+    assert emit._failure_kind("crew-append", RuntimeError("x")) != emit._failure_kind(
+        "crew-append", ValueError("x")
+    ), "the exception class does not reach the key"
+    # And the unit is deliberately absent: it lives in `what`, never in the key.
+    assert "store-1" not in "".join(map(str, key)), key

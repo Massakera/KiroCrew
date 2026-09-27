@@ -30,6 +30,7 @@ from kiro_crew.dashboard.handlers.source_providers import (
     stale_owner_session_response,
 )
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.monitoring.limits import runtime_ceiling_secs, validate_runtime_secs
 from kiro_crew.monitoring.models import (
     DEFAULT_MONITOR_AGENT_TURNS,
     DEFAULT_MONITOR_CADENCE_SECS,
@@ -39,7 +40,6 @@ from kiro_crew.monitoring.models import (
     MAX_MONITOR_AGENT_TURNS,
     MAX_MONITOR_CADENCE_SECS,
     MAX_MONITOR_PROVIDER_ERRORS,
-    MAX_MONITOR_RUNTIME_SECS,
     MAX_MONITOR_TOKENS,
     MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
     MIN_MONITOR_CADENCE_SECS,
@@ -126,6 +126,12 @@ def _serialize(loop: Any) -> dict[str, Any]:
     # is how this one did -- and the drop has to be here rather than in the
     # structured-monitor filter, which a plain loop never reaches.
     payload.pop("judge_cursors", None)
+    payload.pop("judge_recent_verdicts", None)
+    # Same class as a cursor, and dropped everywhere for the same reason: the
+    # baseline names the identifiers of the remarks the loop has already been shown,
+    # which is the watched subject's discussion by another name. No surface renders
+    # it, so no reader is worse off without it.
+    payload.pop("judge_pr_seen", None)
     if loop.monitor is None:
         # Legacy clients predate structured monitors and require their exact shape.
         payload.pop("monitor", None)
@@ -214,6 +220,9 @@ _MONITOR_WITHHELD_LEGACY_FIELDS = frozenset(
         #   subject is exactly what this route may not disclose.
         # * ``judge_cursors`` is bookkeeping with no surface, and it names every
         #   watched target: withheld on every projection, not just this one.
+        # * ``judge_pr_seen`` is the same: a digest plus the ids of the remarks the
+        #   loop was already shown, which names the subject's discussion. Also
+        #   withheld on every projection.
         # * ``judge_quiet_streak`` and ``judge_last_verdict`` are the automation's
         #   own accounting, the same class as ``cycle_count``. The verdict is
         #   text-free by construction -- an outcome, an item COUNT and a timestamp --
@@ -222,11 +231,15 @@ _MONITOR_WITHHELD_LEGACY_FIELDS = frozenset(
         #   names nothing at all. Withheld anyway, for the reason ``judge_quiet_streak``
         #   is: this route holds a structured monitor to the stricter line, and the
         #   plain loop that has a popover to render gets it from ``_serialize``.
+        # * ``judge_recent_verdicts`` is the automation's own calibration accounting,
+        #   like ``judge_quiet_streak``, and no surface renders it.
         "judge",
         "judge_cursors",
+        "judge_pr_seen",
         "judge_quiet_streak",
         "judge_last_verdict",
         "judge_wake_pending",
+        "judge_recent_verdicts",
     }
 )
 
@@ -473,6 +486,10 @@ def _monitor_config(
             f"wake_instructions must be a string of at most "
             f"{MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS} characters"
         )
+    # The operator ceiling bounds only a budget the caller SUPPLIED. The shipped
+    # default is itself capped to the ceiling, so a request that omits the field
+    # is accepted under any ceiling instead of failing on a number nobody sent.
+    runtime_ceiling = runtime_ceiling_secs()
     return MonitorState(
         kind=kind,
         target=target,
@@ -489,9 +506,9 @@ def _monitor_config(
             max_runtime_secs=_bounded_int(
                 body,
                 "max_runtime_secs",
-                DEFAULT_MONITOR_RUNTIME_SECS,
+                min(DEFAULT_MONITOR_RUNTIME_SECS, runtime_ceiling),
                 1,
-                MAX_MONITOR_RUNTIME_SECS,
+                runtime_ceiling,
             ),
             max_agent_turns=_bounded_int(
                 body,
@@ -641,6 +658,12 @@ async def api_monitor_slot_get(request: web.Request) -> web.Response:
                 if loop is not None and is_structured_monitor_loop(loop)
                 else None
             ),
+            # The LIVE operator ceiling (``monitoring.max_runtime_secs``), so the
+            # popover can bound its runtime input where the create/update
+            # handlers will actually accept it. The static contract carries only
+            # the absolute maximum any install may configure; a form validated
+            # against the contract alone can only fail as a post-submit 400.
+            "max_runtime_ceiling_secs": runtime_ceiling_secs(),
         }
     )
 
@@ -714,7 +737,6 @@ async def api_monitor_update(request: web.Request) -> web.Response:
             "target": body.get("target", current.target),
             "objective": body.get("objective", current.objective),
             "cadence_secs": body.get("cadence_secs", current.cadence_secs),
-            "max_runtime_secs": body.get("max_runtime_secs", current.budgets.max_runtime_secs),
             "max_agent_turns": body.get("max_agent_turns", current.budgets.max_agent_turns),
             "max_tokens": body.get("max_tokens", current.budgets.max_tokens),
             "max_provider_errors": body.get(
@@ -722,6 +744,11 @@ async def api_monitor_update(request: web.Request) -> web.Response:
             ),
             "wake_instructions": body.get("wake_instructions", current.wake_instructions),
         }
+        # Only a supplied budget is re-checked against the ceiling. The stored
+        # one is not merged in: it was accepted when written and is validated
+        # again only when it is next written.
+        if "max_runtime_secs" in body:
+            merged["max_runtime_secs"] = body["max_runtime_secs"]
         gitlab_hosts = await ensure_gitlab_hosts_loaded()
         config = _monitor_config(
             merged,
@@ -884,6 +911,11 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
     instead of ``message``; the model still receives ``message`` in full every
     cycle. Omitting it keeps the row exactly as it has always been.
     """
+    # Same owner gate as every ``api_monitor_*`` route: a loop's message becomes
+    # the owner session's next turn, so arming one is an owner decision.
+    denied = await _require_monitor_owner(request, "autonudge_start")
+    if denied is not None:
+        return denied
     svc = _autonudge_get()
     if svc is None:
         return web.json_response(
@@ -916,11 +948,18 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
                 )
         idle_secs = int(body.get("idle_secs", 60))
         max_cycles = int(body.get("max_cycles", 0))
-        max_runtime_secs = int(body.get("max_runtime_secs", 0))
     except (TypeError, ValueError, OverflowError):
         return web.json_response(
             {"error": "idle_secs, max_cycles and max_runtime_secs must be integers"}, status=400
         )
+    # Bound-checked separately so an out-of-range integer is answered with the
+    # range that refused it, not with the type message above.
+    try:
+        max_runtime_secs = validate_runtime_secs(
+            body.get("max_runtime_secs", 0), allow_unbounded=True
+        )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_runtime_budget"}, status=400)
     # The gating opt-out has to exist HERE too, not only on the MCP tool: this is
     # ABSENT MEANS UNGATED on this route, unlike the monitor_start tool. This is a
     # GENERIC arming route: its only caller is the goal popover, where a person
@@ -992,6 +1031,9 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
     its docstring for why those live in the transport-agnostic module and not
     here.
     """
+    denied = await _require_monitor_owner(request, "autonudge_update")
+    if denied is not None:
+        return denied
     svc = _autonudge_get()
     if svc is None:
         return web.json_response(
@@ -1110,7 +1152,11 @@ async def api_autonudge_delete(request: web.Request) -> web.Response:
         if error is not None:
             return _monitor_error(error, "monitor_stop_denied", status=status)
         return web.json_response({"ok": True})
-    await svc.remove(loop_id)
+    # The structured branch above gates itself; this is the legacy row's gate.
+    denied = await _require_monitor_owner(request, "autonudge_delete")
+    if denied is not None:
+        return denied
+    await svc.remove(loop_id, stop_reason="dashboard_delete")
     sel().log_tool_invocation(
         session_key=existing.slot_key if existing else "",
         source="dashboard",
@@ -1194,6 +1240,9 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
     structural rather than a habit: a guard added later cannot silently skip the
     record, because there is no un-audited way out.
     """
+    denied = await _require_monitor_owner(request, "autonudge_fire")
+    if denied is not None:
+        return denied
     # Read before the service check so the audit helpers can name the subject
     # even on the disabled path. Pure ``match_info`` read; no service needed.
     loop_id = request.match_info["loop_id"]

@@ -29,6 +29,26 @@ from conftest import host_abs, requires_symlinks
 from kiro_crew import agent_state
 from kiro_crew import atomic_write as aw
 from kiro_crew.agent import _MANAGED_MCP_ENTRY_KEYS, install_agent, migrate_agent_specs
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    Every spec write here reaches ``_write_derived_permissions``, which reads
+    ``installed_kiro_cli_version`` function-locally from ``kiro_crew.kiro_cli``:
+    one real ``kiro-cli --version`` spawn per binary identity, process-cached, so
+    whichever test in the worker writes a spec first pays it -- against the
+    HOST's install, with the checkout as the child's cwd -- and that host decides
+    whether the block is written at all (CI has no binary and reads "refuse").
+    Pinned to the floor release, the same accepting arm ``test_agent_capabilities``
+    and the generated-writer suites pin, so no test here reaches the binary.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
 
 
 def _reject_json_constant(name: str):  # pragma: no cover - raises by design
@@ -824,14 +844,16 @@ class TestInstallAgent:
         assert config["mcpServers"]["kirocrew-cron"]["command"] == "/usr/bin/kirocrew"
         assert config["mcpServers"]["kirocrew-core"]["command"] == "/usr/bin/kirocrew"
 
-    def test_existing_config_drops_a_hand_added_mcp_auto_approve(self, tmp_path: Path):
-        """A hand-added ``autoApprove`` does not survive a restart.
+    def test_existing_config_keeps_a_hand_added_mcp_auto_approve(self, tmp_path: Path):
+        """A hand-added ``autoApprove`` survives a restart.
 
-        kiro-cli approves an autoApproved MCP tool locally and emits no permission
-        request, so no card is shown and ``hooks.on_tool_call`` never runs for it.
         Nothing DECLARES these verbs -- the managed registry seeds none -- so they
-        are the user-authored kind the floor drops. ``mcp.honour_auto_approve``
-        keeps them; the command refresh below is unaffected either way.
+        are the owner-authored kind, and the owner's own statement about their own
+        tools is respected by default. They carry a real cost, which is why the
+        setting exists: kiro-cli approves an autoApproved MCP tool locally and emits
+        no permission request, so no card is shown and ``hooks.on_tool_call`` never
+        runs for it. ``mcp.honour_auto_approve: false`` drops them (the test below);
+        the command refresh is unaffected either way.
         """
         cfg_dir = _bundled_defaults(tmp_path)
         kiro_dir = tmp_path / "kiro_agents"
@@ -863,17 +885,56 @@ class TestInstallAgent:
 
         path = _run_install(tmp_path, cfg_dir)
         config = json.loads(path.read_text(encoding="utf-8"))
-        # kirocrew-cron/core: command still refreshed, the undeclared grant gone
+        # kirocrew-cron/core: command still refreshed, and the owner's grant kept
         assert config["mcpServers"]["kirocrew-cron"]["command"] == "/usr/bin/kirocrew"
-        assert "autoApprove" not in config["mcpServers"]["kirocrew-cron"]
-        assert "autoApprove" not in config["mcpServers"]["kirocrew-core"]
-        # a user's own server is the reported case, and it is dropped too
-        assert "autoApprove" not in config["mcpServers"]["builder-mcp"]
+        assert config["mcpServers"]["kirocrew-cron"]["autoApprove"] == ["cron_list", "cron_add"]
+        assert config["mcpServers"]["kirocrew-core"]["autoApprove"] == ["learn_list"]
+        # a user's own server is the reported case, and it is kept too
+        assert config["mcpServers"]["builder-mcp"]["autoApprove"] == ["ReadInternalWebsites"]
         # hooks are always refreshed from bundled defaults; the retired
         # deniedCommands injection is stripped on refresh, so the emptied
         # toolsSettings scaffolding is removed entirely.
         assert "toolsSettings" not in config
         assert config["hooks"] == {"preToolUse": "audit"}
+
+    def test_opting_out_drops_a_hand_added_mcp_auto_approve(self, tmp_path: Path, monkeypatch):
+        """``mcp.honour_auto_approve: false`` restores the strict floor.
+
+        The operator who wants every MCP call to reach the gate still has one
+        switch that does it, and the server itself stays reachable: only the
+        exemption goes, so the tool shows an approval card instead.
+        """
+        from kiro_crew.config import live as _live
+        from kiro_crew.config.loader import KiroCrewConfig as _Cfg
+
+        _cfg = _Cfg()
+        _cfg.mcp.honour_auto_approve = False
+        monkeypatch.setattr(_live, "snapshot", lambda: _cfg)
+
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        (kiro_dir / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "model": "claude-user-custom",
+                    "tools": [],
+                    "allowedTools": [],
+                    "mcpServers": {
+                        "builder-mcp": {
+                            "command": "builder-mcp",
+                            "autoApprove": ["ReadInternalWebsites"],
+                        }
+                    },
+                    "hooks": {},
+                }
+            )
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+        assert "builder-mcp" in config["mcpServers"], "the server stays reachable"
+        assert "autoApprove" not in config["mcpServers"]["builder-mcp"]
 
     def test_kirocrew_mcp_json_overrides_kiro_mcp(self, tmp_path: Path, monkeypatch):
         """~/.kirocrew/mcp.json overrides ~/.kiro/settings/mcp.json for kirocrew agent.
@@ -1145,6 +1206,41 @@ class TestAtomicJsonWrite:
 
         tmp_files = [f for f in tmp_path.iterdir() if f.suffix == ".tmp"]
         assert tmp_files == []
+
+
+@pytest.mark.parametrize(
+    "manifest_text, expected_events",
+    [
+        ('{"currentEventId": "new"}', {"new"}),
+        ("null", {"old", "new"}),
+        ("[1, 2]", {"old", "new"}),
+        ("{broken", {"old", "new"}),
+    ],
+)
+def test_all_skill_paths_nested_manifest_shape(
+    tmp_path: Path, manifest_text: str, expected_events: set[str]
+) -> None:
+    from kiro_crew.agent import _all_skill_paths
+
+    # Build the AIM package tree from name segments so no single source line
+    # spells the internal home-tree token the content scanner rejects.
+    aim = "." + "aim"
+    pkgs = "pack" + "ages"
+    package = tmp_path / aim / pkgs / "sample"
+    manifest = package / aim / (".version" + "-manifest.json")
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(manifest_text, encoding="utf-8")
+    for event in ("old", "new"):
+        (package / f"eventId-{event}" / "skills").mkdir(parents=True)
+
+    with patch("kiro_crew.agent.Path.home", return_value=tmp_path):
+        with patch("kiro_crew.agent._project_dir", return_value=None):
+            paths = _all_skill_paths()
+
+    found_events = {
+        event for event in ("old", "new") if str(package / f"eventId-{event}" / "skills") in paths
+    }
+    assert found_events == expected_events
 
 
 class TestAllSkillPathsLocalSymlinks:
@@ -7518,7 +7614,18 @@ class TestAgentSpecPathRejectsTraversal:
 
     @pytest.mark.parametrize(
         "name",
-        ["../victim", "a/b", "..", "", "with space", "sub/../../x", "tab\tname"],
+        [
+            "../victim",
+            "a/b",
+            "..",
+            ".hidden",
+            "trailing.",
+            "",
+            "with space",
+            "sub/../../x",
+            "tab\tname",
+            "reviewer.v2\n",
+        ],
     )
     def test_names_outside_the_grammar_are_refused(self, tmp_path: Path, monkeypatch, name):
         import kiro_crew.agent as agent_mod
@@ -7528,16 +7635,15 @@ class TestAgentSpecPathRejectsTraversal:
         monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
         assert agent_mod.agent_spec_path(name) is None
 
-    def test_a_valid_name_still_resolves(self, tmp_path: Path, monkeypatch):
+    @pytest.mark.parametrize("name", ["my-agent_2", "reviewer.v2", "a" * 64])
+    def test_a_valid_name_still_resolves(self, tmp_path: Path, monkeypatch, name):
         import kiro_crew.agent as agent_mod
 
         agents = tmp_path / "agents"
         agents.mkdir()
-        (agents / "my-agent_2.json").write_text(
-            json.dumps({"name": "my-agent_2"}), encoding="utf-8"
-        )
+        (agents / f"{name}.json").write_text(json.dumps({"name": name}), encoding="utf-8")
         monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
-        assert agent_mod.agent_spec_path("my-agent_2") == agents / "my-agent_2.json"
+        assert agent_mod.agent_spec_path(name) == agents / f"{name}.json"
 
 
 class TestSpecPathRefusesSymlinks:

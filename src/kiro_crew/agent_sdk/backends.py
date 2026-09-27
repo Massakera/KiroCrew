@@ -168,6 +168,8 @@ with no row here.
      - driver-internal (whether this harness's agent asks its client for the hooks
        matching a trigger and to run one, read by the session dispatch loop that
        answers the three hook methods; no consumer above the boundary asks it)
+   * - ``ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS``
+     - semantic question (``SessionCapabilities.crew_fires_spec_hooks``)
    * - ``ACP_BACKENDS_HOST_AUTH_CALLBACK``
      - driver-internal (whether the reader loop may answer the engine's
        ``_kiro/auth/getAccessToken`` from Crew's own vault)
@@ -1670,6 +1672,28 @@ ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
     }
 )
 
+#: How a member of the model channel above says it refused a model VALUE, when the
+#: JSON-RPC code alone does not say so. pi-acp answers a ``provider/model`` id that
+#: pi cannot select -- one absent from the operator's ``models.json``, or whose
+#: provider has no key -- with a bare ``-32603 Internal error`` whose details start
+#: with this text: its ``setSessionModel`` wraps pi's own ``set_model`` failure.
+#: Measured on pi-acp 0.0.34 driving pi 0.87.1. Unread, the refusal is taken for a
+#: protocol fault and a stale pin fails the whole session at startup, where every
+#: other member stays on its default.
+_MODEL_REFUSAL_PHRASE_BY_BACKEND: Mapping[str, str] = {
+    ACP_BACKEND_PI: "pi set_model failed:",
+}
+
+
+def model_refusal_phrase(backend: str) -> str:
+    """The text *backend* puts in a refused model write, or ``""`` when it has none.
+
+    Read only for the ``model`` option: the phrase names the adapter's model write,
+    so it cannot describe a refused effort or any other option.
+    """
+    return _MODEL_REFUSAL_PHRASE_BY_BACKEND.get(backend, "")
+
+
 # Backends that take a reasoning-effort change through
 # ``session/set_config_option("effort", ...)``. A SEPARATE set from the model
 # channel above despite identical membership today: the two config options are
@@ -2193,6 +2217,16 @@ ACP_BACKENDS_HOST_AUTH_CALLBACK = frozenset({ACP_BACKEND_KAS})
 #: Membership authorizes the ROUTE only. The handshake does not announce the
 #: channel (``KAS_CLIENT_CAPABILITIES``), so a member asks nothing yet.
 ACP_BACKENDS_HOOKS_LIST = frozenset({ACP_BACKEND_KAS})
+
+#: Backends whose session never runs the agent spec's own ``hooks``, so Crew's turn
+#: loop fires them instead
+#: (:mod:`kiro_crew.agent_sdk.spec_hooks`). KAS takes its agent over
+#: the wire and the ``customAgents`` schema has no slot for them
+#: (``acp.kas_agents.UNSUPPORTED_SPEC_KEYS``). kiro-cli is NOT a member and must
+#: never become one: it reads the spec off disk and runs the field itself, so
+#: membership there would run every spec hook twice. A harness added later stays
+#: out until it is shown to drop the field.
+ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS = frozenset({ACP_BACKEND_KAS})
 
 # Backends that keep their OWN session records and resolve a resume from the
 # ``sessionId`` alone. For a member there is no Crew-side transcript to check

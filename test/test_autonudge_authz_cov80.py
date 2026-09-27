@@ -22,7 +22,6 @@ import pytest
 from kiro_crew import autonudge_authz
 from kiro_crew.autonudge import MonitorUpdateConflict
 from kiro_crew.autonudge_authz import (
-    MAX_RUNTIME_SECS_CEILING,
     authorize_and_add_nudge,
     authorize_and_update_nudge,
     normalize_banner,
@@ -133,11 +132,23 @@ async def test_update_rejects_runtime_budget_over_the_ceiling(audits: list[dict]
     loop, error, status = await authorize_and_update_nudge(
         svc=svc,
         loop_id="l1",
-        max_runtime_secs=MAX_RUNTIME_SECS_CEILING + 1,
+        max_runtime_secs=604_801,
         source="dashboard",
     )
-    assert loop is None and status == 400 and "7 days" in error
+    assert loop is None and status == 400 and "604800" in error
     assert svc.updated == []  # never applied
+
+
+@pytest.mark.asyncio
+async def test_update_accepts_a_whole_number_float_budget_as_an_int(audits: list[dict]) -> None:
+    """``3600.0`` is how a JSON body may spell an integer; the store receives an int."""
+    svc = RecordingSvc()
+    await authorize_and_update_nudge(
+        svc=svc, loop_id="l1", max_runtime_secs=3600.0, source="dashboard"
+    )
+    assert len(svc.updated) == 1
+    budget = svc.updated[0]["max_runtime_secs"]
+    assert budget == 3600 and type(budget) is int
 
 
 @pytest.mark.asyncio
@@ -271,8 +282,28 @@ async def test_add_rejects_a_non_integer_runtime_budget(audits: list[dict]) -> N
         max_runtime_secs="not-a-number",  # type: ignore[arg-type]
         source="dashboard",
     )
-    assert loop is None and status == 400 and error == "max_runtime_secs must be an integer"
+    assert (
+        loop is None
+        and status == 400
+        and error == "max_runtime_secs must be an integer between 0 and 604800 (7 days)"
+    )
     assert svc.added == []
+
+
+@pytest.mark.asyncio
+async def test_add_accepts_a_whole_number_float_budget_as_an_int(audits: list[dict]) -> None:
+    svc = RecordingSvc()
+    loop, error, status = await authorize_and_add_nudge(
+        svc=svc,
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
+        slot_key="chat-1-1",
+        message="watch",
+        max_runtime_secs=3600.0,  # type: ignore[arg-type]
+        source="dashboard",
+    )
+    assert error is None and status == 200
+    budget = svc.added[0]["max_runtime_secs"]
+    assert budget == 3600 and type(budget) is int
 
 
 @pytest.mark.asyncio
@@ -595,6 +626,35 @@ async def test_add_monitor_returns_conflict_when_a_wake_is_inflight(
 
     assert loop is None and status == 409
     assert error == "existing monitor wake is in flight"
+    assert [event["outcome"] for event in audits] == ["invoked", "denied"]
+
+
+@pytest.mark.asyncio
+async def test_update_monitor_bound_failure_is_an_audited_client_error(
+    audits: list[dict],
+) -> None:
+    """The store re-checks the effective runtime budget against the ceiling on
+    every structured update; its refusal reaches the caller as a 400 quoting
+    the range, matching the legacy update path."""
+
+    class BoundedSvc:
+        def get_by_id(self, _loop_id: str) -> None:
+            return None
+
+        async def update_monitor(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise ValueError("max_runtime_secs must be an integer between 1 and 3600 (1 hour)")
+
+    loop, error, status = await autonudge_authz.authorize_and_update_monitor(
+        svc=BoundedSvc(),
+        state=_state(slots={"chat-1-1": SimpleNamespace(mode="", memory_mode="persistent")}),
+        loop_id="monitor-1",
+        session_key="chat-1-1",
+        patch={"cadence_secs": 600},
+        source="dashboard",
+    )
+
+    assert loop is None and status == 400
+    assert error == "max_runtime_secs must be an integer between 1 and 3600 (1 hour)"
     assert [event["outcome"] for event in audits] == ["invoked", "denied"]
 
 

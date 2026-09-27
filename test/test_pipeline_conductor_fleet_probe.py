@@ -26,8 +26,11 @@ around its function list:
 
 from __future__ import annotations
 
+import ast
+import collections
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -827,9 +830,629 @@ def test_host_lines_reports_a_fleet_owned_unbounded_run(mod, tmp_path, monkeypat
     make_dir_link(entry / "cwd", fleet / "src")
     lines, host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
     assert lines == [
-        f"BANNED pid=101 rule={mod.DEFAULT_BANNED_RES[0]} cwd=fleet age=500s scope=suite"
+        f"BANNED pid=101 rule={mod.DEFAULT_BANNED_RES[0]} cwd=fleet age=500s scope=suite "
+        f"cmd=pytest,-q"
     ]
     assert "banned 1 | foreign 0" in host
+
+
+#: A worker's test step, as the one multi-line script a single ``cmdline`` carries:
+#: a capped run, then a read of the log that run wrote. Both lines name ``pytest``
+#: and only one of them is a command.
+CAPPED_STEP = (
+    "set -euo pipefail\n"
+    'timeout 900 "$PY" -m pytest -n0 test/test_x.py -q > /wt/pytest.log 2>&1\n'
+    'grep -E "^(FAILED|ERROR)| passed|failed" /wt/pytest.log | tail -2\n'
+)
+
+
+def test_a_pytest_filename_is_not_a_pytest_command(mod, tmp_path, monkeypatch):
+    """A mention of the runner is not a run of it, in either of the two shapes.
+
+    Both quiet rows here were reported as violations by a rule that looked for the
+    word alone: ``.`` and ``-`` are non-word characters, so ``\\bpytest\\b`` holds
+    inside ``pytest.log`` and ``pytest-cov``, and the reading of a log a capped run
+    just wrote is the commonest command in a worker's test step. The cost of that
+    is entirely in the signal -- a conductor gates intake on a zero banned count,
+    so a false row withholds work while nothing is wrong, and it teaches whoever
+    reads the probe to discount the counter.
+
+    The packaging rows are the same defect wearing other punctuation, and they are
+    why the boundary is stated positively: naming the characters that CONTINUE a
+    token means naming ``.``, then ``-``, then ``:``, then ``=``, then ``@``, one
+    false stop at a time. Requiring a whole shell token covers all of them at once.
+
+    The loud rows are the reason this cannot be fixed by matching less: a bare run
+    and a run capped on a DIFFERENT line of the same script must still be told
+    apart, which is what the last row pins.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    quiet = {
+        # The capped run itself, both spellings.
+        "201": ["python", "-m", "pytest", "-n0", "test/test_x.py", "-q"],
+        "202": ["pytest", "-n0", "test/test_x.py"],
+        # A filename that merely carries the word.
+        "203": ["grep", "-E", "^(FAILED|ERROR)| passed|failed", "/wt/pytest.log"],
+        "204": ["tail", "-2", "/wt/pytest.log"],
+        "205": ["pip", "install", "pytest-cov"],
+        # The word as a DIRECTORY, where a path separator rather than a dot ends
+        # the token: the command here is `grep`, and the runner names a folder.
+        "210": ["grep", "-rn", "FAILED", "/wt/pytest/results.log"],
+        "211": ["type", r"C:\wt\pytest\results.log"],
+        # The word as the head of a PACKAGING token. Each of these continues the
+        # token with a character a per-character exclusion list has to name one at a
+        # time, and each would otherwise stop a worker that is installing or pulling
+        # something rather than running a suite.
+        "212": ["docker", "run", "pytest:latest"],
+        "213": ["pip", "install", "pytest==7.4.0"],
+        "214": ["conda", "install", "pytest=7.4"],
+        "215": ["npm", "i", "pytest@1.2.3"],
+        # The whole step: a capped run and a log read in one argument.
+        "206": ["bash", "-c", CAPPED_STEP],
+    }
+    loud = {
+        # A run whose worker count nobody chose.
+        "207": ["pytest", "test/test_x.py"],
+        # The same step with an UNCAPPED run beside it, in both orders. A cap
+        # belongs to the command that carries it and can excuse no other, which is
+        # what a lookahead widened to the whole script text would break: scanning
+        # forward past the command's own end reaches the cap on the line BELOW,
+        # and scanning backward would reach the one above.
+        "208": ["bash", "-c", "pytest -q test/test_y.py\n" + CAPPED_STEP],
+        "209": ["bash", "-c", CAPPED_STEP + "pytest -q test/test_y.py\n"],
+    }
+    for pid, argv in {**quiet, **loud}.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    reported = {line.split("pid=")[1].split()[0] for line in lines}
+    assert reported == set(loud), lines
+    assert f"banned {len(loud)} | foreign 0" in host
+
+
+def test_the_banned_line_names_the_command_without_echoing_its_arguments(
+    mod, tmp_path, monkeypatch
+):
+    """``cmd=`` has to make a match judgeable, and carry nothing that can be secret.
+
+    A pid alone cannot separate a real uncapped run from a command that only names
+    one, and by the time anybody opens ``ps`` the process is usually gone. The
+    field answers that -- but a command line is where a credential and a checkout
+    layout ride, so only what cannot hold either is printed: program and runner
+    NAMES from a fixed vocabulary, recognised option names with the value dropped --
+    the cap flag's digits included -- and a count for the rest.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    cases = {
+        # A path-qualified interpreter, a secret as an option VALUE under a flag name
+        # the printable list does not carry, a private path glued to a recognised
+        # option with `=`, and a target.
+        "301": [
+            "/wt/private-checkout/.venv/bin/python",
+            "-m",
+            "pytest",
+            "--token",
+            "s3cr3t-value",
+            "--cov=/wt/private-checkout/src",
+            "test/test_x.py",
+        ],
+        # An environment assignment in front of the command: the one place a secret
+        # sits in the LEADING token, where a program name would otherwise print.
+        "302": ["GITHUB_TOKEN=ghp-not-a-real-secret", "pytest", "test/test_x.py"],
+        # No flag keeps its value, the cap flag included, so `--maxfail=2` prints as
+        # its name and `-n auto` prints as `-n` with the word counted like any other
+        # bare token.
+        "303": ["pytest", "--maxfail=2", "-n", "auto", "test/test_x.py"],
+        # More flags than the field prints: the remainder is counted, never cut
+        # silently.
+        "304": ["pytest", *(f"-{letter}" for letter in "abcdefghij")],
+    }
+    for pid, argv in cases.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    line = {ln.split("pid=")[1].split()[0]: ln for ln in lines}
+    assert set(line) == set(cases), lines
+
+    assert "cmd=python,-m,pytest,--cov,+3" in line["301"]
+    assert "cmd=pytest,+2" in line["302"]
+    assert "cmd=pytest,--maxfail,-n,+2" in line["303"]
+    assert "cmd=pytest,-a,-b,-c,-d,-e,-f,-g,+3" in line["304"]
+
+    whole = "\n".join(lines)
+    for secret in (
+        "s3cr3t-value",
+        "ghp-not-a-real-secret",
+        "private-checkout",
+        ".venv",
+        "test/test_x.py",
+        "auto",
+    ):
+        assert secret not in whole, secret
+
+
+def test_an_assignment_value_holding_a_separator_is_still_withheld(mod, tmp_path, monkeypatch):
+    """The ``=`` decides before the directory is dropped, or the strip leaks the tail.
+
+    An inline ``KEY=value`` in front of a command is the one place a secret sits in
+    the LEADING token, where a program name would otherwise print. Testing its
+    shape AFTER dropping everything up to the last separator cannot see that,
+    because base64 secrets and presigned URLs routinely contain ``/``: the tail of
+    ``AWS_SECRET_ACCESS_KEY=…/dEf9gHi`` is ``dEf9gHi``, which is a perfectly good
+    program name by shape. So the assignment is recognised on the whole token.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    cases = {
+        # Slash-bearing, the shape a separator-stripping check gets wrong.
+        "311": ["OPAQUE_ONE=q7t/x2v/zPmKdR", "pytest", "test/test_x.py"],
+        # Backslash-bearing: the strip folds ``\`` to ``/`` first, so it is the
+        # same hole spelled for the other platform.
+        "312": [r"OPAQUE_TWO=abc\def\gHiJkL", "pytest", "test/test_x.py"],
+        # A separator-bearing value on a token that is NOT first, so neither the
+        # program branch nor the flag branch may take it.
+        "313": ["pytest", "TMPDIR=/wt/private-checkout/tmp", "test/test_x.py"],
+        # The case the ORDER alone decides: a value whose tail after the last
+        # separator is itself a name the printable list carries, so dropping the
+        # directory first hands the program branch a word it accepts.
+        "314": ["SECRET_PATH=/wt/private-checkout/bin/pytest", "pytest", "test/test_x.py"],
+    }
+    for pid, argv in cases.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    line = {ln.split("pid=")[1].split()[0]: ln for ln in lines}
+    assert set(line) == set(cases), lines
+
+    assert "cmd=pytest,+2" in line["311"]
+    assert "cmd=pytest,+2" in line["312"]
+    assert "cmd=pytest,+2" in line["313"]
+    assert "cmd=pytest,+2" in line["314"]
+    # Exactly one runner name: a second would be the assignment's tail arriving at
+    # the program branch because the directory was dropped before the ``=`` was read.
+    assert line["314"].split("cmd=")[1].split()[0].count("pytest") == 1
+
+    whole = "\n".join(lines)
+    for fragment in (
+        "q7t",
+        "x2v",
+        "zPmKdR",
+        "gHiJkL",
+        "private-checkout",
+        "OPAQUE_ONE",
+        "OPAQUE_TWO",
+        "TMPDIR",
+        "SECRET_PATH",
+    ):
+        assert fragment not in whole, fragment
+
+
+def test_a_short_option_value_is_dropped_whether_glued_or_spaced(mod, tmp_path, monkeypatch):
+    """A short option glues its value on, so length is all that separates the two.
+
+    ``-k`` takes a selector, which the scope readout already treats as being as
+    sensitive as any other argument. Spelled ``-k name`` the value is its own token
+    and is withheld; spelled ``-kname`` there is no ``=`` to split at, so a shape
+    that accepts ``-`` plus letters accepts the value along with the name. Only a
+    bare two-character short flag is echoed whole.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    cases = {
+        "321": ["pytest", "-kMyCustomerName", "test/test_x.py"],
+        "322": ["pytest", "-k", "MyCustomerName", "test/test_x.py"],
+        "323": ["pytest", "-k=MyCustomerName", "test/test_x.py"],
+    }
+    for pid, argv in cases.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    line = {ln.split("pid=")[1].split()[0]: ln for ln in lines}
+    assert set(line) == set(cases), lines
+
+    assert "cmd=pytest,-k,+1" in line["321"]
+    assert "cmd=pytest,-k,+2" in line["322"]
+    assert "cmd=pytest,-k,+1" in line["323"]
+    assert "MyCustomerName" not in "\n".join(lines)
+
+
+def test_no_option_value_is_printed_not_even_the_cap_flags(mod, tmp_path, monkeypatch):
+    """No flag keeps its value, and the cap flag is not the exception it looks like.
+
+    A caller-supplied rule can point this scan at any program, and that program's
+    numeric option value can be a secret -- an account id, a token that happens to be
+    digits. The cap flag reads like the one value worth printing, since it is the
+    field the rule judged, but nothing separates ``-n4`` meaning four workers from
+    ``-n<account id>``: both are a flag whose value is digits. So its digits go too.
+    What that costs is the ``-n0``-versus-``-n auto`` readout, and only under a custom
+    rule -- a default-rule line never carries a digits-valued cap, because a run with
+    one is exactly the run the rule declines to report.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    cases = {
+        "331": ["custom-runner", "-u1234567890", "--jobs=4"],
+        "332": ["custom-runner", "-n0", "--numprocesses=4"],
+        # Both cap spellings carrying a secret in place of a worker count.
+        "333": ["custom-runner", "-n4055511234", "--numprocesses=4055511234"],
+    }
+    for pid, argv in cases.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines(
+        {"fleet_worktrees": [str(fleet)], "banned_process_res": [r"\bcustom-runner\b"]}
+    )
+    line = {ln.split("pid=")[1].split()[0]: ln for ln in lines}
+    assert set(line) == set(cases), lines
+
+    assert "cmd=-u,--jobs,+1" in line["331"]
+    assert "cmd=-n,--numprocesses,+1" in line["332"]
+    assert "cmd=-n,--numprocesses,+1" in line["333"]
+
+    whole = "\n".join(lines)
+    assert "1234567890" not in whole
+    assert "4055511234" not in whole
+    # No digit of any option value survives anywhere in the printed field.
+    for pid in cases:
+        printed = line[pid].split("cmd=")[1].split()[0]
+        # The custom program's own NAME is withheld too: a rule may point this scan at
+        # any program, and "looks like a program name" is satisfied by an opaque
+        # credential. What identifies the command is ``rule=``, which the operator
+        # wrote. The only digits left are the withheld count after ``+``.
+        assert "custom-runner" not in printed, printed
+        assert not any(ch.isdigit() for ch in printed.split("+")[0]), printed
+
+
+def test_no_module_level_name_in_the_probe_is_defined_twice() -> None:
+    """A second definition binds and the first goes dead, carrying its docstring with it.
+
+    Rebinding a constant to the same value changes no behaviour, so nothing in the
+    normal evidence chain objects: the formatter, the linter and the type checker all
+    read a plain assignment as legal, and every test still passes because the value is
+    identical. What moves is which docstring the module ships -- the LAST block wins,
+    so an edited explanation sitting in the first copy is the one that stops being the
+    file's own account of the constant. This reads the file structurally rather than
+    importing it, because import keeps only the surviving binding and cannot see that
+    a second one existed.
+    """
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    counts: collections.Counter[str] = collections.Counter()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    counts[target.id] += 1
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            counts[node.target.id] += 1
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            counts[node.name] += 1
+
+    assert counts, "parsed no module-level definitions, so this guard proves nothing"
+    duplicated = {name: n for name, n in counts.items() if n > 1}
+    assert not duplicated, duplicated
+
+
+def test_every_printable_token_is_shorter_than_the_character_bound(mod):
+    """The clip is a BACKSTOP, so what needs proving is that nothing reaches it.
+
+    No option keeps its value, so every token this field can print is either a
+    two-character flag or an entry of a fixed vocabulary -- the per-token clip has
+    nothing to clip, and a runtime test feeding a long token cannot reach it. What
+    matters instead is the property that makes it unreachable, which is a statement
+    about the vocabularies themselves: check them directly, and the day somebody adds
+    a longer entry this fails rather than silently emitting a clipped token nobody
+    expected.
+    """
+    bound = mod._MAX_CMD_TOKEN_CHARS
+    vocabularies = {
+        "_RUNNER_BASES": mod._RUNNER_BASES,
+        "_LAUNCHER_BASES": mod._LAUNCHER_BASES,
+        "_SAFE_LONG_FLAG_NAMES": mod._SAFE_LONG_FLAG_NAMES,
+    }
+    for label, entries in vocabularies.items():
+        assert entries, label
+        for entry in entries:
+            assert len(entry) <= bound, (label, entry, len(entry))
+
+    # ``python3.12`` and the longest version this stem admits.
+    assert mod._PYTHON_BASE_RE.match("python3.12")
+    assert len("python3.99.exe") <= bound
+
+    # The clip itself still works, checked on the helper rather than through a
+    # process, since no process can produce a token this long any more.
+    assert mod._SAFE_SHORT_FLAG_RE.match("-n")
+
+
+def test_the_character_bound_clips_and_marks_an_over_long_token(mod, tmp_path, monkeypatch):
+    """The backstop is dead code unless it is exercised, so exercise it directly.
+
+    A vocabulary entry longer than the bound is the case this guards, and no argv can
+    produce one today. Adding such an entry for the length of one call is what shows
+    the clip fires and marks what it cut.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    long_flag = "--" + "z" * 4096
+    monkeypatch.setattr(
+        mod, "_SAFE_LONG_FLAG_NAMES", frozenset(mod._SAFE_LONG_FLAG_NAMES | {long_flag})
+    )
+    entry = proc_pid(root, "341", ["pytest", long_flag], starttime=50_000)
+    make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert len(lines) == 1, lines
+    printed = lines[0].split("cmd=")[1].split()[0]
+    assert printed == f"pytest,{long_flag[: mod._MAX_CMD_TOKEN_CHARS]}~"
+    assert len(printed) < len(long_flag)
+
+
+def test_a_launchers_own_option_cannot_supply_the_runners_cap(mod, tmp_path, monkeypatch):
+    """Suppressing a genuinely uncapped run is the fail-OPEN direction, so it must not.
+
+    Reading the cap from the tokens is what stops an argument's own bytes being read as
+    shell syntax, but it introduces the opposite risk: ``-n`` is not pytest's alone.
+    ``nice`` spells its priority that way and ``xvfb-run`` its display number, and both
+    are launchers this scan recognises, so a scan starting at argv[0] finds a number
+    attached to the wrong program and withholds a run nobody capped. A conductor gates
+    intake on a zero banned count, so that row going missing is worse than a false one:
+    the run keeps its unbounded worker pool and nothing says so.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    loud = {
+        # The launcher's own numeric option, in each spelling, on an UNCAPPED run.
+        "391": ["nice", "-n", "10", "pytest", "test/"],
+        "392": ["nice", "-n19", "python", "-m", "pytest", "test/"],
+        "393": ["xvfb-run", "-n", "99", "pytest", "test/"],
+        # The launcher carries one AND the runner carries a non-numeric one.
+        "394": ["nice", "-n", "5", "pytest", "-n", "auto", "test/"],
+    }
+    quiet = {
+        # The RUNNER's own cap, behind the same launcher: genuinely capped.
+        "395": ["nice", "-n", "10", "pytest", "-n0", "test/"],
+        "396": ["nice", "-n19", "python", "-m", "pytest", "--numprocesses=4", "test/"],
+    }
+    for pid, argv in {**loud, **quiet}.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    reported = {ln.split("pid=")[1].split()[0] for ln in lines}
+
+    assert set(loud) <= reported, sorted(set(loud) - reported)
+    assert reported & set(quiet) == set(), sorted(reported & set(quiet))
+
+    # Read the helper directly for the case the rule cannot deliver: an argv with no
+    # standalone runner token. The rule needs ``pytest`` as a whole shell token, and
+    # wherever that sits inside a script string the launcher's options sit there too,
+    # invisible to a token walk -- so this guard cannot be reached through
+    # ``_host_lines`` today. It is what keeps the answer conservative rather than
+    # launcher-derived if some future argv shape does arrive at it.
+    assert mod._argv_declares_a_worker_cap(["pytest", "-n0"]) is True
+    assert mod._argv_declares_a_worker_cap(["nice", "-n", "10", "pytest"]) is False
+    assert mod._argv_declares_a_worker_cap(["nice", "-n", "10"]) is False
+
+
+def test_the_cap_scan_does_not_backtrack_over_bracketed_spans(mod):
+    """Ambiguous alternatives turn an ordinary rerun argv into a stalled patrol.
+
+    The scan's first branch must not also match the characters that OPEN its span
+    branches, or every span has two parses -- whole, or character by character -- and k
+    spans admit 2**k of them. The star sits inside a NEGATIVE lookahead, so the case
+    forced to walk every parse is the one with no cap to find: exactly the ``BANNED``
+    case. A rerun naming a few dozen failed parametrized node ids is an ordinary command
+    line, nothing in this script bounds the cmdline length or the match time, and the
+    probe stalls inside the ``/proc`` walk, so the conductor loses the whole cycle.
+
+    Structural, not a stopwatch: a timing assertion on a shared runner is a flake, while
+    the disjointness is the property that makes the blow-up impossible.
+    """
+    # The first branch is a negated character class; splitting the pattern on ``|``
+    # would cut inside it, so the class is extracted and compiled instead.
+    leading = re.match(r"\(\?:(\[\^[^\]]*\])", mod._CAP_SCAN)
+    assert leading, mod._CAP_SCAN
+    first_branch = re.compile(leading.group(1))
+    for opener in ("[", "'", '"'):
+        assert not first_branch.match(opener), (opener, leading.group(1))
+
+    # And the cheap end-to-end check: a many-span uncapped argv still resolves.
+    rule = re.compile(mod.DEFAULT_BANNED_RES[0])
+    spans = " ".join(f"a.py::t[c{i}]" for i in range(40))
+    assert rule.search(f"pytest -n auto {spans}") is not None
+    assert rule.search(f"pytest -n0 {spans}") is None
+
+
+def test_a_separator_inside_one_argument_does_not_hide_the_runs_own_cap(mod, tmp_path, monkeypatch):
+    """``/proc`` gives NUL-separated arguments, so a metacharacter in one is not syntax.
+
+    The arguments are joined before matching, which puts every byte of every argument
+    into the text the cap search walks -- and a node id, a log format or a ``-k``
+    expression all carry the bytes that end a shell command. A capped run whose own
+    ``-n0`` sits behind one therefore reads as uncapped, and the response to a
+    ``cwd=fleet`` line is to stop the worker and discard the turn it was in, so this
+    direction of the mistake costs work rather than signal.
+
+    Two things answer it, and the second is what makes the first sufficient. The scan
+    crosses a bracketed or quoted span whole, which covers the spellings that mark
+    themselves as data. And for a pid that IS the runner rather than a shell holding a
+    script, the whole argv is ONE command, so the cap is re-asked of the TOKENS, where
+    an argument's own bytes can never be read as syntax -- which is the only thing that
+    covers an option value with no bracket or quote around it at all.
+
+    The loud rows keep the other direction: an UNQUOTED separator in shell text really
+    is one, and a bare run must not borrow a neighbour's cap.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    quiet = {
+        # A pipe and a semicolon inside a node id, on a properly capped run.
+        "381": ["pytest", "test/test_x.py::test_y[a|b]", "-n0"],
+        "382": ["pytest", "test/test_x.py::test_y[a;b]", "-n0"],
+        # The same inside a quoted argument, and with the long cap spelling.
+        "383": ["pytest", "'test/test_x.py::test_y[a|b]'", "--numprocesses=4"],
+        # Cap BEFORE the bracketed separator rather than after it.
+        "384": ["pytest", "-n0", "test/test_x.py::test_y[a|b]", "--cov", "src"],
+        # A separator in an argument with NO bracket and NO quote around it: an option
+        # VALUE that happens to carry one. Nothing in the text marks it as data, which
+        # is why the TOKENS rather than the joined line have to answer.
+        "387": ["pytest", "--log-format=%(levelname)s|%(message)s", "-n0"],
+        "388": ["pytest", "-k", "not slow&not flaky", "-n", "4"],
+        "389": ["pytest", "--deselect", "f.py::t[a|b]", "--numprocesses", "2"],
+    }
+    loud = {
+        # A real pipe: the command before it carries no cap, so the run is unbounded.
+        "385": ["bash", "-c", "pytest test/test_x.py | tee out.log"],
+        # A bracketed separator must not let a LATER command's cap reach back.
+        "386": ["bash", "-c", "pytest test/test_x.py::test_y[a|b];pytest -n0 g.py"],
+    }
+    for pid, argv in {**quiet, **loud}.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    reported = {ln.split("pid=")[1].split()[0] for ln in lines}
+
+    assert reported & set(quiet) == set(), sorted(reported & set(quiet))
+    assert set(loud) <= reported, sorted(set(loud) - reported)
+
+
+def test_a_recognised_name_prints_its_vocabulary_entry_not_the_token(mod, tmp_path, monkeypatch):
+    """The branch licences a vocabulary ENTRY, so the entry is what it may print.
+
+    Matching is case-insensitive, which leaves the token's casing as the one thing on
+    this line that the command being read still chooses: a word already known to equal
+    an entry of ``_RUNNER_BASES``, ``_LAUNCHER_BASES`` or the ``_PYTHON_BASE_RE`` family
+    carries no other information. That is a small disclosure, but it is the only
+    caller-chosen material the branch can reach, and printing the canonical form
+    removes it for the cost of one expression -- cheaper than tracking each token's
+    offset back to the regex match, which couples the redactor to the rule.
+
+    Both fixtures carry a lowercase invocation because the RULE is case-sensitive; the
+    vocabulary check in the redactor is not, and that difference is exactly why a
+    mixed-case token can reach the printing branch at all.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    cases = {
+        # A runner name in an OPERAND slot, in a casing the command chose.
+        "371": ["pytest", "--password", "PyTeSt", "test/test_x.py"],
+        # A recognised launcher and a Windows-cased runner, both path-qualified.
+        "372": [
+            "/wt/private-checkout/.venv/bin/PYTHON3.12",
+            "-m",
+            "pytest",
+            "PyTest.EXE",
+            "f.py",
+        ],
+    }
+    for pid, argv in cases.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    line = {ln.split("pid=")[1].split()[0]: ln for ln in lines}
+    assert set(line) == set(cases), lines
+
+    assert "cmd=pytest,pytest,+2" in line["371"]
+    assert "cmd=python3.12,-m,pytest,pytest.exe,+1" in line["372"]
+
+    whole = "\n".join(lines)
+    for chosen in ("PyTeSt", "PYTHON3.12", "PyTest.EXE", "--password"):
+        assert chosen not in whole, chosen
+
+
+def test_an_opaque_word_in_the_program_position_is_withheld(mod, tmp_path, monkeypatch):
+    """A program NAME and an opaque credential are the same text, so a shape cannot sort them.
+
+    The leading token is the one position where a bare word is printed rather than
+    counted, and a secret carrying no ``/`` and no ``=`` satisfies every rule a shape
+    can state about a program name: letters, digits, a leading alphanumeric. So the
+    branch asks a fixed list instead. Reading the name from the executable's path
+    would answer the same finding and blank the field on the ordinary case, which the
+    last two pids here are: a fleet's runner lives in a venv, and its BASENAME is what
+    this prints, so the directory it sits in does not decide whether it is readable.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    opaque = "q7TkV2xPmKdR9sLbN4zH"
+    cases = {
+        # Program-shaped by every test a shape can apply, and not a program.
+        "351": [opaque, "pytest", "test/test_x.py"],
+        # A recognised launcher, version and all, out of a private venv.
+        "352": ["/wt/private-checkout/.venv/bin/python3.12", "-m", "pytest", "test/test_x.py"],
+        # The runner itself out of a venv: the case a path-derived name would blank.
+        "353": ["/wt/private-checkout/.venv/bin/pytest", "test/test_x.py"],
+    }
+    for pid, argv in cases.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    line = {ln.split("pid=")[1].split()[0]: ln for ln in lines}
+    assert set(line) == set(cases), lines
+
+    assert "cmd=pytest,+2" in line["351"]
+    assert "cmd=python3.12,-m,pytest,+1" in line["352"]
+    assert "cmd=pytest,+1" in line["353"]
+
+    whole = "\n".join(lines)
+    assert opaque not in whole
+    assert "private-checkout" not in whole
+
+
+def test_an_opaque_word_spelled_as_a_long_option_is_withheld(mod, tmp_path, monkeypatch):
+    """``--`` and letters is a well-formed option name AND a well-formed credential.
+
+    A long option's value is dropped at the ``=`` whatever it holds, which is why the
+    NAME was the printable part -- but the name is as long as its author cares to make
+    it, so a secret spelled with two leading dashes arrived under the same branch that
+    prints ``--numprocesses``. The list of names this line has a reason to print is
+    fixed for that reason; an unrecognised flag is counted like any other token.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    opaque = "q7TkV2xPmKdR9sLbN4zH"
+    cases = {
+        # The secret wearing an option's spelling, bare and with a value.
+        "361": ["pytest", f"--{opaque}", "test/test_x.py"],
+        "362": ["pytest", f"--{opaque}=1", "test/test_x.py"],
+        # A recognised concurrency flag still prints, with its value dropped.
+        "363": ["pytest", "--dist=loadscope", "test/test_x.py"],
+    }
+    for pid, argv in cases.items():
+        entry = proc_pid(root, pid, argv, starttime=50_000)
+        make_dir_link(entry / "cwd", fleet)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    line = {ln.split("pid=")[1].split()[0]: ln for ln in lines}
+    assert set(line) == set(cases), lines
+
+    assert "cmd=pytest,+2" in line["361"]
+    assert "cmd=pytest,+2" in line["362"]
+    assert "cmd=pytest,--dist,+1" in line["363"]
+
+    whole = "\n".join(lines)
+    assert opaque not in whole
+    assert "loadscope" not in whole
+
+
+def test_every_default_rule_prints_as_one_whitespace_separated_field(mod):
+    """``rule=`` echoes the pattern verbatim onto a line read as fields.
+
+    The reader splits a ``BANNED`` line on whitespace to find ``cwd=``, ``age=``,
+    ``scope=`` and ``cmd=``, which is why ``cmd=`` joins its tokens with commas. A
+    pattern carrying a literal space would split ``rule=`` into several fields and
+    break the same reader, so whitespace inside a rule is spelled as an escape.
+    """
+    for pattern in mod.DEFAULT_BANNED_RES:
+        assert len(pattern.split()) == 1, pattern
 
 
 def test_host_lines_counts_someone_elses_run_without_printing_it(mod, tmp_path, monkeypatch):
@@ -869,6 +1492,178 @@ def test_host_lines_reports_the_wrapper_under_a_custom_rule(mod, tmp_path, monke
     )
     assert len(lines) == 1
     assert "pid=104" in lines[0]
+
+
+# --- the vitest rule: an invocation, never a mention ------------------------
+#
+# Pinned as CONDITIONS over a generated space rather than as a list of command
+# lines, because the defect is a whole class: any command whose text happens to
+# end in the phrase reads as a run of it. A fixture list pins the members someone
+# thought of, and the next spelling is another silent false stop.
+#
+# Every case goes in as argv and is stored the way the kernel stores it -- NUL
+# separated, NUL terminated -- so the read, the split and the join are all
+# exercised. A decision that only looks right against a hand-written joined string
+# cannot pass here, which is the point: the joined string is where the two
+# directions below become indistinguishable.
+
+#: Programs that carry the phrase as DATA. None of them is a test runner, and each
+#: is a thing someone maintaining these rules actually runs.
+_PHRASE_CARRIERS = (
+    ["grep", "-rn"],
+    ["rg", "--files-with-matches"],
+    ["cat"],
+    ["echo"],
+)
+
+#: Ways ONE argument can hold the phrase: alone, behind another command's words,
+#: and as the tail of a longer word. All three are one argv entry, which is what
+#: separates them from an invocation and what the joined text erases.
+_PHRASE_FORMS = (
+    "vitest run",
+    "docker run vitest run",
+    "my-vitest run",
+    "./vitest run",
+)
+
+#: How a real vitest reaches a cmdline, including the qualified shim path.
+_VITEST_PROGRAMS = ("vitest", "node_modules/.bin/vitest", "/wt/node_modules/.bin/vitest")
+
+#: What stands in front of the program when something launches it.
+_VITEST_LAUNCHERS = ([], ["npx"], ["pnpm"], ["yarn"], ["npx", "--yes"])
+
+
+def vitest_case(root, fleet, pid: str, argv: list[str]):
+    """One /proc entry for *argv*, owned by the fleet so its row would be printed."""
+    entry = proc_pid(root, pid, argv, starttime=50_000)
+    make_dir_link(entry / "cwd", fleet)
+    return entry
+
+
+def test_a_command_carrying_the_phrase_as_text_is_never_a_banned_run(mod, tmp_path, monkeypatch):
+    """The condition: the phrase inside ONE argument names no run, however carried."""
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    cases = [carrier + [form] for carrier in _PHRASE_CARRIERS for form in _PHRASE_FORMS]
+    for offset, argv in enumerate(cases):
+        # Not vacuous: the rule's PATTERN still selects every one of these, so a
+        # quiet answer can only come from the argv decision. Without this guard a
+        # case that merely stopped matching would pass while proving nothing.
+        assert re.search(mod._VITEST_BANNED_RE, " ".join(argv)), argv
+        vitest_case(root, fleet, str(200 + offset), argv)
+    lines, host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert lines == []
+    assert "banned 0 | foreign 0" in host
+
+
+def test_a_vitest_run_that_names_a_target_is_never_a_banned_run(mod, tmp_path, monkeypatch):
+    """The condition: a run with a file argument is scoped, whatever spells it."""
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    targets = (["test/a.test.ts"], ["packages/ui/test/b.spec.ts"], ["test/a.test.ts", "-t", "x"])
+    cases = [
+        launcher + [program, "run"] + target
+        for launcher in _VITEST_LAUNCHERS
+        for program in _VITEST_PROGRAMS
+        for target in targets
+    ]
+    for offset, argv in enumerate(cases):
+        vitest_case(root, fleet, str(300 + offset), argv)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert lines == []
+
+
+def test_a_bare_whole_suite_vitest_run_stays_banned(mod, tmp_path, monkeypatch):
+    """The loud half of the same condition: no file argument is a whole-suite run."""
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    cases = [
+        launcher + [program, "run"]
+        for launcher in _VITEST_LAUNCHERS
+        for program in _VITEST_PROGRAMS
+    ]
+    for offset, argv in enumerate(cases):
+        vitest_case(root, fleet, str(400 + offset), argv)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert len(lines) == len(cases)
+    assert all(mod._VITEST_BANNED_RE in line for line in lines)
+
+
+def test_the_argv_decision_only_ever_narrows_the_pattern(mod):
+    """Nothing this rule reports was quiet under the pattern alone.
+
+    The structural half of the fix: the argv decision is a SUBSET of the pattern's,
+    so the change can only shrink the set of pids reported and can never introduce
+    a stop that did not already exist. Stated over the generated space rather than
+    asserted in prose, because a later widening of the argv side is exactly the
+    change that would break it silently.
+    """
+    space = [
+        launcher + [program, "run"] + tail
+        for launcher in _VITEST_LAUNCHERS
+        for program in _VITEST_PROGRAMS + ("my-vitest", "vitest.cmd", "notvitest")
+        for tail in ([], ["test/a.test.ts"], ["--reporter=dot"])
+    ] + [carrier + [form] for carrier in _PHRASE_CARRIERS for form in _PHRASE_FORMS]
+    narrower = 0
+    for argv in space:
+        if mod._invokes_bare_vitest_run(argv):
+            assert re.search(mod._VITEST_BANNED_RE, " ".join(argv)), argv
+        elif re.search(mod._VITEST_BANNED_RE, " ".join(argv)):
+            narrower += 1
+    # The subset is PROPER, so the assertion above is not passing on an empty set.
+    assert narrower > 0
+
+
+def test_the_argv_decision_states_the_whole_shape_it_requires(mod):
+    """The predicate holds its own contract, not one borrowed from the pattern.
+
+    The pattern's trailing anchor already implies ``run`` ends the text for every
+    cmdline it selects, so the last two cases here cannot arrive through
+    ``_host_lines``. They are pinned at the predicate anyway: a decision that is
+    right only because something upstream filtered its input is one nobody can
+    safely edit, and retuning the pattern is exactly the edit that would reach it.
+    """
+    # The program, its subcommand, nothing else -- however the program is qualified.
+    assert mod._invokes_bare_vitest_run(["npx", "vitest", "run"])
+    assert mod._invokes_bare_vitest_run(["/wt/node_modules/.bin/vitest", "run"])
+    # The name has to be the program, not a word ending in it, and not a phrase
+    # carried inside one argument.
+    assert not mod._invokes_bare_vitest_run(["my-vitest", "run"])
+    assert not mod._invokes_bare_vitest_run(["vitest run"])
+    assert not mod._invokes_bare_vitest_run(["run"])
+    # ``run`` has to be the LAST token, and adjacent to the program: a command that
+    # merely carries the word somewhere names no bare run.
+    assert not mod._invokes_bare_vitest_run(["vitest", "run", "test/a.test.ts"])
+    assert not mod._invokes_bare_vitest_run(["npm", "run", "test:unit", "--", "vitest", "-w"])
+
+
+def test_a_custom_rule_keeps_its_joined_text_decision(mod, tmp_path, monkeypatch):
+    """An operator's own pattern is a statement about the text they wrote it against.
+
+    The argv narrowing belongs to the built-in rule, so an operator's own pattern
+    still reports the mention it was written to catch. Without this the narrowing
+    would silently answer a question the operator never asked.
+
+    A rule is identified by its pattern TEXT, so a config that copies the built-in
+    pattern verbatim IS the built-in rule and is narrowed with it -- the same
+    identity the wrapper exemption above uses, and the same answer either way, since
+    a verbatim copy asks for exactly the built-in behaviour.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    entry = proc_pid(root, "500", ["grep", "-rn", "vitest run"], starttime=50_000)
+    make_dir_link(entry / "cwd", fleet)
+    operator_rule = r"vitest\s+run\s*$"
+    assert operator_rule not in mod.DEFAULT_BANNED_RES
+    lines, _host = mod._host_lines(
+        {"fleet_worktrees": [str(fleet)], "banned_process_res": [operator_rule]}
+    )
+    assert len(lines) == 1
+    assert "pid=500" in lines[0]
 
 
 def test_host_lines_drops_the_age_when_the_pid_is_recycled_mid_scan(mod, tmp_path, monkeypatch):
@@ -1323,3 +2118,1672 @@ def test_no_parametrize_argument_reads_the_clock() -> None:
                         f"line {inner.lineno}: {ast.unparse(inner)} is evaluated at "
                         f"collection time in the parametrize list of {node.name}"
                     )
+
+
+# Every way this repo's runner is spelled on a command line, as an argv PREFIX. The
+# pin below is enumerated over this table crossed with the cap spellings, not over a
+# list of command lines: the property under test is "any invocation form, bounded or
+# not", so a form added here is covered in both directions by construction and a fix
+# that only repairs the spelling someone happened to write down cannot pass.
+RUNNER_FORMS = {
+    "bare": ["pytest"],
+    "module": ["python3", "-m", "pytest"],
+    "versioned-interpreter-module": ["python3.12", "-m", "pytest"],
+    "venv-abspath": ["/wt/.venv/bin/pytest"],
+    "py.test": ["py.test"],
+    "pytest.exe": ["pytest.exe"],
+    "alias": ["pytest-3"],
+    "alias-minor": ["pytest-3.12"],
+    "alias-abspath": ["/usr/bin/pytest-3"],
+    "alias-py.test": ["py.test-3"],
+    "alias-shebang": ["python3", "{sys}/bin/pytest-3"],
+    "alias-shebang-venv": ["python3", "{venv}/bin/pytest-3"],
+    "alias-shebang-behind-value-flag": ["python3", "-W", "ignore", "{sys}/bin/pytest-3"],
+    "alias-behind-launcher": ["timeout", "900", "pytest-3"],
+    "alias-behind-launcher-with-own-flag": ["nice", "-n", "10", "pytest-3"],
+}
+
+# Every spelling of a numeric worker cap. `-n auto` is deliberately absent: the rule's
+# documented sense is that a count nobody chose is the reportable one, and `auto` is
+# bounded by the rootdir hook rather than by the caller.
+CAP_SPELLINGS = {
+    "glued-zero": ["-n0"],
+    "glued-four": ["-n4"],
+    "split": ["-n", "0"],
+    "equals": ["-n=0"],
+    "long-equals": ["--numprocesses=0"],
+    "long-split": ["--numprocesses", "2"],
+}
+
+# Tokens that appear AFTER the cap and name the runner without being an invocation of
+# it. Each one defeated the cap lookahead, which only ever looked forward from the
+# token it matched: the bound sits earlier in the line, so from the second occurrence
+# it is invisible and a bounded run was reported.
+TRAILING_RUNNER_SHAPED_ARGS = {
+    "junitxml": ["--junitxml=build/pytest.xml"],
+    "log-file": ["--log-file", "/var/tmp/pytest-run.log"],
+    "basetemp": ["--basetemp", "/var/tmp/pytest-of-ci"],
+    "rootdir": ["--rootdir", "/wt/pytest-sandbox"],
+}
+
+
+def banned_pids(mod, root: Path, fleet: Path) -> set[str]:
+    """The pids ``_host_lines`` emitted a ``BANNED`` line for."""
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    return {line.split()[1].split("=", 1)[1] for line in lines if line.startswith("BANNED pid=")}
+
+
+def fleet_pid(
+    root: Path, fleet: Path, pid: str, argv: list[str], *, unspoofed: bool = True
+) -> None:
+    """A fleet-owned pid whose ``cmdline`` carries the real procfs byte shape.
+
+    ``proc_pid`` writes ``"\\0".join(argv) + "\\0"`` -- arguments NUL-separated and one
+    NUL terminator, which is what the kernel produces. The scan is driven through that
+    byte path on purpose: a pre-joined string handed straight to the rules cannot show
+    that the split, the dropped terminator and the re-join preserved the argument
+    boundaries the argv-side checks read.
+
+    The ``cwd`` link goes through ``make_dir_link`` like every other directory link in
+    this file: a name meaning another DIRECTORY is a junction on Windows and needs no
+    privilege, where a bare ``symlink_to`` would raise on an unelevated Windows shell and
+    ERROR every case built on this fixture instead of running it.
+
+    ``unspoofed`` supplies the ``exe`` link as well, because a real fleet-owned process
+    has one: it runs as the fleet's own uid, so the kernel's binary always reads, and the
+    ``argv[0]`` rule requires that binary to CONFIRM the name the process claims. An
+    unspoofed process is one whose binary's name IS what ``argv[0]`` says, so the link is
+    built from ``argv[0]``'s own last component -- the ordinary case, and therefore the
+    default. Pass ``unspoofed=False`` for a test that arranges the link itself or needs it
+    absent.
+
+    That link is a DIRECTORY junction rather than a symlink to a file, and the difference
+    is free: the probe reads the link's TARGET as a string and takes its last component,
+    never stating it, so a junction carries exactly the same fact while needing no
+    Windows privilege and adding nothing to the real-symlink inventory.
+    """
+    entry = proc_pid(root, pid, argv, starttime=500)
+    make_dir_link(entry / "cwd", fleet)
+    if unspoofed and argv:
+        name = argv[0].replace("\\", "/").rpartition("/")[2] or "program"
+        binary = fleet.parent / "kernel" / name
+        binary.mkdir(parents=True, exist_ok=True)
+        make_dir_link(entry / "exe", binary)
+
+
+def install_prefixes(tmp_path: Path) -> dict[str, str]:
+    """Real prefixes for the entry-point tests, keyed for ``str.format`` substitution.
+
+    A console script is installed into the same directory as the interpreter it was
+    installed for, so these tests have to BUILD that rather than name a path and rely on
+    the host having one. Naming ``/usr/local/bin`` would pass or fail with whatever the
+    runner happens to have installed there, which is the worst kind of test: green on one
+    host and red on another for reasons the change never touched.
+
+    The four installed prefixes are deliberately unlike each other -- a system root, a
+    virtualenv inside the fleet checkout, a version-manager prefix -- because the rule
+    must recognise all of them without naming any. Each one's ``bin`` gets the three
+    interpreter spellings a real installation carries.
+
+    Three counterexamples come with them, and the third is the one that matters most.
+    ``checkout`` is the case GPT's finding named: a repository that merely HOLDS a ``bin``
+    directory, with no interpreter installed beside its contents. Every prefix's ``sbin``
+    is created EMPTY, because a python console script is never installed there -- it
+    separates "a directory whose name looks like an installation's" from "a directory an
+    interpreter was installed into". And ``user`` models a ``pip install --user``, which
+    writes the console script into ``~/.local/bin`` and NO interpreter with it: writing
+    one there would fabricate a file a real ``--user`` install never creates, and a test
+    passing on a fabricated file certifies a behaviour that cannot occur. So the
+    interpreter is deliberately absent and ``user`` belongs among the declining cases --
+    that miss is stated in ``_is_installed_entry_point`` rather than claimed away.
+
+    Only plain files and directories are created, so nothing here joins the real-symlink
+    privilege inventory.
+
+    Building them is host-independent; USING one is not. A prefix is only meaningful to
+    ``_is_installed_entry_point`` when it is POSIX-absolute, so the cases that actually
+    substitute one are guarded by ``require_resolvable_prefixes``. Merely calling this
+    helper is not guarded, because most of its callers enumerate runner forms of which only
+    three carry a prefix at all, and skipping the other twelve would discard real coverage
+    of platform-independent logic.
+    """
+    made: dict[str, str] = {}
+    for key, relative in (
+        ("sys", "usr"),
+        ("local", "usr/local"),
+        ("venv", "wt/.venv"),
+        ("shim", "opt/pythons/3.12.13"),
+    ):
+        prefix = tmp_path / relative
+        (prefix / "bin").mkdir(parents=True, exist_ok=True)
+        (prefix / "sbin").mkdir(parents=True, exist_ok=True)
+        (prefix / "tools").mkdir(parents=True, exist_ok=True)
+        for interpreter in ("python", "python3", "python3.12"):
+            (prefix / "bin" / interpreter).write_text("#!/bin/sh\n", encoding="utf-8")
+        made[key] = str(prefix)
+    (tmp_path / "checkout" / "bin").mkdir(parents=True, exist_ok=True)
+    made["checkout"] = str(tmp_path / "checkout")
+    # A --user install: the console script, and pointedly no interpreter beside it.
+    (tmp_path / "home" / "u" / ".local" / "bin").mkdir(parents=True, exist_ok=True)
+    made["user"] = str(tmp_path / "home" / "u" / ".local")
+    return made
+
+
+def require_resolvable_prefixes(prefixes: dict[str, str]) -> None:
+    """Skip a case that needs an installed prefix the running host cannot express.
+
+    ``_is_installed_entry_point`` declines any path it cannot resolve, and a drive-lettered
+    one is exactly that: the rule reads ``/proc/<pid>/cmdline``, which only a Linux kernel
+    writes, so ``C:/...`` never reaches it from a scanned process. On a host whose own
+    absolute paths are drive-lettered, every case built on a prefix therefore declines --
+    which turns the cases expecting a REPORT into failures and, worse, leaves the ones
+    expecting a decline passing for a reason that has nothing to do with what they pin.
+
+    Adapting the fixture would need a real interpreter at a POSIX-absolute path outside
+    ``tmp_path``, which is the host-dependent test ``install_prefixes`` exists to avoid, and
+    widening the rule would add a branch no caller can reach. So the prefix-dependent cases
+    state their absence here instead, and what the decline GUARANTEES on such a host is
+    pinned on every host by
+    ``test_an_installed_entry_point_needs_a_posix_absolute_path_on_any_host``.
+    """
+    unresolvable = sorted(p for p in prefixes.values() if not p.replace("\\", "/").startswith("/"))
+    if unresolvable:
+        pytest.skip(
+            "an installed entry point is a real interpreter beside a real script at a "
+            f"POSIX-absolute path, and this host builds {unresolvable[0]!r}; the decline "
+            "that replaces these cases is pinned on every host by "
+            "test_an_installed_entry_point_needs_a_posix_absolute_path_on_any_host"
+        )
+
+
+def with_prefixes(tokens: list[str], prefixes: dict[str, str]) -> list[str]:
+    """Substitute ``install_prefixes`` keys into an argv enumeration's tokens.
+
+    An enumeration cannot hold the paths directly, because they only exist once a test
+    has built them under its own ``tmp_path``. A token carrying no placeholder passes
+    through unchanged, so a case that is deliberately relative or deliberately Windows
+    stays exactly as written.
+
+    A case that DID take a substitution now depends on the prefix being resolvable, so that
+    is the point where ``require_resolvable_prefixes`` applies -- and only there. Three of
+    the fifteen runner forms carry a placeholder; guarding the helper itself would skip the
+    other twelve, whose logic is platform-independent and worth covering everywhere.
+    """
+    substituted = [token.format(**prefixes) for token in tokens]
+    if substituted != tokens:
+        require_resolvable_prefixes(prefixes)
+    return substituted
+
+
+@pytest.mark.parametrize("form", sorted(RUNNER_FORMS))
+@pytest.mark.parametrize("cap", sorted(CAP_SPELLINGS))
+def test_every_runner_form_stays_quiet_when_it_declares_a_cap(
+    mod, tmp_path, monkeypatch, form, cap
+):
+    """A run that CHOSE its worker count is never reported, however it is spelled.
+
+    This is the direction that destroys work: the documented answer to a fleet-owned
+    ``BANNED`` line is to stop that worker and discard the turn it was in, so a false
+    row here costs real work rather than signal.
+    """
+    prefixes = install_prefixes(tmp_path)
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    form_argv = with_prefixes(RUNNER_FORMS[form], prefixes)
+    argv = [*form_argv, *CAP_SPELLINGS[cap], "test/test_x.py"]
+    fleet_pid(root, fleet, "401", argv)
+    assert banned_pids(mod, root, fleet) == set(), f"{form} + {cap} was reported while capped"
+
+
+@pytest.mark.parametrize("form", sorted(RUNNER_FORMS))
+def test_every_runner_form_is_reported_when_it_declares_no_cap(mod, tmp_path, monkeypatch, form):
+    """A run whose worker count nobody chose is reported, however it is spelled.
+
+    The other direction, and the one the probe exists for. A form missing here is an
+    unbounded run the conductor's banned counter cannot see, so intake keeps admitting
+    work while the host is being consumed.
+    """
+    prefixes = install_prefixes(tmp_path)
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    fleet_pid(root, fleet, "402", [*with_prefixes(RUNNER_FORMS[form], prefixes), "test/"])
+    assert banned_pids(mod, root, fleet) == {"402"}, f"{form} went unreported while uncapped"
+
+
+@pytest.mark.parametrize("form", sorted(RUNNER_FORMS))
+@pytest.mark.parametrize("trailing", sorted(TRAILING_RUNNER_SHAPED_ARGS))
+def test_a_capped_run_stays_quiet_when_a_later_argument_names_the_runner(
+    mod, tmp_path, monkeypatch, form, trailing
+):
+    """A cap is still a cap when a LATER argument spells the runner's name.
+
+    ``--junitxml=build/pytest.xml`` and ``--log-file /var/tmp/pytest-run.log`` are
+    ordinary arguments of a bounded run. A forward-only cap lookahead re-tries at that
+    second occurrence, where the bound is behind it and cannot be seen, and reports the
+    run -- measured as two deterministic false rows on a live fleet.
+    """
+    prefixes = install_prefixes(tmp_path)
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    argv = [
+        *with_prefixes(RUNNER_FORMS[form], prefixes),
+        "-n0",
+        "test/test_x.py",
+        *TRAILING_RUNNER_SHAPED_ARGS[trailing],
+    ]
+    fleet_pid(root, fleet, "403", argv)
+    assert banned_pids(mod, root, fleet) == set(), (
+        f"{form} was reported while capped because a later argument named the runner "
+        f"({trailing})"
+    )
+
+
+# The alias in a position that is NOT the program: a directory component, a package
+# name, a log filename, an argument to some other command. These are what a joined-line
+# rule cannot separate from an invocation, and the whole reason the alias is detected on
+# the argv side instead -- so they are the control for that choice, not a side note.
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["ls", "/var/tmp/pytest-of-ci/pytest-3"], id="tmpdir-as-final-token"),
+        pytest.param(["pip", "install", "pytest-3"], id="package-name"),
+        pytest.param(["pip", "install", "pytest-3.12"], id="versioned-package-name"),
+        pytest.param(["cat", "pytest-3.log"], id="log-filename"),
+        pytest.param(["cat", "py.test.log"], id="py.test-log-filename"),
+        pytest.param(["ls", "/var/tmp/pytest-of-ci/py.test"], id="py.test-as-path"),
+        pytest.param(
+            ["grep", "-rn", "FAILED", "/var/tmp/pytest-of-ci/pytest-3/results.log"],
+            id="grep-target",
+        ),
+        pytest.param(["tail", "-2", "/var/tmp/pytest-of-ci/pytest-3/x.log"], id="tail-target"),
+        pytest.param(["rm", "-rf", "/var/tmp/pytest-of-ci/pytest-3"], id="cleanup-target"),
+    ],
+)
+def test_an_alias_that_is_not_the_program_is_never_reported(mod, tmp_path, monkeypatch, argv):
+    """The alias as data, under a command that is not a test run.
+
+    Each one is disqualified by its own FIRST token rather than by a pattern that has to
+    guess: the command already had a program before the alias appeared, so the alias is
+    an argument. Reporting these is what adding the alias to the joined-line rule would
+    have cost.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "404", argv)
+    assert banned_pids(mod, root, fleet) == set()
+
+
+def test_the_argv_row_names_the_argv_path_rather_than_a_rule_that_did_not_fire(
+    mod, tmp_path, monkeypatch
+):
+    """``rule=`` on an alias row names the argv path, not the pytest pattern.
+
+    The pattern genuinely did not match -- the alias is invisible to it by design --
+    so printing it would send a reader to a lookahead that is working correctly.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "405", ["pytest-3", "test/"])
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert len(lines) == 1
+    assert f"rule={mod.ARGV_RUNNER_RULE_LABEL}" in lines[0]
+    assert mod.ARGV_RUNNER_RULE_LABEL not in mod.DEFAULT_BANNED_RES
+    # The label has to survive being read as one whitespace-separated field on a line
+    # the conductor parses, so it carries no space and nothing that reopens a field.
+    assert not any(ch in mod.ARGV_RUNNER_RULE_LABEL for ch in " \t\"'`")
+
+
+def test_an_alias_run_reports_its_scope_instead_of_declining(mod, tmp_path, monkeypatch):
+    """``scope=`` answers for an alias run too.
+
+    Scope keys on the runner's own token standing alone in argv. While the alias was
+    absent from that set, every alias row printed ``scope=unknown`` -- the readout that
+    says the probe could not tell a whole-suite run from a one-file one, on exactly the
+    rows where it matters.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "406", ["pytest-3", "test/test_x.py"])
+    fleet_pid(root, fleet, "407", ["pytest-3", "--cov", "src/kiro_crew"])
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    scopes = {
+        line.split()[1].split("=", 1)[1]: line.split("scope=", 1)[1].split()[0] for line in lines
+    }
+    assert scopes == {"406": "paths", "407": "suite"}
+
+
+@pytest.mark.parametrize(
+    ("base", "is_alias"),
+    [
+        ("pytest-3", True),
+        ("pytest-3.12", True),
+        ("pytest-3.12.1", True),
+        ("py.test-3", True),
+        ("pytest-3.exe", True),
+        ("pytest", False),
+        ("pytest-cov", False),
+        ("pytest-3.log", False),
+        ("pytest-of-ci", False),
+        ("pytest3", False),
+        ("pytest-", False),
+        ("mypytest-3", False),
+        ("pytest-3-extra", False),
+    ],
+)
+def test_the_alias_pattern_admits_a_version_and_nothing_else(mod, base, is_alias):
+    """The alias shape is a version suffix, not any suffix.
+
+    ``pytest-cov`` is a plugin, ``pytest-3.log`` is a file and ``pytest-of-ci`` is a
+    tmpdir. All three are alias-SHAPED under a loose pattern, and the argv-position gate
+    would not save a token that reached it at index 0.
+    """
+    assert bool(mod._ALIAS_RUNNER_BASE_RE.match(base)) is is_alias
+
+
+# Every spelling of the interpreter, so the module-position rule is pinned as a property
+# of the python family rather than of one token.
+PYTHON_SPELLINGS = {
+    "python": ["python"],
+    "python3": ["python3"],
+    "python3.12": ["python3.12"],
+    "python-abspath": ["/wt/.venv/bin/python3"],
+    "python-with-own-flag": ["python3", "-u"],
+}
+
+# What an interpreter is given when the thing it runs is a SCRIPT. In each one the alias
+# is an argument to that script, so it names no program.
+#
+# The tails are split deliberately. A script whose name carries a program suffix is also
+# caught by the suffix rule, so those cases alone cannot show the interpreter rule doing
+# any work -- a mutation removing it stays green. The suffixless tails are the ones that
+# isolate it: nothing but "an interpreter's first non-option operand is the script"
+# separates them from an invocation.
+INTERPRETER_SCRIPT_TAILS = {
+    "script-then-alias": ["worker.py", "pytest-3"],
+    "script-then-alias-path": ["cleanup.py", "/var/tmp/pytest-of-ci/pytest-3"],
+    "script-then-py.test": ["worker.py", "py.test"],
+    "script-then-alias-among-args": ["runner.py", "--target", "pytest-3", "test/"],
+    "dashless-script-then-alias": ["tools/sweep.py", "pytest-3.12"],
+    "suffixless-script-then-alias": ["worker", "pytest-3"],
+    "suffixless-script-then-py.test": ["harness", "py.test"],
+    "suffixless-script-then-alias-path": ["sweep", "/var/tmp/pytest-of-ci/pytest-3"],
+    "inline-code-then-alias": ["-c", "import sys; print(sys.argv)", "pytest-3"],
+    "subcommand-shaped-operand-then-alias": ["run", "pytest-3"],
+    # These two isolate the POSITION guard from the entry-point requirement. Every tail
+    # above hands the script a name that is not an installed path, so the entry-point
+    # test alone would decline it and the position guard is never reached. Here the
+    # argument IS an installed entry-point path, so only "the candidate must BE python's
+    # execution target" can decline it -- an ordinary way to tell a wrapper which runner
+    # to use.
+    "script-then-entry-point-path": ["worker.py", "{sys}/bin/pytest-3"],
+    "script-then-venv-entry-point": ["harness.py", "{venv}/bin/pytest-3"],
+}
+
+# What an interpreter is given when the SCRIPT IT RUNS IS the runner. This is the
+# position the ordinary packaged alias actually occupies: `/usr/bin/pytest-3` carries a
+# python shebang, so the kernel's argv for it is `python3 /usr/bin/pytest-3 …` and the
+# alias never reaches argv[0] at all. Admitting the alias only as the argument of `-m`
+# therefore declines the ordinary run of the very spelling this file detects.
+#
+# The flag tails are here for the same reason the suffixless tails are in the set above:
+# they isolate one rule. `python3 -W ignore prog` has a non-option token that is NOT the
+# script, so a reading that simply took the first dashless token would answer `ignore`
+# and decline the real invocation one position later.
+INTERPRETER_ENTRY_POINT_SCRIPTS = {
+    "system-prefix": ["{sys}/bin/pytest-3"],
+    "local-prefix": ["{local}/bin/pytest-3"],
+    "venv-prefix": ["{venv}/bin/pytest-3"],
+    "venv-minor-version": ["{venv}/bin/pytest-3.12"],
+    "venv-dotted-spelling": ["{venv}/bin/py.test"],
+    "version-manager-prefix": ["{shim}/bin/py.test-3"],
+    "behind-flag-bundle": ["-Es", "{sys}/bin/pytest-3"],
+    "behind-split-value-flag": ["-W", "ignore", "{sys}/bin/pytest-3"],
+    "behind-attached-value-flag": ["-Wignore", "{sys}/bin/pytest-3"],
+    "behind-long-option": ["--check-hash-based-pycs", "always", "{sys}/bin/pytest-3"],
+}
+
+# A script position whose path is an ordinary repository file rather than an installed
+# console script. The name alone cannot tell these from the real thing -- they are drawn
+# from the same namespace -- so the INSTALLATION is the evidence: a console script is
+# written into the same directory as the interpreter it was installed for.
+#
+# ``checkout-bin-dir`` is why the directory's NAME cannot carry this on its own. Any
+# repository can hold a ``bin``, so a rule satisfied by the name reports
+# ``python3 <worktree>/bin/pytest-3`` -- a file the checkout happens to carry -- and stops
+# a healthy worker over it. ``sbin-holds-no-interpreter`` and
+# ``install-prefix-but-not-bin`` sit inside a REAL prefix and still decline, which is what
+# separates a directory an interpreter was installed into from one that merely sits near
+# it. The three relative paths cannot be resolved at all from here, because the probe's
+# working directory is not the scanned process's.
+NON_ENTRY_POINT_SCRIPTS = {
+    "repo-tools-dir": "tools/pytest-3",
+    "repo-scripts-dir": "scripts/py.test",
+    "repo-tools-py.test-3": "tools/py.test-3",
+    "bare-name-in-cwd": "pytest-3",
+    "dot-slash-in-cwd": "./pytest-3",
+    "nested-repo-path": "src/vendor/pytest-3",
+    "pytest-temp-root": "/var/tmp/pytest-of-ci/pytest-3",
+    "absolute-repo-path": "/wt/tools/pytest-3.12",
+    "windows-venv-scripts": "C:\\wt\\.venv\\Scripts\\pytest-3",
+    "checkout-bin-dir": "{checkout}/bin/pytest-3",
+    "checkout-bin-dotted": "{checkout}/bin/py.test",
+    "checkout-bin-minor-version": "{checkout}/bin/pytest-3.12",
+    "sbin-holds-no-interpreter": "{sys}/sbin/pytest-3",
+    "install-prefix-but-not-bin": "{sys}/tools/pytest-3",
+    "user-install-has-no-interpreter": "{user}/bin/py.test",
+    "user-install-versioned-alias": "{user}/bin/pytest-3",
+    "relative-bin-dir": "bin/pytest-3",
+    "relative-dot-bin-dir": "./bin/py.test",
+    "relative-sbin-dir": "sbin/pytest-3",
+}
+
+
+@pytest.mark.parametrize("python", sorted(PYTHON_SPELLINGS))
+@pytest.mark.parametrize("script", sorted(NON_ENTRY_POINT_SCRIPTS))
+def test_a_script_position_that_is_not_an_installed_entry_point_is_not_a_runner(
+    mod, tmp_path, monkeypatch, python, script
+):
+    """``python3 tools/pytest-3`` runs a file the checkout holds, not the test runner.
+
+    The script position has no ``/proc`` fact to lean on -- the kernel's binary there is
+    the interpreter -- so the path is the only evidence, and a bare or repository-relative
+    name is a file rather than an installation. Accepting one stops a healthy worker and
+    discards its turn, which is the direction that destroys work.
+
+    The Windows ``Scripts`` case is here rather than among the entry points on purpose:
+    ``_basename`` lowercases, so it would arrive indistinguishable from an ordinary
+    ``scripts/`` directory, and a ``/proc`` cmdline comes from a Linux kernel anyway.
+    """
+    prefixes = install_prefixes(tmp_path)
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    script_path = NON_ENTRY_POINT_SCRIPTS[script].format(**prefixes)
+    argv = [*PYTHON_SPELLINGS[python], script_path, "test/"]
+    fleet_pid(root, fleet, "433", argv)
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"{python} + {script} was reported, but that path is a repo file"
+
+
+@pytest.mark.parametrize("prefix", ["sys", "local", "venv", "shim"])
+def test_an_installed_entry_point_directory_still_reports(mod, tmp_path, monkeypatch, prefix):
+    """The other direction: requiring an installation must not cost the packaged run.
+
+    The packaged alias run is the whole point of the argv path, so requiring an
+    installation has to leave every ordinary installation reporting -- and these five
+    prefixes are deliberately unalike, because the rule reads what an installation IS
+    rather than where it sits. A system root, a virtualenv and a version-manager prefix
+    all answer yes without the rule naming any of them, which is what keeps a host whose
+    interpreter is a global shim from being a special case. A ``--user`` install is NOT
+    among them: it installs no interpreter beside its scripts, so it is a stated miss and
+    sits among the declining cases instead.
+    """
+    prefixes = install_prefixes(tmp_path)
+    require_resolvable_prefixes(prefixes)
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    script = f"{prefixes[prefix]}/bin/pytest-3"
+    fleet_pid(root, fleet, "434", ["python3", script, "test/"])
+    assert banned_pids(mod, root, fleet) == {
+        "434"
+    }, f"{prefix} entry point went unreported while uncapped"
+
+
+def test_a_relative_script_path_is_not_resolved_against_the_probes_own_directory(
+    mod, tmp_path, monkeypatch
+):
+    """A relative path belongs to the scanned process's directory, not to the probe's.
+
+    ``/proc/<pid>/cmdline`` records the arguments as written, so ``python3 bin/pytest-3``
+    says nothing about which ``bin`` was meant -- and the one directory the probe must not
+    answer with is its own. Here the probe's working directory really does hold
+    ``bin/python3``, so a rule that resolved the relative path from where it happens to be
+    running would find an interpreter beside a file it has never seen and stop a healthy
+    worker. Refusing the relative path outright is what makes that impossible, and the
+    cost is a missed signal on a spelling no packaged run uses.
+    """
+    prefixes = install_prefixes(tmp_path)
+    require_resolvable_prefixes(prefixes)
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    monkeypatch.chdir(prefixes["sys"])
+    fleet_pid(root, fleet, "437", ["python3", "bin/pytest-3", "test/"])
+    assert banned_pids(mod, root, fleet) == set(), (
+        "a relative script path was resolved against the probe's own working directory, "
+        "which is not the scanned process's"
+    )
+
+
+def test_an_installed_entry_point_needs_a_posix_absolute_path_on_any_host(mod, tmp_path):
+    """A path the rule cannot resolve declines, and a drive letter is one of those.
+
+    ``_is_installed_entry_point`` asks the filesystem for one named file beside the script,
+    so it needs a path it can resolve. A drive-lettered path is not one: the rule's input is
+    ``/proc/<pid>/cmdline``, which only a Linux kernel writes, so ``C:/...`` cannot reach it
+    from a scanned process at all. Accepting it would add a branch no caller can reach,
+    while a host whose own absolute paths are drive-lettered would otherwise let every
+    entry-point case pass for the wrong reason -- declining everything, including the
+    counterexamples that are supposed to decline.
+
+    So the expectation here is tied to the PROPERTY rather than to a platform name: the
+    same real installation must report where the path is POSIX-absolute and decline where it
+    is not, which makes this one pin meaningful on both. The literal Windows spellings are
+    asserted on EVERY host, so a Linux lane guards them too.
+    """
+    prefix = tmp_path / "usr"
+    (prefix / "bin").mkdir(parents=True, exist_ok=True)
+    (prefix / "bin" / "python3").write_text("#!/bin/sh\n", encoding="utf-8")
+    installed = f"{str(prefix).replace(chr(92), '/')}/bin/pytest-3"
+    resolvable = installed.startswith("/")
+    assert mod._is_installed_entry_point(installed, "python3") is resolvable, (
+        "a real interpreter sits beside this script, so the answer must follow only "
+        f"whether the path is POSIX-absolute (it is {resolvable})"
+    )
+    for spelling in (
+        "C:/wt/.venv/Scripts/pytest-3",
+        "D:\\wt\\.venv\\Scripts\\pytest-3.exe",
+    ):
+        assert mod._is_installed_entry_point(spelling, "python3") is False, (
+            f"{spelling!r} was accepted, but a drive-lettered path cannot come from the "
+            "/proc cmdline this rule reads and cannot be resolved from the probe"
+        )
+
+
+def test_an_interpreter_absent_from_the_scripts_directory_is_not_an_installation(
+    mod, tmp_path, monkeypatch
+):
+    """The interpreter that must be present is the one ``argv[0]`` names, not any python.
+
+    A prefix carrying ``python3.12`` did not install a console script for ``python3.13``,
+    so a run naming that interpreter is not evidence of an installation here. The pin
+    matters because the cheap mistake is to accept the directory once ANY interpreter is
+    found in it, which would readmit a checkout that vendors an unrelated one.
+    """
+    prefixes = install_prefixes(tmp_path)
+    require_resolvable_prefixes(prefixes)
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    script = f"{prefixes['sys']}/bin/pytest-3"
+    fleet_pid(root, fleet, "435", ["python3.13", script, "test/"])
+    assert banned_pids(mod, root, fleet) == set(), (
+        "python3.13 was accepted against a prefix that only installed python3.12, so the "
+        "check is not asking for the interpreter argv[0] names"
+    )
+    fleet_pid(root, fleet, "436", ["python3.12", script, "test/"])
+    assert banned_pids(mod, root, fleet) == {
+        "436"
+    }, "the control failed: python3.12 IS installed there and must still report"
+
+
+# An assignment or option whose VALUE ends in a runner-shaped path component, standing in
+# front of the real runner. `_token_base` reduces a token to its last path component, so
+# each value below reduces to a runner name -- and every pytest temp directory is named
+# after the runner, which makes the shape ordinary rather than contrived. Answering with
+# that position hands the cap reader a span that begins before the LAUNCHER, so the
+# launcher's own `-n` is read as the run's cap and a genuinely uncapped run is skipped.
+RUNNER_SHAPED_VALUES_BEFORE_THE_RUNNER = {
+    "tmpdir-alias": "TMPDIR=/tmp/pytest-of-ci/pytest-3",
+    "tmpdir-plain": "TMPDIR=/tmp/pytest-of-ci/pytest",
+    "basetemp-dotted": "BASETEMP=/var/tmp/pytest-of-x/py.test",
+    "tmpdir-minor-version": "TMPDIR=/tmp/pytest-of-ci/pytest-3.12",
+    "lowercase-name": "pytest_tmp=/tmp/pytest-of-ci/py.test-3",
+}
+
+# A launcher's own worker-ish option, which is NOT the run's cap. `nice -n 10` sets a
+# scheduling priority and `timeout 900` a deadline; neither says anything about pytest
+# workers, and reading either as the cap is how the run goes unreported.
+LAUNCHER_OWN_CAP_SHAPED_OPTIONS = {
+    "nice": ["nice", "-n", "10"],
+    "nice-glued": ["nice", "-n10"],
+    "timeout": ["timeout", "900"],
+}
+
+
+@pytest.mark.parametrize("launcher", sorted(LAUNCHER_OWN_CAP_SHAPED_OPTIONS))
+@pytest.mark.parametrize("value", sorted(RUNNER_SHAPED_VALUES_BEFORE_THE_RUNNER))
+def test_a_runner_shaped_assignment_value_is_not_the_runners_own_position(
+    mod, tmp_path, monkeypatch, value, launcher
+):
+    """An UNCAPPED run is still reported when a token in front of it looks like the runner.
+
+    This is the fail-open direction of the position lookup, and the expensive thing here is
+    not a false row but a lost one: the run really is unbounded, and the conductor's banned
+    counter never sees it, so intake keeps admitting work while the host is consumed.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    argv = [
+        "env",
+        RUNNER_SHAPED_VALUES_BEFORE_THE_RUNNER[value],
+        *LAUNCHER_OWN_CAP_SHAPED_OPTIONS[launcher],
+        "pytest",
+        "test/",
+    ]
+    fleet_pid(root, fleet, "438", argv)
+    assert banned_pids(mod, root, fleet) == {"438"}, (
+        f"{value} + {launcher} went unreported: the position lookup answered with the "
+        "assignment, so the launcher's own option was read as the run's cap"
+    )
+
+
+@pytest.mark.parametrize("launcher", sorted(LAUNCHER_OWN_CAP_SHAPED_OPTIONS))
+@pytest.mark.parametrize("value", sorted(RUNNER_SHAPED_VALUES_BEFORE_THE_RUNNER))
+def test_the_runners_own_cap_still_silences_a_run_behind_such_a_value(
+    mod, tmp_path, monkeypatch, value, launcher
+):
+    """The other direction: moving the position forward must not cost the cap.
+
+    Skipping the assignment makes the cap be read from the RUNNER's own arguments, which is
+    where it belongs -- so a run that chose its worker count stays silent, and this is the
+    direction whose failure would stop a healthy worker.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    argv = [
+        "env",
+        RUNNER_SHAPED_VALUES_BEFORE_THE_RUNNER[value],
+        *LAUNCHER_OWN_CAP_SHAPED_OPTIONS[launcher],
+        "pytest",
+        "-n0",
+        "test/",
+    ]
+    fleet_pid(root, fleet, "439", argv)
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"{value} + {launcher} was reported despite the runner declaring its own cap"
+
+
+# A transparent launcher's OWN operand, standing where the candidate itself sits. Each
+# value's last path component is alias-shaped for the same reason every pytest temp path's
+# is, and each command runs something that is not pytest at all. With the candidate at
+# index 1 the "what stands in front" slice is empty and vacuously true, so the candidate
+# has to be vetted as well as its predecessors.
+LAUNCHER_OWN_OPERAND_AS_CANDIDATE = {
+    "env-tmpdir-make": ["env", "TMPDIR=/var/tmp/pytest-of-ci/pytest-3", "make", "test"],
+    "env-basetemp-npm": ["env", "BASETEMP=/tmp/pytest-of-x/pytest-3.12", "npm", "test"],
+    "env-two-assignments": ["env", "CI=1", "TMPDIR=/tmp/pytest-of-x/pytest-3", "make", "test"],
+    "env-assignment-then-node": ["env", "TMPDIR=/tmp/pytest-of-x/py.test-3", "node", "run.js"],
+    "env-assignment-alone": ["env", "TMPDIR=/tmp/pytest-of-x/pytest-3"],
+    "timeout-assignment-shaped": ["timeout", "900", "TMPDIR=/tmp/pytest-of-x/pytest-3", "make"],
+}
+
+
+@pytest.mark.parametrize("shape", sorted(LAUNCHER_OWN_OPERAND_AS_CANDIDATE))
+def test_a_launchers_own_operand_is_never_the_runners_program_position(
+    mod, tmp_path, monkeypatch, shape
+):
+    """An assignment is the launcher's grammar, so it cannot be the command's subject.
+
+    The empty-slice case is the one that matters: when the candidate stands at index 1
+    there is nothing in front of it to vet, and a check written only about predecessors
+    passes vacuously. Every command here runs ``make``, ``npm`` or ``node`` and holds no
+    pytest invocation, so a row against one stops a healthy worker and discards its turn.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "436", LAUNCHER_OWN_OPERAND_AS_CANDIDATE[shape])
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"{shape} was reported, but the alias-shaped token is the launcher's own operand"
+
+
+#: An alias-shaped assignment standing in FRONT of a genuine run. Declining the
+#: assignment must not end the search, or the run two tokens later is hidden.
+ASSIGNMENT_BEFORE_A_REAL_RUNNER = ["env", "TMPDIR=/var/tmp/pytest-of-ci/pytest-3"]
+
+
+def test_an_assignment_in_front_does_not_hide_a_real_runner_behind_it(mod, tmp_path, monkeypatch):
+    """Declining one candidate must not stop the search: a later token can be the runner.
+
+    This argv holds BOTH -- an alias-shaped assignment that is the launcher's own grammar,
+    and a genuine uncapped run two tokens later. Answering only the FIRST candidate would
+    decide the pid on the assignment and never look at the runner, turning a fix for a
+    false positive into a missed detection.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    argv = [*ASSIGNMENT_BEFORE_A_REAL_RUNNER, "pytest-3", "test/"]
+    fleet_pid(root, fleet, "437", argv)
+    assert banned_pids(mod, root, fleet) == {
+        "437"
+    }, "the runner behind the assignment went unreported"
+
+
+@pytest.mark.parametrize("cap", sorted(CAP_SPELLINGS))
+def test_a_runner_behind_an_assignment_still_stays_quiet_when_capped(
+    mod, tmp_path, monkeypatch, cap
+):
+    """The other direction: searching every candidate must not cost the cap.
+
+    The cap is read from the runner's own arguments, so it is asserted here through the
+    same cross product of spellings as every other invocation form.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    argv = [*ASSIGNMENT_BEFORE_A_REAL_RUNNER, "pytest-3", *CAP_SPELLINGS[cap], "test/"]
+    fleet_pid(root, fleet, "438", argv)
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"the runner behind the assignment was reported despite {cap}"
+
+
+# A kernel binary that REFUTES the name the process gave itself. `argv[0]` is chosen by
+# the process, so `exec -a pytest-3 sleep 600` presents a sleeping shell as a runner, and
+# this path would otherwise stop a healthy worker on a self-issued name. Each value is
+# what `/proc/<pid>/exe` really points at.
+SPOOFED_ARGV0_KERNEL_PROGRAMS = {
+    "sleep": "/usr/bin/sleep",
+    "bash": "/usr/bin/bash",
+    "cat": "/usr/bin/cat",
+    "outside-a-trusted-dir": "/home/someone/bin/sleep",
+    "deleted-binary": "/usr/bin/sleep (deleted)",
+    # An interpreter belongs here rather than among the exemptions. A shebang script's
+    # kernel binary IS the interpreter, but the kernel puts the interpreter at argv[0]
+    # and the runner one position later, so a packaged run never reaches this check.
+    # What reaches it with an interpreter behind it is `exec -a pytest-3 python3 -c …`.
+    "interpreter": "/usr/bin/python3",
+}
+
+# A launcher's operand that is not part of the launcher's OWN grammar is the subject of
+# the command, whatever shape it takes: a subcommand, a bare word, a script name, a path.
+# The runner spelling behind it is that subject's argument.
+LAUNCHER_SUBJECT_OPERANDS = {
+    "npm-subcommand": (["npm"], ["run", "build"]),
+    "npm-single-subcommand": (["npm"], ["test"]),
+    "poetry-run": (["poetry"], ["run"]),
+    "yarn-subcommand": (["yarn"], ["workspace", "api"]),
+    "tox-bare-env": (["tox"], ["envlist"]),
+    "make-target": (["make"], ["clean"]),
+    "coverage-script": (["coverage", "run"], ["worker.py"]),
+    "node-script": (["node"], ["runner.js"]),
+    "bash-script": (["bash"], ["teardown.sh"]),
+    "hatch-script-path": (["hatch"], ["scripts/sweep"]),
+    "timeout-then-subject": (["timeout", "900"], ["make"]),
+}
+
+# A launcher that interposes a subject of its own never puts the runner in the program
+# position, not even as its IMMEDIATE operand. `make pytest-3.12` is the case that makes
+# this matter: a per-interpreter test matrix spells its targets that way, each target
+# wraps a run that caps its own workers, and a fleet-owned row against one stops a
+# healthy worker with no automatic recovery.
+NON_TRANSPARENT_IMMEDIATE_OPERAND = {
+    "make": ["make"],
+    "make-minor-version": ["make"],
+    "npm": ["npm"],
+    "npx": ["npx"],
+    "yarn": ["yarn"],
+    "poetry": ["poetry"],
+    "tox": ["tox"],
+    "nox": ["nox"],
+    "hatch": ["hatch"],
+    "coverage": ["coverage"],
+    "node": ["node"],
+    "bash": ["bash"],
+    "sh": ["sh"],
+    "py": ["py"],
+    "uv": ["uv"],
+}
+
+# What a launcher consumes as part of its own grammar. A runner standing after only these
+# is still the program, so every one of them must keep qualifying.
+LAUNCHER_OWN_GRAMMAR = {
+    "nothing": ([], []),
+    "numeric-operand": (["timeout"], ["900"]),
+    "flag-and-numeric": (["nice"], ["-n", "10"]),
+    "bare-flag": (["xvfb-run"], ["-a"]),
+    "env-assignment": (["env"], ["CI=1"]),
+    "two-assignments": (["env"], ["CI=1", "TERM=dumb"]),
+    "flag-then-numeric-then-flag": (["timeout"], ["-k", "5", "900"]),
+}
+
+
+@pytest.mark.parametrize("launcher", sorted(NON_TRANSPARENT_IMMEDIATE_OPERAND))
+@pytest.mark.parametrize("runner", ["pytest-3", "pytest-3.12", "py.test-3"])
+def test_a_non_transparent_launchers_immediate_operand_is_not_the_program(
+    mod, tmp_path, monkeypatch, launcher, runner
+):
+    """`make pytest-3.12` names a TARGET, and that target runs a capped suite.
+
+    A launcher that interposes a subject of its own does not put the runner in the
+    program position at any distance, the immediate operand included. This is the case
+    with the highest cost in the file: a per-interpreter matrix target is ordinary, the
+    run behind it caps its own workers, and the row stops a healthy worker with no
+    automatic recovery beyond switching the whole detection off.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "460", [*NON_TRANSPARENT_IMMEDIATE_OPERAND[launcher], runner])
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"{launcher} {runner} was reported, but the operand is that launcher's subject"
+
+
+def test_the_transparent_launchers_are_a_subset_of_the_recognised_ones(mod):
+    """The two launcher sets cannot drift apart.
+
+    A transparent launcher this file does not otherwise recognise would be admitted by
+    one rule and unknown to the rest, so the subset relation is asserted rather than
+    assumed.
+    """
+    assert mod._TRANSPARENT_LAUNCHER_BASES <= mod._LAUNCHER_BASES
+    # Each one adjusts the environment and execs what follows, which is why its own
+    # grammar is exactly options, numbers and assignments.
+    assert mod._TRANSPARENT_LAUNCHER_BASES == {"env", "nice", "timeout", "xvfb-run"}
+
+
+@pytest.mark.parametrize("shape", sorted(LAUNCHER_SUBJECT_OPERANDS))
+def test_a_launcher_operand_that_is_the_subject_ends_the_program_position(
+    mod, tmp_path, monkeypatch, shape
+):
+    """A bare word after a launcher is what the launcher runs, so the alias is its argument.
+
+    Most of ``_LAUNCHER_BASES`` takes a subcommand or a script this way -- `npm run`,
+    `poetry run`, `tox`, `make`, `node`, `bash`. Reporting any of these stops a worker
+    over a string that names a runner without being one, and an attributable false
+    positive costs a discarded turn rather than only noise.
+    """
+    launcher, operands = LAUNCHER_SUBJECT_OPERANDS[shape]
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "422", [*launcher, *operands, "pytest-3"])
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"{shape} was reported, but the launcher's operand is the program"
+
+
+@pytest.mark.parametrize("shape", sorted(LAUNCHER_OWN_GRAMMAR))
+@pytest.mark.parametrize("runner", ["pytest-3", "py.test", "pytest.exe"])
+def test_a_runner_after_only_the_launchers_own_grammar_is_still_the_program(
+    mod, tmp_path, monkeypatch, shape, runner
+):
+    """The other direction: an option, a number and an assignment are not subjects.
+
+    `timeout 900 pytest-3` is a real uncapped run. Declining these would hide exactly the
+    invocations the probe exists to see, so the allow-list has to admit each one.
+    """
+    launcher, operands = LAUNCHER_OWN_GRAMMAR[shape]
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "423", [*launcher, *operands, runner, "test/"])
+    assert banned_pids(mod, root, fleet) == {
+        "423"
+    }, f"{shape} + {runner} went unreported while uncapped"
+
+
+@pytest.mark.parametrize("python", sorted(PYTHON_SPELLINGS))
+@pytest.mark.parametrize("tail", sorted(INTERPRETER_SCRIPT_TAILS))
+def test_an_interpreter_running_a_script_never_reports_an_alias_in_its_arguments(
+    mod, tmp_path, monkeypatch, python, tail
+):
+    """An interpreter's first non-option operand is the script, and it ends the walk.
+
+    ``python3 worker.py pytest-3`` runs ``worker.py``; the alias is a string that script
+    was handed. Nothing unusual is needed to produce this shape -- no custom config, no
+    timing -- so admitting it draws a stop against a worker doing compliant work, which
+    is the direction that destroys a turn.
+    """
+    prefixes = install_prefixes(tmp_path)
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    argv = [*PYTHON_SPELLINGS[python], *with_prefixes(INTERPRETER_SCRIPT_TAILS[tail], prefixes)]
+    fleet_pid(root, fleet, "420", argv)
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"{python} + {tail} was reported, but the program is the script, not the alias"
+
+
+@pytest.mark.parametrize("python", sorted(PYTHON_SPELLINGS))
+@pytest.mark.parametrize(
+    "runner", ["pytest-3", "pytest-3.12", "py.test-3", "py.test", "pytest.exe"]
+)
+def test_an_argv_only_spelling_in_the_module_position_is_not_a_runner(
+    mod, tmp_path, monkeypatch, python, runner
+):
+    """No pytest MODULE carries a version suffix, so ``-m pytest-3`` is not a pytest run.
+
+    The packaged ``pytest-3`` is a console SCRIPT; the module has always been plain
+    ``pytest``, which the joined-line rule matches on its own. What ``python -m pytest-3``
+    actually runs is a checkout-local ``pytest-3.py``, found by name because an import
+    finder resolves names rather than identifiers -- and reporting it stops a healthy
+    worker and discards its turn.
+
+    What declining costs is ``python -m py.test``, a spelling modern pytest does not
+    provide, so the trade is a missed signal against a stopped worker.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "421", [*PYTHON_SPELLINGS[python], "-m", runner, "test/"])
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"{python} -m {runner} was reported, but no pytest module is spelled that way"
+
+
+@pytest.mark.parametrize("python", sorted(PYTHON_SPELLINGS))
+def test_the_plain_module_spelling_is_still_reported_by_its_own_rule(
+    mod, tmp_path, monkeypatch, python
+):
+    """Declining the module position must not touch ``python -m pytest``.
+
+    That spelling is matched by the joined-line rule, not by the argv path, so narrowing
+    the argv path leaves it exactly where it was -- the direction that proves the
+    subtraction above is a subtraction and not a hole.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "422", [*PYTHON_SPELLINGS[python], "-m", "pytest", "test/"])
+    assert banned_pids(mod, root, fleet) == {"422"}
+
+
+@pytest.mark.parametrize("python", sorted(PYTHON_SPELLINGS))
+@pytest.mark.parametrize("script", sorted(INTERPRETER_ENTRY_POINT_SCRIPTS))
+def test_an_interpreter_reports_the_runner_standing_as_its_script_operand(
+    mod, tmp_path, monkeypatch, python, script
+):
+    """The interpreter's SCRIPT is the program, so a runner standing there qualifies.
+
+    This is the shape the alias really arrives in. A packaged ``pytest-3`` is a python
+    script with a shebang, so running it makes the kernel's argv ``python3
+    /usr/bin/pytest-3 …``: the alias is the interpreter's script operand and appears at
+    ``argv[0]`` never. A rule admitting the alias only behind ``-m`` declines the
+    ordinary packaged run of the one spelling this detection exists for, and nothing
+    later re-asks -- a declined pid emits no line at all.
+    """
+    prefixes = install_prefixes(tmp_path)
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    tail = with_prefixes(INTERPRETER_ENTRY_POINT_SCRIPTS[script], prefixes)
+    argv = [*PYTHON_SPELLINGS[python], *tail, "test/"]
+    fleet_pid(root, fleet, "426", argv)
+    assert banned_pids(mod, root, fleet) == {
+        "426"
+    }, f"{python} + {script} went unreported while uncapped"
+
+
+@pytest.mark.parametrize("cap", sorted(CAP_SPELLINGS))
+@pytest.mark.parametrize("script", sorted(INTERPRETER_ENTRY_POINT_SCRIPTS))
+def test_a_runner_as_the_script_operand_stays_quiet_when_it_declares_a_cap(
+    mod, tmp_path, monkeypatch, script, cap
+):
+    """Admitting the script position must not cost the cap, in either spelling.
+
+    The expensive direction of this whole file: a run that CHOSE its worker count is
+    healthy, and reporting it stops a worker and discards its in-flight turn. The cap
+    is re-asked of the runner's own arguments, so it is read here through the same
+    function that reads it for every other form.
+    """
+    prefixes = install_prefixes(tmp_path)
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    argv = [
+        "python3",
+        *with_prefixes(INTERPRETER_ENTRY_POINT_SCRIPTS[script], prefixes),
+        *CAP_SPELLINGS[cap],
+        "test/",
+    ]
+    fleet_pid(root, fleet, "427", argv)
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"{script} + {cap} was reported despite declaring a cap"
+
+
+@pytest.mark.parametrize("program", sorted(SPOOFED_ARGV0_KERNEL_PROGRAMS))
+def test_a_kernel_binary_that_is_not_a_runner_refutes_a_spoofed_argv0(
+    mod, tmp_path, monkeypatch, program
+):
+    """``argv[0]`` is the process's own claim, and the kernel's binary overrules it.
+
+    ``exec -a pytest-3 sleep 600`` introduces a sleeping process as a test runner. At
+    ``argv[0]`` there is no earlier token to read, so this is the only position where the
+    claim stands unchecked -- and acting on it stops a healthy worker and discards its
+    turn.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "428", ["pytest-3", "test/"], unspoofed=False)
+    (root / "428" / "exe").symlink_to(SPOOFED_ARGV0_KERNEL_PROGRAMS[program])
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"a pid whose kernel binary is {program} was reported as a runner"
+
+
+def test_an_unreadable_kernel_link_declines_argv0(mod, tmp_path, monkeypatch):
+    """At ``argv[0]`` the kernel's binary must CONFIRM, so an unreadable link declines.
+
+    This position is the one that ACCUSES on nothing but the name the process chose for
+    itself, and a process can make its own ``exe`` unreadable by going non-dumpable -- so
+    treating that silence as permission to report puts the stop back under the control of
+    whatever is being stopped.
+
+    The reading that an unreadable link is harmless does not survive measurement. It
+    rested on the pid already being sorted ``foreign``/``unknown``, but ``_owner_class``
+    falls back to ``_program_class``, which reads the SAME process-chosen argv: an
+    ``argv[0]`` naming a path under a fleet worktree is classified ``fleet`` with no link
+    and no readable ``cwd`` at all. One token then produces a fleet-owned row, and the
+    documented response to one is to stop that worker and discard its in-flight turn,
+    which nothing restores. What declining costs instead is a missed signal on a process
+    whose binary this uid cannot read.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "429", ["pytest-3", "test/"], unspoofed=False)
+    assert not (root / "429" / "exe").exists()
+    assert banned_pids(mod, root, fleet) == set(), (
+        "an alias-shaped argv[0] was reported with no kernel binary to confirm it, so one "
+        "process-chosen token can stop a healthy worker"
+    )
+
+    # The same shape the adjudication named: ownership derived from that same token.
+    spoofed = tmp_path / "wt" / "bin" / "pytest-3"
+    fleet_pid(root, fleet, "432", [str(spoofed), "test/"], unspoofed=False)
+    assert banned_pids(mod, root, fleet) == set(), (
+        "an argv[0] naming a path under the fleet worktree was reported with no kernel "
+        "binary, so argv alone supplied both the accusation and the ownership"
+    )
+
+
+def test_a_kernel_binary_agreeing_with_argv0_confirms_it(mod, tmp_path, monkeypatch):
+    """The other direction: a genuine runner binary outside a trusted directory still counts.
+
+    ``_trusted_program_base`` refuses a basename outside ``_TRUSTED_PROGRAM_DIRS``
+    because a SHELL's name there is a claim about a file anybody could have placed. A
+    runner's own ``bin`` inside a venv is the ordinary home of one, so this question is
+    asked of the link without that gate.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "430", ["pytest-3", "test/"], unspoofed=False)
+    (root / "430" / "exe").symlink_to("/home/u/wt/.venv/bin/pytest-3")
+    assert banned_pids(mod, root, fleet) == {"430"}
+
+
+def test_an_interpreter_kernel_binary_does_not_refute_a_shebang_runner(mod, tmp_path, monkeypatch):
+    """A shebang run is decided one position later, so the refutation never sees it.
+
+    This is why an interpreter is not exempted from the refutation: the kernel puts the
+    interpreter at ``argv[0]`` and the runner after it, so the packaged run is answered
+    by the script-operand rule and reaches the ``argv[0]`` check at all. An exemption
+    there would only ever admit ``exec -a pytest-3 python3 -c …``, which is the spoof.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    prefixes = install_prefixes(tmp_path)
+    require_resolvable_prefixes(prefixes)
+    script = f"{prefixes['sys']}/bin/pytest-3"
+    fleet_pid(root, fleet, "431", ["python3", script, "test/"], unspoofed=False)
+    (root / "431" / "exe").symlink_to(f"{prefixes['sys']}/bin/python3")
+    assert banned_pids(mod, root, fleet) == {"431"}
+
+
+@pytest.mark.parametrize(
+    "argv, expected",
+    [
+        pytest.param(["python3", "prog.py"], (1, "script"), id="script"),
+        pytest.param(["python3", "-W", "ignore", "prog.py"], (3, "script"), id="split-value-flag"),
+        pytest.param(["python3", "-Wignore", "prog.py"], (2, "script"), id="attached-value-flag"),
+        pytest.param(["python3", "-Es", "prog.py"], (2, "script"), id="flag-bundle"),
+        pytest.param(["python3", "-X", "utf8", "prog.py"], (3, "script"), id="X-split"),
+        pytest.param(["python3", "-m", "pytest"], (2, "module"), id="module-selector"),
+        pytest.param(["python3", "-O", "-m", "pytest"], (3, "module"), id="flag-then-module"),
+        pytest.param(["python3", "-Om", "pytest"], (2, "module"), id="bundle-trailing-module"),
+        pytest.param(["python3", "-m"], None, id="module-selector-with-no-module"),
+        pytest.param(["python3", "-mpytest"], None, id="attached-module-declines"),
+        pytest.param(
+            ["python3", "worker.py", "-m", "pytest"],
+            (1, "script"),
+            id="post-script-m-is-an-argument",
+        ),
+        pytest.param(
+            ["python3", "-c", "print(1)", "-m", "x"], None, id="post-command-m-is-an-argument"
+        ),
+        pytest.param(["python3", "-", "-m", "x"], None, id="post-stdin-m-is-an-argument"),
+        pytest.param(["python3", "-c", "print(1)"], None, id="command-runs-no-script"),
+        pytest.param(["python3", "-"], None, id="stdin-script"),
+        pytest.param(["python3"], None, id="no-operand-at-all"),
+        pytest.param(["python3", "-Z", "prog.py"], None, id="unknown-option-declines"),
+    ],
+)
+def test_the_execution_target_is_located_by_pythons_own_grammar(mod, argv, expected):
+    """Python runs exactly ONE thing, and its grammar says which token that is.
+
+    The first selector to appear wins -- ``-m``, ``-c``, ``-``, or the script operand --
+    and every token after it belongs to the thing being run. A single index is what makes
+    ``python3 worker.py -m pytest`` answer 1 rather than 3: the script came first, so the
+    ``-m`` is an argument that script was handed, and a script may spell its own options
+    however it likes. An option this grammar cannot classify answers None, which
+    declines, because a missed line costs a signal and a false one costs a turn.
+
+    The KIND travels with the index because only one of the two can be checked for being
+    an installed entry point: a module name is resolved by the import machinery, while a
+    script is a path that proves only what sits there.
+    """
+    assert mod._python_execution_target(argv) == expected
+
+
+# An ``-m`` that is NOT python's own selector, because a selector already appeared. Each
+# tail hands the interpreter a program and then a string that merely looks like a module
+# request, which is an ordinary way for a script to take its own options.
+POST_SELECTOR_MODULE_TAILS = {
+    "script-then-m": ["worker.py", "-m", "pytest-3"],
+    "script-then-m-capped": ["worker.py", "-m", "pytest-3", "-n0"],
+    "script-then-m-among-args": ["cleanup.py", "--mode", "-m", "pytest-3"],
+    "suffixless-script-then-m": ["worker", "-m", "pytest-3"],
+    "subcommand-shaped-then-m": ["run", "-m", "pytest-3"],
+    "command-then-m": ["-c", "import sys", "-m", "pytest-3"],
+    "stdin-then-m": ["-", "-m", "pytest-3"],
+}
+
+
+@pytest.mark.parametrize("python", sorted(PYTHON_SPELLINGS))
+@pytest.mark.parametrize("tail", sorted(POST_SELECTOR_MODULE_TAILS))
+def test_an_m_after_pythons_selector_is_an_argument_not_a_module_request(
+    mod, tmp_path, monkeypatch, python, tail
+):
+    """``python3 worker.py -m pytest-3`` runs ``worker.py``; the ``-m`` is its argument.
+
+    Testing the token in FRONT of the candidate cannot see this: an ``-m`` sits directly
+    before the alias in every one of these, and every one is a healthy process. Only
+    python's own first selector settles it, which is why the grammar walk returns one
+    index and the rule compares against it.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    argv = [*PYTHON_SPELLINGS[python], *POST_SELECTOR_MODULE_TAILS[tail]]
+    fleet_pid(root, fleet, "432", argv)
+    assert (
+        banned_pids(mod, root, fleet) == set()
+    ), f"{python} + {tail} was reported, but python's program is not the alias"
+
+
+@pytest.mark.parametrize("python", sorted(PYTHON_SPELLINGS))
+@pytest.mark.parametrize(
+    "flags",
+    [
+        pytest.param(["-O"], id="optimise"),
+        pytest.param(["-B"], id="no-bytecode"),
+        pytest.param(["-O", "-B"], id="two-flags"),
+    ],
+)
+def test_an_interpreter_reports_the_alias_when_only_flags_stand_in_front(
+    mod, tmp_path, monkeypatch, python, flags
+):
+    """``python3 -O pytest-3`` runs the file ``pytest-3``, and that file IS the program.
+
+    Only flags intervene here, so nothing about the launcher's own grammar separates
+    this from an invocation -- which makes it the case that isolates the script-operand
+    rule from every other reason a token can qualify.
+
+    The opposite reading, that such a file may be any data an operator named that way,
+    does not survive the mechanism. For the pid to exist long enough to be scanned the
+    operand has to be something python can actually execute: a file of unparsable data
+    or a directory without ``__main__.py`` -- a pytest temp root such as
+    ``/var/tmp/pytest-of-ci/pytest-3`` is exactly that -- exits before any walk sees it.
+    An alias in a script position that runs is a runner, and it is the position the
+    ordinary packaged spelling always occupies.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    prefixes = install_prefixes(tmp_path)
+    require_resolvable_prefixes(prefixes)
+    argv = [*PYTHON_SPELLINGS[python], *flags, f"{prefixes['sys']}/bin/pytest-3", "test/"]
+    fleet_pid(root, fleet, "424", argv)
+    assert banned_pids(mod, root, fleet) == {
+        "424"
+    }, f"{python} + {flags} went unreported, but the alias stands as the script"
+
+
+def test_the_named_opt_out_switches_the_argv_shape_off(mod, tmp_path, monkeypatch):
+    """An operator CAN disable the argv shape, by saying so about the argv shape.
+
+    Without an escape hatch this detection is an absolute an operator cannot decline,
+    which is a real complaint. With one it is policy -- and the key names the thing it
+    disables, so nobody removes it while meaning to change something else.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "450", ["pytest-3", "test/"])
+    off, _host = mod._host_lines({"fleet_worktrees": [str(fleet)], "argv_runner_detection": False})
+    assert [line for line in off if line.startswith("BANNED pid=")] == []
+    # The control: the same pid with the key absent IS reported, so the silence is the
+    # opt-out and not a broken fixture.
+    assert banned_pids(mod, root, fleet) == {"450"}
+
+
+def test_the_opt_out_and_the_rule_list_are_independent(mod, tmp_path, monkeypatch):
+    """Neither setting reaches the other, in either direction.
+
+    This is the whole point of the separation. Replacing ``banned_process_res`` must not
+    disable the argv shape -- a protection removed as a side effect of an unrelated edit
+    is removed by someone who never decided to remove it. And disabling the argv shape
+    must not disable the operator's own rules.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "451", ["pytest-3", "test/"])
+    fleet_pid(root, fleet, "452", ["npm", "audit", "--json"])
+    custom = [r"\bnpm\b\s+audit"]
+
+    def reported(cfg):
+        lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)], **cfg})
+        return {
+            line.split()[1].split("=", 1)[1] for line in lines if line.startswith("BANNED pid=")
+        }
+
+    # A replaced rule list leaves the argv shape ON.
+    assert reported({"banned_process_res": custom}) == {"451", "452"}
+    # The opt-out leaves the operator's own rule in force.
+    assert reported({"banned_process_res": custom, "argv_runner_detection": False}) == {"452"}
+    # The opt-out alone leaves the built-in rules in force; 452 is not an npm-audit
+    # match under the defaults, so only the argv row disappears.
+    assert reported({"argv_runner_detection": False}) == set()
+    assert reported({}) == {"451"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("false", id="string"),
+        pytest.param(0, id="zero"),
+        pytest.param(1, id="one"),
+        pytest.param([], id="empty-list"),
+        pytest.param({}, id="empty-dict"),
+    ],
+)
+def test_a_non_boolean_opt_out_is_malformed_config(mod, value):
+    """A near-miss value is refused at load, never guessed at.
+
+    ``"false"`` is not False, so a permissive read would leave the shape ON for an
+    operator who believes they switched it off. A falsey read would switch a protection
+    off for one who wrote nothing of the kind. Both directions are silent, so the value
+    has to be a real boolean.
+    """
+    problem = mod._config_error({"argv_runner_detection": value})
+    assert problem == "argv_runner_detection must be true or false"
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+def test_a_boolean_or_absent_opt_out_is_valid_config(mod, value):
+    """Both booleans and omission are accepted, so the check does not reject real use."""
+    cfg = {} if value is None else {"argv_runner_detection": value}
+    assert mod._config_error(cfg) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(None, id="explicit-null"),
+        pytest.param(0, id="zero"),
+        pytest.param("", id="empty-string"),
+        pytest.param([], id="empty-list"),
+    ],
+)
+def test_a_value_that_is_not_false_never_disables_the_shape(mod, tmp_path, monkeypatch, value):
+    """Only ``false`` disables it. Anything merely falsey leaves the protection ON.
+
+    An explicit ``null`` is the live case: config validation treats it as "not set", so
+    it reaches here, and a permissive truthiness read would switch the shape off for an
+    operator who wrote nothing of the kind. The other values cannot pass validation, so
+    for them this is the fail-safe direction held one layer deeper -- a caller reaching
+    ``_host_lines`` without validating still keeps the protection.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "453", ["pytest-3", "test/"])
+    lines, _host = mod._host_lines(
+        {"fleet_worktrees": [str(fleet)], "argv_runner_detection": value}
+    )
+    reported = {
+        line.split()[1].split("=", 1)[1] for line in lines if line.startswith("BANNED pid=")
+    }
+    assert reported == {"453"}, f"{value!r} disabled the shape without saying false"
+
+
+def test_only_transparent_launchers_can_ever_carry_a_detection(mod):
+    """The detector is BOUNDED: every recognised launcher is enumerated, and the set that
+    can carry a detection is exactly the transparent one.
+
+    This is the asymmetry expressed at the position check. The two error directions cost
+    wildly different things -- a miss costs a signal, a false row costs a stopped worker
+    and its discarded turn -- so the check answers from a closed list of shapes and
+    anything unlisted is NOT DETECTED. A launcher added to ``_LAUNCHER_BASES`` therefore
+    produces a miss, never a stop, until someone decides it execs what follows and adds it
+    to ``_TRANSPARENT_LAUNCHER_BASES`` deliberately.
+
+    Enumerated from source rather than from a written list, so the assertion cannot drift
+    behind the launcher set it is about.
+    """
+    tails = (
+        ["pytest-3", "test/"],
+        ["run", "pytest-3", "test/"],
+        ["-n", "1", "pytest-3", "test/"],
+        ["900", "pytest-3", "test/"],
+        ["CI=1", "pytest-3", "test/"],
+        ["build", "release", "pytest-3", "test/"],
+    )
+    carriers = set()
+    for base in sorted(mod._LAUNCHER_BASES):
+        for tail in tails:
+            argv = [base, *tail]
+            indices = mod._argv_only_runner_indices(argv)
+            if indices and mod._argv_is_uncapped_argv_only_runner(argv):
+                carriers.add(base)
+    assert carriers == set(mod._TRANSPARENT_LAUNCHER_BASES), (
+        "a launcher outside the transparent set can carry a detection: "
+        f"{sorted(carriers - set(mod._TRANSPARENT_LAUNCHER_BASES))}"
+    )
+    # The control: the enumeration really does reach a detection, so equality above is not
+    # two empty sets agreeing.
+    assert carriers, "no launcher carried a detection, the enumeration is broken"
+
+
+def test_the_cap_reader_accepts_every_spelling_its_flags_have(mod):
+    """The reader's COVERAGE, enumerated from ``_CAP_FLAGS`` rather than from the reader.
+
+    The implication pin below asks "whatever the reader accepts is never reported", which
+    is the asymmetry itself -- but it reads its own subject, so a reader that stops
+    recognising a spelling simply drops out of it and the pin stays green while a capped
+    run starts being reported. This asserts the other half: each flag's spellings are
+    generated from the flag list, and the reader must accept every one of them.
+
+    Glued digits are asserted only for a SHORT flag. The file documents why:
+    ``--numprocessesN`` is not a spelling that option has, so a longer token starting with
+    it is a different option and must not be read as a cap.
+    """
+    assert mod._CAP_FLAGS, "no cap flags to enumerate"
+    for flag in sorted(mod._CAP_FLAGS):
+        short = len(flag) == 2 and flag.startswith("-") and not flag.startswith("--")
+        required = [[f"{flag}=0"], [flag, "0"], [f"{flag}=4"], [flag, "4"]]
+        if short:
+            required += [[f"{flag}0"], [f"{flag}4"]]
+        for cap in required:
+            assert mod._argv_declares_a_worker_cap(
+                ["pytest-3", *cap, "test/"]
+            ), f"the reader stopped recognising {' '.join(cap)!r} as a cap"
+        if not short:
+            glued = [f"{flag}0"]
+            assert not mod._argv_declares_a_worker_cap(
+                ["pytest-3", *glued, "test/"]
+            ), f"{glued[0]!r} is a different option, not a cap spelling"
+
+
+def test_a_cap_the_reader_accepts_is_never_reported(mod, tmp_path, monkeypatch):
+    """THE ASYMMETRY, as an implication: cap reader says yes, so the scan stays silent.
+
+    A false negative costs a signal. A false positive is a fleet-owned row, which is
+    ``session_stop`` and a worker's discarded in-flight turn with no automatic recovery.
+    So the one thing that must never happen is a row against a run that declared its
+    worker count.
+
+    The cap positions are enumerated FROM SOURCE -- every flag in ``_CAP_FLAGS``, every
+    spelling around it -- and which of them count is decided by
+    ``_argv_declares_a_worker_cap`` itself rather than by a list written here. Whatever
+    that reader accepts, every detectable shape carrying it must produce no line.
+    """
+    candidates: list[list[str]] = []
+    for flag in sorted(mod._CAP_FLAGS):
+        candidates.append([f"{flag}0"])
+        candidates.append([f"{flag}4"])
+        candidates.append([f"{flag}=0"])
+        candidates.append([f"{flag}=4"])
+        candidates.append([flag, "0"])
+        candidates.append([flag, "4"])
+    accepted = [
+        cap for cap in candidates if mod._argv_declares_a_worker_cap(["pytest-3", *cap, "test/"])
+    ]
+    assert accepted, "the cap reader accepted no spelling, so this pin proves nothing"
+
+    prefixes = install_prefixes(tmp_path)
+    shapes: dict[str, list[str]] = {
+        name: with_prefixes(tokens, prefixes) for name, tokens in RUNNER_FORMS.items()
+    }
+    for name, (launcher, operands) in LAUNCHER_OWN_GRAMMAR.items():
+        shapes[f"grammar-{name}"] = [*launcher, *operands, "pytest-3"]
+
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir(exist_ok=True)
+    pid = 700
+    for shape, prefix in sorted(shapes.items()):
+        for cap in accepted:
+            pid += 1
+            fleet_pid(root, fleet, str(pid), [*prefix, *cap, "test/test_x.py"])
+    assert banned_pids(mod, root, fleet) == set(), (
+        f"a run declaring a cap was reported; {len(shapes)} shapes x {len(accepted)} "
+        "accepted cap spellings must all stay silent"
+    )
+
+
+def test_every_directory_link_in_this_file_goes_through_make_dir_link():
+    """A ``cwd`` link is a DIRECTORY name, so it must be a junction, not a symlink.
+
+    This file's header states the split: a name meaning another directory is supplied by a
+    junction on Windows with no privilege, while a link to a FILE needs
+    ``SeCreateSymbolicLinkPrivilege`` and is inventoried by exact node id. A bare
+    ``symlink_to`` on a ``cwd`` entry therefore does not skip on an unelevated Windows
+    shell -- it raises, and every case built on that fixture ERRORS instead of running.
+
+    Asserted over the file's own source because the rule is about which call is written,
+    which no runtime behaviour on a POSIX host can reveal.
+    """
+    source = Path(__file__).read_text(encoding="utf-8")
+    # Built from parts so this scan's own condition is not a match for itself: written
+    # whole, the line below would be the first offender it reported.
+    directory_entry = '"' + "cwd" + '"'
+    symlink_call = ".symlink" + "_to("
+    offenders = [
+        (number, line.strip())
+        for number, line in enumerate(source.splitlines(), start=1)
+        if directory_entry in line and symlink_call in line
+    ]
+    assert offenders == [], f"cwd links must use make_dir_link: {offenders}"
+    # The control: the file really does contain directory links, so an empty offender
+    # list means they are all correct rather than that the scan matched nothing.
+    assert source.count("make_dir_link(entry / " + directory_entry) >= 10
+
+
+def test_every_argv_only_spelling_is_also_a_recognised_runner_base(mod):
+    """A spelling the argv path admits must also be one the CAP check can see.
+
+    `_runner_token_index` keys on `_is_runner_base`, and `_argv_declares_a_worker_cap`
+    declines to answer when no runner token stands alone. So a member of
+    `_ARGV_ONLY_RUNNER_BASES` that `_is_runner_base` does not recognise is reported
+    while its own `-n0` is invisible -- a CAPPED run drawing a stop, the most expensive
+    direction this file has. The invariant is asserted over the whole set rather than
+    one token, so adding a spelling cannot reopen it.
+    """
+    for base in sorted(mod._ARGV_ONLY_RUNNER_BASES):
+        assert mod._is_runner_base(base), f"{base} is admitted but its cap cannot be read"
+
+
+@pytest.mark.parametrize("runner", ["py.test", "py.test.exe", "pytest.exe"])
+@pytest.mark.parametrize("cap", sorted(CAP_SPELLINGS))
+def test_a_capped_argv_only_spelling_is_never_reported(mod, tmp_path, monkeypatch, runner, cap):
+    """Every argv-only spelling honours a cap, through the same check as plain ``pytest``.
+
+    This is the direction that destroys work: the run chose its worker count, and a row
+    against it stops a worker doing exactly what the standing directive asks.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "441", [runner, *CAP_SPELLINGS[cap], "test/test_x.py"])
+    assert banned_pids(mod, root, fleet) == set(), f"{runner} + {cap} was reported while capped"
+
+
+def test_a_custom_rule_list_does_not_switch_off_the_argv_shape(mod, tmp_path, monkeypatch):
+    """Rule ORIGIN carries built-in authority, not the absence of custom config.
+
+    ``test_pipeline_conductor_agent.py`` already writes this down for the wrapper
+    exemption: the gate is written against the rule that MATCHED rather than against
+    ``cfg["banned_process_res"]`` being set at all. Standing the argv shape down whenever
+    an operator supplies a list would let a config EDIT switch a built-in protection off,
+    which is a worse property than one extra line on a replaced policy -- and the line it
+    emits is factually true of the process, an uncapped alias run in a fleet worktree.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "430", ["pytest-3", "test/"])
+    custom, _host = mod._host_lines(
+        {"fleet_worktrees": [str(fleet)], "banned_process_res": [r"\bnpm\b\s+audit"]}
+    )
+    reported = {
+        line.split()[1].split("=", 1)[1] for line in custom if line.startswith("BANNED pid=")
+    }
+    assert reported == {"430"}, "a custom rule list silenced the argv shape"
+    # The same pid under the defaults, so the assertion above is about authority rather
+    # than about the fixture happening to report everything.
+    assert banned_pids(mod, root, fleet) == {"430"}
+
+
+def test_a_custom_rule_list_still_reports_its_own_shape(mod, tmp_path, monkeypatch):
+    """The operator's own rules keep working alongside the built-in shape.
+
+    The two authorities are additive in effect even though the config REPLACES the
+    pattern list: a custom rule reports what it names, and the argv shape reports what
+    this file detects on its own authority.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "431", ["npm", "audit", "--json"])
+    lines, _host = mod._host_lines(
+        {"fleet_worktrees": [str(fleet)], "banned_process_res": [r"\bnpm\b\s+audit"]}
+    )
+    reported = {
+        line.split()[1].split("=", 1)[1] for line in lines if line.startswith("BANNED pid=")
+    }
+    assert reported == {"431"}
+
+
+@pytest.mark.parametrize(
+    ("argv", "program"),
+    [
+        pytest.param(["pytest-3", "test/"], "pytest-<version>", id="alias"),
+        pytest.param(["pytest-3.12", "test/"], "pytest-<version>", id="alias-minor"),
+        pytest.param(["/usr/bin/pytest-3", "test/"], "pytest-<version>", id="alias-abspath"),
+        pytest.param(["py.test-3", "test/"], "py.test-<version>", id="alias-py.test"),
+        pytest.param(["pytest-3.exe", "test/"], "pytest-<version>", id="alias-exe"),
+        pytest.param(["py.test", "test/"], "py.test", id="py.test"),
+        pytest.param(["pytest.exe", "test/"], "pytest.exe", id="pytest.exe"),
+    ],
+)
+def test_an_argv_row_prints_the_program_it_fired_on(mod, tmp_path, monkeypatch, argv, program):
+    """``cmd=`` names the runner on an argv row, because ``rule=`` cannot.
+
+    A joined-line row can be judged from its rule text. An argv row names a shape rather
+    than a pattern, so the program name is the only field that separates a real uncapped
+    run from a command that merely spells one -- and it is the field the owning skill
+    says to read before stopping anyone.
+
+    A versioned alias prints as a fixed LABEL rather than as itself, because the pattern
+    admitting it is a shape and a shape cannot bound what follows its stem. The label says
+    which stem fired, which is what the field is for, and carries none of the digits.
+    """
+    root = host_proc(tmp_path, monkeypatch)
+    fleet = tmp_path / "wt"
+    fleet.mkdir()
+    fleet_pid(root, fleet, "440", argv)
+    lines, _host = mod._host_lines({"fleet_worktrees": [str(fleet)]})
+    assert len(lines) == 1
+    cmd = lines[0].split("cmd=", 1)[1].split()[0]
+    assert cmd.split(",")[0] == program, f"cmd= withheld the program name: {cmd}"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "pytest-123456",
+        "pytest-9",
+        "pytest-0.0.0.0.1",
+        "py.test-99999999",
+        "pytest-123456.exe",
+        "pytest-" + "1" * 40,
+    ],
+)
+def test_no_digits_a_command_carried_ever_reach_the_printed_command(mod, secret):
+    """A token the alias SHAPE admits is printed as a label, so its text cannot escape.
+
+    The pattern admitting a versioned alias is anchored at both ends but open in the
+    middle: it accepts ``pytest-`` followed by any digits, so a secret of that spelling
+    satisfies it exactly as ``pytest-3.12`` does. The row lands in the conductor's model
+    context, so echoing the token would carry the secret there.
+
+    Each case is asserted to BE an alias by the pattern first, so a future narrowing of
+    the pattern makes this test stop proving nothing rather than silently pass.
+    """
+    assert mod._ALIAS_RUNNER_BASE_RE.match(
+        secret
+    ), f"{secret} is not alias-shaped, so it proves nothing"
+    cmd = f"pytest -q --token {secret} test/x.py"
+    out = mod._redacted_command(cmd, (0, len(cmd)))
+    digits = secret.partition("-")[2]
+    assert digits not in out, f"the token's own text reached cmd=: {out}"
+    assert mod._alias_program_label(secret) in out.split(","), f"no label stood in for it: {out}"
+
+
+def test_every_alias_the_pattern_admits_has_a_label(mod):
+    """A stem the pattern admits with no label would fall back to echoing the token.
+
+    The label lookup and the pattern are two lists that must agree, so this asserts the
+    agreement structurally rather than by naming today's two stems.
+    """
+    for stem, _label in mod._ALIAS_PROGRAM_LABELS:
+        assert mod._ALIAS_RUNNER_BASE_RE.match(f"{stem}3"), f"{stem} is labelled but not admitted"
+    for spelling in ("pytest-3", "py.test-3", "pytest-3.12.4", "py.test-12.0"):
+        assert (
+            mod._alias_program_label(spelling) is not None
+        ), f"{spelling} is admitted but not labelled"
+    # The lookup is gated on the PATTERN, not on the stem alone. Today's caller only
+    # reaches it for a token the pattern already admitted, so this cannot be observed
+    # through `cmd=`; it is asserted directly so a future caller admitting a wider set
+    # cannot obtain a runner label for a word that is not a versioned alias.
+    for not_an_alias in ("pytest-abc", "pytest-", "py.test-v3", "pytest-3x", "pytest"):
+        assert mod._alias_program_label(not_an_alias) is None, f"{not_an_alias} got a runner label"
+
+
+def test_vitest_is_left_to_its_own_rule_rather_than_a_pytest_cap_check(mod):
+    """``vitest.cmd`` is a runner base and is deliberately not an argv-only shape.
+
+    Its rule spells an uncapped run as ``vitest run`` with nothing following, not as a
+    missing ``-n``. Admitting it here would route it through the pytest cap grammar,
+    where a bounded vitest run carries no ``-n`` and would be reported as unbounded.
+    """
+    assert "vitest.cmd" in mod._RUNNER_BASES
+    assert "vitest.cmd" not in mod._ARGV_ONLY_RUNNER_BASES
+    assert not mod._ALIAS_RUNNER_BASE_RE.match("vitest.cmd")
+    # The two spellings whose dot defeats the rule's token boundary ARE admitted, which
+    # is the asymmetry this assertion fixes in place: the reason is the cap grammar, not
+    # the spelling.
+    assert {"py.test", "pytest.exe"} <= mod._ARGV_ONLY_RUNNER_BASES

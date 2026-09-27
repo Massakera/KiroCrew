@@ -3764,7 +3764,7 @@ async def test_shadow_records_a_stalled_watch_as_a_stall_not_as_the_subject() ->
         last_fingerprint="red-1",
         last_wake_fingerprint="red-1",
         coalesce_alerted={f"{MONITOR_REVISION_KEY_SPACE}red-1": 1_000.0},
-        budgets=MonitorBudgets(max_runtime_secs=10_000_000),
+        budgets=MonitorBudgets(max_runtime_secs=2_592_000),
     )
 
     for tick in range(DEFAULT_MONITOR_STALL_TICKS):

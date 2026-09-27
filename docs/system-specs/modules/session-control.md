@@ -40,7 +40,19 @@ target QUEUES it, and the queue entry carries the containment that held at
 admission (`containment_meta`); the drain recomputes those constraints and drops
 any entry for which one is newly held (`newly_held_constraints`), so a target that
 gains a channel mirror between enqueue and drain never broadcasts the delivered
-text. The re-check is not specific to this module — a human-typed message into a
+text. The mirror half of that snapshot is an identity, not a boolean (a mirror
+retargeted A→B keeps "mirrored" true while substituting the audience), and it is
+composed from BOTH store accessors the delivery legs read — `get_mirror_link` and
+`get_slack_link` — because the first shadows the second: it answers the explicit
+`mirror` row alone, while the dashboard's slack-link binds its thread onto a
+channel-born slot's own session key without touching that row. Read through the
+mirror alone, a thread bound while an entry waited would leave the identity
+unchanged and the drain would post into a room the admission never saw; the
+composed identity reports it as `mirror_retarget`. That identity is a set of
+rooms (`mirror_audience`), and the drain compares it as one: a room the admission
+never saw — a retargeted mirror, a thread bound beside it — drops, while a room
+that has since gone away (the thread unlinked, the mirror cleared) is a narrowing
+that admits, because every room the delivery can still reach was admitted. The re-check is not specific to this module — a human-typed message into a
 busy session drains through the same path — which is why it lives at the drain
 rather than in each caller (#5911).
 
@@ -205,6 +217,12 @@ loses nothing — existence is confirmed read-only under the folder-store lock
 only after the filing has landed, so a refused create leaves no folder-tree
 mutation behind.
 
+`session_create` also takes an optional `model` — the model the child starts
+on, pinned as the person's own pick in the model dropdown would be (same
+`_model_rejected_reason` guard, same pick-generation bump). An id the guard
+refuses fails the whole create with `model_rejected`; omitted, the child starts
+on the agent's or the global default.
+
 ### `session_fork`: a created child that carries a transcript
 
 `session_create` opens an empty session, and the case it cannot serve is the
@@ -348,10 +366,11 @@ create already in flight. Revoking mid-call yields an untrusted child.
 
 Nothing about trust is persisted at birth. The birth metadata carries
 `tab_id`, `origin`, `created_at`, `workspace`, `agent`, `project`, `title`,
-`memory_mode`, and `folder_id` / `created_by` when set — no trust field — so a
+`memory_mode`, and `folder_id` / `created_by` / `model` when set — no trust field — so a
 restart returns the child to interactive along with its creator.
 
-The create's SEL record carries `agent`, `folder_id`, and what the child was
+The create's SEL record carries `agent`, `folder_id`, `model` (empty when none
+was asked for), and what the child was
 born with: `inherited_trust` and `inherited_trust_reads`, present on both
 outcomes so `"false"` is positive evidence the posture did not transfer. That is
 what makes an auto-approved tool call in a dispatched session traceable to the
@@ -395,7 +414,7 @@ that is out of bounds is visible after the fact even though nothing happened.
 | Caller is an unattended session (`workflow-*`) | 403 | A `workflow-<run_id>` slot exists only once its originating tab is gone, so there is no owning session to fence it to. **Exception:** a cron slot (`cron-*` caller key) is admitted and fenced by creator ownership instead — see "Cron callers" below |
 | Caller is itself incognito, temporary, or app-scoped | 403 | Caller-side isolation — the direction the target-side checks cannot see |
 | Caller is an APP-owned cron (`created_by` starts `app:`), or a cron whose job cannot be found | 403 | `app_owned_cron_caller` / `cron_owner_unverifiable`. A cron tab is minted without `app=`, so the `_app` check above cannot see an app's own scheduled job; ownership is read from the JOB instead, and an unverifiable owner fails closed — see "Cron callers" below |
-| Caller is channel-linked (`linked_session_key` set) | 403 | The exfiltration direction: a linked caller's conversation IS a channel thread, so a read would hand a private dashboard transcript to that channel's readers. `CHANNEL_AGENT_BLOCKED_TOOLS` keys on the agent identity; a linked slot is a second route to the same surface. **Two exceptions:** a `cron:<job_id>` link, which names the job's own run transcript and republishes to nobody; and a 1:1 DM whose only human is the configured owner (`audience_is_owner`) — see "Owner-DM channel callers" below |
+| Caller is channel-linked (`linked_session_key` set) | 403 | The exfiltration direction: a linked caller's conversation IS a channel thread, so a read would hand a private dashboard transcript to that channel's readers. `CHANNEL_AGENT_BLOCKED_TOOLS` keys on the agent identity; a linked slot is a second route to the same surface. **Two exceptions:** a `cron:<job_id>` link, which names the job's own run transcript and republishes to nobody; and a 1:1 DM whose only human is the configured owner (`owner_dm_refusal` answering `""`) — see "Owner-DM channel callers" below |
 | Caller's own session is no longer open | 403 | Nothing to attribute the operation to |
 | Caller changed workspace while a creation was in flight | 403 | Creation resolves the workspace's project directory off-loop, so it suspends between authorizing the caller and allocating the slot. Both decisions that read the caller's workspace -- the memory boundary the child inherits, and whether the answering agent is bound to that workspace -- are invalidated by a move, and re-deciding the binding here is not available: it needs a config load, which must not run on the event loop |
 | Named agent does not resolve to a configured one | 403 | The resolver falls back to the default agent, which passes the workspace check because it is the caller's own default -- so no boundary is crossed, but the created session would store and advertise a name that is not what answers. `ResolvedBindings.requested_resolved` states that contract for callers that store the requested name. Refused rather than rewritten to the effective agent: nothing exists yet, so a corrected name costs one retry, whereas an existing slot keeps its stored name verbatim so a momentarily stale resolution cannot permanently rebind it |
@@ -406,7 +425,7 @@ that is out of bounds is visible after the fact even though nothing happened.
 | Target is incognito or temporary | 403 | Never addressable, matching `list_sessions` |
 | Target is app-scoped | 403 | App sessions are the app's, not a peer's |
 | Target is channel-linked (`linked_session_key` set) | 403 | Its conversation is mirrored to Slack/Telegram, so reaching it crosses a surface boundary both ways — and its stop cannot be honoured, because the stop path addresses `dashboard:<slot>` while a linked slot's turns run under its linked key |
-| Target or caller has an outbound channel mirror (`get_mirror_link`) | 403 | The same boundary reached by the other mechanism. `linked_session_key` marks a channel-BORN slot; a dashboard-born slot given a mirror link republishes its turns to a channel just as surely, and the link lives in the session store rather than on the slot, so the slot-side check reads empty on exactly the session that mirrors. **Caller-side exception:** an owner DM whose mirror IS its own conversation — the same audience, established by `audience_is_owner` before either caller-side channel refusal runs |
+| Target or caller has an outbound channel mirror (`get_mirror_link`) | 403 | The same boundary reached by the other mechanism. `linked_session_key` marks a channel-BORN slot; a dashboard-born slot given a mirror link republishes its turns to a channel just as surely, and the link lives in the session store rather than on the slot, so the slot-side check reads empty on exactly the session that mirrors. **Caller-side exception:** an owner DM whose mirror IS its own conversation — the same audience, established by `owner_dm_refusal` before either caller-side channel refusal runs; the threadless Slack row every unlinked channel session carries reads as no mirror from the store itself (`SessionMap.get_mirror_link` never synthesizes a Slack mirror without a thread), and a Slack thread bound beside the mirror row (`get_slack_link`) counts as a second audience. **A paused mirror refuses exactly like a live one.** `_has_channel_mirror` reads the binding, never `mirror_paused`: the dashboard's Disconnect row mutes outbound delivery and keeps the binding, inbound from that conversation still routes into the session (`SessionBinder.resolve_inbound` does not read the flag either), and one click on the same row resumes delivery — so a paused binding is a latent audience that returns without any further authorization, and admitting the session while it stands would let a session control peers between two clicks of the same toggle. Fail-closed here means the way back into session control is to **sever** the binding: the menu's `Unlink from X` item (`mirror-unlink` / `slack-unlink`) or an in-channel `/unlink`, both of which drop the row and the pause flag with it (#14068; pinned in `test_session_control_boundaries.py::test_a_paused_mirror_still_refuses`). Not decided here: whether a dashboard-born session mirroring to the owner's OWN DM is the contained audience `owner_dm_refusal` admits for the channel-born DM session itself — the predicate deliberately judges channel-born slots only, and a dashboard-born mirrored caller stays refused (see #14084) |
 | Target is in another workspace | 403 | Workspaces are the memory boundary |
 | Target names no open session | 404 | A mistake, not an authorization failure |
 | Title matches more than one session | 409 | Guessing means acting on the wrong conversation |
@@ -497,7 +516,20 @@ or replace the creator-ownership checks in `session_control.py`.
 `create_session` captures the caller's canonical execution before asynchronous
 project or template resolution. An omitted member inherits the caller; an explicit
 member uses its existing stable member/store identity under the ordinary
-delegation rules. Template and project choices do not select memory. The child's
+delegation rules. Template and project choices do not select memory. An explicit
+TEMPLATE named by a caller that carries an execution keeps that caller's store and
+member identity and takes the template's selection namespace — `selection_kind`
+`"template"`, the requested name as `selection_name`, the resolved provider
+template as `template_id` — through `ExecutionContext.with_template`, the same
+rewrite the subagent admission gate makes for `spawn_run(agent=…)`. The record
+therefore says whose memory the child runs on and, separately, what was picked to
+run it: a member's child that selected a template is that member's delegate, and
+`ContextBuilder` reads the namespace to withhold the member operating protocol from
+it (see [memory-skills-hooks](memory-skills-hooks.md)). A caller whose member has
+no persisted `member_id` is the one exception: its member is named by the selection
+alone, so the arm keeps that selection and changes only the template with its own
+`replace` — `with_template` would leave the child attributed to no member, which is
+the shape the spawn gate mints for that caller. The child's
 execution record is published before slot metadata, broadcast or provider startup.
 Publication failure retracts an idle empty child and reports the actual failure.
 
@@ -999,16 +1031,17 @@ Three gates decide this, and three different facts are available to them — the
 live `linked_session_key`, the key prefix (`is_channel_session_key`), the mirror
 store. A key prefix can never be cleared while a link can, so gates keying on
 different facts would disagree about one slot. They therefore consult **one
-predicate**, `session_control.audience_is_owner(state, slot)`, and the ledger
-reaches it through `session_audience_is_owner(state, session_key)`,
+predicate**, `session_control.owner_dm_refusal(state, slot)`, and the ledger
+reaches it through `session_owner_dm_refusal(state, session_key)`,
 which resolves the slot with the same `caller_slot_key` every session-control verb
 uses — so "the ledger gate and session control agree on the same slot" holds by
-construction. The clause walk itself is `owner_dm_refusal`, which returns the
-first fact that FAILED (`""` when none did) and of which `audience_is_owner` is the
-boolean face; every gate renders that reason into its refusal, so the three tell a
-caller the same thing about the same slot and none of them can name a clause the
-predicate did not actually evaluate. The refusal CODES are unchanged
-(`linked_session_caller`, `mirrored_caller`, `channel_session`).
+construction. The predicate IS the clause walk: it returns the first fact that
+FAILED, and `""` when none did, which is the admission; there is no separate
+boolean face, because the only consumers are the three gates and each of them
+needs the reason, not a verdict. Every gate renders that reason into its refusal,
+so the three tell a caller the same thing about the same slot and none of them
+can name a clause the predicate did not actually evaluate. The refusal CODES are
+unchanged (`linked_session_caller`, `mirrored_caller`, `channel_session`).
 
 The predicate is a conjunction of positive facts, and any it cannot establish
 answers **false**:
@@ -1042,7 +1075,30 @@ answers **false**:
    so no derivation from the key could stand in for the recorded truth. An
    unknown origin, an unreadable store, or a mirror aimed anywhere else refuses.
    A **paused** mirror (the dashboard's Disconnect row) keeps its binding and
-   reads exactly like a live one — the audience did not change.
+   reads exactly like a live one — the audience did not change. An **unlinked**
+   DM reads `None` and is admitted: the dispatcher's first turn stamps the
+   conversation's namespaced bucket into the legacy `slack_channel_id` field with
+   no thread, `clear_mirror_link` pops only the `mirror` row, so `!unlink` /
+   `/unlink` (which also persists the opt-out that keeps the next turn from
+   rebinding) and the dashboard's mirror-unlink both leave that threadless row —
+   and `SessionMap.get_mirror_link` filters it **at the source**: a Slack row that
+   names no thread is bookkeeping nobody can deliver through (an empty `thread_ts`
+   never enters Slack's thread index) and is never synthesized into a mirror. One
+   filter in the store rather than a copy of the rule in each reader, because the
+   readers cannot all be enumerated — this clause and `bind_origin_mirror` each
+   carried one, and the `!sessions` resume, the link projection and the
+   containment probe read the same method without one. A Slack mirror
+   that names a thread is a real second audience and refuses — and it is read
+   **through `get_slack_link`, not only through the mirror**: `get_mirror_link`
+   returns the explicit `mirror` row whenever one exists and never looks at the
+   Slack fields beside it, while the dashboard's slack-link writes its thread onto
+   the slot's *effective* key (`DashboardState.link_slack`), which for a
+   channel-born slot is this very session, and the turn path posts every
+   dashboard-driven reply into that thread straight off `get_slack_link`. So a DM
+   whose mirror row still equals its origin can carry a Slack thread the mirror
+   read cannot see; a non-empty `thread_ts` refuses on its own clause ("the
+   session also mirrors to a Slack thread"), and the threadless bucket stays no
+   mirror.
 
    **The origin does not survive a gateway restart, and the exemption goes with
    it.** `set_origin_link` holds the record in memory by design (`session.py`),
@@ -1064,7 +1120,13 @@ answers **false**:
 
 **What is relaxed.** An admitted owner DM may `session_create`, and may `send`,
 `read`, `stop` and `close` **the sessions it created**, and may hold a work ledger
-— the whole conductor loop. **What is kept.** It is creator-fenced:
+— the whole conductor loop. Holding a ledger needs one more thing than the gate:
+the ledger is a projection of the crew log and appends every write to the acting
+session's log, refusing (`crew_log_unrecorded`) when there is nowhere to append,
+so the Discord and Telegram dispatchers open their own sessions' crew logs ahead
+of each turn exactly as the dashboard runner does
+(`messaging.dispatch.open_turn_crew_log`, see [messaging](messaging.md)). **What
+is kept.** It is creator-fenced:
 `_caller_is_ownership_fenced` treats every non-cron channel link as fenced (the
 only linked caller that gets past the refusals is an owner DM), so it inherits a
 crew member's reach, not the owner's own tab's. A wrong audience inference
@@ -1100,14 +1162,19 @@ conductor is keyed `discord:…:genN` while its slot is that key folded to the
 filename charset — a string comparison refused every worker such a conductor
 created as `worker_not_owned`. A dashboard conductor compares as before.
 
-Pinned by `test/test_session_control_owner_dm.py`: a Discord thread and a
-Telegram forum topic refused by all three gates; an owner DM on Discord and on
-Telegram conducting end to end; the fence; the paused mirror; every fail-closed
-edge (two identities, a stranger's DM, an absent or unavailable transport, a
-retargeted mirror, an unknown origin, an unreadable store, unparseable and
-non-direct keys, a dashboard-born mirrored caller); gate agreement over one slot;
-the post-read re-check; the bind fold; and that mirror-unlink clears only the
-mirror.
+Pinned by `test/test_session_control_owner_dm.py`, against a real `SessionMap`
+whose rows carry the dispatcher's first-turn `set_channel` bucket: a Discord
+thread and a Telegram forum topic refused by all three gates; an owner DM on
+Discord and on Telegram conducting end to end; the fence; the paused mirror; every
+fail-closed edge (two identities, a stranger's DM, an absent or unavailable
+transport, a retargeted mirror, an unknown origin, an unreadable store,
+unparseable and non-direct keys, a dashboard-born mirrored caller); gate agreement
+over one slot; the post-read re-check; the bind fold; that an owner DM which
+`!unlink`s its own mirror is still admitted by all three gates while a threaded
+Slack mirror refuses; and that mirror-unlink clears only the mirror. The crew-log
+opener is pinned in `test/test_discord.py` and `test/test_telegram.py`: a DM turn
+followed by a `work_ledger_record` write against the real writer lands, and the
+resumed-session path opens nothing.
 
 ## The wait → read poll loop
 
@@ -1326,3 +1393,13 @@ follow-up.
 - **No waking closed sessions.** See above.
 - **No writes on the read path.** `session_read_message` never changes the
   target's state, so a poll loop cannot perturb what it is measuring.
+
+### Ordinary Codex dashboard grants
+
+An ordinary agent that explicitly grants `@kirocrew-dashboard` receives the
+managed dashboard mount on both create and resume through the Codex mirror.
+The grant, disabled-server and per-tool restrictions remain authoritative; a
+spec-supplied command is replaced before session identity is attached. Broker
+mounts preserve verified per-call identity and are required for host API access
+inside enforced sandboxes. Session ownership, workspace and private-session
+rules remain enforced by the existing session-control handlers.

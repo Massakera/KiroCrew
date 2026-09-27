@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
 import { X, LoaderCircle } from 'lucide-react'
 import { SplitGlyph } from './SplitGlyph'
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
 import ChatMessageList from '../app-sdk/ChatMessageList'
 import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
@@ -35,6 +35,7 @@ import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
 import ModelDropdownList from './ModelDropdownList'
+import ReasoningEffortDropdown from './ReasoningEffortDropdown'
 import { ManageModelsFooter } from './ModelEffortDropdown'
 import { settingsPath } from './settingsPath'
 import { SlotProvider } from '../providers/SlotContext'
@@ -46,13 +47,15 @@ import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModelsQuery } from '../hooks/useAvailableModels'
 import { isModelCatalogUnavailable } from '../api/apiError'
-import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { filterInteractiveModels, legacyCodexEffort, modelWithoutEffort, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { modelSupportsEffort } from '../lib/effort'
 import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
+import { useKirocrewConfigReader } from '../hooks/useKirocrewConfigReader'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { appendFollowUpOption, removeFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
@@ -527,12 +530,18 @@ export default function ChatPane({
   // The transcript row whose bubble the banner is standing in for. The list
   // hides it (ts-keyed, index fallback — see ChatMessageList.hiddenRow);
   // memoised so the memo'd list does not re-render on every pane render.
+  // `stripUncovered` is the hook's BOOLEAN "the row's action strip is still on
+  // screen below the card" (derived from occlusion, see usePinnedPrompt), not
+  // the fold height: liveH moves every scroll frame of the fold, and keying the
+  // memo on it would re-render the list per frame for a marker that only flips
+  // at its two edges.
   const pinnedState = pin.pinned
   const pinnedTs = pinnedState?.ts
   const pinnedIdx = pinnedState?.idx
+  const pinnedStripUncovered = pinnedState?.stripUncovered === true
   const pinHiddenRow = useMemo(
-    () => (pinnedIdx == null ? undefined : { ts: pinnedTs, index: pinnedIdx }),
-    [pinnedTs, pinnedIdx],
+    () => (pinnedIdx == null ? undefined : { ts: pinnedTs, index: pinnedIdx, stripUncovered: pinnedStripUncovered }),
+    [pinnedTs, pinnedIdx, pinnedStripUncovered],
   )
 
   // Pickers — same hooks/data sources ChatPage uses, but selection targets THIS slot.
@@ -558,6 +567,7 @@ export default function ChatPane({
   // review). Mirrors ChatPage's `effectiveDefaultAgent`; '' for a peer whose
   // capabilities have not loaded, which yields no false marker.
   const paneRemoteCrew = useRemoteCapabilities(paneSlot)
+  const queryClient = useQueryClient()
   const paneEffectiveDefaultAgent = paneRemoteCrew.isRemote
     ? (paneRemoteCrew.capabilities?.default_agent || '')
     : defaultAgent
@@ -584,6 +594,16 @@ export default function ChatPane({
       contextWindow: model.context_window || undefined,
     }))
   }, [paneRemoteCrew.isRemote, paneRemoteCrew.capabilities, localModels])
+  const selectionCapabilitiesQ = useQuery({
+    queryKey: ['slot-selection-capabilities', slotKey],
+    queryFn: () => api.chatSlotSelectionCapabilities(slotKey),
+    enabled: !!paneSlot && typeof api.chatSlotSelectionCapabilities === 'function',
+    refetchInterval: query => query.state.data?.known || query.state.dataUpdateCount + query.state.errorUpdateCount >= 5 ? 30_000 : 2_000,
+  })
+  const selectionCapabilities = selectionCapabilitiesQ.data?.known ? selectionCapabilitiesQ.data : undefined
+  const codexPairModels = shouldSeparateModelEffort(
+    selectionCapabilitiesQ.data?.model_effort_pair_ids, effectiveModels,
+  )
   const hiddenModelsQ = useModelPickerHiddenModelsQuery()
   const hiddenModelIds = hiddenModelsQ.data
   const modelPickerConfigured = useModelPickerConfigured()
@@ -608,17 +628,31 @@ export default function ChatPane({
       filterInteractiveModels(effectiveModels, hiddenModelIds, [
         paneSlot?.model || '',
         paneSlot?.served_model || '',
-      ]),
+      ], codexPairModels),
       jevRouteOn,
       jevRouteLabel,
     ),
-    [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model, jevRouteOn, jevRouteLabel],
+    [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model, jevRouteOn, jevRouteLabel, codexPairModels],
   )
   const modelDD = useFilteredDropdown(modelPickerModels)
+  const [reasoningEffortDropdown, setReasoningEffortDropdown] = useState(false)
+  const reasoningEffortDropdownRef = useRef<HTMLDivElement>(null)
   // Picker anchors: keep each portaled menu glued to the ChatInput chip that
   // opened it while the menu is open (#10616, same class as #10580).
   const { rect: agentBtnRect, anchorTo: anchorAgentBtn } = useAnchoredTriggerRect(agentDD.open)
   const { rect: modelBtnRect, anchorTo: anchorModelBtn } = useAnchoredTriggerRect(modelDD.open)
+  const { rect: reasoningEffortBtnRect, anchorTo: anchorReasoningEffortBtn } = useAnchoredTriggerRect(reasoningEffortDropdown)
+  useEffect(() => {
+    if (!reasoningEffortDropdown) return
+    const closeOutside = (event: MouseEvent) => {
+      if (reasoningEffortDropdownRef.current?.contains(event.target as Node)) return
+      const rect = reasoningEffortBtnRect
+      if (rect && event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom) return
+      setReasoningEffortDropdown(false)
+    }
+    document.addEventListener('mousedown', closeOutside)
+    return () => document.removeEventListener('mousedown', closeOutside)
+  }, [reasoningEffortDropdown, reasoningEffortBtnRect])
   // See ChatPage: display what will actually run, not a pin the account lost
   // access to. The slot's own `model_withheld` verdict answers that when the
   // backend has one; the degraded flag gates only the list-membership fallback —
@@ -626,18 +660,38 @@ export default function ChatPane({
   // entitlement — and is subscribed to, since it can flip while the served list
   // stays identical.
   const _modelsDegraded = useModelsDegraded(provider.id)
+  const displayModels = codexPairModels
+    ? filterInteractiveModels(availableModels, [], [], true)
+    : availableModels
   const shownModel = displayModel(
-    paneSlot?.model || '',
-    availableModels,
+    codexPairModels ? modelWithoutEffort(paneSlot?.model || '') : paneSlot?.model || '',
+    displayModels,
     _modelsDegraded,
     paneSlot?.model_withheld,
-    paneSlot?.served_model || '',
+    codexPairModels ? modelWithoutEffort(paneSlot?.served_model || '') : paneSlot?.served_model || '',
   )
+  const effortSupported = provider.capabilities.reasoningEffort && !selectionCapabilitiesQ.isError && (
+    selectionCapabilities
+      ? selectionCapabilities.effort_supported === true
+      : modelSupportsEffort(shownModel === 'auto' ? '' : shownModel)
+  )
+  const effortLevelsOverride = selectionCapabilities
+    ? selectionCapabilities.effort_levels
+    : paneRemoteCrew.isRemote ? (paneRemoteCrew.capabilities?.effort_levels ?? []) : undefined
+  const readKirocrewConfig = useKirocrewConfigReader()
+  const { data: defaultEffort = '' } = useQuery({
+    queryKey: ['default-effort', provider.id],
+    queryFn: () => provider.resolveDefaultEffort(readKirocrewConfig),
+    enabled: provider.capabilities.reasoningEffort,
+  })
+  const effectiveEffort = paneSlot?.reasoning_effort || legacyCodexEffort(
+    paneSlot?.model || '', '', codexPairModels,
+  ) || defaultEffort
   // What the pin alone would say; differing from `shownModel` means the chip
   // is naming the served default an inheriting slot runs on (see ChatPage).
   const _pinShownModel = displayModel(
-    paneSlot?.model || '',
-    availableModels,
+    codexPairModels ? modelWithoutEffort(paneSlot?.model || '') : paneSlot?.model || '',
+    displayModels,
     _modelsDegraded,
     paneSlot?.model_withheld,
   )
@@ -699,24 +753,43 @@ export default function ChatPane({
   const switchModel = useCallback(async (name: string) => {
     setSwitchError('')
     try {
-      // performSlotSwitch owns the whole protocol: serialized dispatch,
-      // latest-request-wins adjudication, hung-request timeout, and exactly
-      // one store write on the authoritative value (#4523) — the pane must
-      // not depend on the coalesced slots rebroadcast to see its own pick.
-      await performSlotSwitch('model', slotKey, name,
-        async () => {
-          const r = await api.chatSlotModel(slotKey, name)
-          return r?.model ?? name
-        },
+      const legacyEffort = legacyCodexEffort(
+        paneSlot?.model || '', paneSlot?.reasoning_effort || '', codexPairModels,
+      )
+      await switchGroupedModel(legacyEffort, async level => {
+        let normalizedModel: string | undefined
+        await performSlotSwitch('reasoning_effort', slotKey, level,
+          async () => {
+            const response = await api.chatSlotReasoningEffort(slotKey, level)
+            normalizedModel = response?.model
+            return response?.reasoning_effort ?? level
+          },
+          value => dispatch(updateSlot({
+            key: slotKey,
+            reasoning_effort: value,
+            ...(normalizedModel ? { model: normalizedModel } : {}),
+          })))
+      }, async () => {
+        // performSlotSwitch owns the whole protocol: serialized dispatch,
+        // latest-request-wins adjudication, hung-request timeout, and exactly
+        // one store write on the authoritative value (#4523) — the pane must
+        // not depend on the coalesced slots rebroadcast to see its own pick.
+        await performSlotSwitch('model', slotKey, name,
+          async () => {
+            const r = await api.chatSlotModel(slotKey, name)
+            return r?.model ?? name
+          },
           // The routing flag is written from the REQUEST, not from the response's
           // `model`: the gateway resolves the sentinel to `auto`, so the stored
           // model cannot tell a routed pick from a plain Auto one. Written on
           // every pick, because picking a concrete model is what clears it.
-        (value) => dispatch(updateSlot({
-          key: slotKey,
-          model: value,
-          jev_route: name === JEV_ROUTE_MODEL,
-        })))
+          (value) => dispatch(updateSlot({
+            key: slotKey,
+            model: value,
+            jev_route: name === JEV_ROUTE_MODEL,
+          })))
+      })
+      queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', slotKey] })
     } catch (e) {
       // Same failure surface as switchAgent above: the shared notice toast,
       // plus the in-pane notice (the toast alone would be the only report of
@@ -728,7 +801,7 @@ export default function ChatPane({
       // eslint-disable-next-line no-console
       console.error('[ChatPane] switchModel failed', e)
     }
-  }, [dispatch, slotKey])
+  }, [codexPairModels, dispatch, paneSlot?.model, paneSlot?.reasoning_effort, queryClient, slotKey])
 
   // Roving-focus keyboard nav for the pickers (mirrors ChatPage / StyledSelect):
   // ArrowUp/Down across options, Enter/Space select, Escape/Tab close + return
@@ -910,15 +983,12 @@ export default function ChatPane({
     // A send while STREAMING dictation is live ends the dictation, before the
     // composer is read and cleared (see useComposerVoice.disarmForSend).
     composerRef.current?.voice()?.disarmForSend()
-    // Capture the stateless card pending at ENTRY (before any state updates
-    // or yields): this send consumes the answer channel of the card the user
-    // saw when they hit send. Retired only after the server confirms it
-    // accepted the message (ok or queued) — the optimistic append below must
-    // not do it, or a failed send (offline, 5xx) deletes the card while the
-    // session never moved on.
-    const cardAtSend = captureStatelessCard(store.getState().chat.pendingQuestions, slotKey)
-    // A blocking card is resolved over the network, not in the store — an agent
-    // is parked on its request.
+    // Capture a pending BLOCKING card at ENTRY (before any state updates or
+    // yields): this send consumes the answer channel of the card the user saw
+    // when they hit send, and a blocking card is resolved over the network, not
+    // in the store — an agent is parked on its request. A stateless card needs
+    // no capture: the server retires it when this send's user row lands and
+    // announces it with `question_card_resolved`.
     const askAtSend = capturePendingAskId(store.getState().chat.pendingQuestions, slotKey)
     // Staged text and files belong to the COMPOSER, so only a send that
     // consumes the composer may clear or carry them. An `optionText` send (the
@@ -1068,13 +1138,10 @@ export default function ChatPane({
         stashDemoted: (queueId) => { if (!optionText) queuedSendStash.set(queueId, { raw: bubblePastes.length ? expandPasteTokens(text, bubblePastes) : text, files, sent: llm }) },
       })
       // -- doSend's send-machinery tail (not steer-receipt policy) --
-      // Stateless card + blocking ask resolution, owned by doSend and run on
-      // every accepted receipt. Guarded independently of the rulings above so
-      // a `steered` or `queued` receipt still settles the card/ask correctly.
-      if (!cardAtSend && !askAtSend) return
-      // Immediate dispatch only: a QUEUED acceptance is still cancellable --
-      // the queued path retires at its queue_pop instead (removeQueuedMessage).
-      if (receipt.status === 'dispatched' && cardAtSend) dispatch(retireStatelessQuestion({ slot: slotKey, expected: cardAtSend }))
+      // Blocking ask resolution, owned by doSend and run on every accepted
+      // receipt. Guarded independently of the rulings above so a `steered` or
+      // `queued` receipt still settles the ask correctly.
+      if (!askAtSend) return
       void resolveAskAfterSend(receipt.body, askAtSend, dispatch)
     })
   }, [input, pendingFiles, pasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure])
@@ -1665,11 +1732,11 @@ export default function ChatPane({
              starts an ordinary next turn, exactly as the non-blocking
              `ask_question` card does. `busy` is the shared `selectComposerBusy`
              rule (chatSlice) the main chat keys on too, so the two routes match.
-             Steer ONLY the native card (no `ask_id`, no server `card_id`): the
-             client always mints a local `cardId`, so the discriminator is
-             `serverCardId`, which the server sets only for the non-blocking
-             `ask_question` card. That card can be answered while sub-agents keep
-             the slot busy, and it must still start a next turn.
+             Steer ONLY the native card, which the server marks `native` on the
+             `question_card` frame and the /pending row. The non-blocking
+             `ask_question` card carries the same server `card_id` but no such
+             mark: it can be answered while sub-agents keep the slot busy, and
+             it must still start a next turn.
 
              Recovery differs by whether this is a live steer. A LIVE steer uses
              the receipt-aware policy owned by `applySteerReceipt` (issue #9457),
@@ -1686,15 +1753,14 @@ export default function ChatPane({
              expired-blocking-card (404) recovery path and is NOT reused here. */
           onDirectSend={(text) => {
             // The card IS the interaction, answered in one click. A NATIVE
-            // AskUserQuestion card (no `ask_id`, no server `card_id`) is raised
+            // AskUserQuestion card (marked `native` by the server) is raised
             // while its own turn is still running and waiting on the answer, so
             // a plain send would queue behind that turn and the question would
             // never be consumed (#10634): when the slot is busy that turn is
-            // live, so the answer STEERS into it. The client always mints a
-            // local `cardId`, so the discriminator is `serverCardId`, which the
-            // server sets only for the non-blocking `ask_question` card; that
-            // card can be answered while sub-agents keep the slot busy and must
-            // still start a next turn, never steer.
+            // live, so the answer STEERS into it. The non-blocking
+            // `ask_question` card carries no such mark; it can be answered
+            // while sub-agents keep the slot busy and must still start a next
+            // turn, never steer.
             //
             // Both routes are otherwise ONE path: mint an optimistic user bubble
             // carrying the `sendId`, POST through `sendTurn`, and reconcile the
@@ -1711,7 +1777,7 @@ export default function ChatPane({
             // reconciled the bubble -- proof it landed, so no restore and no
             // duplicate. Only the `steer` POST flag and the pre-append chunk
             // drain differ between the two routes.
-            const steerLive = busy && !pendingQuestion?.ask_id && !pendingQuestion?.serverCardId
+            const steerLive = busy && pendingQuestion?.native === true
             const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
             // Drain the per-frame chunk buffer before the append, as `doSteer`
             // does: a pre-steer chunk still buffered means the finalize-on-steer
@@ -1765,6 +1831,15 @@ export default function ChatPane({
           testId="chat-pane-switch-error"
           message={switchError}
           onDismiss={() => setSwitchError('')}
+        />
+        {/* No hand-off: this pane holds an unsent draft. A failed ACP capability
+            read hides the stale control; the query retries in place. */}
+        <ErrorNotice
+          variant="inline"
+          className="mx-4 mt-2"
+          testId="chat-pane-effort-capabilities-error"
+          message={provider.capabilities.reasoningEffort && selectionCapabilitiesQ.isError
+            ? i18nT('pages.chatPage.effort_options_unavailable') : ''}
         />
         {/* No hand-off: the composer draft is untouched by a failed stop; the
             turn is still running, so the Stop button stays for a retry. */}
@@ -1830,6 +1905,12 @@ export default function ChatPane({
           agentIsInheritedDefault={!paneSlot?.agent && !!paneEffectiveDefaultAgent}
           agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
           modelName={shownModel}
+          reasoningEffort={effectiveEffort}
+          separateEffort={effortSupported}
+          onReasoningEffortClick={effortSupported ? (rect, trigger) => {
+            anchorReasoningEffortBtn(rect, trigger)
+            setReasoningEffortDropdown(!reasoningEffortDropdown)
+          } : undefined}
           modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
           // See ChatPage: the slot's RAW model, because `shownModel` substitutes
           // the served id and would hide every routed turn.
@@ -2016,8 +2097,27 @@ export default function ChatPane({
             </div>
             {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
               modelDD.setOpen(false)
-              navigate(settingsPath({ tab: 'chat', highlight: 'key:dashboard.model_picker_hidden_models' }))
+              navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: 'key:dashboard.model_picker_hidden_models' }))
             }} />}
+          </div>,
+          document.body,
+        )}
+        {reasoningEffortDropdown && reasoningEffortBtnRect && effortSupported && createPortal(
+          <div
+            ref={reasoningEffortDropdownRef}
+            className="fixed z-[9999] animate-slide-up"
+            style={{
+              bottom: window.innerHeight - reasoningEffortBtnRect.top + 4,
+              left: Math.max(8, Math.min(reasoningEffortBtnRect.left, window.innerWidth - Math.min(240, window.innerWidth - 16) - 8)),
+            }}
+          >
+            <ReasoningEffortDropdown
+              slot={slotKey}
+              currentEffort={paneSlot?.reasoning_effort || legacyCodexEffort(paneSlot?.model || '', '', codexPairModels)}
+              defaultEffort={defaultEffort}
+              levelsOverride={effortLevelsOverride}
+              onClose={() => setReasoningEffortDropdown(false)}
+            />
           </div>,
           document.body,
         )}

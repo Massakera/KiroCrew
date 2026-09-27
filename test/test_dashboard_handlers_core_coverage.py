@@ -1633,6 +1633,45 @@ class TestSttTranscribe:
         assert text.endswith(" thanks")
 
     @pytest.mark.asyncio
+    async def test_none_backend_result_is_a_generic_500(self, monkeypatch) -> None:
+        """The backend's failure sentinel must not look like a silent recording."""
+        monkeypatch.setattr(
+            "kiro_crew.transcribe.transcribe_audio",
+            AsyncMock(return_value=None),
+        )
+        field = SimpleNamespace(
+            name="audio",
+            filename="recording.webm",
+            read_chunk=AsyncMock(side_effect=[b"x", b""]),
+        )
+
+        resp = await core_mod.api_stt_transcribe(_multipart_req(field))
+
+        assert resp.status == 500
+        assert json.loads(resp.body) == {
+            "error": "transcription failed",
+            "code": "stt_transcription_failed",
+        }
+
+    @pytest.mark.asyncio
+    async def test_empty_transcript_remains_a_success(self, monkeypatch) -> None:
+        """A valid recording with no recognised speech remains distinguishable."""
+        monkeypatch.setattr(
+            "kiro_crew.transcribe.transcribe_audio",
+            AsyncMock(return_value=""),
+        )
+        field = SimpleNamespace(
+            name="audio",
+            filename="recording.webm",
+            read_chunk=AsyncMock(side_effect=[b"x", b""]),
+        )
+
+        resp = await core_mod.api_stt_transcribe(_multipart_req(field))
+
+        assert resp.status == 200
+        assert json.loads(resp.body) == {"text": ""}
+
+    @pytest.mark.asyncio
     async def test_backend_failure_is_a_generic_500(self, monkeypatch) -> None:
         monkeypatch.setattr(
             "kiro_crew.transcribe.transcribe_audio",
@@ -1859,8 +1898,21 @@ class TestSecurityStats:
 # ── Agent settings PUT (/api/config/kirocrew) ───────────────────────────
 
 
+@web.middleware
+async def _owner_identity(request, handler):
+    request["user"] = "local-app"
+    request["app"] = ""
+    state = request.app.get("state")
+    if state is not None:
+        state.owner_id = ""
+    return await handler(request)
+
+
 def _agent_cfg_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[_owner_identity])
+    state = MagicMock()
+    state.owner_id = ""
+    app["state"] = state
     app.router.add_route("*", "/api/config/kirocrew", core_mod.api_kirocrew_config)
     return app
 
@@ -2123,7 +2175,8 @@ class TestPatchGuards:
     ) -> None:
         """A dead end ("not editable") becomes a next step for fields whose
         side effects the generic write cannot reproduce."""
-        app = web.Application()
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = SimpleNamespace(owner_id="")
         app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
         async with TestClient(TestServer(app)) as client:
             resp = await client.patch(
@@ -2135,7 +2188,8 @@ class TestPatchGuards:
 
     @pytest.mark.asyncio
     async def test_unknown_field_is_refused(self, seeded_config, fake_sel) -> None:
-        app = web.Application()
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = SimpleNamespace(owner_id="")
         app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
         async with TestClient(TestServer(app)) as client:
             resp = await client.patch(
@@ -2149,7 +2203,10 @@ class TestFallbackModelPatch:
     """agent.fallback_model — single-value str spec with role-model validation."""
 
     def _app(self) -> web.Application:
-        app = web.Application()
+        # PATCH /api/config/kirocrew is owner-gated: supply the same signed
+        # local-owner identity the sibling patch tests use.
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = SimpleNamespace(owner_id="")
         app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
         return app
 
@@ -2467,6 +2524,60 @@ class TestLocalToken:
         assert json.loads(resp.body)["code"] == "member_owner_token_refused"
         assert fake_sel.log_api_access.call_args.kwargs["resources"] == "unverified-owner-process"
         minted.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shares_namespaces,status", [(False, 403), (True, 200)])
+    async def test_linux_namespace_divergence_alone_decides_the_owner_verdict(
+        self, monkeypatch, fake_sel, shares_namespaces, status
+    ) -> None:
+        """On Linux the namespace comparison is the whole owner verdict.
+
+        The other refusal tests on this route hand the gate no peer pid, which
+        answers on its first leg and leaves the Linux measure unreached from here.
+        In this one the kernel DOES identify the caller and its start id IS
+        readable, so the two callers below differ by one bit: whether they share
+        the gateway's user and mount namespaces. A same-uid caller that does not
+        is refused, and the refusal carries the code a mint reads its remedy from
+        beside the audit value the pod records for it.
+
+        Both directions are asserted, because a gate that refused every caller
+        would satisfy the negative one on its own. The comparison is also pinned
+        to the gateway's own pid, which is what makes it a statement about this
+        process rather than about any two processes. The app-backend escape is
+        held off so one cause decides the verdict; it is covered separately.
+        """
+        from kiro_crew import member_memory_auth as auth
+
+        peer_pid = 12345
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        monkeypatch.setattr(auth, "sys", SimpleNamespace(platform="linux"))
+        monkeypatch.setattr(auth, "_request_peer_pid", lambda _request: peer_pid)
+        monkeypatch.setattr(auth, "_gateway_spawned_app_backend", lambda _pid: False)
+        monkeypatch.setattr(
+            auth.platform_compat, "get_process_start_id", lambda _pid: "synthetic-start"
+        )
+        namespaces = MagicMock(return_value=shares_namespaces)
+        monkeypatch.setattr(auth.platform_compat, "process_namespaces_match", namespaces)
+        minted = MagicMock(return_value="issued-value")
+        monkeypatch.setattr(core_mod, "generate_token", minted)
+
+        resp = await core_mod.api_token_local(
+            _req(
+                app={"local_secret": "right", "state": SimpleNamespace(owner_id="owner-1")},
+                headers={"X-Local-Secret": "right"},
+            )
+        )
+
+        assert resp.status == status
+        namespaces.assert_called_once_with(peer_pid, os.getpid())
+        if status == 403:
+            assert json.loads(resp.body)["code"] == "member_owner_token_refused"
+            assert (
+                fake_sel.log_api_access.call_args.kwargs["resources"] == "unverified-owner-process"
+            )
+            minted.assert_not_called()
+        else:
+            minted.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_every_refusal_carries_a_code_matching_its_audit_record(

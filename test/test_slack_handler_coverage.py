@@ -694,6 +694,38 @@ class TestKeywordCommands:
         saver.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_spawn_keyword_says_queued_for_a_deferred_row(
+        self, slack, sessions, owner, monkeypatch
+    ):
+        """The gate parked the row (memory floor): the channel reply relays the
+        gate's reason instead of announcing a start that did not happen."""
+        monkeypatch.setattr(h, "save_conversation_turn_off_loop", AsyncMock())
+        mgr = MagicMock(max_concurrent=4)
+        mgr.spawn.return_value = MagicMock(
+            id="a1",
+            queued=True,
+            queued_reason="low_memory",
+            queued_reason_detail="low memory: 3.2 GB available, need 4 GB",
+        )
+        handled = await h.maybe_handle_keyword_command(
+            "spawn audit the docs",
+            slack,
+            sessions,
+            "C1",
+            "t1",
+            "msg1",
+            "t1",
+            "U1",
+            MagicMock(),
+            subagent_manager=mgr,
+        )
+        assert handled is True
+        text = _texts(slack)
+        assert "Queued subagent" in text
+        assert "low memory: 3.2 GB available, need 4 GB" in text
+        assert "Spawned subagent" not in text
+
+    @pytest.mark.asyncio
     async def test_spawn_keyword_skips_log_when_incognito(
         self, slack, sessions, owner, monkeypatch
     ):
@@ -1266,14 +1298,6 @@ class TestSharedPrivacyDelegation:
 
 
 class TestPrivacyModifiers:
-    def test_token_strippers(self):
-        assert h._strip_temporary_token("hi there") == ("hi there", False)
-        assert h._strip_temporary_token("!temporary  do  it") == ("do it", True)
-        assert h._strip_incognito_token("hi") == ("hi", False)
-        assert h._strip_incognito_token("!INCOGNITO now") == ("now", True)
-        # Embedded in a larger token — must not match.
-        assert h._strip_incognito_token("x!incognito")[1] is False
-
     @pytest.mark.asyncio
     async def test_temporary_only_returns_early(self, slack, sessions, owner):
         text, cmd, only = await h.maybe_apply_privacy_modifiers(
@@ -1318,13 +1342,6 @@ class TestPrivacyModifiers:
         assert not slack.actions
 
     @pytest.mark.asyncio
-    async def test_repeat_application_is_idempotent(self, slack, sessions, owner):
-        await h._apply_temporary_modifier("t1", "U1", "C1", slack, sessions, "t1")
-        posts = len(slack.actions)
-        await h._apply_temporary_modifier("t1", "U1", "C1", slack, sessions, "t1")
-        assert len(slack.actions) == posts
-
-    @pytest.mark.asyncio
     async def test_flags_are_persisted_on_the_session_map(
         self, slack, sessions, owner, tmp_path, monkeypatch
     ):
@@ -1333,8 +1350,12 @@ class TestPrivacyModifiers:
         from kiro_crew.session_map import SessionMap
 
         sessions._session_map = SessionMap()
-        await h._apply_temporary_modifier("t1", "U1", "C1", slack, sessions, "t1")
-        await h._apply_incognito_modifier("t1", "U1", "C1", slack, sessions, "t1")
+        await h._apply_privacy_mode(
+            privacy_mode.MODE_TEMPORARY, "t1", "U1", "C1", slack, sessions, "t1"
+        )
+        await h._apply_privacy_mode(
+            privacy_mode.MODE_INCOGNITO, "t1", "U1", "C1", slack, sessions, "t1"
+        )
         # Assert real durability rather than that set_flag was called: a FRESH
         # map must read both flags back off disk, which is the property the
         # restart path actually depends on. Loop-side mutations defer their
@@ -1348,14 +1369,13 @@ class TestPrivacyModifiers:
         h._hydrate_conv_flags(sessions, "t1")
         assert not h.is_thread_temporary("t1")
 
-    def test_conv_state_map_rejects_auto_attribute_stub(self, sessions):
+    def test_hydrate_ignores_an_auto_attribute_stub(self, sessions):
         """An auto-attribute stub must NOT be mistaken for a real SessionMap.
 
         ``MagicMock().get_flag(...)`` returns a truthy mock, so accepting one
         here would mark every session both temporary and incognito.
         """
         sessions._session_map = MagicMock()
-        assert h._conv_state_map(sessions) is None
         h._hydrate_conv_flags(sessions, "t1")
         assert not h.is_thread_temporary("t1")
         assert not h.is_thread_incognito("t1")

@@ -563,12 +563,30 @@ class AcpSessionProvider(LLMProvider):
         return self._handle.session_id
 
     def is_alive(self) -> bool:
-        """True if the underlying runtime is still alive."""
+        """True if the underlying runtime is still alive.
+
+        A PROCESS-level answer wearing a session-level name. Every session on a
+        shared runtime gets the same one, so it is right about death (the process
+        dying does end all of them) and wrong about eviction: a session removed
+        by ``terminate_session`` still reads alive while its co-tenants keep the
+        process up. A caller asking "may I still use MY session" needs a
+        per-session liveness bit, which this contract has no vocabulary for.
+        """
         return self._runtime.is_alive()
 
     def is_process_alive(self) -> bool:
-        """True if the runtime process exists and has not exited."""
+        """True if the runtime process exists and has not exited.
+
+        Process-level by name as well as by behaviour, and shared by every
+        session on the runtime. Do not read it as "my session is usable" -- see
+        :meth:`is_alive`.
+        """
         return self._runtime.is_alive()
+
+    @property
+    def process_tree_confirmed_dead(self) -> bool:
+        """Whether the owned runtime confirmed its whole process tree exited."""
+        return self._runtime.process_tree_confirmed_dead
 
     @property
     def process_instance(self) -> str:
@@ -603,7 +621,16 @@ class AcpSessionProvider(LLMProvider):
         return proc.returncode if proc else None
 
     def touch_activity(self) -> None:
-        """Refresh activity timestamp on the runtime."""
+        """Refresh activity timestamp on the runtime.
+
+        PROCESS-level: the clock belongs to the runtime, so one session's
+        activity refreshes it for every session on it. An idle co-tenant is
+        therefore never idle while a neighbour talks, which is the SAFE
+        direction for anything that reaps on idleness (it defers, never
+        signals early) and the wrong one for anything that reports idle time
+        as a fact about a session. A per-session activity stamp is the fix;
+        this method cannot be it, because it has only the runtime to write to.
+        """
         self._runtime._last_activity = time.monotonic()
 
     def rekey(
@@ -896,8 +923,11 @@ class AcpSessionProvider(LLMProvider):
         """
         advertised = advertised_model_ids(self._handle.available_models)
         if model_is_unusable(model_id, advertised):
+            # A user's explicit pick must earn a FRESH probe, not be refused on a
+            # recent no-evidence failure the picker read path may have cached
+            # (force=True skips the failure/empty attempt-clock replay).
             fresh = advertised_model_ids(
-                await self._guarded(self._handle.refresh_available_models())
+                await self._guarded(self._handle.refresh_available_models(force=True))
             )
             if model_is_unusable(model_id, fresh or advertised):
                 raise AcpModelUnavailable(model_id, fresh or advertised)
@@ -962,6 +992,23 @@ class AcpSessionProvider(LLMProvider):
     def available_models(self) -> list[dict[str, str]]:
         """Models advertised by the backend."""
         return self._handle.available_models
+
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the advertised-model snapshot on the read path.
+
+        The read-path counterpart to the refresh-before-refuse in
+        :meth:`set_model`: the dashboard picker filter narrows the catalog
+        through this session's snapshot, and an unconfirmed startup-race snapshot
+        would hide models the account actually has with no explicit pick to
+        trigger the refusal-path heal. Delegates the staleness decision and the
+        single-flight probe to
+        :meth:`AcpSessionHandle.maybe_refresh_available_models`, and propagates
+        its contract: on the read deadline it raises
+        :class:`~kiro_crew.acp.session_handle.EntitlementRevalidating` (the probe
+        keeps running); on a probe FAILURE it returns the current snapshot (fail
+        open).
+        """
+        return await self._guarded(self._handle.maybe_refresh_available_models(catalog_ids))
 
     def pop_pending_oauth_requests(self) -> list[dict[str, str]]:
         """Drain OAuth requests captured while the shared session initialized."""

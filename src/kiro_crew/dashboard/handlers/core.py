@@ -62,6 +62,7 @@ from kiro_crew.config.sections import (
     DECISION_BUCKET_MAX,
     DECISION_BUCKET_MIN,
     DECISION_MODEL_ROUTE_TIERS,
+    FOLDER_SORT_MODES,
     JUDGE_PROVIDERS,
     STT_LANGUAGE_AUTO,
 )
@@ -85,6 +86,7 @@ from kiro_crew.dashboard.token_auth import (
 )
 from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.executors import discovery_executor
+from kiro_crew.external_text import redact_external_text as _redact_external
 from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self
 from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
@@ -190,13 +192,8 @@ def _mask_agent_free_text(value: object) -> object:
     makes for schema-sensitive values.
 
     Keyed on ``_redact_external`` itself rather than a second detector so this
-    rule and the roster's cannot drift apart. The import is function-local to
-    match this module's handler-import style, not for boot-path weight —
-    ``handlers.agents`` already imports ``discover`` at module level, so it is
-    loaded at handler setup regardless.
+    rule and the roster's cannot drift apart.
     """
-    from kiro_crew.dashboard.handlers.discover import _redact_external
-
     if not isinstance(value, str):
         return _SENSITIVE_MASK
     # No falsy pre-check on purpose: ``_redact_external`` returns falsy input
@@ -632,6 +629,9 @@ async def api_theme_config(request: web.Request) -> web.Response:
         return web.json_response(_theme_payload(cfg))
 
     # PUT
+    denied = await require_owner_dashboard_request(request, "config.theme.write")
+    if denied is not None:
+        return denied
     body = await request.json()
     if not isinstance(body, dict):
         raise web.HTTPBadRequest(text="request body must be an object")
@@ -1836,6 +1836,10 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
                 )
 
         text = await transcribe_audio(tmp, cfg.stt)
+        if text is None:
+            return web.json_response(
+                {"error": "transcription failed", "code": _CODE_STT_FAILED}, status=500
+            )
         if text:
             from kiro_crew.security import (  # noqa: F811
                 redact_credentials,
@@ -1844,7 +1848,7 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
 
             text, _ = redact_exfiltration_urls(text)
             text, _ = redact_credentials(text)
-        return web.json_response({"text": text or ""})
+        return web.json_response({"text": text})
     except Exception:
         logger.exception("STT transcribe failed")
         return web.json_response(
@@ -2066,6 +2070,10 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
     from kiro_crew.config.loader import config_path  # noqa: F811
 
     if request.method == "PUT":
+        denied = await require_owner_dashboard_request(request, "config.update")
+        if denied is not None:
+            return denied
+
         caller = request.get("user", "dashboard")
 
         def _deny(error: str, status: int = 400, *, code: str | None = None) -> web.Response:
@@ -2256,21 +2264,39 @@ def _agent_values() -> set[str]:
     return {"", *KiroCrewConfig.load().agents}
 
 
-def _active_advertised_ids(request: web.Request) -> list[str] | None:
-    """Advertised model ids from the first active provider, or None if unknown.
+def _provider_backend(provider: object) -> str | None:
+    """Return an active provider's backend when its public shape exposes one."""
+    client = getattr(provider, "client", None)
+    backend = getattr(client, "backend", None)
+    if isinstance(backend, str):
+        return backend
+    backend = getattr(provider, "backend", None)
+    return backend if isinstance(backend, str) else None
+
+
+def _active_advertised_ids(request: web.Request, *, backend: str | None = None) -> list[str] | None:
+    """Advertised model ids for a backend namespace, or None if unknown.
 
     Uses the shared :func:`advertised_model_ids` shape parser so this
     validation sees exactly what the session-init withhold check sees. Returns
     ``None`` when no session has initialized / nothing was advertised, so callers
-    treat entitlement as UNKNOWN rather than denying on no evidence.
+    treat entitlement as UNKNOWN rather than denying on no evidence. When
+    *backend* is supplied, providers for other namespaces cannot supply evidence
+    about the target agent's entitlement.
     """
     from kiro_crew.acp.client import advertised_model_ids
+    from kiro_crew.agent_sdk.backends import model_registry_namespace
 
     try:
         providers = request.app["state"].sessions.active_providers()
     except (KeyError, AttributeError):
         return None
     for provider in providers:
+        pb = _provider_backend(provider)
+        if backend is not None and (
+            pb is None or model_registry_namespace(pb) != model_registry_namespace(backend)
+        ):
+            continue
         getter = getattr(provider, "available_models", None)
         if not callable(getter):
             continue
@@ -2303,7 +2329,11 @@ def _active_provider_name() -> str:
 
 
 def _validate_role_model(
-    value: str, request: web.Request, provider: str | None = None
+    value: str,
+    request: web.Request,
+    provider: str | None = None,
+    *,
+    backend: str | None = None,
 ) -> str | None:
     """Reject a per-role model pin the account cannot use; ``None`` = allow.
 
@@ -2317,7 +2347,8 @@ def _validate_role_model(
 
     *provider* is forwarded to :func:`_model_rejected_reason` so a caller holding
     an already-loaded config does not pay a second synchronous config read; the
-    remaining work is in-memory. Omit it and the provider is resolved there.
+    remaining work is in-memory. *backend* scopes any live catalog to the harness
+    the edited agent will use. Omit either when that identity is unavailable.
     """
     if not value or value == "auto":
         return None
@@ -2327,7 +2358,11 @@ def _validate_role_model(
     reason = _model_rejected_reason(value, provider=provider)
     if reason:
         return reason
-    advertised = _active_advertised_ids(request)
+    advertised = (
+        _active_advertised_ids(request)
+        if backend is None
+        else _active_advertised_ids(request, backend=backend)
+    )
     if advertised is None:
         return None
     if model_is_unusable(value, advertised):
@@ -2437,7 +2472,10 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "type": "enum",
         "values": ["30m", "1h", "6h", "12h", "24h", "until_shutdown"],
     },
-    "agent.sandbox": {"type": "enum", "values": ["auto", "off"]},
+    # Kept equal to the ``agent.sandbox`` enum in ``config/sections.py`` (pinned by
+    # test_sandbox_strict_selectable): a tier the CLI admits must be selectable
+    # here too, or Settings silently offers fewer tiers than ``config set``.
+    "agent.sandbox": {"type": "enum", "values": ["auto", "strict", "off"]},
     "agent.sandbox_allow_no_isolation": {"type": "bool"},
     "agent.tool_search": {"type": "bool"},
     "agent.completion_keep": {"type": "enum", "values": ["head", "tail", "both"]},
@@ -2485,6 +2523,10 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "min": RECENT_TINT_COUNT_MIN,
         "max": RECENT_TINT_COUNT_MAX,
     },
+    # The sidebar's folder sort mode. A view preference the sidebar menu writes and
+    # the kirocrew-dashboard MCP server reads back, so the two draw the tree in
+    # the same order; the enum is the loader's own list, spelled once.
+    "dashboard.folder_sort": {"type": "enum", "values": list(FOLDER_SORT_MODES)},
     # Per-version snooze/skip verdict for the proactive update popup, written
     # as ONE atomic record: the three fields only mean anything together, so
     # per-field writes would open both a crash window (old verdict paired
@@ -2780,13 +2822,20 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         _log_sel("denied", resources or msg)
         return web.json_response({"error": msg}, status=status)
 
+    denied = await require_owner_dashboard_request(request, "config.patch")
+    if denied is not None:
+        return denied
+
     try:
         body = await request.json()
     except Exception:
         return _deny("invalid JSON", "invalid JSON body")
+    if not isinstance(body, dict):
+        return _deny("invalid JSON", "invalid JSON body")
 
-    path_key = body.get("path", "")
-    value = body.get("value")
+    path_key: str = body.get("path", "")
+    value: Any = body.get("value")
+
     spec = _EDITABLE_CONFIG.get(path_key)
     if not spec:
         # `agent.apps_allow_third_party` was deliberately REMOVED from the editable

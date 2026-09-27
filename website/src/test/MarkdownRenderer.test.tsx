@@ -111,7 +111,7 @@ describe('MarkdownRenderer XSS sanitization', () => {
 
   it('strips event handler attributes', () => {
     const { container } = render(
-      <MarkdownRenderer content={'<img src="x" onerror="alert(1)">'} />
+      <MarkdownRenderer content={'<img src="/api/file-raw?path=x" onerror="alert(1)">'} />
     )
     const img = container.querySelector('img')
     expect(img?.getAttribute('onerror')).toBeNull()
@@ -629,8 +629,10 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     // invisible icon carries no affordance, so what this guards is unchanged —
     // a real glyph must never reach a chip the backend did not confirm.
     expect(code.querySelector('svg:not([class*="opacity-0"])')).toBeNull()
-    // Non-path chips now have cursor-pointer for click-to-copy, but no file glyph.
-    expect(code.className).toContain('cursor-pointer')
+    // A non-path chip copies, so it wears the copy cursor — not the pointer hand
+    // and glyph that mark a chip whose click opens something.
+    expect(code.className).toContain('cursor-copy')
+    expect(code.className).not.toContain('cursor-pointer')
   })
 
   it('renders a confirmed directory as a folder chip, not a broken file link', async () => {
@@ -650,8 +652,8 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
     const code = container.querySelector('code')!
-    // Non-path chips now have cursor-pointer for click-to-copy.
-    expect(code.className).toContain('cursor-pointer')
+    // Not a path, so it is the copy chip: copy cursor, no path data.
+    expect(code.className).toContain('cursor-copy')
     expect(code.dataset.pathKind).toBeUndefined()
   })
 
@@ -697,7 +699,7 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     )
     await waitFor(() => {
       const code = container.querySelector('code[data-path-kind]')!
-      expect(code.getAttribute('title')).toBe(`${path}\n${hint}\nCtrl+click to copy`)
+      expect(code.getAttribute('title')).toBe(`${path}\n${hint}\nCtrl/Cmd+click to copy`)
     })
   })
 
@@ -710,7 +712,7 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     await waitFor(() => {
       const code = container.querySelector('code[data-path-kind]')!
       expect(code.getAttribute('title')).toBe(
-        '/home/user/a.md\nClick to open / Shift+click to show in file manager\nCtrl+click to copy',
+        '/home/user/a.md\nClick to open / Shift+click to show in file manager\nCtrl/Cmd+click to copy',
       )
     })
   })
@@ -1617,7 +1619,7 @@ describe('MarkdownRenderer softBreaks', () => {
     // them adds an empty line box and blocks margin collapse, inflating the
     // gap between two attached screenshots from ~8px to ~37px.
     const { container } = render(<MarkdownRenderer
-      content={'shots\n\n![a](https://x.test/a.png)\n![b](https://x.test/b.png)'} softBreaks />)
+      content={'shots\n\n![a](/api/file-raw?path=a.png)\n![b](/api/file-raw?path=b.png)'} softBreaks />)
     expect(container.querySelectorAll('img').length).toBe(2)
     expect(container.querySelectorAll('br').length).toBe(0)
   })

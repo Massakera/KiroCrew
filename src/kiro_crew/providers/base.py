@@ -8,9 +8,9 @@ concrete provider.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from functools import cached_property
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, AsyncContextManager, Literal, Protocol, runtime_checkable
 
 # Event kinds — re-exported from the single source of truth
 from kiro_crew.acp.types import (  # noqa: F401
@@ -339,6 +339,30 @@ class LLMProvider(ABC):
         """Working directory the provider operates in. Default: empty string."""
         return ""
 
+    def set_work_dir_claim_probe(
+        self,
+        probe: Callable[[], AsyncContextManager[bool]],
+    ) -> None:
+        """Install the registry claim held across a work-directory reclaim.
+
+        The yielded answer is evaluated while the session registry lock remains
+        held through the reclaim operation, so a successor cannot register
+        between the ownership decision and deletion. Default no-op for a
+        provider that never reclaims a directory.
+        """
+        return None
+
+    def disown_work_dir(self) -> None:
+        """Declare that this provider does not own its work directory for reclaim.
+
+        The session registry calls this before shutting down a provider whose
+        session KEY another live provider already holds: both derived the same
+        work directory from that key, so the one being discarded must not
+        remove it at shutdown (``session_work_dir``). Default no-op for a
+        provider that never reclaims a directory.
+        """
+        return None
+
     @property
     def served_model(self) -> str:
         """Model id the live session actually resolved to serve.
@@ -593,6 +617,25 @@ class LLMProvider(ABC):
         """Backend-advertised models (``[{modelId, name, ...}]``) for the model
         picker. Default empty for a provider that advertises none."""
         return []
+
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the advertised-model snapshot before the picker narrows with it.
+
+        The model list (`/api/models`) narrows the catalog through the newest live
+        session's snapshot. When that snapshot is a startup-race default it hides
+        models the account actually has, and no explicit pick is refused to
+        trigger the refusal-path heal, so the read path must ask to revalidate.
+
+        Declared HERE rather than probed with ``getattr`` at the consumer: a probe
+        answers "cannot revalidate" for a provider that simply spells the accessor
+        differently, which is indistinguishable from a provider that genuinely has
+        no probe — and the consumer would then silently narrow on a stale snapshot,
+        the exact failure this revalidation exists to remove. A provider with no
+        way to revalidate returns its current snapshot unchanged (fail open), which
+        this default does; ``catalog_ids`` is the unfiltered catalog the picker
+        would otherwise offer, and the keep/drop verdict stays with the caller.
+        """
+        return self.available_models()
 
     def mcp_session_report(self) -> SessionMcpReport | None:
         """This session's own MCP registration report, or None if it keeps none.

@@ -500,6 +500,16 @@ class BackendPool:
         ``asyncio.to_thread``. Snapshotting first is load-bearing: iterating
         ``_backends`` in the worker thread can race a concurrent add/evict
         ("dict changed size during iteration").
+
+        ``stubs`` is ``refcount``, which is ``len(_stub_inboxes)`` — the number
+        of attached stub CONNECTIONS. It is named for what it counts because it
+        is not a session count and cannot be read as one: an agent runtime opens
+        ONE stub per MCP server however many sessions it hosts, so a runtime
+        serving several sessions contributes 1. As a session count it is a lower
+        bound, and every figure derived from it (the pool's own "what this would
+        cost unpooled" estimate) inherits that. The session count is not
+        derivable here: the pool knows stub uuids and caller identities pushed to
+        it, not the set of sessions riding each stub.
         """
         now = time.monotonic()
         async with self._lock:
@@ -509,7 +519,7 @@ class BackendPool:
                         "server": b.pool_key.server_name,
                         "agent": b.pool_key.agent_name,
                         "pid": b.pid,
-                        "sessions": b.refcount,
+                        "stubs": b.refcount,
                         "idle_s": round(max(0.0, now - b.last_used_at), 1),
                     },
                     b.pid,
@@ -837,13 +847,17 @@ class BackendPool:
             return backend
         return None
 
-    def _spawn_shutdown(self, backend: "Backend") -> None:
+    def spawn_shutdown(self, backend: "Backend") -> None:
         """Reap ``backend`` on the event loop without awaiting it here.
 
         Used where the caller may itself be cancelled: an ``await`` on a
         cancelled task re-raises before the shutdown runs, leaking the child.
         The task is strongly referenced until done, since the loop holds only a
-        weak reference to a bare ``create_task``.
+        weak reference to a bare ``create_task`` -- and :meth:`shutdown_all`
+        joins it, so a reap the daemon's teardown interrupted is still finished
+        before the daemon returns. The stub-disconnect path in ``gatewayd`` reaps
+        a connection-private backend this way for exactly that reason: the
+        connection handler is what teardown cancels.
         """
         task = asyncio.create_task(_safe_shutdown(backend))
         self._shutdown_tasks.add(task)
@@ -882,7 +896,7 @@ class BackendPool:
             # here would leak the process. Reap it on the way out, as a tracked
             # task rather than an await — this handler may itself be cancelled,
             # and an await would re-raise before the shutdown ran.
-            self._spawn_shutdown(backend)
+            self.spawn_shutdown(backend)
             raise
         if existing is not None:
             # stub_uuid is a fresh uuid4 per connection, so this means the same

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -231,6 +232,66 @@ class TestAnInstallThatPredatesTheKey:
         stored.write_text(json.dumps(chosen.to_dict()), encoding="utf-8")
 
         assert KiroCrewConfig.load().monitoring.prefer_structured_arming is True
+
+
+class TestAMalformedRuntimeCeilingIsNamedWhenItIsReplaced:
+    """``monitoring.max_runtime_secs`` falls back to the shipped seven days when
+    the stored value cannot be honoured. The fallback is right (a finite bound
+    must always exist) but it must not be SILENT: every budget written from then
+    on is validated against a ceiling the operator did not choose, and the
+    person who typed the value is the one who can correct it. The warning names
+    the value that was replaced and the ceiling that replaced it."""
+
+    _LOGGER = "kiro_crew.monitoring.limits"
+
+    @pytest.mark.parametrize("bad", ["7d", 0, -1, 2_592_001, 1.5, True, {}])
+    def test_a_configured_value_the_policy_rejects_is_named(
+        self, bad: object, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from kiro_crew.monitoring.limits import DEFAULT_RUNTIME_CEILING_SECS, coerce_runtime_ceiling
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            assert coerce_runtime_ceiling(bad) == DEFAULT_RUNTIME_CEILING_SECS
+
+        replaced = [r for r in caplog.records if r.name == self._LOGGER]
+        assert len(replaced) == 1
+        text = replaced[0].getMessage()
+        assert repr(bad) in text and str(DEFAULT_RUNTIME_CEILING_SECS) in text and "7 days" in text
+
+    def test_an_unset_key_is_the_ordinary_default_and_stays_quiet(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from kiro_crew.monitoring.limits import DEFAULT_RUNTIME_CEILING_SECS, coerce_runtime_ceiling
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            assert coerce_runtime_ceiling(None) == DEFAULT_RUNTIME_CEILING_SECS
+
+        assert not [r for r in caplog.records if r.name == self._LOGGER]
+
+    def test_a_valid_value_is_kept_and_stays_quiet(self, caplog: pytest.LogCaptureFixture) -> None:
+        from kiro_crew.monitoring.limits import coerce_runtime_ceiling
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            assert coerce_runtime_ceiling(2_592_000) == 2_592_000
+
+        assert not [r for r in caplog.records if r.name == self._LOGGER]
+
+    def test_the_stored_document_path_reports_through_the_same_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The operator edits ``config.json``, not the coercer: the load path
+        has to carry the same report."""
+        stored = tmp_path / "config.json"
+        stored.write_text(
+            json.dumps({"monitoring": {"max_runtime_secs": "thirty days"}}), encoding="utf-8"
+        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: stored)
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            resolved = KiroCrewConfig.load()
+
+        assert resolved.monitoring.max_runtime_secs == 604_800
+        assert any("'thirty days'" in r.getMessage() for r in caplog.records)
 
 
 class TestTheOperatorFacingClaimsSurviveMeasurement:

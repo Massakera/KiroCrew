@@ -16,6 +16,7 @@ import secrets
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -47,16 +48,41 @@ from kiro_crew.dashboard.state import (
     append_and_surface,
     parse_cls_meta,
 )
-from kiro_crew.history import transcript_sort_key
+from kiro_crew.execution_context import (
+    ExecutionContext,
+    canonical_memory_mode,
+    read_live_session_execution,
+    rollback_live_session_tightening,
+    stricter_memory_mode,
+    tighten_live_session_execution,
+)
+from kiro_crew.external_text import redact_external_text
+from kiro_crew.history import (
+    is_incognito_transcript,
+    transcript_lock_stems,
+    transcript_sort_key,
+    transcript_stems,
+)
 from kiro_crew.hooks import _HOST_READ_ONLY_BUILTIN_TOOLS, safe_read_file
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key
 from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.security import (
+    CREDENTIAL_REDACTION_TAGS,
+    EXFILTRATION_REDACTION_TAG_PREFIX,
     _exempt_exact_hosts,
+    bounded_blocked_links,
     oauth_url_contains_credential,
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.security.credential_sources import bounded_credential_records
+from kiro_crew.security.exfil import (
+    current_scoped_exempt_hosts,
+    restore_allowed_links,
+    scoped_exempt_hosts,
+)
+from kiro_crew.security.redaction_allow import allowed_hosts_for
 from kiro_crew.sel import SecurityEvent, sel
 from kiro_crew.session_surface import has_dashboard_surface, set_dashboard_surfaced
 from kiro_crew.slack.outbound import (
@@ -91,6 +117,74 @@ def chunk_generation() -> str:
     replays. Not a secret and not an identity: it only says "same process".
     """
     return _CHUNK_GENERATION
+
+
+def _resettle_restricted_key(state: DashboardState, name: str) -> None:
+    """Re-derive ``dashboard:{name}``'s restricted marker from whoever owns ``name`` NOW.
+
+    ``state._restricted_keys`` is keyed by SESSION KEY, not by slot identity, so the
+    marker describes whatever object holds the key -- never the object a close happens
+    to be carrying. Every exit of a teardown, and every tightening of a live slot,
+    owes the one postcondition this function IS: ``dashboard:{name}`` is in the set
+    iff the slot currently at ``name`` is restricted, an absent key counting as
+    unrestricted.
+
+    Two shapes of exit need it, and they need opposite answers. An ordinary close
+    pops the slot for good, so the marker must be DROPPED -- otherwise an incognito
+    tab's key stays blocked for every later holder of it. A close that yields the key
+    to a concurrent same-key replacement must re-derive from the REPLACEMENT:
+    ``_is_restricted_session`` tests the key BEFORE it looks at the slot, so an
+    incognito original's leftover marker makes every memory, artifact and mcp-apps
+    call on a PERSISTENT replacement answer 403 for as long as that tab lives.
+
+    Re-derived rather than blindly discarded, because a replacement that is itself
+    restricted has to KEEP the marker: dropping it is the fail-OPEN direction.
+    """
+    key = f"dashboard:{name}"
+    current = state._slots.get(name)
+    if current is not None and current.is_restricted:
+        state._restricted_keys.add(key)
+    else:
+        state._restricted_keys.discard(key)
+
+
+def tighten_live_slot_memory_mode(
+    state: DashboardState,
+    name: str,
+    memory_mode: object,
+    *,
+    expected_slot: _ChatSlot | None = None,
+) -> bool:
+    """Tighten the current slot to *memory_mode* and re-derive its key marker.
+
+    ``expected_slot`` prevents an off-loop save completion for a retired slot
+    from changing a successor. The operation is synchronous so callers perform
+    the slot write and marker update in one event-loop turn.
+    """
+    current = state._slots.get(name)
+    if current is None or (expected_slot is not None and current is not expected_slot):
+        return False
+    current_mode = canonical_memory_mode(getattr(current, "memory_mode", "persistent"))
+    tightened = stricter_memory_mode(current_mode, canonical_memory_mode(memory_mode))
+    changed = tightened != current_mode
+    if changed:
+        current.memory_mode = tightened
+    _resettle_restricted_key(state, name)
+    return changed
+
+
+def apply_pending_slot_memory_mode(state: DashboardState, slot: _ChatSlot) -> bool:
+    """Apply a save thread's folded mode to its still-live slot on the event loop.
+
+    The pending value is never cleared: it is monotonic (a save thread only ever
+    folds it stricter) and tightening is idempotent, so re-applying it is free,
+    while a clear would race a producer that lands between the read and the
+    clear and lose its stricter value until the next turn's read-back.
+    """
+    pending = getattr(slot, "_pending_memory_mode", None)
+    if pending is None:
+        return False
+    return tighten_live_slot_memory_mode(state, slot.key, pending, expected_slot=slot)
 
 
 async def run_config_write(fn, /, *args, **kwargs):
@@ -372,6 +466,10 @@ _SLASH_COMMANDS = frozenset(
     }
 )
 
+# Blocked on the kiro path ONLY: the KiroACP harness does not implement /todos
+# and rejects it with an "unknown variant" error, while Claude Code has its own.
+_KIRO_ONLY_BLOCKED_SLASH_COMMANDS = frozenset({"/todos"})
+
 # Commands that exist in kiro-cli's interactive TUI but cannot work in the
 # dashboard (they drive a local terminal: quitting it, pasting from its
 # clipboard, opening an editor, or toggling checkpoint modes the dashboard's
@@ -380,10 +478,9 @@ _SLASH_COMMANDS = frozenset(
 # GET /api/slash-commands suggestion payload, so every surface hides them at
 # once — advertising a command that only yields a warning teaches a gesture
 # that does not work.
-# /todos was removed because the KiroACP harness does not implement it and
-# rejects it with an "unknown variant" error.
-_BLOCKED_SLASH_COMMANDS = frozenset(
-    {"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/tangent", "/todos"}
+_BLOCKED_SLASH_COMMANDS = (
+    frozenset({"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/tangent"})
+    | _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
 )
 
 # Single source of truth for slash-command descriptions surfaced by the
@@ -625,13 +722,14 @@ def _broadcast_compaction_result(
 
 def _emit_agent_assignment(slot_key: str, agent: str, outcome: str = "applied") -> None:
     """Emit a SEL audit event when an agent is set, changed, or rejected on a slot."""
+    safe_agent = redact_external_text(agent)
     sel().log(
         SecurityEvent(
             event_id=uuid.uuid4().hex,
             timestamp=datetime.now(tz=timezone.utc).isoformat(),
             event_type="agent_assignment",
             caller_identity=f"dashboard:{slot_key}",
-            agent=agent,
+            agent=safe_agent,
             source="dashboard",
             operation="slot_agent_set",
             outcome=outcome,
@@ -835,6 +933,219 @@ def effective_session_key(slot: _ChatSlot) -> str:
     :func:`session_key_for` for the ones that have no slot YET.
     """
     return session_key_for(slot.key, getattr(slot, "linked_session_key", "") or "")
+
+
+def replacement_shares_transcript(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
+    """Whether a different slot at *name* writes *slot*'s transcript file."""
+    current = state._slots.get(name)
+    if current is None or current is slot:
+        return False
+    return bool(
+        set(transcript_stems(slot_history_key(current)))
+        & set(transcript_stems(slot_history_key(slot)))
+    )
+
+
+@dataclass(frozen=True)
+class ReplacementTightening:
+    """State changed before a rows-only hand-over write."""
+
+    replacement: _ChatSlot
+    previous_mode: str
+    tightened_mode: str
+    replacement_key: str
+    previous_execution: ExecutionContext | None
+    tightened_execution: ExecutionContext | None
+
+
+def tighten_replacement_to_restricted_original(
+    state: DashboardState, name: str, slot: _ChatSlot
+) -> ReplacementTightening | None:
+    """Tighten a same-transcript replacement before *slot*'s rows are written.
+
+    A rows-only writer can outlive the slot that produced its rows. If another
+    slot has taken over the same key and file, the replacement must become at
+    least as restricted before those rows reach disk; otherwise live-slot gates
+    can derive from private rows while the transcript line is being ratcheted.
+
+    The live carrier compare-and-set runs before the slot or restricted marker
+    mutates. If another turn rebinds the carrier, retry once from a fresh read;
+    a second conflict propagates with every slot-owned value unchanged. Callers
+    therefore receive either a complete tightening plus its rollback witness,
+    or no slot/marker mutation to roll back.
+    """
+    replacement = state._slots.get(name)
+    if replacement is None or replacement is slot:
+        return None
+    if not replacement_shares_transcript(state, name, slot):
+        return None
+    if not slot.messages and slot._disk_older_count <= 0:
+        return None
+    current = canonical_memory_mode(getattr(replacement, "memory_mode", "persistent"))
+    retained = stricter_memory_mode(
+        current, canonical_memory_mode(getattr(slot, "memory_mode", "persistent"))
+    )
+    if retained == current:
+        return None
+    # Tighten the replacement's LIVE carrier in place (compare-and-set) rather
+    # than clearing it: a clear evicts the only in-memory record of a live
+    # member-bound session's identity, so the store-binding check for the rest
+    # of that turn sees no execution and skips -- the fail-OPEN direction -- and
+    # the next turn's fold has nothing to fold into. A persistent replacement
+    # has no live carrier (its record is durable, and the save that lands these
+    # rows tightens that record with the line); its next restricted binding
+    # withdraws the vouched entry. Only ever tighter: ``with_mode`` never loosens.
+    replacement_key = effective_session_key(replacement)
+    previous_execution = read_live_session_execution(replacement_key)
+    try:
+        tightened_execution = tighten_live_session_execution(
+            replacement_key, retained, expected=previous_execution
+        )
+    except UnknownMemoryStore:
+        previous_execution = read_live_session_execution(replacement_key)
+        tightened_execution = tighten_live_session_execution(
+            replacement_key, retained, expected=previous_execution
+        )
+    replacement.memory_mode = retained
+    _resettle_restricted_key(state, name)
+    logger.info(
+        "Slot %s: the replacement holding this key was tightened from %s to %s because "
+        "it shares the transcript of the %s original whose rows are being written",
+        name,
+        current,
+        retained,
+        retained,
+    )
+    return ReplacementTightening(
+        replacement=replacement,
+        previous_mode=current,
+        tightened_mode=retained,
+        replacement_key=replacement_key,
+        previous_execution=previous_execution,
+        tightened_execution=tightened_execution,
+    )
+
+
+async def restore_replacement_if_handover_did_not_land(
+    state: DashboardState,
+    name: str,
+    tightened: ReplacementTightening | None,
+    history_key: str,
+) -> bool:
+    """Undo a pre-write tightening only while its exact witness is still current.
+
+    The durable line is read under the same transcript lock every line writer
+    takes, and the generation-guarded carrier rollback runs inside that hold.
+    The carrier registry has its own thread-safe lock, so this worker step does
+    not touch loop-owned slot state. A writer that tightens the line records the
+    live holder's monotonic pending mode after its atomic rewrite and before
+    releasing the transcript lock. Therefore a writer ordered before this read
+    is visible in ``durable_mode``; one ordered after it is visible in
+    ``_pending_memory_mode`` before loop-owned state is loosened. The loop then
+    checks that pending witness plus the exact slot, mode and marker without
+    another await before mutating.
+
+    An unreadable or busy line cannot prove rollback safe and leaves every live
+    restriction in place. Nor can rollback loosen below the locked line: when
+    ``stricter(previous_mode, durable_mode)`` is restricted, mode, marker and
+    carrier all stay at the attempted tightening.
+    """
+    if tightened is None:
+        return False
+    conversation_log = getattr(state, "conversation_log", None)
+    if conversation_log is None:
+        return False
+
+    def _validate_and_rollback_carrier() -> tuple[str, str, bool, bool]:
+        with conversation_log.derivation_hold(transcript_lock_stems(history_key)):
+            metadata, readable = conversation_log.get_metadata_status(history_key)
+            if not readable:
+                return "persistent", "persistent", False, False
+            durable_mode = canonical_memory_mode(metadata.get("memory_mode"))
+            rollback_mode = stricter_memory_mode(tightened.previous_mode, durable_mode)
+            if is_incognito_transcript(rollback_mode):
+                return durable_mode, rollback_mode, True, False
+            rolled_back = rollback_live_session_tightening(
+                tightened.replacement_key,
+                tightened.previous_execution,
+                expected=tightened.tightened_execution,
+            )
+            return durable_mode, rollback_mode, True, rolled_back
+
+    try:
+        durable_mode, rollback_mode, readable, carrier_rolled_back = await asyncio.to_thread(
+            _validate_and_rollback_carrier
+        )
+    except Exception:
+        logger.info(
+            "Slot %s: could not lock and verify the failed hand-over line %s; "
+            "keeping the replacement restricted",
+            name,
+            history_key,
+            exc_info=True,
+        )
+        return False
+    if not readable:
+        logger.info(
+            "Slot %s: the privacy line for %s is unreadable after a failed hand-over; "
+            "keeping the replacement restricted",
+            name,
+            history_key,
+        )
+        return False
+    if is_incognito_transcript(rollback_mode):
+        logger.info(
+            "Slot %s: the locked line for %s requires %s; keeping the replacement at %s",
+            name,
+            history_key,
+            rollback_mode,
+            tightened.tightened_mode,
+        )
+        return False
+    if not carrier_rolled_back:
+        return False
+
+    # Imported lazily: chat_persistence imports this module. The pending read is
+    # the only worker-owned value consulted here; every live-state check and the
+    # mutation below remains in this uninterrupted event-loop turn.
+    from kiro_crew.dashboard.chat_persistence import pending_slot_memory_mode
+
+    replacement = tightened.replacement
+    if state._slots.get(name) is not replacement:
+        return False
+    if canonical_memory_mode(getattr(replacement, "memory_mode", "persistent")) != (
+        tightened.tightened_mode
+    ):
+        return False
+    if f"dashboard:{name}" not in state._restricted_keys:
+        return False
+    pending_mode = pending_slot_memory_mode(replacement)
+    if pending_mode is not None and is_incognito_transcript(pending_mode):
+        # The carrier rollback was atomic with the older line snapshot. A writer
+        # that committed a tighter line afterwards published this pending witness;
+        # restore the carrier tightening while its generation is still the one we
+        # rolled back, and leave the loop-owned mode and marker untouched.
+        try:
+            tighten_live_session_execution(
+                tightened.replacement_key,
+                stricter_memory_mode(tightened.tightened_mode, pending_mode),
+                expected=tightened.previous_execution,
+            )
+        except UnknownMemoryStore:
+            pass
+        return False
+    replacement.memory_mode = rollback_mode
+    _resettle_restricted_key(state, name)
+    logger.info(
+        "Slot %s: restored the replacement from %s to %s because the failed "
+        "hand-over left %s at %s",
+        name,
+        tightened.tightened_mode,
+        rollback_mode,
+        history_key,
+        durable_mode,
+    )
+    return True
 
 
 def subagents_attached(
@@ -1724,6 +2035,121 @@ def _redact_value(v):  # type: ignore[no-untyped-def]
     return v
 
 
+#: Every record set a row carries about its own redactions: the key it lives
+#: under, the one bounded constructor that rebuilds it from a transcript line,
+#: and the placeholder tags its text must still hold for the records to describe
+#: anything. One table, so a helper that moves or bounds records covers every
+#: kind at once and a new kind is one row, not a new call site to forget.
+REDACTION_RECORD_FIELDS: dict[str, tuple[Callable[[object], list[dict]], tuple[str, ...]]] = {
+    "blocked_links": (bounded_blocked_links, (EXFILTRATION_REDACTION_TAG_PREFIX,)),
+    "redactions": (bounded_credential_records, tuple(CREDENTIAL_REDACTION_TAGS)),
+}
+
+
+def variant_from_row(row: dict) -> dict:
+    """Stash a row as a variant, taking its redaction records with it.
+
+    The mirror of ``adopt_variant_text``: that one moves a variant onto the row,
+    this one moves the row into the variant list. Both directions carry the
+    records because the records cannot be recovered from the text -- the stashed
+    content is already redacted, so what they describe is gone and a rescan
+    finds nothing to describe. A stash that dropped them would destroy the
+    explanation for good, and the reader switching back would be handed a bare
+    placeholder with no way to learn what was removed.
+    """
+    entry = {"content": row.get("content", ""), "ts": row.get("ts", "")}
+    meta = row.get("meta")
+    if isinstance(meta, dict):
+        # Bounded here, at retention: the row's meta was read off a transcript
+        # line, and a variant list outlives the render that would bound it later.
+        for key, (bound, _tags) in REDACTION_RECORD_FIELDS.items():
+            records = bound(meta.get(key))
+            if records:
+                entry[key] = records
+    return entry
+
+
+def with_bounded_redaction_records(container: dict) -> dict:
+    """``container`` with each redaction record set rebuilt through its one
+    bounded constructor, or removed when nothing valid is left.
+
+    Every place that RETAINS a row's meta or a variant read off a transcript line
+    goes through this, not only the places that display it: a bound applied at
+    render leaves the slot holding whatever the line carried. Returns the same
+    object when there is no such key, so the common row costs nothing.
+    """
+    if not any(key in container for key in REDACTION_RECORD_FIELDS):
+        return container
+    out = dict(container)
+    for key, (bound, _tags) in REDACTION_RECORD_FIELDS.items():
+        if key not in out:
+            continue
+        records = bound(out[key])
+        if records:
+            out[key] = records
+        else:
+            del out[key]
+    return out
+
+
+def drop_records_without_placeholders(container: dict, text: str) -> None:
+    """Remove each record set with no placeholder of its kind in ``text``.
+
+    Records describe one text; a text with no placeholder of their kind has
+    nothing for them to explain.
+    """
+    for key, (_bound, tags) in REDACTION_RECORD_FIELDS.items():
+        if key in container and not any(tag in text for tag in tags):
+            container.pop(key, None)
+
+
+def _variant_for_emit(variant: dict) -> dict:
+    """A regenerate variant as the client receives it: allowed links restored,
+    display-redacted text, and its redaction records rebuilt through their
+    bounded constructors. Runs inside the same allowed-host scope as the row it
+    belongs to, so a variant shows the links its row shows."""
+    bounded = with_bounded_redaction_records(variant)
+    text = bounded.get("content", "")
+    if isinstance(text, str) and "blocked_links" in bounded:
+        text, left = restore_allowed_links(
+            text, bounded["blocked_links"], current_scoped_exempt_hosts()
+        )
+        bounded = {**bounded, "content": text}
+        if left:
+            bounded["blocked_links"] = left
+        else:
+            bounded.pop("blocked_links", None)
+    return with_bounded_redaction_records(
+        {**bounded, "content": redact_display_content(bounded.get("content", ""))}
+    )
+
+
+def adopt_variant_text(row: dict, variant: dict) -> None:
+    """Move a row onto one of its variants, text and redaction records together.
+
+    A record describes ONE text: it names what was removed from a placeholder
+    standing in that text. A caller that takes a variant's content without its
+    records leaves the row explaining something absent from the text on screen.
+    The pair moves through this one function so no site can take half of it --
+    the records are replaced when the variant carries them and REMOVED when it
+    does not, because a variant with no records has nothing to explain.
+    """
+    row["content"] = variant.get("content", "")
+    row["ts"] = variant.get("ts", row.get("ts", ""))
+    meta = row.get("meta")
+    for key, (bound, _tags) in REDACTION_RECORD_FIELDS.items():
+        records = bound(variant.get(key))
+        if records:
+            if not isinstance(meta, dict):
+                meta = {}
+                row["meta"] = meta
+            meta[key] = records
+        elif isinstance(meta, dict):
+            meta.pop(key, None)
+    if isinstance(meta, dict) and not meta:
+        row.pop("meta", None)
+
+
 def _redact_meta(meta: dict) -> dict:
     """Recursively redact string values in meta dict.
 
@@ -1749,9 +2175,23 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
     dependency runs chat_persistence -> chat_utils, so keeping it here lets both
     the save path and the emit path share one implementation without a cycle.
     """
+    # Redaction records (REDACTION_RECORD_FIELDS) are born at the redaction that
+    # removed each value (chat_runner._flush_segment) and carried with their
+    # text; the generic string redaction below would blank them. Preserve them
+    # across every role, but the transcript line is attacker-writable, so each
+    # set is rebuilt through its one bounded constructor: it re-validates each
+    # record, drops any that fails on its own -- never the message -- and bounds
+    # the count, because this is a RETENTION point that reads the line and it
+    # runs on every render of the message that holds it.
+    validated_records = {
+        key: bound(meta.get(key)) for key, (bound, _tags) in REDACTION_RECORD_FIELDS.items()
+    }
+
     if role == "mcp_oauth":
         out: dict = {}
         for k, v in list(meta.items()):
+            if k in REDACTION_RECORD_FIELDS:
+                continue
             if k == "oauth_url" and isinstance(v, str):
                 # Two gates, and deliberately NOT a third:
                 #   1. http(s)-only — a tampered history line can't smuggle a
@@ -1778,8 +2218,11 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
                 out[k] = v if (safe_scheme and not oauth_url_contains_credential(v)) else ""
             else:
                 out[k] = _redact_value(v)
+        out.update({k: v for k, v in validated_records.items() if v})
         return out
-    return _redact_meta(meta)
+    out = {k: _redact_value(v) for k, v in list(meta.items()) if k not in REDACTION_RECORD_FIELDS}
+    out.update({k: v for k, v in validated_records.items() if v})
+    return out
 
 
 # One process-local LRU shared by HTTP snapshot renders and live WS emission.
@@ -1841,7 +2284,9 @@ def _display_redaction_cache_key(text: str) -> tuple[_DisplayRedactionKey, int]:
     hash per lookup, so the cache stays cheaper than the battery it fronts.
     """
     raw = text.encode("utf-8", errors="surrogatepass")
-    hosts = "\0".join(sorted(_exempt_exact_hosts())).encode("utf-8", errors="surrogatepass")
+    hosts = "\0".join(sorted(_exempt_exact_hosts() | current_scoped_exempt_hosts())).encode(
+        "utf-8", errors="surrogatepass"
+    )
     digest = hmac.new(_DISPLAY_REDACTION_SALT, raw + b"\0" + hosts, hashlib.sha256).digest()
     return (digest, len(raw)), len(raw)
 
@@ -1951,10 +2396,21 @@ def serialize_wire_content(content: Any) -> str:
 
 
 def _remove_queued_by_id(messages: list[dict], queue_id: str) -> bool:
-    """Remove a 'queued' placeholder by queue_id stored in cls JSON."""
+    """Remove a 'queued' placeholder by its queue id.
+
+    Two spellings, matching the two twin shapes: the cron twin stores
+    ``queue_id`` in a JSON ``cls``, while the app twin wears a plain CSS
+    ``cls`` and carries ``queueId`` in ``meta`` (the hydration spelling) —
+    a cls-only match leaves an unreapable ghost row for every app message
+    queued behind a live turn.
+    """
     for i, m in enumerate(messages):
         if m.get("role") != "queued":
             continue
+        meta = m.get("meta")
+        if isinstance(meta, dict) and meta.get("queueId") == queue_id:
+            del messages[i]
+            return True
         try:
             cls = json.loads(m.get("cls", "{}"))
             if cls.get("queue_id") == queue_id:
@@ -3283,11 +3739,39 @@ AUTH_REQUIRED_KIND = "auth_required"
 #: copy edit or a translation moves).
 USAGE_LIMIT_KIND = "usage_limit"
 
+#: Row-level kind for the terminal `error` row a SESSION START that never
+#: answered produces (``session/new`` / ``session/load`` timed out -- the
+#: ``session_start_failed`` tag both ACP exception families carry). Unlike the
+#: three kinds above a retry CAN help here once: a cold start under load is
+#: host weather, so the first Resume keeps its button and its behaviour. What
+#: the kind exists for is the SECOND failure in a row. A start that timed out
+#: registered no session, so ``SessionManager.record_failure`` has nothing to
+#: count against and every Resume re-issued the identical ``session/new`` with
+#: no exit condition -- the transcript IS the count. The Continue endpoint
+#: refuses the re-run once two tagged rows sit at the tail with nothing but
+#: recovery rows between them, and the error card swaps Resume for the remedy
+#: (restart the gateway). Decided from the exception's tag, never from the
+#: prose, which a reword or a translation moves.
+SESSION_START_FAILED_KIND = "session_start_failed"
+
 #: Structural queue-entry kinds for system injections.  Classification by kind
 #: tag — set at enqueue time — is unforgeable: a user typing the same prefix
 #: text will not have the kind tag and will correctly classify as plain input.
 SUBAGENT_COMPLETION_KIND = "subagent_completion"
 CRON_NOTIFICATION_KIND = "cron_notification"
+#: An embedded MCP App's ui/message delivery (SEP-1865 return channel) — see
+#: ``dashboard.handlers.mcp_apps.api_mcp_apps_message``. System injection like
+#: the two above: app-authored, never user speech, must break user-message
+#: merges (folding it into a merged user turn would flip server-authored text
+#: into user-authored, persisted, channel-mirrored history).
+MCP_APP_MESSAGE_KIND = "mcp_app_message"
+
+#: Provenance banner wrapped around every app-originated message. Structural
+#: classification is by the queue entry's ``kind`` tag (unforgeable, set at
+#: enqueue time); the banner exists for the MODEL and the transcript reader,
+#: so the turn's text says who authored it. Mirrors ``CRON_NOTIFY_PREFIX``.
+APP_MESSAGE_PREFIX = "[MCP app message from "
+APP_MESSAGE_END = "[End of MCP app message]"
 
 #: Queue-entry kinds whose turns must settle before an Autopilot stage advances.
 STAGE_DELIVERY_KINDS = frozenset((SUBAGENT_COMPLETION_KIND, SYNTHETIC_RECOVERY_KIND))
@@ -3307,8 +3791,22 @@ def owned_stage_delivery_entry(boundary: Any, entries: list[dict]) -> dict | Non
 
 #: All system-injection kinds (for set-membership checks).
 _SYSTEM_INJECTION_KINDS = STAGE_DELIVERY_KINDS | frozenset(
-    (CRON_NOTIFICATION_KIND, FALSE_TOOL_BLOCKER_REPLAY_KIND)
+    (CRON_NOTIFICATION_KIND, MCP_APP_MESSAGE_KIND, FALSE_TOOL_BLOCKER_REPLAY_KIND)
 )
+
+
+def app_inject_row(label: str) -> tuple[str, str, dict]:
+    """The ONE builder for an app-delivery transcript row.
+
+    Both delivery paths (direct dispatch in ``handlers/mcp_apps.py`` and the
+    queue drain in ``chat_runner.py``) call this, so the row cannot diverge
+    between them. ``cls`` is a plain CSS class — NEVER a JSON payload: a JSON
+    ``cls`` makes ``_prepare_messages`` replace the stored meta with the
+    cls-derived dict on the HTTP rebuild path, silently dropping
+    ``injectKind`` and with it the row's collapse/fold exemptions. The label
+    travels in ``meta`` only, and is never re-derived from the banner text.
+    """
+    return "inject", "msg msg-inject", {"injectKind": "mcp_app", "appLabel": label}
 
 
 def is_synthetic_recovery_item(item: dict) -> bool:
@@ -3359,10 +3857,17 @@ def is_synthetic_payload_item(item: dict) -> bool:
     errors are not symmetric: mirroring runner text as if the user typed it
     misattributes machine orchestration, while suppressing a mirror only loses an
     echo of something the user can already see.
+
+    An MCP-App message entry (``MCP_APP_MESSAGE_KIND``) is synthetic by the same
+    asymmetry: its text is app-authored (server-authored), so mirroring it to a
+    linked channel as the human's own words would attribute machine speech to a
+    person.
     """
     payload = item.get("payload")
     if payload:
         return payload == RecoveryPayload.CONTINUATION
+    if item.get("kind") == MCP_APP_MESSAGE_KIND:
+        return True
     return is_synthetic_recovery_item(item)
 
 
@@ -3691,7 +4196,9 @@ def _expire_dead_child_oauth_meta(role: str, meta: dict, live_child: str) -> dic
     return out
 
 
-def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -> list[dict]:
+def _prepare_messages(
+    messages: list[dict], running: bool, *, live_child: str, workspace: str | None = None
+) -> list[dict]:
     """Prepare messages for API response.
 
     ``live_child`` is the process-instance identity of the ACP child currently
@@ -3702,7 +4209,41 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
     :func:`_live_child_instance` on the event loop, as close to the render as
     possible (a verdict sampled long before use can name a child that has
     since died, serving one stale read).
+
+    ``workspace`` is the slot's workspace: the display redaction relaxes the
+    hosts a reader allowed there, the same hosts the segment flush relaxed, so
+    an allowed link reaches the page it was kept for.
     """
+    with scoped_exempt_hosts(allowed_hosts_for(workspace)):
+        return _prepare_messages_scoped(messages, running, live_child=live_child)
+
+
+def with_allowed_links_restored(m: dict) -> dict:
+    """``m`` with the blocked links its reader has since allowed shown again.
+
+    Runs inside an allowed-host scope (:func:`_prepare_messages` and the live
+    ``chat_message`` frame), before the
+    display redaction, so a restored address is checked by the same pass that
+    let the host through (see :func:`restore_allowed_links`).
+    """
+    text = m.get("content")
+    meta = m.get("meta")
+    if not isinstance(text, str) or not isinstance(meta, dict) or "blocked_links" not in meta:
+        return m
+    records = bounded_blocked_links(meta.get("blocked_links"))
+    new_text, left = restore_allowed_links(text, records, current_scoped_exempt_hosts())
+    if new_text == text:
+        return m
+    new_meta = dict(meta)
+    if left:
+        new_meta["blocked_links"] = left
+    else:
+        new_meta.pop("blocked_links", None)
+    return {**m, "content": new_text, "meta": new_meta}
+
+
+def _prepare_messages_scoped(messages: list[dict], running: bool, *, live_child: str) -> list[dict]:
+    """:func:`_prepare_messages` inside its allowed-host scope."""
     out: list[dict] = []
     for m in _collapse_wire_rows(messages):
         role = m.get("role", "")
@@ -3738,7 +4279,8 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
         # Content may be structured (a legacy or hand-edited row):
         # redact_display_content recurses into it rather than raising.
         if role != "user" and text:
-            m = {**m, "content": redact_display_content(text)}
+            m = with_allowed_links_restored(m)
+            m = {**m, "content": redact_display_content(m.get("content", ""))}
         else:
             # The wire-string invariant covers EVERY row, not just the
             # redacted ones: a structured user row or a falsy container
@@ -3751,11 +4293,13 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
         if msg_out.get("variants"):
             # Snapshot for the same reason as _redact_meta — this runs in a
             # worker thread (slot-detail render offload) while the event
-            # loop may still be appending variants to the live list.
+            # loop may still be appending variants to the live list. A variant's
+            # records are re-validated here exactly as a row's are in
+            # _redact_meta_for_role: they can hold a full address a reader may
+            # open, and a transcript line is attacker-writable, so no record
+            # reaches a client without the serve-time check.
             msg_out["variants"] = [
-                {**v, "content": redact_display_content(v.get("content", ""))}
-                for v in list(msg_out["variants"])
-                if isinstance(v, dict)
+                _variant_for_emit(v) for v in list(msg_out["variants"]) if isinstance(v, dict)
             ]
         meta = parse_cls_meta(m.get("cls", ""))
         if meta is not None:

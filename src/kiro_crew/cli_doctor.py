@@ -110,6 +110,7 @@ from kiro_crew.mcp_cleanup import ALWAYS_ON_BIN_MCP_SERVERS as _ALWAYS_ON_MCPS
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS as _MANAGED_MCPS
 from kiro_crew.mcp_cleanup import OPT_IN_BIN_MCP_SERVERS as _OPT_IN_MCPS
 from kiro_crew.mcp_discovery import McpServerInfo, probe_server
+from kiro_crew.members import is_dispatchable_member_name
 from kiro_crew.model_registry import acp_id_correction
 from kiro_crew.platform import (
     PlatformCompositionError,
@@ -133,7 +134,7 @@ from kiro_crew.session_pid_sig import signing_health
 from kiro_crew.stall_attribution import attribute_dump, describe
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.transcribe import _find_ffmpeg, availability_detail, ensure_ffmpeg_in_path
-from kiro_crew.validation import _AGENT_NAME_RE
+from kiro_crew.validation import is_registered_agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -143,15 +144,16 @@ logger = logging.getLogger(__name__)
 # so the name is kept and read through ``_agents_dir()``.
 KIRO_AGENTS_DIR: Path | None = None
 
-# Alias count above which the skill-view census warns. Every spawn projects one
-# ``kirocrew-skill-view-*.json`` per authored agent into the shared agents
-# directory, and kiro-cli reads EVERY file there on startup, so the count is a
-# startup cost for every session on the host. A healthy host carries live
-# sessions x authored agents (a few hundred); the measured trouble starts past a
-# couple of thousand -- about 8s of prune walk per spawn at 2,360 files, and
-# ``EMFILE: too many open files`` from kiro-cli at 15k. The reclaim drains a
-# backlog by a bounded number per spawn, so a count above this is either a
-# pre-reclaim backlog still draining or one this gateway cannot drain (another
+# Alias count above which the skill-view census warns. The projection publishes
+# one ``kirocrew-skill-view-*.json`` per distinct agent view into the shared
+# agents directory -- spawns that derive the same view share one file -- and
+# kiro-cli reads EVERY file there on startup, so the count is a startup cost for
+# every session on the host. A healthy host carries roughly authored agents x
+# workspaces; the measured trouble starts past a couple of thousand -- about 8s
+# of prune walk per spawn at 2,360 files, and ``EMFILE: too many open files``
+# from kiro-cli at 15k. A boot drain clears a backlog at gateway start and the
+# per-spawn reclaim covers steady-state orphans, so a count above this is either
+# a backlog this gateway has not drained yet or one it cannot drain (another
 # data home's aliases, an unreadable lease record); the warning tells which.
 _SKILL_VIEW_BACKLOG_WARN = 2000
 
@@ -174,6 +176,56 @@ def _safe_display(value: object) -> str:
     return repr(value)
 
 
+#: Printed by the two member sections when the redaction policy that decides
+#: dispatchability cannot be consulted. Doctor is the one command that runs on a
+#: host whose platform failed to compose (``cli.py`` exempts it from the
+#: fail-closed re-raise), and ``is_dispatchable_member_name`` reaches
+#: ``platform.context.redact_via_context``, which re-raises that failure rather
+#: than degrade. The Platform section already reports the composition error as
+#: the blocking issue, so these sections say "not checked" and move on instead
+#: of aborting the report -- or double-counting the same issue.
+_MEMBER_NAMES_NOT_CHECKED = (
+    "  ⚠️  not checked: the platform did not compose, so stored Crew Member names "
+    "cannot be vetted (see the Platform section above)"
+)
+
+
+def _member_dispatchability(cfg: KiroCrewConfig) -> dict[str, bool] | None:
+    """Dispatchability per configured member, or ``None`` when it cannot be decided.
+
+    ``None`` -- never a partial dict -- when the redaction policy is unavailable:
+    a member whose eligibility is unknown must not be printed by name, because
+    the redaction that would have masked a credential-shaped one is exactly what
+    failed. The two member sections fail closed on disclosure by skipping.
+    """
+    try:
+        return {name: is_dispatchable_member_name(name) for name in cfg.agents}
+    except PlatformCompositionError:
+        return None
+    except Exception:  # noqa: BLE001 -- doctor must survive a broken setup
+        return None
+
+
+def _doctor_member_dispatchability(cfg: KiroCrewConfig, issues: list[str]) -> None:
+    """Report non-dispatchable stored member names without printing them."""
+    dispatchable = _member_dispatchability(cfg)
+    if dispatchable is None:
+        print("\nCrew Member Names")
+        print(_MEMBER_NAMES_NOT_CHECKED)
+        return
+    count = sum(1 for ok in dispatchable.values() if not ok)
+    if not count:
+        return
+    noun = "name" if count == 1 else "names"
+    print("\nCrew Member Names")
+    print(f"  count:       {count} stored Crew Member {noun} cannot reach a model")
+    print("               Open Crew Manager and create a replacement with a safe name.")
+    print("               If needed, make the replacement the default. Then delete the old member.")
+    print("               The replacement gets a new member identity. The old member's DM")
+    print("               history stays under its old key and is not transferred automatically.")
+    issues.append("stored Crew Member names are not dispatchable")
+
+
 def _doctor_member_memory_bindings(cfg: KiroCrewConfig, issues: list[str]) -> None:
     """Check every configured member's existing binding without initializing memory."""
     from kiro_crew.memory_stores import (
@@ -192,7 +244,17 @@ def _doctor_member_memory_bindings(cfg: KiroCrewConfig, issues: list[str]) -> No
     print("\nMember Memory Bindings")
     if not cfg.agents:
         print("  (no configured members)")
+    dispatchable = _member_dispatchability(cfg)
+    if dispatchable is None:
+        # Every binding line below names its member; with no way to vet the
+        # names, none of them may be printed.
+        print(_MEMBER_NAMES_NOT_CHECKED)
+        return
     for name, member in cfg.agents.items():
+        if not dispatchable[name]:
+            # The dispatchability report counts this record without naming it;
+            # building the binding string here would disclose the stored name.
+            continue
         store = getattr(member, "memory_store", None)
         binding = f"{_safe_display(name)} -> {_safe_display(store)}"
         if isinstance(store, str) and store in legacy and not legacy[store]:
@@ -210,7 +272,9 @@ def _doctor_member_memory_bindings(cfg: KiroCrewConfig, issues: list[str]) -> No
             print(f"  {binding}: valid binding")
     for store, reason in legacy.items():
         if not reason:
-            continue  # pending: reported above through its one bound member
+            # Dispatchable owners report pending stores above. Unsafe owners are
+            # counted without names in the Crew Member Names section.
+            continue
         print(
             f"  store {_safe_display(store)}: no member identity and not upgradable "
             f"({_safe_display(reason)}); to repair it, {LEGACY_MEMBER_STORE_REMEDY}"
@@ -294,15 +358,9 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
         bound = "kirocrew"
     # kiro_agent is free text in config.json and this name reaches a path join.
     # An ABSOLUTE value would make pathlib discard the directory on the left
-    # (`base / "/etc/passwd.json"` is `/etc/passwd.json`), so an unvalidated
-    # binding turns a spec lookup into an arbitrary read. The type check is not
-    # redundant with the grammar: the config loader deliberately KEEPS a
-    # type-mismatched value ("validated by its consumer"), so a hand-edited
-    # non-string reaches here intact and `re.match` would raise TypeError --
-    # aborting the one command a user runs BECAUSE their config is broken.
-    # Anything outside a plain string in the shared grammar is reported and then
-    # treated as unbound.
-    if not isinstance(bound, str) or not _AGENT_NAME_RE.match(bound):
+    # (`base / "/etc/passwd.json"` is `/etc/passwd.json`), so anything outside
+    # the registered agent grammar is reported and treated as unbound.
+    if not is_registered_agent_name(bound):
         print(f"  bound agent: ⚠️  {_safe_display(bound)} is not a valid agent name")
         issues.append("configured kiro_agent is not a valid agent name")
         bound = "kirocrew"
@@ -699,7 +757,8 @@ def _doctor_mcp_tools(
        into ``tools`` nor probed (see :func:`_spec_gate_closed`). Missing
        ``tools`` entries — and ``allowedTools`` entries for every server
        outside :data:`_NO_BLANKET_ALLOW_MCPS` — are auto-appended and the file
-       is rewritten atomically. A missing ``mcpServers`` entry cannot be
+       is rewritten atomically; an instance that must not own the shared agent
+       home writes nothing and reports the repairs as issues. A missing ``mcpServers`` entry cannot be
        auto-added because the command path is install-specific.
     2. Live handshake probe via :func:`mcp_discovery.probe_server`. Reports
        per-server status with tool count on success, and on failure shows
@@ -727,6 +786,8 @@ def _doctor_mcp_tools(
     allowed = agent_data.get("allowedTools", [])
     mcps = agent_data.get("mcpServers", {})
     config_changed = False
+    # Read-only probe (no SEL write): a declined instance never writes the shared spec.
+    declined = _agent._decline_shared_agent_home(audit=False) is not None
 
     probe_targets = []
     if gated_off is None:
@@ -817,7 +878,12 @@ def _doctor_mcp_tools(
         # `allowedTools` auto-approves, which is the one path that never reaches
         # the PreToolUse gate — so what the ceiling says about this server decides
         # both whether doctor may mint a grant and whether an existing one stands.
-        if not may_skip_gate_now(ref):
+        if not may_skip_gate_now(ref) and ref in allowed and declined:
+            config_changed = True
+            issues.append(
+                f"{ref} auto-approve forbidden by ceiling (repair from the owning install)"
+            )
+        elif not may_skip_gate_now(ref):
             # REVOKE, not merely "do not add". A grant can predate the ceiling —
             # the policy arrives on a host whose config was written while it was
             # ungoverned — and leaving it in place means the ceiling applies only
@@ -878,6 +944,20 @@ def _doctor_mcp_tools(
         )
 
     if config_changed:
+        try:  # both verdicts on the shared spec are audited; the audit must not break doctor
+            sel().log_api_access(
+                caller="system",
+                operation="agent_home_write",
+                outcome="denied" if declined else "allowed",
+                source="cli_doctor",
+                resources=str(agent_path),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("SEL audit unavailable for doctor spec write", exc_info=True)
+    if config_changed and declined:
+        print("  → Auto-fix skipped: shared home")
+        issues.append("agent config (auto-fix skipped: shared home)")
+    elif config_changed:
         agent_data["tools"] = tools
         agent_data["allowedTools"] = allowed
         agent_data["mcpServers"] = mcps
@@ -1936,11 +2016,14 @@ def _kiro_cli_signed_in() -> bool | None:
     kiro-cli row above already reports the install, and "not signed in" would send
     someone to ``kiro-cli login`` before there is a ``kiro-cli`` to run it.
     """
-    if not shutil.which(KIRO_CLI_BIN):
+    binary = resolve_kiro_cli()
+    if not binary:
         return None
+    # The same binary the gateway spawns: the desktop app's bundled copy ranks
+    # above PATH, so ``shutil.which`` could name a copy no session runs.
     try:
         result = subprocess.run(  # noqa: S603 - argv list, no shell, local binary
-            [KIRO_CLI_BIN, "whoami"],
+            [binary, "whoami"],
             capture_output=True,
             timeout=10,
             **UTF8_TEXT,
@@ -2702,6 +2785,116 @@ def _doctor_live_target_pointer(issues: list[str]) -> None:
             "start at all is the Sandbox section's answer, not this one. Fix the pointer "
             "before the host starts confining spawns, or the first one that does fails "
             "closed."
+        )
+
+
+def _doctor_masked_credential_aliases(issues: list[str]) -> None:
+    """Report a masked credential leaf that will refuse the next agent spawn.
+
+    The same job :func:`_doctor_live_target_pointer` does for the live-target pointer, for
+    the same shape on the leaves whose bytes are a credential: ``sandbox`` refuses a spawn
+    when one of them has a second hard link, because a mask binds a path and the second name
+    reaches the same bytes unmasked. A hard link on a file in the home is ordinary operation
+    for ``cp -al``, rsnapshot and other hard-link snapshot tools, so the condition appears
+    without anybody doing anything wrong and the first symptom is that agents stop starting.
+
+    Both confined launch paths issue this refusal -- the namespace launcher through
+    :func:`sandbox.namespace_argv` and the Seatbelt profile through
+    :func:`sandbox.sandbox_exec_argv` -- so the probe runs on Linux and on macOS. A platform
+    with no confined launch path is skipped: naming the condition there would report an
+    outage that cannot arrive.
+
+    The sentence is the launcher's own, not a paraphrase, so an operator who reads this line
+    and later meets the refusal reads one diagnosis rather than two.
+    """
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        return
+    try:
+        aliased = sandbox.masked_credential_leaf_aliases()
+    except Exception as exc:  # noqa: BLE001 — doctor must survive a broken probe
+        print("\nMasked Credential Leaves")
+        print(f"  aliases:     ⚠️  could not check ({_safe_display(exc)})")
+        return
+    if not aliased:
+        return
+    # ``credential_mask_applies`` rather than a mode comparison of this module's own, for
+    # the reason the pointer's section states: it counts BOTH unwrapped outcomes, so a host
+    # that hands the command over unwrapped is not told it is about to lose every spawn.
+    try:
+        confined = sandbox.credential_mask_applies(sandbox.configured_sandbox_mode())
+    except Exception:  # noqa: BLE001 — an unreadable mode must not hide the leaf
+        confined = True
+    print("\nMasked Credential Leaves")
+    try:
+        live_home = str(config_dir())
+    except Exception:  # noqa: BLE001 — an unresolvable home must not hide the leaf
+        live_home = ""
+    refusing = False
+    masked_any = False
+    outside_live_any = False
+    for path, links, root, accounted in aliased:
+        # Only the live home refuses, and only when a name could NOT be located. A leaf whose
+        # every other name is located is masked for the spawn and nothing is refused, so
+        # saying "REFUSED" for it sends the operator after a failure that is not coming --
+        # the same error in the other direction as reporting nothing at all. Every other
+        # spelling is reported and the spawn proceeds, because an unused home is masked by
+        # nothing while it is absent and a refusal there would be reachable from inside a
+        # sandbox.
+        in_live = bool(live_home) and root == live_home
+        if accounted:
+            masked_any = True
+            print(f"  alias:       ⚠️  masked for each spawn — {path} ({links} links)")
+        elif confined and in_live:
+            refusing = True
+            print(f"  alias:       ❌ agent spawns will be REFUSED — {path} ({links} links)")
+        elif in_live:
+            print(f"  alias:       ⚠️  will refuse spawns once confined — {path} ({links} links)")
+        else:
+            outside_live_any = True
+            print(f"  alias:       ⚠️  reported, spawns proceed — {path} ({links} links)")
+        # Whole tokens: the remedy names a path and a ``find`` invocation the operator
+        # copies, and the default wrap splits both.
+        # An accounted leaf gets the search command WITHOUT the refusal sentence. The full
+        # detail opens with "cannot mask", which is what a spawn raises with and the direct
+        # contradiction of the "masked for each spawn" line above it.
+        if accounted:
+            _print_wrapped(sandbox._masked_leaf_alias_search_hint(path))
+        else:
+            _print_wrapped(sandbox._masked_leaf_multilink_detail(path, links))
+    if refusing:
+        _print_wrapped(
+            "Until this is fixed every agent spawn on this host fails closed, and the "
+            "only other notice is a warning in the gateway log."
+        )
+        issues.append("masked credential leaf alias")
+    elif confined:
+        # Each sentence is selected by what was actually printed. A single fixed trailer
+        # claimed these leaves sit outside the live data home, which is false for an
+        # accounted leaf in the live home -- the case this host reaches whenever the auth
+        # store keeps its staging link.
+        reasons = ["No spawn is refused for these."]
+        if masked_any:
+            reasons.append(
+                "Where every other name was located, those names are masked for each spawn "
+                "too, so the bytes are unreachable from inside one."
+            )
+        if outside_live_any:
+            reasons.append(
+                "Where a name could not be located, the leaf is outside the live data home, "
+                "which the launcher reports rather than refusing on, so that a file inside a "
+                "home this install does not use cannot stop every launch."
+            )
+        reasons.append(
+            "Remove the extra link anyway: a name no mask covers leaves the bytes readable, "
+            "and this report is the only notice."
+        )
+        _print_wrapped(" ".join(reasons))
+    else:
+        _print_wrapped(
+            "This is not what stops a spawn on this host yet: the launcher reaches the "
+            "mask only when it WRAPS a child, and this host hands the command over "
+            "unwrapped or refuses it for a different reason. Remove the extra link before "
+            "the host starts confining spawns, or the first one that does fails closed."
         )
 
 
@@ -4086,6 +4279,64 @@ def _doctor_agents_janitor(issues: list[str], sweep_backups: bool) -> None:
     else:
         print("  janitor:     ✅ no stale temp/backup files to reclaim")
     _doctor_skill_view_census(agents_dir)
+    _doctor_run_dirs()
+
+
+# Unmarked run directories above which the doctor warns. Each is one directory
+# holding one small file; the count matters as a listing cost on the workspace
+# root, which every derived-cwd spawn's ``mkdir`` re-enumerates.
+_RUN_DIR_BACKLOG_WARN = 1000
+
+
+def _doctor_run_dirs() -> None:
+    """Report, in one line, the run directories the gateway's sweep cannot reclaim.
+
+    Advisory and read-only. A subagent or stateless cron run gets a directory
+    under the workspace root that the provider marks at first start and reclaims
+    at shutdown; the gateway sweeps what a dead predecessor of its own data home
+    left. Two figures from one bounded walk, judged by the sweep's own rule:
+    directories from builds that wrote no marker (a name is not provenance, so
+    the sweep deletes nothing it cannot prove Crew made), and marked directories
+    this data home cannot act on -- another data home's, an unreadable marker,
+    or a gateway the pid ledger still retains entries for. Named, never done:
+    the doctor deletes nothing.
+    """
+    from kiro_crew.config.loader import workspace_root
+    from kiro_crew.session_pid import retained_gateway_pids
+    from kiro_crew.session_work_dir import DERIVED_NAME_RE, RUN_DIR_MARKER, count_run_dirs
+
+    try:
+        # Resolve only: the default resolver creates the tree, and a read-only
+        # report must not leave a workspace behind where no gateway ever ran.
+        root = workspace_root(create=False)
+    except OSError:
+        return
+    if not root.is_dir():
+        print("  run dirs:    ✅ no workspace root yet, so no run directories")
+        return
+    try:
+        retained = retained_gateway_pids()
+    except OSError:
+        print("  run dirs:    ⚠️  the session pid ledger cannot be read; census skipped")
+        return
+    census = count_run_dirs(root, retained_gateway_pids=retained)
+    if not census.unmarked and not census.refused:
+        print("  run dirs:    ✅ no run directories left behind that the sweep cannot reclaim")
+        return
+    suffix = "+" if census.floor else ""
+    warn = census.unmarked > _RUN_DIR_BACKLOG_WARN or census.refused > 0
+    print(
+        f"  run dirs:    {'⚠️ ' if warn else '✅'} under {root}: {census.unmarked}{suffix} run"
+        f" director(ies) carry no {RUN_DIR_MARKER} marker (left by a build that wrote none);"
+        f" {census.refused}{suffix} marked director(ies) this data home cannot reclaim (another"
+        f" data home's, an unreadable marker, or a gateway the pid ledger still retains)"
+    )
+    if census.unmarked > _RUN_DIR_BACKLOG_WARN:
+        print(
+            f"{_INDENT}The gateway reclaims only marked run directories. With the gateway"
+            f" stopped, move directories matching {DERIVED_NAME_RE.pattern} that hold only"
+            f" .kiro/settings/cli.json out of {root}; a live run recreates its own."
+        )
 
 
 def _doctor_skill_view_census(agents_dir: Path) -> None:
@@ -4093,10 +4344,12 @@ def _doctor_skill_view_census(agents_dir: Path) -> None:
 
     Advisory and read-only, like the janitor line above it. The count matters
     because kiro-cli enumerates every file in this directory on every startup
-    and the projection writes one alias per authored agent per spawn: a backlog
-    from a build that predates the lease-based reclaim reached 28k files on one
-    host and made every session start crawl. The gateway's reclaim drains its
-    own home's unreferenced aliases a bounded number per spawn; the report says
+    and the projection writes one alias per distinct agent view, shared by
+    every spawn of that agent: a backlog from a build that predates the
+    lease-based reclaim reached 28k files on one host and made every session
+    start crawl. The gateway drains its own home's unreferenced aliases -- the
+    whole backlog at boot in lock-bounded batches, a bounded number per spawn
+    after that; the report says
     exactly which share that covers -- not aliases another data home owns, not
     lease-named ones while their lease is held -- and refuses to promise any
     drain while a lease record is unreadable, since the reclaim then keeps
@@ -4606,7 +4859,11 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # reported as a real optional backend -- present or absent -- rather than only
     # when it happens to be installed. The verdict comes from the same owner the
     # dashboard asks, so doctor and the panel cannot disagree.
-    kiro = shutil.which(KIRO_CLI_BIN)
+    # Resolved the way the gateway resolves it -- KIROCREW_KIRO_BIN, then the
+    # desktop app's bundled copy, then the known install dirs, then PATH -- so
+    # this row names the binary a session actually spawns. ``shutil.which`` would
+    # name the user's own install on a bundled app, which is not the one running.
+    kiro = resolve_kiro_cli()
     if kiro:
         print(f"  kiro-cli:    ✅ {kiro}")
         _doctor_headless_auth(issues)
@@ -4784,6 +5041,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # agent.model, and the whole point here is that the global is not
     # necessarily what a new session gets.
     _doctor_effective_model(cfg, proj, issues)
+    _doctor_member_dispatchability(cfg, issues)
     _doctor_member_memory_bindings(cfg, issues)
 
     # ── Stored defaults a release has since changed ──
@@ -4831,6 +5089,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # who just read the backend verdict is the one who needs to know a spawn will be
     # refused for a reason the backend line cannot express.
     _doctor_live_target_pointer(issues)
+    _doctor_masked_credential_aliases(issues)
 
     # ── Memory pressure preparedness (swap / userspace OOM killer) ──
     _doctor_memory_pressure(issues)
@@ -5325,7 +5584,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     print("\nConnectivity")
     if kiro:
         kiro_result = subprocess.run(
-            [KIRO_CLI_BIN, "--version"],
+            [kiro, "--version"],
             capture_output=True,
             text=True,
             encoding="utf-8",

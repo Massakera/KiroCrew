@@ -20,6 +20,7 @@
       "/opt/lib/codex-acp/index.js"
     ],
     "env_added": {
+      "DISABLE_MCP_CONFIG_FILTERING": "true",
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
       "KIROCREW_SPAWNED": "1",
       "KIROCREW_SPAWN_INSTANCE": "<spawn-instance>",

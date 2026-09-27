@@ -57,6 +57,7 @@ from kiro_crew.agent_files import (
     AGENT_FILENAME,
 )
 from kiro_crew.agent_files import CONDUCTOR_AGENT_FILENAME as _CONDUCTOR_AGENT_FILENAME
+from kiro_crew.agent_files import GUEST_AGENT_FILENAME as _GUEST_AGENT_FILENAME
 from kiro_crew.agent_files import HEARTBEAT_AGENT_FILENAME as _HEARTBEAT_AGENT_FILENAME
 from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_FILENAME
 from kiro_crew.agent_files import (
@@ -110,7 +111,14 @@ from kiro_crew.hooks import (
     safe_read_file_bytes_nolink,
     unc_probe_allowed,
 )
-from kiro_crew.mcp_cleanup import prune_dangling_tool_refs, purge_deleted_proxy_from_config
+from kiro_crew.mcp_cleanup import (
+    invalid_disabled_flag,
+    mcp_entries_muted,
+    mcp_entry_is_muted,
+    prune_dangling_tool_refs,
+    purge_deleted_proxy_from_config,
+    warn_invalid_disabled,
+)
 from kiro_crew.mcp_provenance import (
     DERIVED_KEY,
     command_is_ours,
@@ -142,7 +150,7 @@ from kiro_crew.sel import (  # circular import: sel imports config which imports
     SecurityEvent,
     sel,
 )
-from kiro_crew.validation import _AGENT_NAME_RE
+from kiro_crew.validation import is_registered_agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -1831,9 +1839,9 @@ def _all_skill_paths() -> list[str]:
                     current_event = ""
                     if manifest.is_file():
                         try:
-                            current_event = json.loads(manifest.read_text(encoding="utf-8")).get(
-                                "currentEventId", ""
-                            )
+                            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+                            if isinstance(manifest_data, dict):
+                                current_event = manifest_data.get("currentEventId", "")
                         except (json.JSONDecodeError, OSError):
                             pass
                     for sub in pkg.iterdir():
@@ -4475,14 +4483,9 @@ def agent_spec_path(name: str, *, agents_dir: Path | None = None) -> Path | None
     resolution, and every writer that receives one refuses rather than
     serializing JSON over a markdown file.
 
-    *name* is validated against the shared agent-name grammar BEFORE it reaches
-    the path join, so a caller passing a traversal (``../../something``) gets
-    ``None`` rather than a path outside the agents directory. The check lives
-    here, at the resolver, so every caller inherits it instead of each one
-    remembering: this function returns a path that :func:`reset_agent_model`
-    then WRITES, and the CLI takes the name from a user-supplied ``--agent``.
-    A symlinked or otherwise unsafe candidate is refused for the same reason --
-    see :func:`_spec_path_is_safe`.
+    A malformed or path-shaped *name* returns ``None``, so a traversal such as
+    ``../../something`` cannot escape the agents directory. Symlinked and other
+    unsafe candidates are also refused; see :func:`_spec_path_is_safe`.
 
     A DECLARED ``name`` wins over a matching filename, which is the order the
     other two resolvers already use (``_resolve_named_agent_model`` and the
@@ -4497,7 +4500,7 @@ def agent_spec_path(name: str, *, agents_dir: Path | None = None) -> Path | None
     iterates the directory unordered, so which of them is live is undefined, and
     a writer cannot pick without risking clearing the pin nothing is reading.
     """
-    if not _AGENT_NAME_RE.match(name or ""):
+    if not is_registered_agent_name(name):
         return None
     agents_dir = agents_dir if agents_dir is not None else kiro_agents_dir_path()
     if not agents_dir.is_dir():
@@ -6455,13 +6458,27 @@ def rebuild_agent_config(
     # collision sibling remains mounted. Grant revocation is intentionally looser:
     # every disabled source denies auto-approval to its canonical alias family,
     # because ``allowedTools`` bypasses the PreToolUse gate.
+    #
+    # "Disabled" is ``mcp_entry_is_muted``, the launch predicate the gateway
+    # rewriter, the session projections and the dashboard listing share: a
+    # non-boolean ``disabled`` (``"false"``, ``null``) is read FAIL-CLOSED here
+    # too, so a server the listing shows as Disabled is never mounted by this
+    # rebuild -- truthiness would have mounted one muted with ``null`` or ``0``.
     _shared_source_entries = tuple(
         itertools.chain(extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items())
     )
+    # The rebuild strips a mount on a non-boolean ``disabled`` exactly as the
+    # listing withholds the row, so it reports the value the same way -- through
+    # the shared bounded warn-once ledger -- rather than silently. A headless
+    # install rebuilds without a dashboard read, and would otherwise never say
+    # why a server the operator meant to switch on is not mounted.
+    for _scope_label, _scope_map in _scopes:
+        for _srv, _srv_spec in _scope_map.items():
+            _invalid, _flag = invalid_disabled_flag(_srv_spec)
+            if _invalid:
+                warn_invalid_disabled(_srv, _flag, _scope_label)
     _disabled_source_names = {
-        srv
-        for srv, srv_spec in _shared_source_entries
-        if isinstance(srv_spec, dict) and srv_spec.get("disabled")
+        srv for srv, srv_spec in _shared_source_entries if mcp_entry_is_muted(srv_spec)
     }
     _disabled_mounted_aliases = {
         mounted
@@ -6472,7 +6489,7 @@ def rebuild_agent_config(
     _disabled_grant_families = {
         mcp_server_alias(srv)
         for srv, srv_spec in _shared_source_entries
-        if isinstance(srv_spec, dict) and srv_spec.get("disabled")
+        if mcp_entry_is_muted(srv_spec)
     }
 
     def _grant_ref_is_in_alias_family(ref: object, base: str) -> bool:
@@ -6537,7 +6554,29 @@ def rebuild_agent_config(
             lst[:] = kept
             return True
 
-        if spec.get("disabled") or alias in _disabled_mounted_aliases:
+        # Muted when ANY scope's entry for this alias mutes it -- the shared
+        # multi-scope predicate, so this arm and the dashboard row answer alike.
+        # ``spec`` is the merge's winner; the other sources are read too, because
+        # a higher-priority ``false`` must never argue a lower scope's mute away.
+        muted_here = mcp_entries_muted(
+            itertools.chain(
+                (spec,),
+                (
+                    s
+                    for srv, s in _shared_source_entries
+                    if _mounted_alias_by_source.get(srv) == alias
+                ),
+            )
+        )
+        if muted_here or alias in _disabled_mounted_aliases:
+            # The rendered entry says ``true`` whenever the server is muted --
+            # over a merged ``false`` from a higher-priority scope as much as over
+            # a raw ``null``/``0``/``"false"``. The file kiro-cli parses must
+            # agree with the listing: a selective ``@srv/tool`` ref this arm keeps
+            # would otherwise launch a server every surface calls muted.
+            rendered = valid_servers.get(alias)
+            if isinstance(rendered, dict):
+                rendered["disabled"] = True
             for key in ("tools", "allowedTools"):
                 if (
                     _strip_owned_refs(key, strip_per_tool=key == "allowedTools")
@@ -7714,6 +7753,47 @@ def _install_aim_capabilities() -> None:
     still written.
     """
     _install_lite_agent_fallback()
+    _install_guest_agent()
+
+
+#: What a non-operator channel sender's agent is told. Conversational, because a
+#: human is on the other end; explicit about having no tools, because the spec
+#: mounts none and the model should not promise to act.
+GUEST_AGENT_PROMPT = (
+    "You are answering a guest: a person the operator allowed to message this "
+    "account, not the operator. Reply to what they ask, briefly and helpfully, "
+    "from the conversation alone. You have no tools: you cannot run commands, read "
+    "or write files, browse, or act on anything, so never claim to have done so. "
+    "If a request needs any of that, say the account owner has to do it."
+)
+
+
+def _install_guest_agent() -> None:
+    """Write the tool-less ``kirocrew-guest`` config a non-operator sender talks to.
+
+    Separate from ``kirocrew-lite`` on purpose: the lite agent is the background
+    helper (titles, extraction) and may one day need a tool; this one is a trust
+    boundary and never may. Same model as the operator's chat so an admitted
+    sender gets an ordinary answer, never a background worker's minimal default.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    try:
+        model = KiroCrewConfig.load().agent.model or "auto"
+    except Exception:
+        model = "auto"
+    guest_path = kiro_agents_dir_path() / _GUEST_AGENT_FILENAME
+    guest_config = {
+        "name": "kirocrew-guest",
+        "model": model,
+        "tools": [],
+        "mcpServers": {},
+        # Pinned: kiro-cli defaults this to True and would spawn every server in
+        # the user-level mcp.json for a session that must mount nothing.
+        "includeMcpJson": False,
+        "prompt": GUEST_AGENT_PROMPT,
+    }
+    _atomic_json_write(guest_path, guest_config)
 
 
 def _install_lite_agent_fallback() -> None:
@@ -7940,7 +8020,8 @@ it.
 
 Arm a loop on your own session with `monitor_start`, carrying the cycle
 instructions AND the exit condition, then end the turn. A reply saying
-*requested* is success — do not retry it. If arming is refused outright, say no
+*requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If arming is refused outright, say no
 loop is running and drive that one round with `wait`. Call `autonudge_stop` when
 you stop. (The loop is on a timer today. When `monitor_start` accepts a
 `watch: "work-ledger"` field, gate on that instead and the quiet cycles stop
@@ -8123,6 +8204,10 @@ handle immediately.
 #:   goes to ``/api/chat/slots/<target>/tags`` where the target is the session
 #:   named in the ARGUMENTS — the same shape as ``chat_folder_move_session``.
 #:   Ingested content could re-label any persistent same-workspace session.
+#: * ``chat_session_pin`` — WITHHELD. Writes another session's ``pinned`` flag:
+#:   the PATCH goes to ``/api/chat/slots/<target>/pin`` where the target is the
+#:   session named in the ARGUMENTS, the same shape as ``chat_tag_assign``, and
+#:   no conductor step needs it.
 #: * ``session_send`` — WITHHELD. Runs text as another session's user-role turn
 #:   under that target's own grants. The server-side gates bound WHICH target is
 #:   reachable; nothing bounds WHAT is sent.
@@ -9122,7 +9207,8 @@ in that case.
 
 **Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
 instructions AND the exit condition, then end the turn; call `autonudge_stop`
-when you stop. A reply saying *requested* is success — do not retry it. If
+when you stop. A reply saying *requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If
 arming is refused outright, say no loop is running and drive that one round
 with `wait`. A quiet cycle is one line, then end the turn.
 
@@ -10076,7 +10162,8 @@ gate is the correct state; assuming its answer is not.
 
 **Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
 instructions AND the exit condition, then end the turn; call `autonudge_stop`
-when you stop. A reply saying *requested* is success — do not retry it. If
+when you stop. A reply saying *requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If
 arming is refused outright, say no loop is running and drive that one round
 with `wait`. A quiet cycle is one line, then end the turn.
 

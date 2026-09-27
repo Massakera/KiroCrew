@@ -160,6 +160,8 @@ _SPAWN_NAMES = {
     "create_subprocess_limited",
     "run_limited",
     "popen_limited",
+    # kiro_prerequisite's one-shot wrapper; its call sites must stay visible.
+    "spawn_supervised_oneshot",
 }
 
 # Tokens whose presence anywhere in the enclosing function marks the spawn as
@@ -195,6 +197,8 @@ _PREEXEC_TOKENS = (
     "create_subprocess_limited(",
     "run_limited(",
     "popen_limited(",
+    # Spawns through create_subprocess_limited, so its callers get the same limits.
+    "spawn_supervised_oneshot(",
     "resource_limit_preexec()",
     "session_host_preexec(",
 )
@@ -241,6 +245,13 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
         "acp/runtime.py::_get_rss_mb",
+        # The spawn primitive for three fixed-argv kiro-cli one-shots
+        # (`chat --list-models`, `whoami`, the `/usage` scrape). Every caller has
+        # already wrapped the argv with sandbox.wrap_argv and cgroup_scope_argv
+        # before handing it over; this function only prefixes the immutable
+        # process-group supervisor and spawns through create_subprocess_limited
+        # in a new session. Nothing agent-influenced reaches the argv here.
+        "kiro_prerequisite.py::spawn_supervised_oneshot",
         # Eight pre-existing spawns in one app's own test module, invisible to this
         # audit until receivers were derived from each file's imports: they are
         # reached through a function-local ``import subprocess as sp``. Every one is
@@ -332,18 +343,22 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # canary values, never the key. Called from a worker thread, never the
         # event loop.
         "acp/client.py::_verify_deepseek_gate",
-        # The subprocess-pool child interpreter: ONE fixed argv, ``sys.executable -S <leaf
-        # script>``, where the script is a module-relative constant (tests pass their
-        # own stub). No agent value reaches the command, the args or the cwd -- the
+        # The subprocess-pool child interpreter: ONE fixed argv, ``sys.executable -I -S
+        # -c <leaf source>``, where the source is the text of a module-relative
+        # constant script (the sensitive-path resolver's
+        # ``security/_child_realpath.py``; tests pass their own stub) captured when
+        # the executor module loads, so a later edit to the file reaches no respawn.
+        # No agent value reaches the command, the args or the cwd -- the
         # path to resolve travels over stdin as a length-prefixed frame, never as an
         # argument, and no shell is involved. It is listed rather than routed because
         # this child exists to ``lstat``/``readlink`` the very paths the
         # sensitive-path gate is checking, sensitive ones included: under the agent
         # sandbox it would be denied exactly those reads, and a resolver answering
         # "cannot resolve" where the true answer is a credential symlink's target
-        # would weaken the gate rather than harden it. The env is inherited
-        # deliberately, so a path resolves in the child to what it resolves to in
-        # the parent.
+        # would weaken the gate rather than harden it. ``-I`` drops ``PYTHONPATH``
+        # and the script directory from ``sys.path`` so nothing can be planted in
+        # front of its four stdlib imports; the cwd is inherited deliberately, so a
+        # path resolves in the child to what it resolves to in the parent.
         "subprocess_pool/executor.py::_spawn",
         # The PDF extractor child: ONE fixed argv, ``sys.executable -P -m
         # kiro_crew.pdf_extract_child --max-chars=N --max-pages=M`` with both
@@ -1538,6 +1553,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # verb set plus a label built from a validate_name-checked pod name —
         # not agent-influenced. Same disposition as the systemctl wrapper.
         "pod/launchd.py::launchctl",
+        # Windows interpreter discovery for the worktree venv, the same class as
+        # platform_compat.py::find_python_interpreter above. Fixed argv: the `py`
+        # launcher plus `-<version>` and a literal `-I -X utf8 -c` probe that
+        # prints sys.executable. The only variable is the version string, which is
+        # this module's own "3.12" default or a caller-supplied literal -- never
+        # agent input -- and it is a later argv element, never the command. No
+        # shell, no cwd, bounded timeout, stderr discarded, and the result is used
+        # only after it is confirmed to name a real file.
+        "pod/provision.py::_find_python_via_launcher",
         "pod/provision.py::_run",
         "pod/runtime.py::_git_worktrees",
         "pod/runtime.py::_run",

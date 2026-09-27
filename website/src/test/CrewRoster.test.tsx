@@ -18,7 +18,6 @@ import { render, screen, fireEvent, waitFor, within, act } from '@testing-librar
 import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
 import { MemoryRouter, useLocation } from 'react-router-dom'
-import { ApiError } from '../api/apiError'
 import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import dashboardReducer from '../store/dashboardSlice'
@@ -293,7 +292,7 @@ describe('crew roster — memory ownership notice', () => {
     // Page-level, so it is on screen before the user picks a view.
     expect(screen.getByText(NOTICE)).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'List' }))
     await screen.findByRole('table')
     // Switching the layout must not take the caveat away with the cards.
     expect(screen.getByText(NOTICE)).toBeInTheDocument()
@@ -315,14 +314,14 @@ describe('crew roster — memory ownership notice', () => {
     // so the page-level notice is not readable from here — the tooltip is the
     // only place this caveat reaches a user who is mid-edit.
     expect(within(sheet).getAllByTitle(TIP)).toHaveLength(1)
-    const memory = within(sheet).getByText(/This member keeps its current memory \(V1\)\./)
-    expect(memory).toHaveTextContent(/^This member keeps its current memory \(V1\)\. Member memory \(V2\) is only available when creating a new crew member\.$/)
+    const memory = within(sheet).getByText(/This crewmate keeps its current memory \(V1\)\./)
+    expect(memory).toHaveTextContent(/^This crewmate keeps its current memory \(V1\)\. Its own memory \(V2\) is only available when creating a new crewmate\.$/)
     expect(within(sheet).queryByText(/This member cannot return to its previous memory/)).toBeNull()
   })
 
   it('marks the workspace and memory columns in the list view', async () => {
     await renderRoster()
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'List' }))
     const table = await screen.findByRole('table')
     expect(within(table).getAllByTitle(TIP)).toHaveLength(2)
     // Each tip is a named control rather than announcing as "question mark",
@@ -441,7 +440,7 @@ describe('crew roster — description', () => {
     // OTHER_CREW is non-default with no description -> the placeholder.
     expect(within(crewCard('oncall')).getByText('No description')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'List' }))
     await screen.findByRole('table')
     const row = screen.getByRole('button', { name: 'Edit agent oncall' }).closest('tr')!
     expect(within(row).getByText('No description')).toBeInTheDocument()
@@ -460,7 +459,7 @@ describe('crew roster — view toggle', () => {
     await renderRoster()
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'List' }))
 
     const table = await screen.findByRole('table')
     expect(screen.getAllByTestId('crew-row')).toHaveLength(2)
@@ -476,7 +475,7 @@ describe('crew roster — view toggle', () => {
 
   it('carries each crew’s bindings into its row', async () => {
     await renderRoster()
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'List' }))
     await screen.findByRole('table')
 
     const row = screen.getByRole('button', { name: 'Edit agent oncall' }).closest('tr')!
@@ -487,7 +486,7 @@ describe('crew roster — view toggle', () => {
 
   it('opens the editor from a row', async () => {
     await renderRoster()
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'List' }))
     await screen.findByRole('table')
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit agent oncall' }))
@@ -498,7 +497,7 @@ describe('crew roster — view toggle', () => {
     // The row is a click target for convenience AND contains a real control
     // with the same action. One gesture must not fire both.
     await renderRoster()
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'List' }))
     await screen.findByRole('table')
 
     const nameControl = screen.getByRole('button', { name: 'Edit agent oncall' })
@@ -510,7 +509,7 @@ describe('crew roster — view toggle', () => {
 
   it('remembers the choice across mounts', async () => {
     const { unmount } = await renderRoster()
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'List' }))
     await screen.findByRole('table')
     expect(localStorage.getItem('mc-crews-view')).toBe('list')
 
@@ -529,7 +528,7 @@ describe('crew roster — view toggle', () => {
       default_agent: 'kirocrew',
     })
     await renderRoster()
-    fireEvent.click(screen.getByRole('button', { name: 'List' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'List' }))
     await screen.findByRole('table')
 
     const row = screen.getByRole('button', { name: 'Edit agent oncall' }).closest('tr')!
@@ -543,8 +542,8 @@ describe('crew roster — view toggle', () => {
     await waitFor(() =>
       expect(screen.getByTestId('empty-state-title')).toHaveTextContent('No agents'),
     )
-    expect(screen.queryByRole('button', { name: 'List' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Cards' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: 'List' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: 'Cards' })).not.toBeInTheDocument()
   })
 })
 
@@ -1408,105 +1407,6 @@ describe('avatar editor entry — discoverability (issue #9103)', () => {
     await waitFor(() => expect(screen.getByTestId('location-search')).toHaveTextContent(/^\?tab=crews$/))
   })
 
-  it('?new=1&from=members titles the form in the roster\'s words and strips both params', async () => {
-    renderPage('/capabilities?tab=crews&new=1&from=members')
-    // The Members roster's "+" lands HERE — on the form, not on the list a
-    // second "New crew" click would be needed on (#9513) — and the form says
-    // what the user pressed ("Add crew member"), not "Create Agent".
-    const sheet = await screen.findByRole('dialog', { name: 'Add crew member' })
-    expect(screen.getByRole('heading', { name: 'Add crew member' })).toBeInTheDocument()
-    // The body keeps the same word: the section heading and the triggers
-    // helper say "member", not "agent", so the form never renames the thing
-    // one field in.
-    expect(within(sheet).getByRole('heading', { name: 'What this member uses' })).toBeInTheDocument()
-    expect(within(sheet).queryByRole('heading', { name: 'What this agent uses' })).toBeNull()
-    expect(within(sheet).getByText(/hand work to this member/)).toBeInTheDocument()
-    expect(within(sheet).getByText(/The starting setup this member uses/)).toBeInTheDocument()
-    expect(within(sheet).getByText(/no member color/)).toBeInTheDocument()
-    expect(within(sheet).queryByText(/this agent/)).toBeNull()
-    await waitFor(() => expect(screen.getByTestId('location-search')).toHaveTextContent(/^\?tab=crews$/))
-  })
-
-  it('cancelling a create that arrived from the Members roster returns to the roster', async () => {
-    renderPage('/capabilities?tab=crews&new=1&from=members')
-    const sheet = await screen.findByRole('dialog', { name: 'Add crew member' })
-    await waitFor(() => expect(screen.getByTestId('location-search')).toHaveTextContent(/^\?tab=crews$/))
-    fireEvent.click(within(sheet).getByRole('button', { name: 'Cancel' }))
-    // Not stranded on a crew list the user never asked to visit.
-    await waitFor(() => expect(screen.getByTestId('location-pathname')).toHaveTextContent('/members'))
-    expect(screen.getByTestId('location-search')).toHaveTextContent(/^$/)
-  })
-
-  it('a create that arrived via ?new=1&from=members lands on the new member\'s thread', async () => {
-    renderPage('/capabilities?tab=crews&new=1&from=members')
-    const sheet = await screen.findByRole('dialog', { name: 'Add crew member' })
-    const user = userEvent.setup()
-    await user.type(within(sheet).getByPlaceholderText('e.g. oncall'), 'staging')
-    const template = within(sheet).getByRole('combobox', { name: 'Agent Template' })
-    fireEvent.keyDown(template, { key: 'ArrowDown' })
-    fireEvent.click(await screen.findByRole('option', { name: 'oncall-agent' }))
-    // The primary action names its object in the roster's words.
-    expect(within(sheet).queryByRole('button', { name: 'Create' })).toBeNull()
-    fireEvent.click(within(sheet).getByRole('button', { name: 'Create member' }))
-    await waitFor(() => expect(mockApi.createKirocrewAgent).toHaveBeenCalled())
-    // Exact name in `?member=` — MembersPage resolves by name, not slug.
-    await waitFor(() => expect(screen.getByTestId('location-pathname')).toHaveTextContent('/members'))
-    expect(screen.getByTestId('location-search')).toHaveTextContent(/^\?member=staging$/)
-  })
-
-  it.each([
-    ['memory unavailable', 409, '{"code":"member_memory_unavailable"}'],
-    ['template lineage', 409, '{"code":"lineage_unverifiable"}'],
-    ['foreign template', 409, '{"code":"foreign_private_copy"}'],
-    ['unknown code', 409, '{"code":"future_conflict"}'],
-    ['uncoded conflict', 409, '{"error":"Creation failed"}'],
-    ['malformed body', 409, 'not JSON'],
-    ['null body', 409, 'null'],
-    ['non-string code', 409, '{"code":409}'],
-    ['non-conflict status', 400, '{"code":"agent_exists"}'],
-  ])('preserves %s instead of reporting a duplicate member', async (_label, status, body) => {
-    const message = 'Creation is unavailable; retry after repairing the configuration.'
-    mockApi.createKirocrewAgent.mockRejectedValueOnce(new ApiError(status, message, body))
-    renderPage('/capabilities?tab=crews&new=1&from=members')
-    const sheet = await screen.findByRole('dialog', { name: 'Add crew member' })
-    const name = within(sheet).getByPlaceholderText('e.g. oncall')
-    fireEvent.change(name, { target: { value: 'staging' } })
-    const template = within(sheet).getByRole('combobox', { name: 'Agent Template' })
-    fireEvent.keyDown(template, { key: 'ArrowDown' })
-    fireEvent.click(await screen.findByRole('option', { name: 'oncall-agent' }))
-    fireEvent.click(within(sheet).getByRole('button', { name: 'Create member' }))
-    const err = await screen.findByTestId('crew-sheet-error')
-    expect(err).toHaveTextContent(message)
-    expect(err).not.toHaveTextContent('already exists')
-    expect(name).toHaveValue('staging')
-    expect(template).toHaveTextContent('oncall-agent')
-    expect(screen.getByRole('dialog', { name: 'Add crew member' })).toBeInTheDocument()
-    expect(screen.getByTestId('location-pathname')).toHaveTextContent('/capabilities')
-    expect(mockApi.createKirocrewAgent).toHaveBeenCalledTimes(1)
-  })
-
-  it('a duplicate name from the Members roster is refused in the form\'s own word', async () => {
-    mockApi.createKirocrewAgent.mockRejectedValueOnce(new ApiError(409, "Agent 'staging' already exists", '{"error":"Agent \'staging\' already exists","code":"agent_exists"}'))
-    renderPage('/capabilities?tab=crews&new=1&from=members')
-    const sheet = await screen.findByRole('dialog', { name: 'Add crew member' })
-    const user = userEvent.setup()
-    await user.type(within(sheet).getByPlaceholderText('e.g. oncall'), 'staging')
-    const template = within(sheet).getByRole('combobox', { name: 'Agent Template' })
-    fireEvent.keyDown(template, { key: 'ArrowDown' })
-    fireEvent.click(await screen.findByRole('option', { name: 'oncall-agent' }))
-    fireEvent.click(within(sheet).getByRole('button', { name: 'Create member' }))
-    // The server says "Agent"; the member-titled form does not repeat it.
-    const err = await screen.findByTestId('crew-sheet-error')
-    expect(err).toHaveTextContent("A member named 'staging' already exists.")
-    expect(err).not.toHaveTextContent(/Agent/)
-    // Still on the form — a refusal is not a dismissal.
-    expect(screen.getByRole('dialog', { name: 'Add crew member' })).toBeInTheDocument()
-    // Editing the name answers the error: it clears, so Create reads as
-    // safe to press again.
-    await user.type(within(sheet).getByPlaceholderText('e.g. oncall'), '2')
-    expect(screen.queryByTestId('crew-sheet-error')).toBeNull()
-  })
-
   it('a create from this page\'s own "New crew" button stays on the crew list', async () => {
     await renderRoster()
     const sheet = await openCreate()
@@ -1558,13 +1458,13 @@ describe('crew avatar — uploaded picture', () => {
     fireEvent.click(within(sheet).getByTestId('header-avatar-button'))
     const builder = await screen.findByRole('dialog', { name: 'Customize avatar' })
 
-    fireEvent.click(within(builder).getByRole('button', { name: 'Picture' }))
+    fireEvent.click(within(builder).getByRole('radio', { name: 'Picture' }))
     expect(within(builder).getByTestId('avatar-upload-dropzone')).toBeInTheDocument()
     // No picture chosen and none saved: Apply must not stage an empty image
     // override.
     expect(within(builder).getByTestId('avatar-builder-save')).toBeDisabled()
     // The ghost pane's draft survives the round-trip through the picture tab.
-    fireEvent.click(within(builder).getByRole('button', { name: 'Ghost face' }))
+    fireEvent.click(within(builder).getByRole('radio', { name: 'Ghost face' }))
     expect(within(builder).getByTestId('avatar-builder-preview')).toBeInTheDocument()
   })
 })

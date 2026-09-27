@@ -79,6 +79,7 @@ _EXPECTED_ROUTED_JOBS = {
     ("fast-gate.yml", "builtin-skill-scope"),
     ("fast-gate.yml", "loop-bound-locks"),
     ("fast-gate.yml", "testpaths-coverage"),
+    ("fast-gate.yml", "cwd-relative-repo-reads"),
     ("fast-gate.yml", "harness-parity"),
     ("fast-gate.yml", "memory-store-seam"),
     ("fast-gate.yml", "docs-lint"),
@@ -86,6 +87,7 @@ _EXPECTED_ROUTED_JOBS = {
     ("build.yml", "desktop-matrix"),
     ("main-ratchet-audit.yml", "ratchet-gates"),
     ("main-ratchet-audit.yml", "frontend-ceiling"),
+    ("main-ratchet-audit.yml", "bundle-ceiling"),
     ("main-ratchet-audit.yml", "report"),
     ("release.yml", "version"),
     ("release.yml", "resolve-promotion"),
@@ -148,6 +150,7 @@ _EXPECTED_RESOLVER_CONSUMER_JOBS = {
     ("ci.yml", "frontend-coverage-merge"): _CANONICAL_CONSUMER_EXPR,
     ("ci.yml", "bundle-size"): _CANONICAL_CONSUMER_EXPR_LARGE,
     ("ci.yml", "e2e"): _CANONICAL_CONSUMER_EXPR_LARGE,
+    ("ci.yml", "integration"): _CANONICAL_CONSUMER_EXPR_LARGE,
     ("ci.yml", "e2e-boot-matrix"): _CANONICAL_BOOT_MATRIX_EXPR,
     ("ci.yml", "real-adapter-contract"): _CANONICAL_CONSUMER_EXPR,
 }

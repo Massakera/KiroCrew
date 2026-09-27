@@ -287,6 +287,8 @@ class TestHumanOverrideHandler:
         assert 'select(.external_id | startswith(\\"$lane-pr-$PR-\\"))' in script
         assert 'select(.external_id == \\"$lane-pr-$PR\\")' not in script
         assert "sort_by(.started_at) | last" in script
+        # The default filter=latest returns one check-run per name: nothing to sort.
+        assert "check-runs?check_name=$enc&per_page=100&filter=all" in script
         # The resolved run must be verified to belong to the expected fork
         # lane before anything is re-run: any workflow with checks:write
         # could post a check-run of the same name.
@@ -964,11 +966,24 @@ class TestPrReadiness:
         assert '"GPT 5.6 Review (fork PR)"' not in workflow
         assert 'state="maintainer_review"' not in workflow
         assert "AI reviews could not run" not in workflow
-        # Stage-2 fork reviewers re-trigger readiness on completion so the
-        # green verdict actually lands.
-        assert "Fork Opus 5 Review" in workflow
-        assert "Fork GPT 5.6 Review" in workflow
-        assert "github.event.workflow_run.event == 'workflow_run'" in workflow
+        # The Stage-2 fork reviewers must NOT be in the trigger allowlist.
+        # Asserting their presence there proves nothing about function: presence
+        # does not say the trigger can resolve a pull request, and it cannot. A
+        # `workflow_run`-triggered lane runs from the default branch, so the
+        # payload it hands readiness names the default branch's tip, and the
+        # resolve step's `pulls?head=<repo>:<default branch>` lookup is empty by
+        # construction. Measured 700/700 runs across all seven fork lanes on the
+        # default branch, and 158 no-op readiness runs on one default-branch SHA.
+        # The green fork verdict lands through the lanes that DO run on the PR
+        # head -- Fast Gate above -- plus the 15-minute sweep, which re-fires by
+        # PR number.
+        assert "      - Fork Opus 5 Review" not in workflow
+        assert "      - Fork GPT 5.6 Review" not in workflow
+        assert "      - Fork Internal Content Scan" not in workflow
+        assert "github.event.workflow_run.event == 'workflow_run'\n" not in workflow
+        # The check-run specs above are what read a fork lane's verdict, and
+        # they are keyed on Fast Gate, which does carry the PR head.
+        assert '|fast-gate.yml"' in workflow
 
     def test_external_check_polling_counts_each_pass_once(self) -> None:
         workflow = _workflow("pr-readiness.yml")
@@ -976,6 +991,56 @@ class TestPrReadiness:
         assert 'success|neutral|skipped) passed+=("$check_name")' not in workflow
         assert 'if [ "${#failed[@]}" -gt 0 ]; then' in workflow
         assert 'if [ "${#pending[@]}" -gt 0 ]; then' in workflow
+
+    def test_no_monitored_lane_is_itself_workflow_run_triggered(self) -> None:
+        # GitHub runs a `workflow_run`-triggered workflow from the default
+        # branch, so the payload its completion hands readiness names the
+        # default branch as head_branch and the default branch's tip as
+        # head_sha, never the pull request's head. The resolve step then asks
+        # which open pull request has `<this repo>:<default branch>` as its head
+        # and gets an empty answer every time, so the run exits SKIP having
+        # published nothing and spent one request from the shared hourly REST
+        # pool. Listing such a lane therefore buys no refresh at all while
+        # dispatching a run per completion, keyed on ONE shared concurrency
+        # group (the default branch's tip) rather than per head update -- which
+        # is how it accumulated across every open pull request at once.
+        #
+        # A lane whose verdict readiness must observe belongs in the check-run
+        # specs (keyed on a workflow that does carry the PR head) or behind the
+        # `pr-readiness-sweep.yml` backstop, which re-fires by PR number.
+        readiness = yaml.safe_load(_workflow("pr-readiness.yml"))
+        # PyYAML resolves a bare `on:` key to the boolean True.
+        monitored = (readiness.get("on") or readiness[True])["workflow_run"]["workflows"]
+        assert monitored, "readiness must monitor at least one lane"
+
+        triggers: dict[str, object] = {}
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if not isinstance(doc, dict):
+                continue
+            name = doc.get("name")
+            on = doc.get("on", doc.get(True))
+            if isinstance(name, str):
+                triggers[name] = on
+
+        offenders = sorted(
+            name
+            for name in monitored
+            if isinstance(triggers.get(name), dict) and "workflow_run" in triggers[name]
+        )
+        assert offenders == [], (
+            "these monitored lanes are themselves workflow_run-triggered, so their "
+            f"payload can never resolve to a pull request: {offenders}"
+        )
+
+    def test_the_job_gate_refuses_a_workflow_run_upstream(self) -> None:
+        # Second fence for the same rule, so re-adding such a lane has to clear
+        # both. The allowlist is the primary one.
+        gate = yaml.safe_load(_workflow("pr-readiness.yml"))["jobs"]["readiness"]["if"]
+
+        assert "github.event.workflow_run.event == 'pull_request'" in gate
+        assert "github.event.workflow_run.event == 'dynamic'" in gate
+        assert "github.event.workflow_run.event == 'workflow_run'" not in gate
 
 
 class TestDesignReviewPresentation:
@@ -1474,8 +1539,12 @@ class TestFirstPrinciplesReview:
         workflow = _workflow("pr-readiness.yml")
 
         assert "      - First Principles Review" in workflow
-        assert "      - Fork First Principles Review" in workflow
         assert '"first-principles-review.yml|First Principles Review"' in workflow
+        # The fork path is registered by its check-run spec, keyed on Fast Gate.
+        # It is NOT in the trigger allowlist: a `workflow_run`-triggered lane
+        # runs from the default branch, so its payload names the default
+        # branch's tip and readiness can never resolve it to a pull request.
+        assert "      - Fork First Principles Review" not in workflow
         assert (
             '"checkrun:First Principles Review|First Principles Review'
             '|first-principles-pr-|fast-gate.yml"' in workflow
@@ -9522,7 +9591,14 @@ class TestReviewLaneVerdictVisibility:
         # And that branch answers 2 as well: a rival comment in the slot is the
         # same refusal as finding one before the first write, reached later.
         rival = canonical.split("took this lane's slot while this run was retrying", 1)[1]
-        assert rival.split("\n")[1].strip() == "return 2", rival[:160]
+        # Read as the FIRST return after that branch rather than the next
+        # physical line: a withheld arm retains the verdict before returning, so
+        # a line sits between the message and the answer. Any other status here,
+        # including one the retention introduced, still fails.
+        rival_returns = [
+            line.strip() for line in rival.split("\n") if line.strip().startswith("return ")
+        ]
+        assert rival_returns and rival_returns[0] == "return 2", rival[:240]
         # Two classified reads, asking the same question at different times:
         # before the first write, and again during the backoff. Both are scoped
         # to the slot as well as the needle.
@@ -10397,10 +10473,23 @@ class TestConcernsIsVisibleInTheChecksUi:
     def test_pr_readiness_still_counts_neutral_as_a_pass(self) -> None:
         # This is what makes the change safe: `neutral` is visible to a human
         # and invisible to the gate, so an advisory CONCERNS cannot start
-        # blocking merges. Read-only assertion -- this PR does not edit the file.
+        # blocking merges.
         readiness = _workflow("pr-readiness.yml")
         assert 'IN("success","neutral")' in readiness
-        assert "success|neutral|skipped) passed+=" in readiness
+        # Bound to the SAME-REPO advisory case block -- the second of the two
+        # readers that name all three lanes -- so the arm scoring `neutral`
+        # cannot be confused with the generic lane reader's own arm below it.
+        # Whatever else that arm does, `neutral` reaches `passed` and never the
+        # BLOCK-only failing arm, which is the property this pins.
+        branch = (
+            '[ "$label" = "Design Review" ] || [ "$label" = "UX Review" ] '
+            '|| [ "$label" = "First Principles Review" ]'
+        )
+        region = readiness.split(branch)[2].split("esac", 1)[0]
+        arms = [arm for arm in region.split(";;") if "neutral" in arm]
+        assert len(arms) == 1, "exactly one arm may score a neutral conclusion"
+        assert 'passed+=("$label")' in arms[0]
+        assert "failed+=" not in arms[0]
 
     def test_same_repo_lanes_annotate_concerns_and_still_exit_zero(self) -> None:
         for name, _, status_step, lane in CONCERNS_SAME_LANES:
@@ -10816,6 +10905,24 @@ class TestFirstPrinciplesProblemsFirstContract:
         assert "DO NOT REASON FROM AN ASSUMED USER COUNT, in either direction" in contract
         assert "the AGENT is untrusted with respect to its own governance" in contract
 
+    def test_over_engineering_is_judged_against_the_frozen_goal(self) -> None:
+        # The body below `## What changed` is regenerated each round to match
+        # the diff, so it cannot be the Goal a mechanism is measured against.
+        # An out-of-goal mechanism must surface as a removable Subtraction, and
+        # an older PR without the frozen headings still has a Goal to read.
+        flat = " ".join(_fp_contract().split())
+        assert "THE GOAL: when the description has a `**Goal:**` line" in flat
+        assert "never from `## What changed` or anything below it" in flat
+        assert "When there is no `**Goal:**` line (an older PR)" in flat
+        # Today's template already has `## Problem / Motivation`, so that
+        # heading alone must not switch a PR into frozen-goal mode.
+        assert "a `## Problem / Motivation` section or" not in flat
+        assert "does any mechanism go beyond the Goal's scope" in flat
+        assert "If so, is that justified?" in flat
+        assert "MINIMALITY PRINCIPLE: the change fits the original Goal" in flat
+        assert "tagged `oversized`" in flat
+        assert "`Clears when: the mechanism is removed, or a human amends the Goal.`" in flat
+
 
 class TestFirstPrinciplesOneStatementPerProblem:
     """A review that says the same three items three times -- under
@@ -10990,7 +11097,12 @@ class TestReviewLanesPublishOnlyTheReview:
         script = (
             'summary="$(cat body.md)"\n'
             + trim
-            + "\nprintf '%s\\n' \"$summary\" | head -n1\n"
+            # First line via `awk 'NR == 1'`, never `head -n1`: head closes the
+            # pipe on its producer, and under this script's own `-o pipefail`
+            # the producer's SIGPIPE (141) becomes the script's exit status.
+            # Same reason the lanes themselves are held to it -- see
+            # test_guard_function_is_byte_identical_across_all_lanes.
+            + "\nprintf '%s\\n' \"$summary\" | awk 'NR == 1'\n"
             + "awk '/<details>/ { skip = 1 } !skip { print } /<\\/details>/ { skip = 0 }' <<< \"$summary\" | wc -w | tr -d ' '\n"
         )
         result = subprocess.run(
@@ -11564,6 +11676,42 @@ class TestForkLaneSurfacesAnUnstampedReviewBody:
         assert "UNSTAMPED" not in posted
 
 
+def _fork_gpt_cli_config(tmp_path: Path) -> dict:
+    """Run the fork GPT lane's config step and parse the file it writes.
+
+    PARSE, never grep: a heredoc emitting invalid TOML would still satisfy a
+    substring assertion while codex discards the whole file -- taking the shell
+    environment policy and the sandbox mode with it.
+    """
+    import tomllib
+
+    bash = _bash()
+    if bash is None:
+        pytest.skip("writing the review CLI config requires Bash")
+    home = tmp_path / "home"
+    home.mkdir()
+    script_file = tmp_path / "step.sh"
+    script_file.write_text(
+        _step_script(
+            _workflow("fork-gpt-review.yml"), "Configure the review CLI for Amazon Bedrock"
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    proc = subprocess.run(
+        [bash, "-e", str(script_file)],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+        cwd=tmp_path,
+        env={**os.environ, "HOME": str(home)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    written = home / ".codex" / "config.toml"
+    assert written.is_file(), "the step wrote no config.toml"
+    return tomllib.loads(written.read_text(encoding="utf-8"))
+
+
 class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
     """`codex exec` hands the model a shell; the Opus lane deliberately does not.
 
@@ -11579,34 +11727,7 @@ class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
     STEP = "Configure the review CLI for Amazon Bedrock"
 
     def _config(self, tmp_path: Path) -> dict:
-        import tomllib
-
-        bash = _bash()
-        if bash is None:
-            pytest.skip("writing the review CLI config requires Bash")
-        home = tmp_path / "home"
-        home.mkdir()
-        script_file = tmp_path / "step.sh"
-        script_file.write_text(
-            _step_script(_workflow("fork-gpt-review.yml"), self.STEP),
-            encoding="utf-8",
-            newline="\n",
-        )
-        proc = subprocess.run(
-            [bash, "-e", str(script_file)],
-            check=False,
-            capture_output=True,
-            encoding="utf-8",
-            cwd=tmp_path,
-            env={**os.environ, "HOME": str(home)},
-        )
-        assert proc.returncode == 0, proc.stderr
-        written = home / ".codex" / "config.toml"
-        assert written.is_file(), "the step wrote no config.toml"
-        # PARSE, never grep: a heredoc emitting invalid TOML would still satisfy a
-        # substring assertion while codex discards the policy and the model's
-        # shell keeps the credentials.
-        return tomllib.loads(written.read_text(encoding="utf-8"))
+        return _fork_gpt_cli_config(tmp_path)
 
     def test_the_bedrock_provider_still_resolves(self, tmp_path: Path) -> None:
         # The exclusions must not cost the lane its model: the provider reads its
@@ -11630,6 +11751,55 @@ class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
         # false so GH_TOKEN and future secret-shaped variables drop out too.
         policy = self._config(tmp_path)["shell_environment_policy"]
         assert policy["ignore_default_excludes"] is False
+
+
+class TestForkGptLaneSandboxModeLivesInTheConfigFile:
+    """A `--sandbox` flag on the command line makes this lane's config unreachable.
+
+    The flag wins over `sandbox_mode` in the staged config AND suppresses a
+    `default_permissions` profile outright, so a filesystem rule written into that
+    file is inert for as long as the flag is passed. The mode therefore belongs in
+    the file, which is the only place a read restriction can be attached to it.
+
+    Both halves are asserted because either one alone is unsafe. Dropping the flag
+    without pinning the key leaves the effective mode to a config default this
+    repository does not control, and `workspace-write` and `danger-full-access`
+    are legal values for it -- on a lane that reviews a fork's UNTRUSTED diff
+    holding Bedrock credentials.
+    """
+
+    WORKFLOW = "fork-gpt-review.yml"
+
+    def _codex_commands(self) -> list[str]:
+        """Every `codex exec` invocation, backslash continuations joined up."""
+        joined = re.sub(r"\\\n\s*", " ", _workflow(self.WORKFLOW))
+        commands = [
+            _flat(line).strip()
+            for line in joined.splitlines()
+            if ".bin/codex" in line and " exec " in _flat(line)
+        ]
+        assert commands, f"{self.WORKFLOW} runs no `codex exec` command to check"
+        return commands
+
+    def test_neither_pass_passes_the_sandbox_flag(self) -> None:
+        for command in self._codex_commands():
+            assert "--sandbox" not in command, (
+                f"{self.WORKFLOW} passes --sandbox on a `codex exec` command line: "
+                f"{command!r}. The flag overrides the staged config.toml and "
+                "suppresses its `default_permissions` profile, so every filesystem "
+                "rule in that file stops being enforced while this argument is "
+                "present -- silently, because the lane still reports a read-only "
+                "sandbox and still produces a verdict"
+            )
+
+    def test_the_staged_config_pins_the_mode_explicitly(self, tmp_path: Path) -> None:
+        config = _fork_gpt_cli_config(tmp_path)
+        assert config.get("sandbox_mode") == "read-only", (
+            'the staged config.toml does not pin sandbox_mode = "read-only". With '
+            "no --sandbox argument on the command line, `codex exec` resolves the "
+            "mode from this file, so an absent or widened key hands the model's "
+            "shell more of the runner than reading the diff needs"
+        )
 
 
 class TestForkModelStepsDenyReadingTheEnvironment:
@@ -14077,3 +14247,947 @@ class TestUxLensZeroIsIdenticalInBothLanes:
             assert "across the whole app, not one panel" in flat, name
             # "The issue asked for it here" is not a design decision.
             assert "is NOT a design decision and is itself a finding" in flat, name
+
+
+#: Every review lane's notice step, with the slot-lookup shape it is allowed to
+#: carry. ``defines_lookup`` says the step declares ``find_existing``; ``creates``
+#: says at least one branch in it CREATES a marker comment rather than only
+#: patching one that already exists. A create is the case that cannot be undone,
+#: so it is the case the gate exists for -- but the lookup is budgeted in both,
+#: because a swallowed read on a patch-only branch silently leaves an earlier
+#: revision's outcome standing in the slot.
+_NOTICE_LANES = (
+    ("claude-review.yml", "Post Opus 5 review summary", False, False),
+    ("codex-review.yml", "Post/update review comment", False, False),
+    ("design-review.yml", "Post design review summary", True, True),
+    ("first-principles-review.yml", "Post first-principles review summary", True, True),
+    ("fork-design-review.yml", "Post/update design review comment", False, False),
+    (
+        "fork-first-principles-review.yml",
+        "Post/update first-principles review comment",
+        True,
+        False,
+    ),
+    ("fork-gpt-review.yml", "Post/update summary comment", False, False),
+    ("fork-opus-review.yml", "Post/update summary comment", False, False),
+    ("fork-security-scope-review.yml", "Post/update the scope review comment", False, False),
+    ("fork-ux-review.yml", "Post UX review summary", True, False),
+    ("security-scope-review.yml", "Post the scope verdict", False, False),
+    ("ux-review.yml", "Post UX review summary", True, True),
+)
+
+_NOTICE_LANE_PARAMS = [
+    pytest.param(workflow, step, defines, creates, id=f"{workflow}-{int(defines)}{int(creates)}")
+    for workflow, step, defines, creates in _NOTICE_LANES
+]
+
+
+class TestNoticeSlotLookupLicensesEveryCreate:
+    """A notice comment is created only from a slot read that actually answered.
+
+    The verdict writes in these steps route through a guarded upsert that
+    pre-reads the slot and refuses an occupant. The override, no-contract and
+    skip notices in the same steps do not: they decide between PATCH and CREATE
+    from one marker lookup of their own. When that lookup is a single attempt
+    whose error is swallowed, an ordinary API flake is indistinguishable from an
+    empty slot, and the branch takes the CREATE arm against a slot that already
+    holds a comment. Two comments then share one marker: a later lookup patches
+    whichever id it picks first and the other keeps whatever line it carries,
+    with no run that reconciles them.
+    """
+
+    #: The arms a notice write may sit behind. A write runs only when the slot
+    #: read answered AND this PR's head is still the head the notice is about.
+    #: The third arm only REPORTS, so it carries no head licence: an unreadable
+    #: slot is a fact worth printing whatever the head now says, and requiring
+    #: the licence there would swallow it whenever both reads fail at once.
+    GATE = 'elif [ "$head_unchanged" -eq 1 ] && [ "$lookup_ok" -eq 1 ]; then'
+    UNREADABLE = 'elif [ "$lookup_ok" -eq 0 ]; then'
+    PATCH_GATE = (
+        'if [ "$head_unchanged" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then'
+    )
+
+    def _notice_script(self, workflow: str, step: str) -> str:
+        return _step_script(_workflow(workflow), step)
+
+    def test_slot_lookup_is_one_budgeted_body_wherever_it_is_defined(self) -> None:
+        # Same invariant retry_comment_write already carries, applied to the
+        # lookup that gates the notice writes: one body, edited in every lane at
+        # once, so the budget cannot drift lane by lane.
+        bodies = set()
+        for workflow, step, defines, _creates in _NOTICE_LANES:
+            script = self._notice_script(workflow, step)
+            if not defines:
+                assert "find_existing() {" not in script, workflow
+                continue
+            bodies.add(_shell_function(script, "find_existing"))
+        assert len(bodies) == 1, (
+            "find_existing must stay byte-identical across every lane that "
+            "defines one; edit all copies together"
+        )
+        canonical = bodies.pop()
+        code = [line for line in canonical.splitlines() if not line.lstrip().startswith("#")]
+        # Bounded and budgeted on the same terms as the reads that gate a
+        # verdict: six attempts, 5s linear backoff, ~75s. The window this
+        # exists for is an API exhaustion lasting minutes, not one bad request.
+        assert any("for attempt in 1 2 3 4 5 6; do" in line for line in code)
+        assert any('sleep "$(( attempt * 5 ))"' in line for line in code)
+        assert any('if [ "$attempt" -lt 6 ]; then' in line for line in code)
+        # The failure is REPORTED, not swallowed. `|| true` on the read is the
+        # whole defect: it turns "the API refused" into "the slot is empty".
+        assert not any("|| true" in line for line in code), code
+        # Two separate facts, because only one of them licenses a create.
+        assert any(line.strip() == "lookup_ok=1" for line in code)
+        assert any(line.strip() == 'existing=""' for line in code)
+        # `awk 'NR == 1'`, not `head -n1`: a head in the pipeline SIGPIPEs the
+        # api call under pipefail, which is itself a swallowed read.
+        assert not any("head -n1" in line for line in code), code
+        assert any("| awk 'NR == 1'" in line for line in code)
+
+    @pytest.mark.parametrize(("workflow", "step", "defines", "creates"), _NOTICE_LANE_PARAMS)
+    def test_every_notice_create_sits_behind_the_gate(
+        self, workflow: str, step: str, defines: bool, creates: bool
+    ) -> None:
+        # Enumerated per lane rather than spot-checked: the lanes that create a
+        # notice must gate every one of those creates, and the lanes that do not
+        # create must still not gain an ungated one later. A lane whose notices
+        # only patch reports an unreadable slot instead, because the comment
+        # left standing there describes an earlier revision.
+        script = self._notice_script(workflow, step)
+        lines = script.replace("\\\n", " ").splitlines()
+        # The guarded upsert's own writes are not notices: they are already
+        # pre-read and refused on an occupant, and they carry `write_rc` rather
+        # than `|| true`.
+        notice_creates = [
+            (n, line)
+            for n, line in enumerate(lines)
+            if not line.lstrip().startswith("#")
+            if "gh pr comment " in line
+            if "write_rc" not in line
+        ]
+        if not creates:
+            assert notice_creates == [], (
+                f"{workflow} gained a notice create; flip its _NOTICE_LANES "
+                f"'creates' flag to True and keep the gate below: {notice_creates}"
+            )
+        else:
+            assert notice_creates, workflow
+        for n, line in notice_creates:
+            assert lines[n - 1].strip() == self.GATE, (workflow, line, lines[n - 1])
+        if defines:
+            # Every branch that reads the slot accounts for the unreadable case:
+            # either it gates a create, or it says the notice did not land.
+            assert self.GATE in script or self.UNREADABLE in script, workflow
+            # This read names ITSELF in the log. The guarded upsert's own slot
+            # pre-read already prints "to find this lane's slot failed on
+            # attempt N"; reusing that sentence here makes a failed publish a
+            # column of identical lines and leaves the reader unable to tell
+            # which read gave up. Asserting on a phrase both reads share would
+            # pass without measuring anything, because both live in this step.
+            assert (
+                "Reading this PR's comments before writing this lane's notice" in script
+            ), workflow
+
+    @pytest.mark.parametrize(("workflow", "step", "defines", "creates"), _NOTICE_LANE_PARAMS)
+    def test_no_notice_read_keeps_its_own_unbudgeted_copy(
+        self, workflow: str, step: str, defines: bool, creates: bool
+    ) -> None:
+        # A second, private marker lookup inside one branch is what lets the
+        # override note read the slot on different terms from the rest of its own
+        # step. Every marker-filtered read in these steps belongs to the one
+        # budgeted body, so a lane may hold no other.
+        script = self._notice_script(workflow, step)
+        lines = script.splitlines()
+        inline_reads = [
+            line
+            for line in lines
+            if not line.lstrip().startswith("#")
+            if "issues/$PR/comments" in line
+            if "head -n1" in line
+        ]
+        assert inline_reads == [], (workflow, inline_reads)
+
+    def test_head_confirmation_is_one_body_wherever_a_notice_is_written(self) -> None:
+        # Same one-body rule the slot lookup carries, for the check that decides
+        # whether writing is still safe. A per-lane copy is how one lane keeps
+        # treating an unreadable head as a clear one.
+        bodies = set()
+        for workflow, step, defines, _creates in _NOTICE_LANES:
+            script = self._notice_script(workflow, step)
+            if not defines:
+                assert "confirm_head() {" not in script, workflow
+                continue
+            bodies.add(_shell_function(script, "confirm_head"))
+        assert len(bodies) == 1, (
+            "confirm_head must stay byte-identical across every lane that "
+            "writes a notice; edit all copies together"
+        )
+        code = [line for line in bodies.pop().splitlines() if not line.lstrip().startswith("#")]
+        # The head is read from the PR itself, not from the event payload, which
+        # names the head the run started on and need not still be current.
+        assert any("repos/$REPO/pulls/$PR" in line for line in code), code
+        assert any("'.head.sha'" in line for line in code), code
+        # Three outcomes, and only one of them licenses a write. An unreadable
+        # answer is treated as a moved head because writing is the direction
+        # that destroys something: the notice carries no verdict, so declining
+        # costs a stale line while writing costs a newer revision's verdict.
+        assert any(line.strip() == "head_unchanged=1" for line in code), code
+        assert sum(1 for line in code if line.strip() == "return 0") == 3, code
+        assert any('[ -n "$head_now" ]' in line for line in code), code
+        assert any('[ "$head_now" != "$HEAD" ]' in line for line in code), code
+        # Both refusals are visible in the run log, and each names the revision
+        # whose notice was withheld.
+        assert sum(1 for line in code if "::warning::" in line) == 2, code
+        assert sum(1 for line in code if "$HEAD" in line) >= 2, code
+        # The read carries the same budget as the slot read above it, because the
+        # two run inside one exhaustion window: a lane that has just spent up to
+        # 75s retrying the slot is the least likely to get this one answered
+        # first time, and an unbudgeted refusal here reads as a moved head.
+        assert any("for attempt in 1 2 3 4 5 6; do" in line for line in code), code
+        assert any('sleep "$(( attempt * 5 ))"' in line for line in code), code
+        assert any('[ "$attempt" -lt 6 ]' in line for line in code), code
+        # A moved head is a definite answer, so it is not retried: its `return`
+        # sits INSIDE the loop, ahead of the line that reports a failed attempt.
+        moved = next(n for n, line in enumerate(code) if '[ "$head_now" != "$HEAD" ]' in line)
+        retry = next(n for n, line in enumerate(code) if "failed on attempt $attempt" in line)
+        licensed = next(n for n, line in enumerate(code) if line.strip() == "head_unchanged=1")
+        assert moved < retry, code
+        assert licensed < retry, code
+
+    @pytest.mark.parametrize(("workflow", "step", "defines", "creates"), _NOTICE_LANE_PARAMS)
+    def test_every_notice_write_is_licensed_by_a_confirmed_head(
+        self, workflow: str, step: str, defines: bool, creates: bool
+    ) -> None:
+        # Enumerated per lane, per arm. A notice PATCH is the arm that can bury
+        # a verdict: the slot read answered, so the branch holds a real comment
+        # id, and by the time it writes that comment can be the newer
+        # revision's. A notice CREATE is the weaker half -- it presents a
+        # superseded revision's line as the current one.
+        script = self._notice_script(workflow, step)
+        if not defines:
+            assert "confirm_head" not in script, workflow
+            return
+        lines = script.replace("\\\n", " ").splitlines()
+        bare = [line for line in lines if not line.lstrip().startswith("#")]
+        # Both questions are asked before every write, and the ORDER is the content
+        # of the rule, because the head check can spend over a minute on backoff:
+        #
+        #   creates  -- head first, slot read LAST. An empty slot means POST, so
+        #               deciding that from a minute-old read lets another run on
+        #               this same head fill the slot inside the gap. A write is
+        #               pending as soon as the head holds, so asking early is free.
+        #   replaces -- slot read first, head inside the occupant test. There is no
+        #               CREATE to misfire, and an empty slot means do nothing, so
+        #               asking the head first reports a notice the arm never had.
+        heads = [n for n, line in enumerate(bare) if line.strip() == "confirm_head"]
+        reads = [n for n, line in enumerate(bare) if line.strip() == "find_existing"]
+        assert heads and reads, workflow
+        assert len(heads) == len(reads), (workflow, heads, reads)
+        creating = replacing = 0
+        for n in heads:
+            following = bare[n + 1].strip()
+            if following == "find_existing":
+                # Head first, then slot: only legitimate where the arm can create.
+                assert bare[n + 2].strip() == self.PATCH_GATE, (workflow, bare[n + 2])
+                tail = "\n".join(bare[n : n + 12])
+                assert self.GATE in tail, (workflow, "reads last but never creates", tail)
+                creating += 1
+                continue
+            # Otherwise the head check sits inside the occupant test, which the
+            # slot read must therefore precede.
+            assert following == 'if [ "$head_unchanged" -eq 1 ]; then', (workflow, following)
+            opener = bare[n - 1].strip()
+            assert opener == 'if [ -n "$existing" ] && [ "$existing" != "null" ]; then', (
+                workflow,
+                opener,
+            )
+            assert bare[n - 2].strip() == "find_existing", (workflow, bare[n - 2])
+            # And it must NOT create, or deferring the question would skip it.
+            tail = "\n".join(bare[n - 2 : n + 14])
+            assert self.GATE not in tail, (workflow, "defers the question yet creates", tail)
+            replacing += 1
+        assert creating + replacing == len(heads), workflow
+        # And every notice write arm states its own licence rather than
+        # inheriting one from an enclosing branch. The verdict writes in the
+        # same step are not notices: they route through retry_comment_write and
+        # carry its `write_rc`, and the test below is what holds them out.
+        notice_writes = [
+            (n, line)
+            for n, line in enumerate(bare)
+            if "retry_comment_write" not in line
+            if "write_rc" not in line
+            if "issues/comments/$existing" in line or "gh pr comment " in line
+        ]
+        assert notice_writes, workflow
+        for n, line in notice_writes:
+            arm = next(
+                bare[m].strip()
+                for m in range(n, -1, -1)
+                if bare[m].strip().startswith(("if ", "elif "))
+            )
+            assert '"$head_unchanged" -eq 1' in arm, (workflow, line, arm)
+        # The complement, and the third case in the enumeration: the arm that
+        # only REPORTS an unreadable slot writes nothing, so it needs no licence
+        # and must not borrow one. Requiring it there loses the slot fact in the
+        # one run where both reads fail, which is the run most in need of it.
+        assert self.UNREADABLE in script, workflow
+        assert 'elif [ "$head_unchanged" -eq 1 ]; then' not in script, workflow
+
+    def test_the_verdict_path_does_not_take_the_notice_head_gate(self) -> None:
+        # The qualifier on the rule above, and the reason it says NOTICE rather
+        # than every write. A verdict withheld is the expensive direction: the
+        # slot is the only thing a freshness verifier reads, so a run that
+        # declines to publish leaves the revision indistinguishable from one no
+        # lane ever reviewed. The guarded upsert therefore writes on its first
+        # attempt whatever the head now says, and confirms the head only before
+        # a REPEAT, whose first write may already have landed.
+        for workflow, step, defines, _creates in _NOTICE_LANES:
+            if not defines:
+                continue
+            script = self._notice_script(workflow, step)
+            upsert_step = _step_script(_workflow(workflow), step)
+            assert "retry_comment_write" in upsert_step, workflow
+            body = _shell_function(upsert_step, "retry_comment_write")
+            code = [line for line in body.splitlines() if not line.lstrip().startswith("#")]
+            assert not any("head_unchanged" in line for line in code), workflow
+            assert any('[ "$attempt" -gt 1 ]' in line for line in code), workflow
+            assert any('[ "$head_now" != "$HEAD" ]' in line for line in code), workflow
+            # The notice gate lives in the same step, so the two must not be
+            # confused for one another by a later edit.
+            assert "confirm_head() {" in script, workflow
+
+    def test_a_moved_head_leaves_the_newer_revision_verdict_in_the_slot(
+        self, tmp_path: Path
+    ) -> None:
+        # The behavioural half of the head gate, and the exact sequence the
+        # backoff above widened: this run's slot read fails, it sleeps, a newer
+        # revision publishes its verdict into the slot during that window, and
+        # this run's retry then succeeds and holds a real comment id. Writing
+        # that id replaces a verdict for a revision this run never reviewed,
+        # and no later run puts it back.
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("notice slot-lookup test requires Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        head = "a" * 40
+        newer_head = "b" * 40
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# The slot read answers and reports an occupant, so this run holds a\n"
+            "# real comment id. The PR's head has moved on while it was reading.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
+            "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
+            f'  echo "{newer_head}"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
+            "  echo '4242'\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sleep_stub.chmod(0o755)
+
+        script = self._notice_script(
+            "first-principles-review.yml", "Post first-principles review summary"
+        )
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "STUB_CALLS": str(calls_dir),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output.txt"),
+            "GH_TOKEN": "stub",
+            "REPO": "o/r",
+            "PR": "1",
+            "HEAD": head,
+            "HUMAN_OVERRIDE": "false",
+            "OVERRIDE_ACTOR": "",
+            "ACTOR": "someone",
+            "EXEC_FILE": "",
+            "SURFACE": "true",
+            "CONTRACT": "false",
+            "REVIEW_OUTCOME": "success",
+        }
+        result = subprocess.run(
+            [bash, str(script_file)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # The assertion that names the defect: the slot read answered and gave a
+        # comment id, so without the head check this branch PATCHes its own
+        # notice over the newer revision's verdict.
+        assert not (calls_dir / "patch-calls.txt").exists()
+        assert not (calls_dir / "create-calls.txt").exists()
+        # The head was in fact consulted, once, and only after the slot read.
+        assert (calls_dir / "head-calls.txt").read_text(encoding="utf-8").splitlines() == ["head"]
+        # The log names both revisions, so a reader can tell which run gave way
+        # to which.
+        stdout = result.stdout.decode()
+        assert "::warning::" in stdout
+        assert newer_head in stdout
+        assert head in stdout
+
+    def test_an_unreadable_slot_creates_nothing_and_says_so(self, tmp_path: Path) -> None:
+        # The behavioural half. The lane has a no-contract notice to publish and
+        # the comments API refuses every read. The slot in fact already holds
+        # this lane's comment, so the create arm would produce the second comment
+        # that no run can take back out.
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("notice slot-lookup test requires Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        head = "f" * 40
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# Records every mutation; refuses every comments read, which is the\n"
+            "# condition the gate exists for.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
+            "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
+            "  echo 'gh: api rate limit exceeded' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
+            "  echo 'gh: api rate limit exceeded' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+        # `sleep` is stubbed away so the six-attempt budget costs no wall clock.
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sleep_stub.chmod(0o755)
+
+        script = self._notice_script(
+            "first-principles-review.yml", "Post first-principles review summary"
+        )
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "STUB_CALLS": str(calls_dir),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output.txt"),
+            "GH_TOKEN": "stub",
+            "REPO": "o/r",
+            "PR": "1",
+            "HEAD": head,
+            "HUMAN_OVERRIDE": "false",
+            "OVERRIDE_ACTOR": "",
+            "ACTOR": "someone",
+            "EXEC_FILE": "",
+            # The no-contract branch: the lane has reviewable surface and the
+            # contract step reported the rubric absent from the base commit.
+            "SURFACE": "true",
+            "CONTRACT": "false",
+            "REVIEW_OUTCOME": "success",
+        }
+        result = subprocess.run(
+            [bash, str(script_file)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # Nothing was written on either arm. The create is the assertion that
+        # names the defect: with an unbudgeted, error-swallowing read this is the
+        # second comment under this lane's marker, and no run takes it back out.
+        # No PATCH either, against an id the failed read never produced.
+        assert not (calls_dir / "create-calls.txt").exists()
+        assert not (calls_dir / "patch-calls.txt").exists()
+        # And the read was budgeted, not attempted once.
+        reads = (calls_dir / "read-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(reads) == 6, reads
+        # So was the head check that follows it, and this run is why: one
+        # exhausted window refuses BOTH reads, so an unbudgeted head read would
+        # spend the slot budget and then treat its own first refusal as a moved
+        # head. It refuses here only after the same 6 attempts.
+        heads = (calls_dir / "head-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(heads) == 6, heads
+        # The run says which notice did not land, naming the revision.
+        stdout = result.stdout.decode()
+        assert "::warning::" in stdout
+        assert "unreadable after 6 attempts" in stdout
+        assert head in stdout
+
+    def test_a_transient_head_read_is_retried_not_read_as_a_moved_head(
+        self, tmp_path: Path
+    ) -> None:
+        # The sequence the unbudgeted read turned into a withheld write: a human
+        # override is accepted, the slot holds this lane's prior blocking comment,
+        # and the head read blips twice before answering with the SAME head. One
+        # attempt makes that blip indistinguishable from a moved head, so nothing
+        # is written while `verdict=OVERRIDE` is still emitted -- the slot keeps a
+        # block over an override a human already accepted, and no later run in
+        # this lane clears it.
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("notice slot-lookup test requires Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        head = "c" * 40
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# The slot read answers at once and reports an occupant. The head\n"
+            "# read refuses twice, then answers with the head this run is about.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
+            "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
+            '  attempts=$(wc -l < "$STUB_CALLS/head-calls.txt")\n'
+            '  if [ "$attempts" -lt 3 ]; then\n'
+            "    echo 'api blip' >&2\n"
+            "    exit 1\n"
+            "  fi\n"
+            f'  echo "{head}"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
+            "  echo '4242'\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sleep_stub.chmod(0o755)
+
+        script = self._notice_script(
+            "first-principles-review.yml", "Post first-principles review summary"
+        )
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "STUB_CALLS": str(calls_dir),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output.txt"),
+            "GH_TOKEN": "stub",
+            "REPO": "o/r",
+            "PR": "1",
+            "HEAD": head,
+            "HUMAN_OVERRIDE": "true",
+            "OVERRIDE_ACTOR": "someone",
+            "ACTOR": "someone",
+            "EXEC_FILE": "",
+            "SURFACE": "true",
+            "CONTRACT": "true",
+            "REVIEW_OUTCOME": "success",
+        }
+        result = subprocess.run(
+            [bash, str(script_file)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # The assertion that names the defect: the override note replaced the
+        # blocking comment, rather than the blip leaving it standing.
+        assert (calls_dir / "patch-calls.txt").exists()
+        assert (calls_dir / "patch-calls.txt").read_text(encoding="utf-8").splitlines() == [
+            "repos/o/r/issues/comments/4242"
+        ]
+        # It took three attempts to get there, and no second comment was made.
+        assert len((calls_dir / "head-calls.txt").read_text(encoding="utf-8").splitlines()) == 3
+        assert not (calls_dir / "create-calls.txt").exists()
+        # A retried blip is not reported as a withheld notice.
+        stdout = result.stdout.decode()
+        assert "::warning::" not in stdout, stdout
+        assert "failed on attempt 1" in stdout
+        assert (tmp_path / "gh-output.txt").read_text(encoding="utf-8").count(
+            "verdict=OVERRIDE"
+        ) == 1
+
+    def test_a_skip_arm_with_an_empty_slot_asks_nothing_about_the_head(
+        self, tmp_path: Path
+    ) -> None:
+        # The complement, and the case that made the head question premature: a
+        # skip arm only ever replaces a comment already in the slot. With the
+        # slot readable and empty there is no write to license, so asking makes
+        # a run annotate a notice this arm was never going to make -- the normal
+        # outcome on a docs-only revision whose head moved on.
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("notice slot-lookup test requires Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        head = "d" * 40
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# The slot read answers and reports the slot empty. Any head read\n"
+            "# is recorded and refused, so one taken here is visible as a call\n"
+            "# and as a warning.\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
+            "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
+            "  echo 'api blip' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sleep_stub.chmod(0o755)
+
+        script = self._notice_script(
+            "first-principles-review.yml", "Post first-principles review summary"
+        )
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "STUB_CALLS": str(calls_dir),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output.txt"),
+            "GH_TOKEN": "stub",
+            "REPO": "o/r",
+            "PR": "1",
+            "HEAD": head,
+            "HUMAN_OVERRIDE": "false",
+            "OVERRIDE_ACTOR": "",
+            "ACTOR": "someone",
+            "EXEC_FILE": "",
+            # The skip arm: this revision ships no reviewable capability.
+            "SURFACE": "false",
+            "CONTRACT": "true",
+            "REVIEW_OUTCOME": "success",
+        }
+        result = subprocess.run(
+            [bash, str(script_file)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # The assertion that names the defect: no head was read at all, because
+        # no write was pending.
+        assert not (calls_dir / "head-calls.txt").exists()
+        # So the run says nothing about a notice it was never going to write.
+        stdout = result.stdout.decode()
+        assert "::warning::" not in stdout, stdout
+        assert "was not written" not in stdout, stdout
+        # And it wrote nothing, on either arm.
+        assert not (calls_dir / "patch-calls.txt").exists()
+        assert not (calls_dir / "create-calls.txt").exists()
+        # The slot was in fact consulted, and the lane still reported its skip.
+        assert (calls_dir / "read-calls.txt").exists()
+        assert "verdict=SKIPPED" in (tmp_path / "gh-output.txt").read_text(encoding="utf-8")
+
+    def test_a_create_arm_reads_the_slot_after_the_head_backoff(self, tmp_path: Path) -> None:
+        # The window the head budget opens, and the one arm it can hurt. The head
+        # check may spend over a minute retrying; a create decided from a slot read
+        # taken BEFORE that wait acts on a minute-old answer. Two runs of this lane
+        # on the SAME head both pass the head check -- a re-run, or a run cancelled
+        # by cancel-in-progress whose post step keeps executing -- so the second
+        # comment lands under one marker and no run takes it back out.
+        #
+        # The stub reports the slot empty on the first read and occupied on any
+        # later one, so an arm that reads before the wait creates and an arm that
+        # reads after it patches. The head answers only on its third attempt, which
+        # is what puts real backoff between the two reads.
+        bash = _bash()
+        if bash is None or shutil.which("jq") is None:
+            pytest.skip("notice slot-lookup test requires Bash and jq")
+        if os.name == "nt":
+            pytest.skip("stubbed-PATH gh interception is exercised on POSIX runners")
+
+        head = "e" * 40
+        stub_dir = tmp_path / "stub"
+        stub_dir.mkdir()
+        calls_dir = tmp_path / "calls"
+        calls_dir.mkdir()
+        runner_temp = tmp_path / "runner-temp"
+        runner_temp.mkdir()
+
+        gh_stub = stub_dir / "gh"
+        gh_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "api" ] && [ "$2" = "--method" ] && [ "$3" = "PATCH" ]; then\n'
+            '  printf \'%s\\n\' "$4" >> "$STUB_CALLS/patch-calls.txt"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "api" ] && [ "$2" = "repos/o/r/pulls/1" ]; then\n'
+            "  printf 'head\\n' >> \"$STUB_CALLS/head-calls.txt\"\n"
+            '  attempts=$(wc -l < "$STUB_CALLS/head-calls.txt")\n'
+            '  if [ "$attempts" -lt 3 ]; then\n'
+            "    exit 1\n"
+            "  fi\n"
+            f'  echo "{head}"\n'
+            "  exit 0\n"
+            "fi\n"
+            "# The slot is empty until the head backoff has run, and taken after it.\n"
+            "# That is the race: another run on this same head publishes during the\n"
+            "# wait. An arm reading the slot BEFORE the wait sees empty and creates;\n"
+            "# one reading after sees the occupant and patches.\n"
+            'if [ "$1" = "api" ]; then\n'
+            "  printf 'read\\n' >> \"$STUB_CALLS/read-calls.txt\"\n"
+            "  tries=0\n"
+            '  if [ -f "$STUB_CALLS/head-calls.txt" ]; then\n'
+            '    tries=$(wc -l < "$STUB_CALLS/head-calls.txt")\n'
+            "  fi\n"
+            '  if [ "$tries" -ge 3 ]; then\n'
+            "    echo '4242'\n"
+            "  fi\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then\n'
+            "  printf 'create\\n' >> \"$STUB_CALLS/create-calls.txt\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        gh_stub.chmod(0o755)
+        # A real sleep would make this test as slow as the backoff it proves; the
+        # ORDER of the two reads is what decides the outcome, not the wall clock.
+        sleep_stub = stub_dir / "sleep"
+        sleep_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        sleep_stub.chmod(0o755)
+
+        script = self._notice_script(
+            "first-principles-review.yml", "Post first-principles review summary"
+        )
+        script_file = tmp_path / "step.sh"
+        script_file.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "STUB_CALLS": str(calls_dir),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(tmp_path / "gh-output.txt"),
+            "GH_TOKEN": "stub",
+            "REPO": "o/r",
+            "PR": "1",
+            "HEAD": head,
+            # The override-note arm, which is a creating arm.
+            "HUMAN_OVERRIDE": "true",
+            "OVERRIDE_ACTOR": "someone",
+            "ACTOR": "someone",
+            "EXEC_FILE": "",
+            "SURFACE": "true",
+            "CONTRACT": "true",
+            "REVIEW_OUTCOME": "success",
+        }
+        result = subprocess.run(
+            [bash, str(script_file)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode()
+        # The assertion that names the defect: the arm saw the occupant the head
+        # backoff let arrive, so it patched instead of adding a second comment.
+        assert not (calls_dir / "create-calls.txt").exists()
+        assert (calls_dir / "patch-calls.txt").read_text(encoding="utf-8").splitlines() == [
+            "repos/o/r/issues/comments/4242"
+        ]
+        # And the order is the reason: the head was asked before the slot, and the
+        # slot read that decided the write came after the retries.
+        heads = (calls_dir / "head-calls.txt").read_text(encoding="utf-8").splitlines()
+        reads = (calls_dir / "read-calls.txt").read_text(encoding="utf-8").splitlines()
+        assert len(heads) == 3, heads
+        assert len(reads) == 1, reads
+
+    def test_a_replace_arm_still_writes_from_a_head_read_taken_before_the_write(self) -> None:
+        # The residual this enumeration leaves, pinned at its current answer so a
+        # later reading of the rule does not mistake it for solved.
+        #
+        # On a replace-only arm the order has to be slot-then-head, so the head
+        # answer is up to a minute old when the PATCH runs. The head check narrows
+        # that window and cannot close it: the slot holds one comment id whichever
+        # revision wrote it, so re-reading the id proves nothing about whose body is
+        # there now. Closing it needs a conditional write the API does not offer.
+        #
+        # The exposure is bounded where the create arms' is not: a stale PATCH
+        # overwrites one comment, while a stale CREATE adds a second under one
+        # marker that no run removes.
+        for workflow, step, defines, creates in _NOTICE_LANES:
+            if not defines:
+                continue
+            script = self._notice_script(workflow, step)
+            bare = [
+                line
+                for line in script.replace("\\\n", " ").splitlines()
+                if not line.lstrip().startswith("#")
+            ]
+            for n, line in enumerate(bare):
+                if line.strip() != "confirm_head":
+                    continue
+                if bare[n + 1].strip() == "find_existing":
+                    continue  # a creating arm, covered by the test above
+                # The replacing arm: no read sits between the head answer and the
+                # write, so the head answer is as old as its own backoff.
+                window = bare[n + 1 : n + 10]
+                assert not any(entry.strip() == "find_existing" for entry in window), (
+                    workflow,
+                    window,
+                )
+                assert any("issues/comments/$existing" in entry for entry in window), (
+                    workflow,
+                    window,
+                )
+            # `creates` stays part of the table this residual is scoped by.
+            assert creates in (True, False)
+
+    def test_one_marker_serves_every_write_in_the_step(self) -> None:
+        # The invariant the added comments state, pinned rather than asserted in
+        # prose: a single marker is what makes the slot one slot. Two marker VALUES
+        # in one step would split it, so the notice writes and the verdict writes
+        # would read different comments and neither could see the other's.
+        #
+        # The value is the invariant, not the assignment count: a name re-assigned
+        # to the same string still names one slot, while a second name or a second
+        # value splits it however few times either is written.
+        for workflow, step, defines, _creates in _NOTICE_LANES:
+            if not defines:
+                continue
+            script = self._notice_script(workflow, step)
+            assigns = [
+                line.strip()
+                for line in script.splitlines()
+                if not line.lstrip().startswith("#")
+                if re.match(r"^[A-Z_]*MARKER=", line.strip())
+            ]
+            assert assigns, workflow
+            names = {line.split("=", 1)[0] for line in assigns}
+            values = {line.split("=", 1)[1] for line in assigns}
+            assert names == {"MARKER"}, (workflow, names)
+            assert len(values) == 1, (workflow, values)
+            # No lane retains a second marker name it could read the slot with.
+            assert "OV_MARKER" not in script, workflow
+            # And no second marker STRING anywhere in the step. This is what a
+            # split slot looks like: the reads themselves spell the marker several
+            # ways -- `$MARKER` directly, or a positional the caller fills from it
+            # -- so the literal is the thing worth counting.
+            literals = set(re.findall(r"<!--[^>]*-->", script))
+            assert len(literals) == 1, (workflow, sorted(literals))
+            assert literals == {values.pop().strip('"')}, (workflow, literals)
+
+    @pytest.mark.parametrize(("workflow", "step", "defines", "creates"), _NOTICE_LANE_PARAMS)
+    def test_no_notice_body_is_staged_at_a_hardcoded_host_path(
+        self, workflow: str, step: str, defines: bool, creates: bool
+    ) -> None:
+        # Every body a lane this change touches stages goes under the runner's own
+        # temp dir. A hardcoded `/tmp/...` path is shared state three ways: two
+        # lanes on one runner write the same file, a self-hosted runner keeps it
+        # between jobs, and a test that executes the arm writes it on the host.
+        #
+        # Both spellings are accepted. `$RUNNER_TEMP/x` is the stricter one and
+        # several fork lanes use it; `${RUNNER_TEMP:-/tmp}/x` adds a fallback for a
+        # context where the variable is unset. What is refused is the literal path.
+        del creates  # the rule is about where a body is staged, not who writes it
+        script = self._notice_script(workflow, step)
+        flat = script.replace("\\\n", " ")
+        offenders = [
+            line.strip()
+            for line in flat.splitlines()
+            if not line.lstrip().startswith("#")
+            if re.search(r"(?:>|--body-file|\bcat)\s+/tmp/", line)
+        ]
+        if defines:
+            # The five lanes this change owns: the rule holds outright.
+            assert not offenders, (workflow, offenders)
+            return
+        # Outside them, the current answer is recorded rather than assumed clean, so
+        # the one remaining instance is visible instead of quietly excluded by the
+        # lane filter. Fixing it should turn this red and update the record.
+        known_unfixed = {"claude-review.yml": ["/tmp/claude-summary.md"]}
+        expected = known_unfixed.get(workflow, [])
+        staged = sorted({m for m in re.findall(r"/tmp/[A-Za-z0-9_.-]+", " ".join(offenders))})
+        assert staged == sorted(expected), (workflow, staged, expected)

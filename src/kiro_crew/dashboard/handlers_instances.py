@@ -30,7 +30,13 @@ from urllib.parse import unquote
 from aiohttp import web
 
 import kiro_crew
+from kiro_crew.apps.version import versions_compatible
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard.chat_persistence import (
+    cap_effort_capability_levels,
+    register_reasoning_effort_values,
+)
+from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.handlers._shared import (
     SESSION_SEARCH_TEXT_FIELDS,
     _owner_denial_response,
@@ -39,6 +45,8 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.session_transfer import (
     SnapshotUnstable,
+    TranscriptBusy,
+    TranscriptWithheld,
     build_transfer_bundle_async,
     local_instance_label,
 )
@@ -1070,6 +1078,46 @@ async def api_instances_send_session(request: web.Request) -> web.Response:
     # every unsaved turn twice in the copy.
     try:
         bundle = await build_transfer_bundle_async(state, slot, origin=local_instance_label())
+        publication_key = slot_history_key(slot)
+
+        def _revalidate_for_publication() -> None:
+            log = state.conversation_log
+            if log is not None:
+                expected_keys = getattr(bundle, "publication_keys", (publication_key,))
+                with log.publication_hold(publication_key, expected_keys=expected_keys):
+                    pass
+
+        # The tunnel call below awaits network I/O, so the threading lock is
+        # released immediately after this off-loop revalidation. The remaining
+        # race window is the transmit itself; holding across the await would
+        # stall the event loop behind a cross-process transcript lock.
+        await asyncio.to_thread(_revalidate_for_publication)
+    except TranscriptBusy:
+        # The seam could not take the transcript lock in time; nothing was sent
+        # and the source is untouched, so this is the retryable answer.
+        _audit("send_session", "failure", request_id=instance_id, error="transcript busy")
+        return web.json_response(
+            {
+                "error": "the session could not be copied consistently right now; please retry",
+                "code": "transfer_snapshot_unstable",
+            },
+            status=503,
+        )
+    except TranscriptWithheld as exc:
+        # The bundle is built from the transcript on DISK, and the file's own
+        # privacy contract gates it, not only the live slot's mode checked above:
+        # a same-key persistent recreation of a closed restricted tab, or another
+        # writer tightening the line while this slot still reads persistent in
+        # memory. The builder checks the line before and after its read; nothing
+        # was sent. Same refusal as the slot gate, because it is the same fact.
+        _audit("send_session", "denied", request_id=instance_id, error=f"on-disk line: {exc}")
+        return web.json_response(
+            {
+                "error": "cannot transfer a non-persistent session",
+                "code": "transfer_slot_not_persistent",
+            },
+            status=400,
+        )
     except SnapshotUnstable:
         # No consistent view of the source: either a flush landed inside every
         # retry, or a rewind/regenerate rewrite is still owed so disk is stale.
@@ -1405,10 +1453,15 @@ async def api_instances_capabilities(request: web.Request) -> web.Response:
     )
     effort_payload = _cap_list(raw.get("effort_levels"), "effort_levels")
     effort_levels = (
-        [_cap_str(level, 32) for level in effort_payload[:_CAP_MAX_ROWS] if isinstance(level, str)]
+        cap_effort_capability_levels(effort_payload, source="peer pre-session")
         if isinstance(effort_payload, list)
         else []
     )
+    version_match = versions_compatible(kiro_crew.__version__, peer_version)
+    # The remote pre-session picker can offer these levels before a live slot
+    # reports its config. Keep the hub's POST allowlist in sync with that offer.
+    if version_match and effort_levels:
+        effort_levels = register_reasoning_effort_values(effort_levels)
 
     _audit("capabilities", "success", request_id=instance_id)
     return web.json_response(
@@ -1419,7 +1472,7 @@ async def api_instances_capabilities(request: web.Request) -> web.Response:
             # The gate the relay enforces on every dispatch, surfaced so the UI
             # can explain a refusal BEFORE the user types a message rather than
             # after their first send fails.
-            "version_match": bool(peer_version) and peer_version == kiro_crew.__version__,
+            "version_match": version_match,
             "agents": _cap_rows(
                 _cap_list(agents_payload, "agents"),
                 {"name": 128, "description": _CAP_MAX_STR, "scope": 32, "model": 128},

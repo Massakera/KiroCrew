@@ -11,9 +11,11 @@ from aiohttp import web
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
 from kiro_crew.dashboard.chat_utils import (
+    adopt_variant_text,
     effective_session_key,
     reject_if_slot_under_construction,
     slot_history_key,
+    variant_from_row,
 )
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.remote_relay import remote_bound_refusal
@@ -140,7 +142,7 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
         ai_msg = msgs[ai_idx]
         _rv = ai_msg.get("variants")
         variants: list[dict] = list(_rv) if isinstance(_rv, list) else []  # type: ignore[arg-type]
-        current_entry = {"content": ai_msg.get("content", ""), "ts": ai_msg.get("ts", "")}
+        current_entry = variant_from_row(ai_msg)
         if not any(v.get("content") == current_entry["content"] for v in variants):
             variants.append(current_entry)
         if len(variants) > _MAX_VARIANTS:
@@ -311,9 +313,8 @@ async def api_chat_slot_switch_variant(request: web.Request) -> web.Response:
                 {"error": "corrupt variant entry", "code": "variant_corrupt"}, status=400
             )
         target_dict: dict = target
-        target_dict["content"] = chosen.get("content", "")
+        adopt_variant_text(target_dict, chosen)
         slot.invalidate_source_links()
-        target_dict["ts"] = chosen.get("ts", target_dict.get("ts", ""))
         target_dict["variant_idx"] = idx
         slot._dirty = True
         slot._resumed_count = 0
@@ -1022,6 +1023,21 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
             # not release the flag early. ``best_effort=False`` so a failure
             # propagates to the 503 below instead of being swallowed and
             # re-armed as a dirty retry.
+            #
+            # Both axes are pinned INTO the write, because the commit boundary is
+            # the only place either can be decided. ``expected_history_key``
+            # catches a RENAMED replacement; it cannot see a same-name
+            # close-and-recreate, which resumes the same transcript and so keeps
+            # the key identical. ``expected_slot_name`` carries this slot's map
+            # key in, where ``state._slots[name]`` is re-read inside the
+            # transcript lock with no await before the write: a map holding a
+            # different slot object refuses the save, nothing written. The
+            # loop-side identity check above cannot stand in for it -- the
+            # recreate can land during the executor wait, after that check and
+            # before the write -- and the loop-side check is still needed for the
+            # reservation axis (``slot.task``), which the persistence layer
+            # cannot see. A refusal returns ``False`` and reaches the 503 below
+            # with the live slot untouched.
             save_task = asyncio.ensure_future(
                 save_slot_off_loop(
                     state,
@@ -1029,6 +1045,7 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
                     msgs_snapshot,
                     best_effort=False,
                     expected_history_key=expected_history_key,
+                    expected_slot_name=name,
                 )
             )
             try:

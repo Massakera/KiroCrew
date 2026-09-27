@@ -87,6 +87,8 @@ class _FakeProc:
         self._stdout = stdout
         self._stderr = stderr
         self.returncode = returncode
+        # Above every platform's pid_max: a timeout's group kill can reach no one.
+        self.pid = 99_999_999_999
 
     def kill(self):  # noqa: D401 - matches Process API
         pass
@@ -122,7 +124,8 @@ def test_list_models_timeout_returns_503(tmp_path):
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 503
-    assert "error" in _body(resp)
+    # The timeout branch itself answered, not the generic exception handler.
+    assert _body(resp) == {"error": "model list timed out"}
 
 
 def test_list_models_nonzero_exit_returns_503(tmp_path):

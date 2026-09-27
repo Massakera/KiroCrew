@@ -10,9 +10,11 @@ No spawn recursion: subagents cannot spawn other subagents.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import logging
 import math
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable, Container, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -39,6 +41,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401 - STOP_* resol
     classify_stop_reason,
     is_runtime_death,
 )
+from kiro_crew.execution_context import read_session_execution
 from kiro_crew.executors import run_in_embed_pool
 
 if TYPE_CHECKING:
@@ -47,12 +50,21 @@ if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
 
 from kiro_crew import name_grant, platform_compat
-from kiro_crew.agent_discovery import cached_project_agent_names, list_agents
+from kiro_crew.agent_discovery import (
+    AgentsDirMemo,
+    _kiro_agents_dir,
+    _read_agent_spec,
+    cached_project_agent_names,
+    list_agents,
+    plain_markdown_document,
+)
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_CLAUDE_CODE
+from kiro_crew.agent_spec_format import is_markdown_spec, iter_agent_spec_files
 from kiro_crew.config import live
 from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig
 from kiro_crew.config.paths import data_home
+from kiro_crew.config.sections import SESSION_START_TIMEOUT_MIN, AgentConfig
 from kiro_crew.constants import (
     DEFAULT_SUBAGENT_MAX_TURNS,
     SUBAGENT_COMPLETION_PREFIX,
@@ -97,6 +109,22 @@ from kiro_crew.llm_helpers import (
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
 from kiro_crew.platform.context import redact_via_context
+from kiro_crew.process_identity import (  # noqa: F401 - resolved by run.py/terminal.py via bind_component_globals
+    MAX_ERROR_DETAIL_LEN,
+    ProcessHandle,
+    add_handle,
+    ending_fence,
+    failure_name,
+    join_failures,
+    kill_each,
+    kill_set,
+    kill_verified_process,
+    process_handle_of,
+    process_survived_async,
+    spawn_in_flight,
+    teardown_capture,
+    with_kill_failure,
+)
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -113,7 +141,10 @@ from kiro_crew.security import (
     redact_exfiltration_urls,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session import SessionManager
+from kiro_crew.session import (  # noqa: F401 - child_process_helpers resolved by terminal.py via bind_component_globals
+    SessionManager,
+    child_process_helpers,
+)
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.session_workspace import result_path as _ws_result_path
 from kiro_crew.slack.format import extract_options
@@ -151,7 +182,7 @@ from kiro_crew.subagent_manager.monitoring import (  # noqa: F401 - resolved by 
     orphan_resume_hint,
     tombstone_recovery_action,
 )
-from kiro_crew.subagent_persistence import (
+from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone resolved by run.py via bind_component_globals
     _agent_dir,
     _cleanup_session_files_sync,
     _subagents_dir,
@@ -162,12 +193,20 @@ from kiro_crew.subagent_persistence import (
     mark_delivered,
     prune_stale_tombstones,
     read_state,
+    read_tombstone,
     record_slow_command,
     update_state,
     write_result_chunk,
     write_tombstone,
 )
-from kiro_crew.validation import _AGENT_NAME_RE
+from kiro_crew.subagent_wait_reasons import (  # noqa: F401 - re-exported: the gate and handlers read them from this namespace
+    DEFERRED_QUEUED_REASONS,
+    QUEUED_REASON_ADAPTIVE_CAP_ZERO,
+    QUEUED_REASON_CONCURRENCY_LIMIT,
+    QUEUED_REASON_LOW_MEMORY,
+    QUEUED_REASON_POSTURE_CRITICAL,
+)
+from kiro_crew.validation import _AGENT_NAME_RE, is_registered_agent_name
 
 # Standalone ClaudeCodeProvider removed (KiroACP-only). Name kept as None so the
 # legacy isinstance guards short-circuit; which seam serves a session is answered
@@ -220,6 +259,31 @@ UNADVERTISED_AGENTS = frozenset(
 #: code exists to remove.
 AGENT_NOT_FOUND_CODE = "agent_not_found"
 
+# Why an accepted spawn is WAITING rather than running -- the label the admission
+# gate puts on the wait it decided on, carried on ``SubagentInfo.queued_reason``,
+# on the ``subagent_queued`` lifecycle event (``reason``) and, for the deferred
+# kinds, on ``POST /api/spawn``'s ``status: "queued"`` answer. Defined in the leaf
+# module :mod:`kiro_crew.subagent_wait_reasons` so a surface that must not import
+# this module at runtime (the channel command layer) can still read them; re-exported
+# here (see the import block above) because the gate and the handlers read them
+# from this namespace.
+
+#: Wire code for the refusal ``_vet_parent_available_agents`` returns: the target
+#: agent exists, but the PARENT agent's spec declares
+#: ``toolsSettings.subagent.availableAgents`` and the target matches none of its
+#: globs. A second refusal kind, so it carries its own identifier rather than
+#: inheriting ``agent_not_found`` (whose prose tells the caller the name does not
+#: exist, which would send it looking for a typo instead of at its own spec).
+#: Same single-definition rule: ``mcp_tools.spawn`` imports it for the wave
+#: short-circuit, and the gateway handler forwards the field without naming it.
+AGENT_NOT_AVAILABLE_CODE = "agent_not_available"
+
+#: Grammar an ``availableAgents`` glob must satisfy to be RENDERED into a refusal:
+#: the agent-name alphabet plus the fnmatch metacharacters. Matching never
+#: consults this; it only keeps instruction-shaped text out of a caller's context,
+#: as ``_AGENT_NAME_RE`` does for plain names.
+_AGENT_GLOB_RE = re.compile(r"^[A-Za-z0-9_*?!\[\]-]{1,64}$")
+
 
 def visible_agent_names(
     names: Iterable[str],
@@ -239,8 +303,9 @@ def visible_agent_names(
     copies drift, so the SAFETY half lives here where a fourth surface cannot
     omit it:
 
-    * **Grammar.** Every name must match ``_AGENT_NAME_RE`` before it is
-      rendered. This is the load-bearing filter, not a tidiness check: an agent
+    * **Grammar.** Every name must match the registered-agent grammar
+      (``is_registered_agent_name``: the slot grammar or a published dotted
+      template) before it is rendered. This is the load-bearing filter, not a tidiness check: an agent
       spec's ``name`` field is taken verbatim by
       ``agent_discovery._global_agent_info`` with no validation, so a spec can
       declare a name containing a newline plus instruction-shaped text -- which
@@ -263,7 +328,7 @@ def visible_agent_names(
     kept = [
         redact_via_context(n)
         for n in names
-        if n and n not in exclude and _AGENT_NAME_RE.fullmatch(n)
+        if n and n not in exclude and is_registered_agent_name(n)
     ]
     if limit is None or len(kept) <= limit:
         return kept, 0
@@ -275,6 +340,16 @@ def visible_agent_names(
 # other rendered detail in this module; the remainder is reported as a count with
 # a pointer to spawn_list, which lists them all.
 _MAX_AVAILABLE_IN_ERROR = 12
+
+#: Bounds on a spec's ``toolsSettings.subagent.availableAgents`` list as
+#: RETAINED by :func:`spawn_allowlist`: patterns beyond the count, and any
+#: pattern longer than the character cap, are dropped (never matched, so the
+#: overflow fails closed) and logged. The list is matched on the event loop on
+#: every spawn, and the spec reader's only other ceiling is the file size cap.
+#: 64 characters is the agent-name alphabet's own cap (``_AGENT_NAME_RE``,
+#: ``_AGENT_GLOB_RE``); 256 patterns is far beyond any real roster.
+_MAX_AVAILABLE_AGENTS_GLOBS = 256
+_MAX_AVAILABLE_AGENTS_GLOB_CHARS = 64
 
 
 def _available_agents_hint(available: list[str]) -> str:
@@ -426,6 +501,354 @@ def _vet_spawn_governance(parent_session_key: str, agent: str, app: str = "") ->
         return "subagent spawn denied: governance evaluation failed (fail-closed)"
 
 
+def spawn_allowlist(spec: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """The ``toolsSettings.subagent.availableAgents`` globs *spec* declares.
+
+    This is kiro-cli's own key, defined for its built-in ``subagent`` tool: "glob
+    patterns for agents this agent can spawn; omit to allow all". Kiro Crew's
+    sub-agents come through ``spawn_run`` instead, so the same declaration is
+    honoured at the spawn gate rather than silently ignored.
+
+    Returns ``None`` when the key is OMITTED -- that is "allow all", and it is
+    the only value under which the gate stays out of the way, so every spec that
+    never wrote the key keeps the behaviour it had. A declared list is returned
+    as written (non-string entries dropped), bounded to the first
+    :data:`_MAX_AVAILABLE_AGENTS_GLOBS` patterns of at most
+    :data:`_MAX_AVAILABLE_AGENTS_GLOB_CHARS` characters each -- the overflow is
+    dropped and logged, which only narrows what is allowed. A declared value
+    that is not a list is an EMPTY allowlist: the operator meant to restrict and
+    the shape is wrong, so nothing is allowed rather than everything.
+
+    ``trustedAgents``, the sibling key, is NOT an allowlist and is not read
+    here: upstream it means "run these sub-agents without permission prompts",
+    and reading it as a restriction would refuse spawns an operator never meant
+    to forbid.
+    """
+    settings = spec.get("toolsSettings")
+    if not isinstance(settings, Mapping):
+        return None
+    subagent = settings.get("subagent")
+    if not isinstance(subagent, Mapping) or "availableAgents" not in subagent:
+        return None
+    declared = subagent.get("availableAgents")
+    if not isinstance(declared, (list, tuple)):
+        return ()
+    globs = tuple(entry for entry in declared if isinstance(entry, str) and entry)
+    # Bound what is retained: the list is matched on the event loop on every
+    # spawn (one ``fnmatchcase`` compile per pattern, then a regex pass and a
+    # sort on the denial path), and the spec reader's only ceiling is the file
+    # size cap, so a valid-size spec could carry hundreds of thousands of
+    # patterns and stall the loop past the watchdog. Dropping entries only ever
+    # NARROWS what is allowed, so the overflow fails closed: the first
+    # ``_MAX_AVAILABLE_AGENTS_GLOBS`` patterns of at most
+    # ``_MAX_AVAILABLE_AGENTS_GLOB_CHARS`` characters each are kept, the rest
+    # are logged and refused.
+    kept = tuple(
+        g for g in globs[:_MAX_AVAILABLE_AGENTS_GLOBS] if len(g) <= _MAX_AVAILABLE_AGENTS_GLOB_CHARS
+    )
+    if len(kept) != len(globs):
+        logger.warning(
+            "availableAgents declares %d glob(s); keeping %d (limit %d patterns of at most %d "
+            "chars each), the rest are not matched (fail-closed)",
+            len(globs),
+            len(kept),
+            _MAX_AVAILABLE_AGENTS_GLOBS,
+            _MAX_AVAILABLE_AGENTS_GLOB_CHARS,
+        )
+    return kept
+
+
+def agent_matches_allowlist(agent: str, allowlist: Iterable[str], *, app: str = "") -> bool:
+    """kiro-cli's glob semantics for ``availableAgents``: case-sensitive fnmatch.
+
+    *app* is the VERIFIED identity of the calling app (``execution.app``, bound
+    by the SpawnSDK and re-proved by ``_validate_app_agent_ownership``), never a
+    prefix parsed out of *agent*. Only when *agent* is that app's own
+    materialized ``<app>--<name>`` is the bare ``<name>`` tried as well, because
+    that is the name the app's spec lists and kiro-cli's own gate matches. A
+    ``--`` in any other name is just part of the name: an installed
+    ``rogue--reviewer`` does not satisfy a ``reviewer``-only allowlist.
+    """
+    candidates = {agent}
+    if app and agent.startswith(f"{app}--"):
+        candidates.add(agent[len(app) + 2 :])
+    return any(
+        fnmatch.fnmatchcase(candidate, pattern) for pattern in allowlist for candidate in candidates
+    )
+
+
+def parent_spawn_allowlists(parent_template: str) -> tuple[tuple[str, ...], ...] | None:
+    """Every ``availableAgents`` list the specs naming *parent_template* declare.
+
+    Resolution follows :func:`kiro_crew.agent.agent_spec_path`: a spec whose
+    DECLARED ``name`` is *parent_template* wins; ``<parent_template>.json`` (or
+    ``.md``) is read only when no spec declares the name. Two specs declaring
+    the same name are both kept -- the target must then satisfy each, which is
+    tightest-wins rather than a guess at which one kiro-cli loaded.
+
+    ``()`` when *parent_template* is empty, names no spec, or its spec omits the
+    key: each of those is "no declaration to honour", the unchanged case.
+
+    ``None`` means the answer is UNKNOWN and the caller must refuse: the
+    directory exists but cannot be scanned (probed before the snapshot read,
+    which folds a walk failure into "no specs"), or no readable spec declares
+    the name while some spec file in the directory could not be read under the
+    hardened reader (invalid JSON, oversized, a broken link, a symlink to a
+    sensitive target). kiro-cli resolves a name by its DECLARED ``name`` first,
+    under any filename, so the parent's declaration may be inside exactly the
+    file that did not parse; the reader folds it into "no spec", and a
+    restrictive declaration inside it would otherwise fail OPEN. A parent whose
+    declaration IS readable is never refused by an unrelated broken file. The
+    cost is that a parent with no user-level spec at all (a project-scope or
+    edition agent) is refused too while any spec file in the directory is
+    unreadable; the refusal names the file, and repairing or removing it
+    restores admission. AppleDouble ``._`` sidecars, which the reader rejects by
+    design, do not count.
+
+    Reads the user-level agents directory with one fresh walk through the
+    hardened reader (:func:`_scan_parent_spawn_allowlists`), memoized per
+    directory in :data:`_PARENT_ALLOWLIST_MEMO` and pinned to the directory's
+    :func:`kiro_crew.agent_discovery.agents_dir_revision` -- the fingerprint
+    that refuses to pin whenever freshness cannot be proven. The catalog
+    snapshots are NOT used: ``parsed_agent_specs`` revalidates on entry names
+    and mtime only, so an mtime-preserving rewrite of a parent's spec
+    (``cp -p``, ``rsync -t``) would serve its previous, permissive allowlist for
+    ever; ``cached_agent_specs`` serves EMPTY rows on a cold cache, and an empty
+    read here would admit a spawn the declaration forbids. It is a blocking
+    read, so the event-loop entry points call it through ``asyncio.to_thread``
+    (see :func:`parent_spawn_policy`) rather than from the gate. A parent living
+    only in a project's ``.kiro/agents`` is not resolved here (its declaration
+    is not honoured yet; see the module spec).
+    """
+    # ``match``, not ``fullmatch``: the pattern is anchored, and the roster
+    # ratchet reserves the ``fullmatch`` spelling for ``visible_agent_names``.
+    if not parent_template or not _AGENT_NAME_RE.match(parent_template):
+        return ()
+    agents_dir = _kiro_agents_dir()
+    # Probe the walk first: a directory that is absent declares nothing
+    # (nothing could have loaded the parent from it either), while one that
+    # exists but cannot be scanned -- unreadable, or the path replaced by a
+    # file -- is UNKNOWN, never "no declaration" (allow all).
+    try:
+        with os.scandir(agents_dir):
+            pass
+    except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        logger.warning("agents directory %s is not scannable (%s); refusing spawn", agents_dir, exc)
+        return None
+    try:
+        return _PARENT_ALLOWLIST_MEMO.get(
+            agents_dir,
+            parent_template,
+            lambda: _scan_parent_spawn_allowlists(agents_dir, parent_template),
+        )
+    except OSError as exc:  # the directory walk itself failed: an unknown answer
+        logger.warning("agents directory %s is not scannable (%s); refusing spawn", agents_dir, exc)
+        return None
+
+
+#: The gate's answers, one set per agents directory, each pinned to the
+#: directory's stat-only :func:`kiro_crew.agent_discovery.agents_dir_revision`
+#: (entry names, mtime AND ctime, size, inode, mode, the in-process spec
+#: generation, and nothing younger than the racy window). The catalog snapshot
+#: (``parsed_agent_specs``) revalidates on names and mtime alone, so a rewrite
+#: that keeps the mtime -- ``cp -p``, ``rsync -t``, a restore -- would serve a
+#: PERMISSIVE allowlist for ever after the operator tightened it; a security
+#: gate cannot be answered from it. The revision refuses to pin (``None``)
+#: whenever freshness cannot be proven, and the walk then runs uncached. Its
+#: own instance, not shared with the KAS projection's or the tool-policy read's:
+#: the three reads carry different SEL ``operation`` labels.
+_PARENT_ALLOWLIST_MEMO: AgentsDirMemo[tuple[tuple[str, ...], ...] | None] = AgentsDirMemo()
+
+
+def _scan_parent_spawn_allowlists(
+    agents_dir: Path, parent_template: str
+) -> tuple[tuple[str, ...], ...] | None:
+    """One fresh walk of *agents_dir* for :func:`parent_spawn_allowlists`.
+
+    Every spec file goes through the hardened reader under the gate's own SEL
+    labels, and a file the reader refuses is kept as UNREADABLE rather than
+    folded into "no spec" -- except a markdown file with no opening frontmatter
+    fence, which is not a spec at all (:func:`plain_markdown_document`) and is
+    skipped like the AppleDouble sidecar. Propagates ``OSError`` from the
+    directory walk.
+    """
+    rows: list[tuple[dict[str, Any], Path]] = []
+    unreadable: list[Path] = []
+    for path in iter_agent_spec_files(agents_dir):
+        if path.name.startswith("._"):
+            # AppleDouble sidecar: rejected by design, not by failure.
+            continue
+        data = _read_agent_spec(path, operation="spawn_available_agents", source="subagent")
+        if data is None:
+            if is_markdown_spec(path) and plain_markdown_document(path):
+                # No opening frontmatter fence: a README or a shared prompt
+                # fragment, not a spec. It cannot carry a ``name`` kiro-cli
+                # would resolve, so it can hide no declaration and the
+                # fail-closed rule for an unreadable spec does not reach it.
+                # A FENCED document that fails to parse announced itself as a
+                # spec and stays UNREADABLE.
+                continue
+            unreadable.append(path)
+        else:
+            rows.append((data, path))
+    declared = [data for data, _path in rows if data.get("name") == parent_template]
+    if not declared:
+        # No readable spec declares the name. kiro-cli resolves a name by the
+        # DECLARED ``name`` first, so the declaration may sit in a spec file the
+        # hardened reader refused -- invalid JSON, oversized, a broken link, a
+        # symlink to a sensitive target -- under ANY filename, not only
+        # ``<parent_template>.json``. Such a file is known to exist and cannot
+        # be read, so the answer is UNKNOWN: a gate does not fail open on a
+        # document it could not open. Only when every spec-shaped file parsed
+        # is "no readable spec declares the name" the same fact as "no spec
+        # declares the name", and the direct-filename fallback below applies.
+        if unreadable:
+            logger.warning(
+                "parent agent %r has no readable spec while %s could not be read; "
+                "refusing spawn (fail-closed)",
+                parent_template,
+                ", ".join(repr(path.name) for path in unreadable),
+            )
+            return None
+        declared = [data for data, path in rows if path.stem == parent_template]
+    lists = (spawn_allowlist(data) for data in declared)
+    return tuple(allowlist for allowlist in lists if allowlist is not None)
+
+
+class ParentRecordUnreadable(RuntimeError):
+    """The calling session's execution record exists but could not be read.
+
+    Raised by :func:`_parent_template_for_spawn` so :func:`parent_spawn_policy`
+    can answer UNKNOWN (refuse) instead of "no parent" (allow all): the two are
+    different facts, and a security gate must not collapse the first into the
+    second.
+    """
+
+
+def _parent_template_for_spawn(parent_session_key: str) -> str:
+    """The kiro agent template the calling session runs as, or ``""``.
+
+    Read from the session's canonical execution record -- the same record
+    ``resolve_spawn_execution`` derives the child's identity from on this path,
+    served from the live in-process map for a running session. ``""`` means
+    there is NO parent to honour: a caller with no session (a direct API post,
+    a test) or a session that has no record. A record that exists but cannot be
+    read raises :class:`ParentRecordUnreadable`, which the policy resolver turns
+    into a refusal -- an unreadable parent is not a parent without a spec.
+    """
+    if not parent_session_key:
+        return ""
+    try:
+        execution = read_session_execution(parent_session_key)
+    except Exception as exc:  # noqa: BLE001 - every failure class is "unknown", never "none"
+        logger.warning("parent execution record unreadable for %s: %s", parent_session_key, exc)
+        raise ParentRecordUnreadable(str(exc)) from exc
+    return execution.template_id if execution is not None else ""
+
+
+#: What the spawn gate needs to know about the CALLING session's agent spec:
+#: ``(parent_template, allowlists)``. ``allowlists`` is ``()`` when nothing is
+#: declared (allow all), one or more glob tuples when it is, and ``None`` when
+#: the answer is unknown (refuse): the parent's spec candidate or the parent's
+#: execution record could not be read -- see :func:`parent_spawn_allowlists`.
+ParentSpawnPolicy = tuple[str, "tuple[tuple[str, ...], ...] | None"]
+
+
+def parent_spawn_policy(parent_session_key: str) -> ParentSpawnPolicy:
+    """Resolve the parent's template and its ``availableAgents`` declaration.
+
+    Two reads that must not run on the gateway event loop -- the session
+    record (a file when the session is not live) and the agents-directory
+    snapshot (a ``scandir`` warm, a full parse cold). The event-loop entry
+    points (``spawn_async``, the pump's ``_dispatch_async``) call this through
+    ``asyncio.to_thread`` and hand the result to ``spawn_impl`` as
+    ``_parent_spawn_policy``, the same shape ``_record`` / ``_execution_context``
+    already use for the record read. The synchronous ``spawn()`` computes it
+    inline for callers that are not on the loop.
+    """
+    try:
+        template = _parent_template_for_spawn(parent_session_key)
+    except ParentRecordUnreadable:
+        return "", None
+    return template, (parent_spawn_allowlists(template) if template else ())
+
+
+def _vet_parent_available_agents(
+    policy: ParentSpawnPolicy, agent: str, *, app: str = ""
+) -> str | None:
+    """Return a denial reason when the parent's spec forbids spawning *agent*.
+
+    *policy* is :func:`parent_spawn_policy`'s answer -- the kiro agent the
+    CALLING session runs as and its declaration -- *agent* the template the
+    child would run as (explicit, inherited or a member's), *app* the verified
+    calling-app identity (see :func:`agent_matches_allowlist`).
+    The denial is returned when the parent's spec declares
+    ``toolsSettings.subagent.availableAgents`` AND *agent* matches none of its
+    globs, or when that answer cannot be established because the parent's own
+    spec file is present but unreadable (:func:`parent_spawn_allowlists` returns
+    ``None``; a security gate does not fail open on a file it cannot read). No
+    parent, no spec, or an omitted key is ``None`` -- kiro-cli's "omit to allow
+    all" -- so a session whose agent never declared the key sees no change. An
+    empty *agent* is ``None`` too: the gate resolves the effective template
+    before asking, so there is nothing here to match.
+
+    This is one half of an intersection with ``_vet_spawn_governance``
+    (``capabilities.spawn.scopes.agents``): both must admit. It narrows what the
+    agent spec grants and never widens what governance denies.
+    """
+    if not agent:
+        return None
+    parent_template, allowlists = policy
+    if allowlists is None:
+        if not parent_template:
+            return (
+                "the parent session's execution record could not be read, so its agent "
+                "spec's toolsSettings.subagent.availableAgents is unknown; refusing "
+                "(fail-closed)"
+            )
+        return (
+            f"the parent agent {redact_via_context(parent_template)!r} spec could not be "
+            "read, so its toolsSettings.subagent.availableAgents is unknown; refusing "
+            "(fail-closed) -- fix or remove the unreadable spec file"
+        )
+    if not allowlists:
+        return None
+    if all(agent_matches_allowlist(agent, allowlist, app=app) for allowlist in allowlists):
+        return None
+    # The globs travel with the refusal so the caller can self-correct, under the
+    # same discipline as every rendered roster: grammar-checked (a glob adds
+    # ``*?[]!`` to the agent-name alphabet, nothing else), redacted, bounded.
+    patterns = sorted(
+        {
+            pattern
+            for allowlist in allowlists
+            for pattern in allowlist
+            if _AGENT_GLOB_RE.fullmatch(pattern)
+        }
+    )
+    shown = [redact_via_context(p) for p in patterns[:_MAX_AVAILABLE_IN_ERROR]]
+    withheld = len(patterns) - len(shown)
+    roster = ", ".join(shown) + (f" (+{withheld} more)" if withheld else "")
+    # The two names are caller-supplied text: the refusal travels back to that
+    # caller through ``info.error`` BEFORE ``_validate_agent`` has vetted the
+    # target, and the warning lands in the log, so both surfaces get the same
+    # redaction as the roster.
+    shown_agent = redact_via_context(agent)
+    shown_parent = redact_via_context(parent_template)
+    logger.warning(
+        "Agent %r is not in parent agent %r availableAgents; refusing spawn",
+        shown_agent,
+        shown_parent,
+    )
+    return (
+        f"agent {shown_agent!r} is not in the parent agent {shown_parent!r} spec's "
+        f"toolsSettings.subagent.availableAgents"
+        + (f" (allowed: {roster})" if roster else " (the list is empty)")
+    )
+
+
 def _redact(text: str) -> str:
     """Redact credentials and exfiltration URLs from text."""
     text, _ = redact_exfiltration_urls(text)
@@ -443,9 +866,10 @@ def _redact_and_truncate(text: str, max_chars: int) -> str:
     return redact_and_truncate(text, max_chars)
 
 
-# Bounds for a rendered exception chain. The rendering reaches a WS frame, a
-# tombstone and the Subagents panel, so it is capped rather than trusted.
-_MAX_ERROR_DETAIL_LEN = 2_000
+# Bound for a rendered exception chain. The rendering reaches a WS frame, a
+# tombstone and the Subagents panel, so it is capped rather than trusted -- to
+# ``process_identity.MAX_ERROR_DETAIL_LEN``, the one bound every retained error
+# field of a run's terminal record is held to.
 _MAX_ERROR_CHAIN = 4
 
 
@@ -482,7 +906,7 @@ def _describe_exception(exc: BaseException) -> str:
         if nxt is None and not current.__suppress_context__:
             nxt = current.__context__
         current = nxt
-    return " <- caused by ".join(parts)[:_MAX_ERROR_DETAIL_LEN]
+    return " <- caused by ".join(parts)[:MAX_ERROR_DETAIL_LEN]
 
 
 _MAX_DONE_RESULT_LEN = 50_000  # cap subagent_done payload to avoid bloating WS frames
@@ -536,6 +960,13 @@ _STEER_STARTUP_POLL_SECS = 0.5
 # latency is irrelevant next to permanent wedging.
 _WAVE_STUCK_SECS = 1800
 _RESET_TIMEOUT = 30.0  # max seconds for session reset in finally block
+# How long past ``_RESET_TIMEOUT`` the run's terminal report waits for its
+# teardown to decide the kill before publishing. The reset half of the
+# teardown is bounded by ``_RESET_TIMEOUT``; the kill half (the fallback's
+# executor hops, sequential over every handle) is not, so this is a grace,
+# not a bound on the teardown -- and a report whose wait runs out publishes
+# the record with the kill named UNDECIDED, never clean (``_report_terminal``).
+_TEARDOWN_REPORT_GRACE = 30.0
 _RECOVERY_SLOT_WAIT_SECS = 60.0
 _REPORT_DRAIN_TIMEOUT = (
     30.0  # max seconds cancel_all() waits for shielded terminal reports to drain
@@ -559,7 +990,22 @@ _BOUNDARY_CANCELLATION_SCOPE_CAP_REASON = "pending_scope_cap"
 # cannot hold cancel_all()'s untimed gather — bounded shutdown plus recoverable
 # state beats unbounded shutdown.
 _STATE_DRAIN_TIMEOUT = 5.0
-_STARTUP_TIMEOUT_SECS = 120  # max seconds a subagent may sit pre-first-turn with no runtime before the startup watchdog reaps it
+# The startup watchdog's window (``SubagentManager._startup_deadline``) covers one
+# start clock: the ``session/new`` budget, then the late-start collector's wait
+# (timeout plus ``_await_late_start``'s grace), plus a launch margin; floor 120.
+_STARTUP_TIMEOUT_SECS = 120
+_STARTUP_COLLECT_GRACE_SECS = 5
+_STARTUP_LAUNCH_MARGIN_SECS = 30
+# Derived in-startup bound, in rounds of the session-start gate: one round
+# holding permits plus one round already admitted and waiting behind them. See
+# ``SubagentManager._startup_cap`` for why the bound is tied to the gate's
+# width and not to the running cap.
+_STARTUP_CAP_GATE_ROUNDS = 2
+# How often a start released from the spawn-approval prompt re-pumps while it
+# waits for the in-startup bound (``_admit_released_start``). A backstop behind
+# the edges that pump anyway (PID, first answer, terminal, stagger boundary), so
+# it is slow.
+_RELEASE_REPUMP_SECS = 1.0
 _ON_DONE_TIMEOUT = 1200.0  # outer cap: max total seconds for semaphore wait + injection
 
 # Continuation prompt sent when a transient backend error interrupted a turn
@@ -1587,6 +2033,13 @@ class SubagentInfo:
     # settlement can observe it, and keeps this discriminator True so running
     # cancellation and live-resource monitoring do not treat it as executing.
     queued: bool = False
+    # Why a ``queued`` record waits: one of the ``QUEUED_REASON_*`` kinds, or ""
+    # for a wait the gate did not label (a claim retained across a store outage).
+    # ``queued_reason_detail`` is the gate's own sentence for it -- the same text
+    # the task store's ``deferred`` event records -- so ``POST /api/spawn`` can
+    # relay it verbatim. Both stay "" on a running or terminal record.
+    queued_reason: str = ""
+    queued_reason_detail: str = ""
     result: str = ""
     result_path: str = ""
     result_truncated: bool = False  # completion-event copy dropped content → summary+path
@@ -1844,7 +2297,27 @@ class SubagentInfo:
     # startup watchdog measures from THIS timestamp so it never reaps an agent
     # that is merely waiting for approval. None until execution starts.
     _exec_started: float | None = None
+    # Wall-clock moment this execution's own session first answered its prompt
+    # (``SubagentManager._leave_startup``): the first frame addressed to this
+    # session, or a dependency verdict on the prompt. None until then, and reset
+    # by ``_run_inner`` for every execution. The startup watchdog and the
+    # in-startup bound read it only while ``_pid`` is None, because a runtime
+    # PID ends startup on its own; an AcpRuntime-backed start records the PID
+    # its runtime reports before the stream opens, and a runtime reports one
+    # from spawn until its process is reset. The adaptive controller reads it
+    # as the floor of this run's progress.
     _first_stream_started: float | None = None
+    # ``runtime_global`` frames this execution received while still in
+    # startup; named in the startup reap's error. Reset with the marker.
+    _startup_cotenant_frames: int = 0
+    # (start clock, deadline) the startup watchdog fixed for this start.
+    _startup_deadline_stamp: tuple[float, int] | None = None
+    # Wall-clock moment this run began waiting for a ``SessionStartGate``
+    # permit (``_gate_wait_mark``); None outside that wait. While set, the
+    # startup watchdog reads the start clock as frozen at this moment: time
+    # queued for a permit is not start time. Cleared by ``_gate_exit_reset`` at
+    # acquisition, which also restarts the clock.
+    _gate_wait_started: float | None = None
     # Learned-cost high-water marks (dynamic-subagent-sizing.md §4.1), sampled
     # periodically by the reaper loop and folded into the cost store at exit.
     peak_rss_gb: float = 0.0
@@ -1928,7 +2401,7 @@ class SubagentInfo:
     # Queue wait behind the session-start gate, ms; 0 when the gate was free.
     _start_queue_wait_ms: float = 0.0
     # True once the durable row was written ``running`` -- at the FIRST stream
-    # event of the run's own turn, not at execution start, so a row is never
+    # event addressed to the run's own session, not at execution start, so a row is never
     # ``running`` while the session is still being created (RFC §4.4).
     _taskq_running_marked: bool = False
     # Provider built by a StartCollector's late adoption, handed to the run
@@ -1946,6 +2419,10 @@ class SubagentInfo:
     # None while the run holds its slot.
     _resume_event: Any = None
     _wait_failed: str = ""
+    # The wake-up for a start released from the spawn-approval prompt and
+    # waiting to be metered into startup by the pump (``_admit_released_start``).
+    # None except during that wait.
+    _start_release: Any = None
     # True once the terminal report's `_on_done` injection has RETURNED, i.e.
     # the outcome actually reached the parent. Distinct from `_finalized` (the
     # claim, taken before delivery is attempted) and from the "delivered"
@@ -2007,7 +2484,17 @@ def _injection_notice_outcome(info: "SubagentInfo") -> str:
     their record without it) with no wording contract between ``error``
     strings and this notice. The "no result to deliver" phrasings are guarded
     on the absence of any output so they can never contradict the result-path
-    recovery hint. Pure function of the record, unit-tested per branch.
+    recovery hint.
+
+    The completed branch names no delivery MECHANISM. Only two of the six
+    ``notify_injection_failed`` call sites pass a timeout; the rest pass
+    "provider dead after prompt-busy retries", "ACP process died", a raw
+    ``str(exception)`` and the last injection-failure reason. Since the notice
+    prints ``reason`` on the line directly above this one, asserting a timeout
+    here would contradict it — and the reader is an LLM deciding whether to
+    retry. The cause belongs to ``reason``; this line states only the outcome.
+
+    Pure function of the record, unit-tested per branch.
     """
     never_ran = info._exec_started is None and not info.result and not info.result_path
     outcome = info.outcome
@@ -2019,7 +2506,7 @@ def _injection_notice_outcome(info: "SubagentInfo") -> str:
         if never_ran:
             return "The run failed before it started, so there is no result to deliver."
         return "The agent failed before a result could be delivered."
-    return "The agent finished but result delivery timed out."
+    return "The agent finished, but its result could not be delivered."
 
 
 # Event callback: (event_type, info, extra_data) -> None
@@ -2487,7 +2974,7 @@ class SubagentManager:
         max_concurrent: int = _MAX_CONCURRENT,
         default_turn_limit: int = _TURN_LIMIT,
         default_timeout: int = _TIMEOUT_SECS,
-        startup_timeout: int = _STARTUP_TIMEOUT_SECS,
+        startup_timeout: int = 0,
         stall_idle_secs: int = _STALL_IDLE_SECS,
         on_tool_approval: ToolApprovalCallback | None = None,
         on_tool_approval_factory: (
@@ -2542,7 +3029,8 @@ class SubagentManager:
         self._cap_raise_listener: Callable[[], object] | None = None
         self._default_turn_limit = default_turn_limit
         self._default_timeout = default_timeout if default_timeout > 0 else _TIMEOUT_SECS
-        self._startup_deadline = startup_timeout if startup_timeout > 0 else _STARTUP_TIMEOUT_SECS
+        # A positive value pins the window; 0 derives it from the budget.
+        self._startup_timeout_override = startup_timeout if startup_timeout > 0 else None
         self._stall_idle_secs = stall_idle_secs if stall_idle_secs > 0 else _STALL_IDLE_SECS
         self._on_tool_approval = on_tool_approval  # fallback for non-auto sessions
         self._on_tool_approval_factory = on_tool_approval_factory
@@ -2665,6 +3153,17 @@ class SubagentManager:
         # makes that inference unnecessary. Removed by the same ``finally`` that sets
         # the event, so a missing entry always means "nothing left to wait for".
         self._teardown_gates: dict[str, asyncio.Event] = {}
+        #: run id -> the kill handles of every process its session key named,
+        #: RETAINED across the reset that pops the session from the map (see
+        #: :class:`kiro_crew.process_identity.ProcessHandle`).
+        #: Written by :meth:`_retain_process_handles` from whichever teardown path
+        #: reaches the reset first -- the run's own ``finally`` or the reaper --
+        #: and read by the other on a session-map miss, so a force-stop that
+        #: arrives while the first reset is hanging can still name, verify and
+        #: signal the process. Cleared when the path that holds it has decided
+        #: (the handles were consumed by the kill, or the survivor check found
+        #: the processes gone); an entry that outlives its run is one small record.
+        self._process_handles: dict[str, list[ProcessHandle]] = {}
         #: parent session key -> event pulsed whenever one of its runs reaches a
         #: terminal report. Created on demand by :meth:`completion_event` and
         #: dropped by :meth:`release_completion_event`, so the only entries are
@@ -2675,6 +3174,14 @@ class SubagentManager:
         # dropping them made a queued headless/auto spawn hit the deny-by-default gate and
         # a queued silent spawn emit output. See _drain_queue.
         self._queue: list[dict[str, Any]] = []
+        # parent_session_key -> the last wait the gate labelled for that parent
+        # (``{"reason": <QUEUED_REASON_*>, "available_gb"?, "required_gb"?}``).
+        # ``_emit_queue_depth`` attaches it to every ``subagent_queued`` it sends
+        # while the parent still has rows waiting, and forgets it at depth 0: the
+        # drain and the cancel paths re-emit the depth without a verdict of their
+        # own, and without this memory each re-emit would flip a memory-deferred
+        # wave back to the default (concurrency) text.
+        self._queue_wait: dict[str, dict[str, Any]] = {}
         # Batch ids whose spawn_batch_started event has already fired.
         self._seen_batches: set[str] = set()
         # Submission accounting per wave: batch_id -> (submitted, expected).
@@ -2689,6 +3196,20 @@ class SubagentManager:
         # finalize_batch alongside _batch_submitted.
         self._batch_progress_ts: dict[str, float] = {}
         self._reaper_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        # Every ``_force_reap`` that runs OUTSIDE the reaper task -- a dashboard
+        # Stop, a parent-end or stage-boundary cancel, each awaited inside its
+        # caller's own task. ``cancel_all`` cancels these beside the reaper task
+        # so their cancellation arms finish the record and release the report
+        # inside the shutdown drain: a reap the shutdown never touched sat in
+        # its hanging reset until the gateway's budget hard-exited the process,
+        # with its report waiting on a gate nobody released.
+        self._reap_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # The one reap in flight per run, by agent id: a future its owner settles
+        # on every exit. A second stop path arriving while it is pending (a
+        # dashboard Stop racing a deadline reap, or the reverse) joins it
+        # instead of running a second reap, so the kill is decided, recorded
+        # and reported once. See ``_force_reap``.
+        self._reaps_in_flight: dict[str, asyncio.Future] = {}  # type: ignore[type-arg]
         # Cache global approval_mode at init to avoid disk I/O on every
         # parentless spawn (cron, webhooks).
         try:
@@ -2717,6 +3238,26 @@ class SubagentManager:
             )
         except Exception:
             self._spawn_stagger_secs = 0.25
+        # In-startup bound (dynamic-subagent-sizing.md, Configuration). The
+        # stagger bounds the RATE of starts and ``_max_concurrent`` the RUNNING
+        # population; :meth:`_startup_cap` bounds how many admitted agents may
+        # be between execution start and their first runtime/stream/turn at
+        # once, derived from the session-start gate's width alone -- there is
+        # no key for it (see ``_startup_cap`` for why). ``session_start_concurrency``
+        # is boot-only (``restart=True``), so it is captured here and never
+        # re-read by ``apply_limits``: the SessionStartGate it sizes is fixed
+        # for the loop's lifetime, and the derived bound must track the gate
+        # that exists, not a value nothing is serving yet.
+        try:
+            self._session_start_concurrency = max(
+                1, int(KiroCrewConfig.load().agent.session_start_concurrency)
+            )
+        except Exception:
+            self._session_start_concurrency = 2
+        # ClaimPoint reservations not yet registered as a SubagentInfo; counted
+        # by ``_startup_population`` (see there). +1 at reserve, -1 on the
+        # re-entry that registers or on ``release_reservation``.
+        self._startup_reservations = 0
 
         # Every limit captured above is a copy of config.json. The live watcher
         # pushes a rewrite at this object through ``reconfigure`` so a write from
@@ -2749,7 +3290,8 @@ class SubagentManager:
         # callers open inline. Pending or failed opens refuse typed; only
         # agent.task_queue_enabled=false selects the in-memory queue.
         # ``admitted -> starting`` is written at claim; ``running`` at the
-        # run's first stream event; waits and wakes through admission.
+        # run's first stream event addressed to its session; waits and wakes
+        # through admission.
         self._taskq: Any = None
         self._taskq_admit_wait_secs: float = 30.0
         #: Set when ``agent.task_queue_enabled`` is on but the store could not
@@ -2994,13 +3536,14 @@ class SubagentManager:
         self.update_completion_keep(agent.completion_keep, int(agent.completion_keep_chars))
         logger.info(
             "SubagentManager reconfigured: max_concurrent=%d (was %d), turn_limit=%d, "
-            "timeout=%ds, stall_idle=%ds, stagger=%.1fs, result_ttl=%ds",
+            "timeout=%ds, stall_idle=%ds, stagger=%.1fs, max_startups=%d, result_ttl=%ds",
             self._max_concurrent,
             old_cap,
             self._default_turn_limit,
             self._default_timeout,
             self._stall_idle_secs,
             self._spawn_stagger_secs,
+            self._startup_cap(),
             self._result_ttl_secs,
         )
         if self._max_concurrent > old_cap:
@@ -3110,12 +3653,30 @@ class SubagentManager:
             return False
 
     @staticmethod
-    def _kill_orphan_pid(pid: int) -> None:
-        """Best-effort SIGKILL of an orphaned process."""
+    async def _kill_orphan_pid(pid: int) -> str | None:
+        """Best-effort SIGKILL of an orphaned process; returns what stopped it.
+
+        ``None`` once the process is gone -- signalled here, or already exited
+        by the time the signal went out (nothing to kill is not a failure) --
+        and otherwise the failure the kill raised (``PermissionError: …``),
+        named the way the reaper's record names one, so the caller's audit row
+        can say ``failed`` for a process the kill left standing rather than
+        ``killed`` regardless. Never raises: the caller owns a reconciliation
+        it must still finish.
+
+        The signal goes through :func:`platform_compat.kill_pid_async`: the
+        Windows kill is a ``taskkill`` spawn that waits up to five seconds for
+        the target, and the reconciliation runs on the event loop, so that wait
+        happens on the subprocess executor while the loop keeps serving; the
+        POSIX ``os.kill`` is a non-blocking syscall and runs inline.
+        """
         try:
-            platform_compat.kill_pid(pid, platform_compat.SIGKILL)
-        except (ProcessLookupError, OSError):
-            pass
+            await platform_compat.kill_pid_async(pid, platform_compat.SIGKILL)
+        except ProcessLookupError:
+            return None
+        except OSError as exc:
+            return failure_name(exc)
+        return None
 
     async def _notify_orphan(
         self, agent_id: str, state: dict, recovery: str, has_result: bool
@@ -3144,6 +3705,18 @@ class SubagentManager:
 
     async def _reaper_loop(self) -> None:
         return await self._monitor._reaper_loop_impl()
+
+    @property
+    def _startup_deadline(self) -> int:
+        """Seconds a new start may run with no runtime, from the live config."""
+        if self._startup_timeout_override is not None:
+            return self._startup_timeout_override
+        snap = live.snapshot()
+        agent = snap.agent if snap is not None else AgentConfig()
+        budget = max(SESSION_START_TIMEOUT_MIN, agent.session_start_timeout_secs)
+        collect = agent.start_collect_timeout_secs + _STARTUP_COLLECT_GRACE_SECS
+        derived = int(budget + collect + _STARTUP_LAUNCH_MARGIN_SECS)
+        return max(_STARTUP_TIMEOUT_SECS, derived)
 
     def _is_startup_stalled(self, info: SubagentInfo, now: float) -> bool:
         return self._monitor._is_startup_stalled_impl(info, now)
@@ -3252,6 +3825,7 @@ class SubagentManager:
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
+        gate: "asyncio.Future[bool] | None" = None,
     ) -> bool:
         return await self._terminal._report_terminal_impl(
             info,
@@ -3260,6 +3834,7 @@ class SubagentManager:
             mark_delivered_on_success=mark_delivered_on_success,
             settle_digest=settle_digest,
             teardown_done=teardown_done,
+            gate=gate,
         )
 
     async def _run_terminal_report(
@@ -3290,6 +3865,7 @@ class SubagentManager:
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
+        gate: "asyncio.Future[bool] | None" = None,
     ) -> "asyncio.Task[bool]":
         return self._terminal._spawn_terminal_report_impl(
             info,
@@ -3298,6 +3874,7 @@ class SubagentManager:
             mark_delivered_on_success=mark_delivered_on_success,
             settle_digest=settle_digest,
             teardown_done=teardown_done,
+            gate=gate,
         )
 
     @staticmethod
@@ -3732,8 +4309,27 @@ class SubagentManager:
     ) -> None:
         return await self._terminal._force_reap_impl(agent_id, info, elapsed, reason=reason)
 
-    async def _sigkill_session(self, session_key: str) -> None:
-        return await self._terminal._sigkill_session_impl(session_key)
+    async def _reap_once(
+        self, agent_id: str, info: SubagentInfo, elapsed: float, *, reason: str = ""
+    ) -> None:
+        return await self._terminal._reap_once_impl(agent_id, info, elapsed, reason=reason)
+
+    async def _sigkill_session(self, session_key: str, handle: ProcessHandle | None) -> str | None:
+        return await self._terminal._sigkill_session_impl(session_key, handle)
+
+    async def _sigkill_sessions(self, session_key: str, handles: list[ProcessHandle]) -> str | None:
+        return await self._terminal._sigkill_sessions_impl(session_key, handles)
+
+    def _sessions_under(self, session_key: str) -> list[tuple[Any, ProcessHandle]]:
+        return self._terminal._sessions_under_impl(session_key)
+
+    def _retain_process_handles(
+        self,
+        agent_id: str,
+        session_key: str,
+        pairs: list[tuple[Any, ProcessHandle]] | None = None,
+    ) -> list[ProcessHandle]:
+        return self._terminal._retain_process_handles_impl(agent_id, session_key, pairs)
 
     def notify_injection_failed(
         self, info: SubagentInfo, reason: str = "delivery timed out"
@@ -3744,6 +4340,152 @@ class SubagentManager:
         if self._adaptive_cap is None:
             return self._user_max_concurrent
         return max(0, min(self._user_max_concurrent, int(self._adaptive_cap)))
+
+    # ── In-startup population ──────────────────────────────────────────────
+    #
+    # Three different things bound a fan-out: ``_spawn_stagger_secs`` bounds
+    # the RATE of starts, ``_max_concurrent`` bounds the RUNNING population,
+    # and ``_startup_cap`` bounds how many admitted agents may be IN STARTUP at
+    # once. Without the third, one start is admitted every stagger interval however long each
+    # takes, and when starts are slow (a dedicated process per model override,
+    # a queue at the session-start gate, a throttled provider handshake) dozens
+    # sit in startup together, every one of them contending for the same gate
+    # and every one of them running down the same fixed startup deadline.
+    # Measured on a 623-item fan-out: waves of 24-45 lost ~2%, a wave of 120
+    # lost ~50%, every loss a healthy start the watchdog reaped as
+    # "Failed to start within 120s".
+
+    @staticmethod
+    def _in_startup(info: SubagentInfo) -> bool:
+        """True while *info* has entered execution but has nothing to show yet.
+
+        The same shape the startup watchdog reaps on (:meth:`_is_startup_stalled`),
+        minus the clock: past ``_run_inner``'s first statement (``_exec_started``
+        set), no runtime PID, no answer on its own session yet
+        (:meth:`_leave_startup`), no turn, and not already ending. A queued
+        spawn is not in it (not registered until admitted), and
+        neither is an agent PARKED at the spawn-approval prompt
+        (``_awaiting_approval``, ``_exec_started`` still ``None``): it is
+        starting nothing, so it must not consume the startup bound -- counting
+        it would let a handful of unanswered prompts hold every other spawn on
+        the host, auto-approved ones from unrelated parents included. What has
+        to be bounded is the moment its prompt resolves, since a bulk grant
+        (``tool_approval:bulk_trust`` / ``bulk_yolo``) resolves EVERY pending
+        prompt at once: a released agent therefore re-enters through the pump
+        (:meth:`_admit_released_start`) and is metered into startup by the SAME
+        stagger and in-startup checks a fresh spawn passes, so ``_startup_cap``
+        holds through the flood without the parked agents ever counting.
+        """
+        return (
+            not info.done
+            and not info._reap_started
+            and info._exec_started is not None
+            and info.turns == 0
+            and info._pid is None
+            and info._first_stream_started is None
+        )
+
+    def _startup_population(self, *, exclude: SubagentInfo | None = None) -> int:
+        """How many admitted agents are in startup right now (see :meth:`_in_startup`).
+
+        Includes ``_startup_reservations``: a durable-store spawn reserves its
+        slot BEFORE its claim is awaited (``ClaimPoint``, reserve-then-commit)
+        and registers its ``SubagentInfo`` only on re-entry, which skips the
+        admission gate because the reservation already passed it. Between
+        reserve and re-entry the start is admitted but has no info to count, so
+        the reservation is counted in its place; the re-entry's registration
+        and ``release_reservation`` both give it back.
+        """
+        return int(self._startup_reservations) + sum(
+            1 for info in self._agents.values() if info is not exclude and self._in_startup(info)
+        )
+
+    def _startup_cap(self) -> int:
+        """The in-startup bound: ``_STARTUP_CAP_GATE_ROUNDS x session_start_concurrency``.
+
+        Twice the session-start gate's width, clamped to ``[1, cap]``. The
+        bound is tied to the GATE, not to the running cap, because the gate is
+        the one resource every start in startup contends for: ``session/new``
+        runs under ``G`` permits, so at most ``G`` starts make progress at any
+        moment and every other admitted start is a spawned process (dedicated
+        path) or a claimed slot holding nothing but a place in the gate's
+        queue. Time spent in that queue is not charged to the startup deadline
+        (the clock freezes at gate entry and restarts at acquisition --
+        ``_gate_wait_mark`` / ``_gate_exit_reset``), so the queue's length is
+        not what reaps a healthy start; what the bound decides is how much of
+        the running cap may sit in startup contending for ``G`` permits at
+        once. ``2G`` is the smallest value that never idles the gate -- one
+        round holding permits and one round already admitted to take them the
+        moment they free -- and admitting more buys no starts, since the gate
+        serves ``G`` per round however many are queued: it only lengthens the
+        queue and grows the population of admitted-but-idle starts. A
+        cap-derived term (``max(..., ceil(cap / 4))``, say) would do exactly
+        that: 16 in startup at a cap of 64 against a 2-permit gate is seven
+        rounds queued for two permits. The population the bound is checked
+        against (:meth:`_in_startup`) is the agents actually starting, plus
+        reservations not yet registered (:meth:`_startup_population`). Agents
+        parked at the spawn-approval prompt are NOT in it -- they start nothing
+        and must not block unrelated spawns -- and are instead metered through
+        the pump when their prompt resolves (:meth:`_admit_released_start`), so
+        "at most ``2G`` in startup" holds even when a bulk trust/yolo grant
+        releases them all at once.
+
+        There is deliberately NO config key for this value. ``2G`` is both the
+        floor and the ceiling of the useful range: fewer than ``2G`` idles the
+        gate between rounds (no next round already admitted when the current
+        one releases), and more than ``2G`` buys no starts -- the gate serves
+        ``G`` per round however many are queued behind it -- only a longer
+        queue of idle admitted starts. A knob could therefore only make the
+        system worse, and the operator's real lever on this bound already
+        exists: ``agent.session_start_concurrency`` sizes the gate, and the
+        bound tracks it.
+
+        Never above the effective running cap (a larger value could not bind)
+        and never below 1, so at a cap of ``0`` this returns ``1``: the running
+        cap, not this bound, is what pauses admission there.
+        """
+        cap = max(0, int(self._max_concurrent))
+        bound = _STARTUP_CAP_GATE_ROUNDS * int(self._session_start_concurrency)
+        return max(1, min(bound, cap))
+
+    def _note_startup_progress(self, info: SubagentInfo) -> None:
+        """Wake the spawn queue when *info* leaves startup without ending.
+
+        A runtime PID (``_run_inner``'s PID record, ``_bind_shared_handle``) or
+        the first answer on its own session (:meth:`_leave_startup`) takes
+        *info* out of the in-startup population, which may open a slot under
+        :meth:`_startup_cap` that no other edge announces: the slot-release
+        drain fires only on a terminal, and the pump does not poll. Called at
+        those two transitions -- at most twice per start -- and the pump
+        returns at once when nothing waits and re-checks every gate itself, so
+        a call that opens nothing is cheap. A pump failure is logged, never
+        raised: the run that just progressed is not the one at fault, and the
+        next terminal or arrival pumps again.
+        """
+        try:
+            self._drain_queue()
+        except Exception:
+            logger.debug("startup-progress queue pump failed for %s", info.id, exc_info=True)
+
+    def _leave_startup(self, info: SubagentInfo) -> None:
+        """Take *info* out of startup: its own session has answered its prompt.
+
+        Two moments prove that, and each calls this: the first frame out of the
+        provider stream that is addressed to THIS session (the stream loop in
+        ``_run_inner``), and a dependency verdict on the prompt
+        (``_yield_for_dependency``), which
+        the durable row records as ``starting -> running`` in the same step.
+        An opened stream proves neither, and neither does a ``runtime_global``
+        frame -- a co-tenant's traffic that a shared runtime fanned out to
+        every session on it. Stamps ``info._first_stream_started`` once per
+        execution and, on a first turn, wakes a spawn the in-startup bound is
+        holding (:meth:`_note_startup_progress`).
+        """
+        if info._first_stream_started is not None:
+            return
+        info._first_stream_started = time.time()
+        if info.turns == 0:
+            self._note_startup_progress(info)
 
     def set_cap_raise_listener(self, listener: Callable[[], object] | None) -> None:
         """Register the ONE hook a cap raise rings, or ``None`` to drop it.
@@ -3944,6 +4686,7 @@ class SubagentManager:
         _execution_context: dict | None = None,
         _stage_boundary_owner: str = "",
         acp_backend: str = "",
+        _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
     ) -> SubagentInfo | None:
         result = self._admission.spawn_impl(
             task,
@@ -3982,6 +4725,7 @@ class SubagentManager:
             _execution_context=_execution_context,
             _stage_boundary_owner=_stage_boundary_owner,
             acp_backend=acp_backend,
+            _parent_spawn_policy=_parent_spawn_policy,
         )
         assert not isinstance(result, PreparedSpawn)
         # Every synchronous gate return (started, queued, or refused) receives
@@ -4057,6 +4801,20 @@ class SubagentManager:
                         if conversation
                         else await asyncio.to_thread(read_session_execution, parent)
                     )
+                if kwargs.get("_parent_spawn_policy") is None and not conversation:
+                    # The PARENT record is in hand: its template names the spec
+                    # whose ``availableAgents`` the gate honours, so the
+                    # declaration is read here, off-loop, without a second
+                    # record read.
+                    template = record.template_id if record is not None else ""
+                    kwargs["_parent_spawn_policy"] = (
+                        template,
+                        (
+                            await asyncio.to_thread(parent_spawn_allowlists, template)
+                            if template
+                            else ()
+                        ),
+                    )
                 execution = self._admission.resolve_spawn_execution(
                     parent_session_key=parent,
                     conversation_key=conversation,
@@ -4091,6 +4849,14 @@ class SubagentManager:
                         batch_total=batch_total,
                     )
                 )
+        if kwargs.get("_parent_spawn_policy") is None and not kwargs.get("_store_accepted"):
+            # A caller that supplied the execution (``/api/spawn`` hands the
+            # policy along with it; a continuation or retry does not): the
+            # parent's declaration is read OFF the loop here, like the record
+            # above, so the gate below consumes it without a directory scan.
+            kwargs["_parent_spawn_policy"] = await asyncio.to_thread(
+                parent_spawn_policy, str(kwargs.get("parent_session_key") or "")
+            )
         store = self._admission.taskq_store()
         if store is None:
             return self.spawn(task, **kwargs)
@@ -4358,6 +5124,12 @@ class SubagentManager:
     def _drain_queue(self) -> None:
         return self._admission._drain_queue_impl()
 
+    async def _admit_released_start(self, info: SubagentInfo) -> str:
+        return await self._admission._admit_released_start_impl(info)
+
+    def _release_admitted_start(self) -> str:
+        return self._admission._release_admitted_start_impl()
+
     async def _drain_queue_async(self) -> None:
         return await self._admission._drain_queue_async_impl()
 
@@ -4519,12 +5291,27 @@ class SubagentManager:
     async def has_pending_work_for_async(self, parent_session_key: str) -> bool:
         return await self._run_events.has_pending_work_for_async_impl(parent_session_key)
 
-    def _emit_queue_depth(self, parent_session_key: str, batch_id: str = "") -> None:
-        return self._run_events._emit_queue_depth_impl(parent_session_key, batch_id)
+    def _emit_queue_depth(
+        self,
+        parent_session_key: str,
+        batch_id: str = "",
+        *,
+        wait: dict[str, Any] | None = None,
+    ) -> None:
+        return self._run_events._emit_queue_depth_impl(parent_session_key, batch_id, wait=wait)
 
     @staticmethod
     def _write_tombstone(info: SubagentInfo, cause: str) -> None:
-        """Best-effort tombstone write for abnormal exits."""
+        """Best-effort tombstone write for abnormal exits.
+
+        A run that is not persistent gets no tombstone. ``write_tombstone``
+        refuses one whose live-run state or recorded mode says so, but a run
+        that ended before its folder was seeded -- a declined spawn prompt, a
+        stop or a reap while it waited for admission into startup -- has
+        neither, so the run's own mode decides here.
+        """
+        if info.memory_mode != "persistent":
+            return
         try:
 
             write_tombstone(
@@ -4539,7 +5326,7 @@ class SubagentManager:
                 # not enough to act on. ``info.error`` is in-memory only and
                 # dies with the gateway, so without this the specific reason is
                 # recoverable from nothing but the log.
-                detail=(_redact(info.error)[:_MAX_ERROR_DETAIL_LEN] if info.error else ""),
+                detail=(_redact(info.error)[:MAX_ERROR_DETAIL_LEN] if info.error else ""),
             )
         except Exception:
             logger.debug("Failed to write tombstone for %s", info.id, exc_info=True)
@@ -4608,6 +5395,12 @@ class SubagentManager:
         self, info: SubagentInfo, session_key: str, agent: str
     ) -> "LLMProvider":
         return await self._run_events._create_shared_session_impl(info, session_key, agent)
+
+    def _gate_exit_reset(self, info: SubagentInfo) -> Callable[[float], None]:
+        return self._run_events._gate_exit_reset_impl(info)
+
+    def _gate_wait_mark(self, info: SubagentInfo) -> Callable[[], None]:
+        return self._run_events._gate_wait_mark_impl(info)
 
     # Facades for the session-start gate's late-adoption path;
     # implementations live in run.py.

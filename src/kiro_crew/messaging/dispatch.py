@@ -34,9 +34,11 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
+from kiro_crew.agent_sdk.backends import Routing, routing_for
 from kiro_crew.agent_sdk.drivers.acp_vocab import classify_stop_reason
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.history import transcript_stem
 from kiro_crew.hooks import (
     HOOK_REPLY,
     TOOL_AUTO_APPROVE,
@@ -88,6 +90,74 @@ from kiro_crew.sel import sel
 from kiro_crew.session_allocation import SessionClosingError
 
 logger = logging.getLogger(__name__)
+
+#: The agent a ``deny_all_tools`` turn runs on. Its spec declares ``tools: []``
+#: and no MCP servers (``agent._install_guest_agent``), so the backend mounts
+#: nothing for the session: no tool exists to call, whatever the operator's own
+#: agent auto-approves. That is the only enforcement that holds on the stock kiro
+#: backend, where a tool named in ``allowedTools`` raises no permission request
+#: and therefore never reaches the driver's ``deny_all_tools`` branch. A spec of
+#: its own, not the background ``kirocrew-lite``: that helper may grow a tool one
+#: day and its empty prompt reads as "no user to address" on backends that need
+#: one, while this agent talks to a person. The spec pin in
+#: ``test_messaging_dispatch.py::TestToollessAgentSpecIsTheBoundary`` makes any
+#: drift loud.
+TOOLLESS_TURN_AGENT = "kirocrew-guest"
+
+
+#: What a sender whose turn was refused as un-tool-less-able reads. One line, no
+#: internals: silence reads as the agent ignoring the person, and the operator's
+#: side of the story is the SEL row, not this note.
+TOOLLESS_TURN_REFUSAL_NOTE = "This account cannot answer you on its current setup. Ask its owner."
+
+
+def toolless_turns_supported(backend: str) -> bool:
+    """Whether a ``deny_all_tools`` turn can be driven on *backend* at all.
+
+    True only where the agent spec is what the harness mounts
+    (``Routing.AGENT_SPEC``): there ``tools: []`` removes every tool. Read by
+    channel startup to warn an operator whose configuration admits non-operator
+    traffic on a backend that will refuse every such turn.
+    """
+    return routing_for(backend) is Routing.AGENT_SPEC
+
+
+def warn_if_toolless_turns_unservable(
+    channel: str, *, admits_non_operators: bool, backend: str, admission: str
+) -> bool:
+    """Warn once, at a channel's start, when its admitted non-operators will all be refused.
+
+    Shared with every ``deny_all_tools`` adopter because the refusal itself lives
+    on the shared seam (:func:`drive_turn`); a channel supplies only the two facts
+    it alone knows, whether its configuration admits anyone but the operator and
+    how (``admission``, for the message). Returns True when it warned.
+    """
+    if not admits_non_operators or toolless_turns_supported(backend):
+        return False
+    logger.warning(
+        "%s: non-operator senders are admitted (%s) but agent.acp_backend=%r cannot "
+        "run a tool-less turn; every non-operator turn will be refused with a note. "
+        "Use the kiro backend or narrow admission.",
+        channel,
+        admission,
+        backend,
+    )
+    return True
+
+
+class ToollessTurnUnavailable(RuntimeError):
+    """A ``deny_all_tools`` turn cannot be made tool-less on this session.
+
+    Two causes. The session key a channel hands in for such a turn must be one
+    that only tool-less turns ever use; a key shared with the operator's own
+    turns would hand the sender the operator's agent, tools included. And the
+    tool-less agent spec is honoured only by a backend whose routing is
+    ``Routing.AGENT_SPEC`` (the spawn names the agent, so ``tools: []`` is what
+    the harness mounts); a harness that reads no agent spec keeps its own native
+    tools, and a project-preapproved one raises no permission request for the
+    driver to refuse. Raised instead of running the turn either way: refusing
+    costs the sender one reply, running it costs the operator their machine.
+    """
 
 
 async def admit_inbound_callback(
@@ -270,8 +340,23 @@ class ChannelTurn:
     For a turn driven by someone the channel does not trust as its operator. The
     approval mode cannot express it: the PreToolUse hook may answer
     ``auto_approve`` and a session carrying Trust short-circuits, both before the
-    interactive ladder is consulted. Defaults False, so every existing adopter is
-    byte-identical."""
+    interactive ladder is consulted. Nor is a permission request guaranteed to be
+    raised at all: a tool the agent spec lists in ``allowedTools`` runs without
+    one on the kiro backend, so the driver never sees it. The turn is therefore
+    driven on :data:`TOOLLESS_TURN_AGENT`, whose spec mounts no tools and no MCP
+    servers, and the driver's own refusal of any permission request that does
+    arrive is the second line. The session key MUST be one that only such turns
+    use (a per-peer bucket, never the operator's): a session already bound to
+    another agent refuses the turn (:class:`ToollessTurnUnavailable`), and so does
+    a backend whose routing is not ``Routing.AGENT_SPEC``, since only a harness
+    that mounts what the spec names honours ``tools: []``. Defaults False, so
+    every existing adopter is byte-identical."""
+
+    unprompted: bool = False
+    """The turn was not addressed to the agent (a rules-mode group message the
+    model may answer or decline). A refusal of such a turn ends silently: a
+    note nobody asked for is an unsolicited post into the room, and it would
+    start the unprompted cooldown for a turn that never ran. Defaults False."""
 
     bind_provider: Optional[Callable[[Any], None]] = None
     """``(provider) -> None``, called once the session's provider exists.
@@ -360,6 +445,10 @@ class ChannelTurn:
     the shared turn pipeline. It covers the later ``SessionClosingError`` race,
     after callback admission succeeded but before the provider turn opened.
     """
+
+    user_display_name: Optional[str] = None
+    """Human name of the sender, injected as ``[CURRENT USER]`` so the agent
+    knows who it is talking to. ``None`` omits the block (byte-identical to before)."""
 
 
 #: Every spelling a channel accepts for "abort the running turn". The union of
@@ -610,6 +699,210 @@ def consume_reinjection(sessions: Any, session_key: str) -> bool:
     """
     consume = getattr(sessions, "consume_needs_reinjection", None)
     return bool(consume(session_key)) if callable(consume) else False
+
+
+def predecessor_sid(sessions: Any, session_key: str) -> str:
+    """The crew log *session_key*'s live session superseded -- read AFTER the allocation.
+
+    The ``previous_sid`` producer for :func:`open_turn_crew_log`. It does not read
+    the slot-to-session mapping at all: it returns what the allocation boundary
+    captured for the key (``SessionManager.allocation_predecessor``), which the
+    boundary reads under its own lock, in the same tick that registers a
+    cold-started session and before that session's id is mapped. No read taken
+    around ``get_or_create`` can stand in for that: a caller reading the mapping
+    before its call can be suspended INSIDE the allocation, waiting for the turn
+    permit, while a concurrent turn on the same key allocates an intermediate
+    session and has it recycled by a failed compaction -- the caller's value then
+    names the store before that intermediate one, its successor cites its
+    grandparent, and the intermediate log falls off the succession chain. Read
+    after the call, the mapping already names the successor itself. The
+    boundary's capture is the only read that is neither too early nor too late,
+    so this is consumed right after ``get_or_create`` returns, while this turn
+    holds the key's permit.
+
+    The emitter does the comparing: a warm claim hands back the value its live
+    session was registered with and the log already exists, so nothing is
+    written; only the creation of a cold successor's log cites its predecessor,
+    and only after the emitter has checked that predecessor's header names the
+    same slot. Best-effort: a store without the reader answers ``""``, which the
+    emitter reads as "nothing to follow".
+    """
+    reader = getattr(sessions, "allocation_predecessor", None)
+    if not callable(reader):
+        return ""
+    try:
+        return str(reader(session_key) or "")
+    except Exception:
+        logger.debug("crew log: predecessor unreadable for %s", session_key, exc_info=True)
+        return ""
+
+
+def requested_model_sid(sessions: Any, session_key: str) -> str:
+    """The model *session_key*'s live allocation SELECTED, or ``""`` -- read after the claim.
+
+    The ``model_requested`` half of the requested/served pair the ``session/opened``
+    entry records. The dispatcher's own choice is not the whole story: a call handed
+    ``model=None`` has the allocation resolve an id from config itself, and that
+    resolution is invisible in ``get_or_create``'s return, so only the stamp the
+    allocation left on the session (``SessionManager.allocation_requested_model``,
+    the value the provider was constructed with) can say what was asked for. The
+    dashboard runner records the same stamp; without it a channel session's log
+    would carry the served model alone and lose the selected side of the pair for
+    good, the entry being append-only. Best-effort like :func:`predecessor_sid`: a
+    store without the reader answers ``""``, which the emitter records as "no
+    selection to report".
+    """
+    reader = getattr(sessions, "allocation_requested_model", None)
+    if not callable(reader):
+        return ""
+    try:
+        return str(reader(session_key) or "")
+    except Exception:
+        logger.debug("crew log: requested model unreadable for %s", session_key, exc_info=True)
+        return ""
+
+
+def slot_workspace(dashboard_state: Any, session_key: str) -> str:
+    """The workspace the dashboard states for *session_key*'s conversation, or ``""``.
+
+    The ``workspace`` producer for :func:`open_turn_crew_log`, and the SAME source
+    the dashboard runner's writer reads: ``chat_runner._crew_log_workspace`` states
+    ``slot.workspace`` off the live slot, and a channel conversation's slot is the
+    one the dashboard surfaces it under -- ``channel_slot_name(session_key)``, the
+    channel key folded to the filename charset, which is the ``slot`` field this
+    opener already records (:func:`transcript_stem` spells the same fold). A tab
+    opened on that conversation writes its ``session/opened`` from that slot, into
+    the same crew log this dispatcher writes, and the emitter appends a
+    ``session/class`` line whenever the class it is handed differs from the last
+    one stated -- so if the two writers named different workspaces for one
+    session, every switch between them would record a move that never happened.
+    Reading the slot the other writer reads is what makes the two statements one.
+
+    ``""`` when the conversation has no slot yet -- a channel slot is surfaced
+    after its first persisted turn, so the log's opening entry states no workspace
+    -- or when the gateway state is not attached. An unstated workspace is "not
+    observed": the class fold holds the first workspace STATED and records a later
+    different one as a move, so nothing is guessed here for the slot to contradict.
+    Only a ``str`` counts as a statement, so a state double answering with an
+    object of another shape states nothing rather than its ``repr``.
+    """
+    if dashboard_state is None:
+        return ""
+    try:
+        getter = getattr(dashboard_state, "get_slot", None)
+        slot = getter(transcript_stem(session_key)) if callable(getter) else None
+    except Exception:
+        logger.debug("crew log: slot unreadable for %s", session_key, exc_info=True)
+        return ""
+    workspace = getattr(slot, "workspace", "") if slot is not None else ""
+    return workspace if isinstance(workspace, str) else ""
+
+
+def open_turn_crew_log(
+    provider: Any,
+    *,
+    session_key: str,
+    agent: str,
+    resumed: bool,
+    ctx_builder: Any = None,
+    previous_sid: str = "",
+    model_requested: str = "",
+    workspace: str = "",
+) -> None:
+    """Open the channel session's crew log ahead of its turn, as the dashboard runner does.
+
+    ``crew_log_emit.on_session_opened`` is what CREATES a session's crew log, keyed
+    by its ACP session id; ``chat_runner._run_chat`` calls it on every dashboard turn
+    once the handle exists, and a warm reuse is silent. A channel conversation runs
+    its own copy of the turn loop, and without this call it opens no log at all.
+    That is a hole the work ledger falls into: the ledger is a projection of the
+    crew log, every ``work_ledger_record`` / ``work_report`` write appends one
+    ``work/recorded`` entry to the ACTING session's log, and a write with nowhere
+    to append is rolled back and refused (``crew_log_unrecorded``). An owner DM
+    that session control admits as a conductor therefore reached the ledger and
+    lost every write to it. Opening the log here, before ``TurnDriver.run``, is
+    what makes that admission usable. Free while the emitter is off -- the emitter
+    checks its own flag -- and it never raises, because the turn must not be lost
+    to its own record.
+
+    Only facts the dispatcher can establish are recorded; the emitter reads an
+    absent field as "not observed", never as false. The ACP session id comes off
+    *provider* (no id, no log: a turn that never got a session emits nothing, as
+    on the dashboard). ``slot`` is the key the dashboard surfaces this conversation
+    under -- the channel key folded to the filename charset, which is what
+    ``channel_slot_name`` spells and what ``session_create`` stamps as
+    ``_created_by`` on the workers this session dispatches, so the session tree
+    joins the two. The served model and the cwd are read off the provider, the
+    dashboard's own sources for them, and ``model_requested`` is the allocation's
+    stamp of what was SELECTED (:func:`requested_model_sid`, read after the claim
+    like the predecessor) -- the pair the entry records, since a call handed
+    ``model=None`` has the allocation resolve the id itself and nothing else can
+    say what it chose; ``resumed`` is ``get_or_create``'s answer.
+    The class is stated only when the memory mode is known, from the gateway's
+    live policy for the key (``ctx_builder.live_memory_mode_for_session``, wired by
+    the dashboard state; a builder without it states no class, which readers
+    refuse rather than assume), and it carries ``channel=True`` because a
+    channel-born conversation is published to its channel by definition -- the
+    same reading ``_crew_log_class`` takes off a linked slot. ``workspace`` is
+    stated the way the dashboard writer states it, off the slot the dashboard
+    surfaces this conversation under (:func:`slot_workspace`), because a tab on
+    the conversation writes into this same log and the emitter records a
+    ``session/class`` move whenever two statements of one session's class differ:
+    every member the dashboard states, this opener states from the same source, or
+    the two writers would take turns recording a move that never happened. No
+    ``parent``: a
+    conversation the person opened themselves is nobody's child. ``previous_sid``
+    is the crew log this conversation's live session superseded, as the
+    allocation boundary captured it while registering that session
+    (:func:`predecessor_sid`, consumed by the dispatcher right after
+    ``get_or_create`` returns): the emitter writes the ``previous`` edge only when
+    it creates a log that names a different store, which is what keeps a
+    conversation's history reachable across the cold successor a failed
+    compaction leaves behind.
+
+    For the channel's OWN sessions only. A dashboard session resumed into the chat
+    (``!sessions``) is opened by the dashboard runner, which alone holds its
+    lineage: an opener from here would create that log without its ``parent``.
+    """
+    # Imported here, not at module scope, on purpose: this module is on the
+    # dashboard's boot path (``dashboard.handlers.crew_log`` reaches it through the
+    # handlers package -> ``handlers.taskrunner`` -> ``taskrunner`` ->
+    # ``task_executor``), and the crew log is optional -- a flag-off launch must
+    # not load the storage package.
+    # ``test_crew_log_routes.py::test_this_module_does_not_load_the_storage_package_at_import``
+    # pins that from a clean interpreter and fails when this moves up; it is not a
+    # circular import. ``handlers/crew_log.py`` and
+    # ``work_ledger.rebuild_from_projection`` import the emitter the same way. The
+    # ``top-level-imports`` convention is advisory; this boot-path invariant is
+    # enforced, so the invariant wins.
+    from kiro_crew.crew_log import emit as crew_log_emit
+
+    try:
+        session_id = crew_log_emit.session_id_of(provider)
+        if not session_id:
+            return
+        memory_mode = ""
+        live_mode = getattr(ctx_builder, "live_memory_mode_for_session", None)
+        if callable(live_mode):
+            try:
+                memory_mode = str(live_mode(session_key) or "")
+            except Exception:
+                logger.debug("crew log: memory mode unreadable for %s", session_key, exc_info=True)
+        crew_log_emit.on_session_opened(
+            session_id,
+            agent=agent or "",
+            slot=transcript_stem(session_key),
+            model=str(getattr(provider, "served_model", "") or ""),
+            model_requested=model_requested,
+            cwd=str(getattr(provider, "cwd", "") or ""),
+            resumed=bool(resumed),
+            memory=memory_mode,
+            channel=True,
+            workspace=workspace,
+            previous_sid=previous_sid,
+        )
+    except Exception:
+        logger.debug("crew log: opener skipped for %s", session_key, exc_info=True)
 
 
 def stop_reason_landed(stop_reason: str | None) -> bool:
@@ -945,6 +1238,36 @@ def _set_replay_gap(sessions: Any, session_key: str, *, opened: bool) -> None:
             )
 
 
+def _toolless_turn_work_dir(session_key: str) -> Any:
+    """The isolated cwd a ``deny_all_tools`` turn cold-starts in.
+
+    The per-session work directory under the workspace root: created on first
+    use, owned by this session key alone, and never a project checkout, so no
+    ``.kiro/agents`` entry there can shadow the tool-less spec.
+    """
+    from kiro_crew.config.loader import _session_work_dir
+
+    path = _session_work_dir(session_key)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _provider_backend(provider: Any) -> str | None:
+    """The ACP backend id a provider drives, ``None`` when it cannot be read.
+
+    Read through ``provider.client.backend`` with ``getattr`` at both hops, the
+    same mock-safe shape ``session._is_claude_backend`` uses. ``None`` (not
+    ``""``) is the unreadable answer: the empty string IS ``ACP_BACKEND_KIRO``,
+    so collapsing an absent client onto it would route an unknown harness as the
+    one that honours the spec. The caller treats ``None`` as refused.
+    """
+    client = getattr(provider, "client", None)
+    if client is None:
+        return None
+    backend = getattr(client, "backend", None)
+    return backend if isinstance(backend, str) else None
+
+
 async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> None:
     """Run one authorized inbound message end to end.
 
@@ -955,6 +1278,10 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
     """
     renderer = turn.renderer
     session_key = turn.session_key
+    # A sender the channel does not trust talks to a tool-less agent, not to the
+    # operator's. Decided here, on the shared seam, so no adopter can set the
+    # flag and forget the agent that gives it teeth.
+    session_agent = TOOLLESS_TURN_AGENT if turn.deny_all_tools else turn.agent
     _acquired = False
     # Post-compaction re-injection bookkeeping for the finally: whether this
     # turn consumed the one-shot flag, and whether it landed (recorded success).
@@ -1021,6 +1348,22 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         # always did. Widening the call for everyone would make the new field's
         # cost fall on channels that gain nothing from it.
         extra: dict[str, Any] = {"model": turn.model} if turn.model else {}
+        if turn.deny_all_tools:
+            # ``crew_agent=""`` is the explicit "no crew" answer
+            # (``config.loader.resolve_crew_identity``): without it a crew
+            # ENROLLED under the tool-less agent's name would be made canonical by
+            # the crew-namespace fallback, and its tooled template would start
+            # under a binding that reads as the tool-less agent. The spec named
+            # here must be the template itself, never a namesake crew.
+            extra["crew_agent"] = ""
+            # And the process must be a COLD start in this session's own work
+            # directory: a warm-pool process was spawned in the operator's project
+            # cwd, where a project-local spec under the same name (tools and all)
+            # shadows the generated one the harness would otherwise load. An
+            # explicit cwd that is not the pool's makes the pool ineligible
+            # (``cwd_blocks_pool``) and the per-session directory carries no
+            # project-local agents of its own.
+            extra["cwd"] = str(await asyncio.to_thread(_toolless_turn_work_dir, session_key))
         # Bounded by the guard's own countdown: it holds a DONE only while it
         # still has a retry to grant, so this loop runs at most
         # ``1 + _COMPACTION_FAILED_RETRIES`` times. The driver renders through the
@@ -1054,9 +1397,50 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             # provider start. The same identity is then used for this turn's prompt.
             memory_store = await session_store_for_turn(ctx_builder, session_key)
             provider, is_new, resumed = await sessions.get_or_create(
-                session_key, agent=turn.agent, channel_id=turn.conversation_id, **extra
+                session_key, agent=session_agent, channel_id=turn.conversation_id, **extra
             )
             _acquired = True
+            if turn.deny_all_tools:
+                # The tool-less agent is a SPEC, and only a backend that mounts
+                # what the spec names honours it. On any other routing the
+                # harness keeps its own native tools, and one a project has
+                # pre-approved runs with no permission request for the driver to
+                # refuse -- so the turn is refused instead. Positive identity:
+                # the routing that holds, never the absence of another harness.
+                backend = _provider_backend(provider)
+                if backend is None or not toolless_turns_supported(backend):
+                    sel().log_api_access(
+                        caller=session_key,
+                        operation="turn_agent",
+                        outcome="denied",
+                        source="messaging",
+                        resources=(
+                            f"deny_all_tools turn on backend={'unknown' if backend is None else backend!r}: "
+                            "the tool-less agent spec is not honoured there"
+                        ),
+                    )
+                    raise ToollessTurnUnavailable(
+                        "deny_all_tools turn refused: this backend does not mount tools "
+                        "from the agent spec, so an untrusted sender's turn cannot be "
+                        "made tool-less on it"
+                    )
+                # ``get_or_create`` ignores ``agent`` for a session that already
+                # exists, so a key shared with a tooled session would silently run
+                # this turn with the operator's tools. Read the binding back and
+                # refuse rather than trust the key's shape.
+                bound = sessions.get_agent(session_key) if hasattr(sessions, "get_agent") else ""
+                if bound and bound != TOOLLESS_TURN_AGENT:
+                    sel().log_api_access(
+                        caller=session_key,
+                        operation="turn_agent",
+                        outcome="denied",
+                        source="messaging",
+                        resources=f"deny_all_tools turn on a session bound to agent={bound!r}",
+                    )
+                    raise ToollessTurnUnavailable(
+                        "deny_all_tools turn refused: its session is bound to an agent "
+                        "with tools; channels must key untrusted turns separately"
+                    )
             if stop_gen_at_entry is None:
                 stop_gen_at_entry = session_stop_generation(sessions, session_key)
             if conv_gen_at_entry is None:
@@ -1168,6 +1552,7 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
                 minimal_context=turn.minimal_context,
                 runtime_source=turn.channel_type,
                 context_provider=provider,
+                user_display_name=turn.user_display_name,
             )
 
             driver = TurnDriver(
@@ -1386,6 +1771,21 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         # reach for the prompt.
         if not turn.inbound_restricted:
             await spool_refused_turn(channel_type=turn.channel_type, route=turn.inbound_route)
+    except ToollessTurnUnavailable as exc:
+        # Refused before the prompt opened; the sender gets one neutral line so
+        # the silence is not read as being ignored, the SEL row already names why.
+        # Not charged to the circuit breaker: this is a configuration refusal,
+        # not a provider failure, and a group of refused members would otherwise
+        # trip the breaker for the session they never got to use.
+        logger.warning("%s: %s", turn.channel_type, exc)
+        if not turn.unprompted:
+            try:
+                await renderer.on_text_chunk(TOOLLESS_TURN_REFUSAL_NOTE)
+                await renderer.on_done()
+            except Exception:
+                logger.warning(
+                    "%s: could not display tool-less refusal", turn.channel_type, exc_info=True
+                )
     except UnknownMemoryStore as exc:
         logger.warning("%s member memory unavailable: %s", turn.channel_type, exc)
         try:

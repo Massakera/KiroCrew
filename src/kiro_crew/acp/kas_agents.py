@@ -76,12 +76,13 @@ from kiro_crew.acp.kas_permissions import (
 from kiro_crew.agent_discovery import (
     AgentsDirMemo,
     AmbiguousAgentSpecError,
+    plain_markdown_document,
     read_agent_spec_strict,
     spec_by_declared_name,
     spec_welcome_message,
 )
 from kiro_crew.agent_files import KAS_RESERVED_AGENT_IDS
-from kiro_crew.agent_spec_format import agent_spec_candidates
+from kiro_crew.agent_spec_format import agent_spec_candidates, is_markdown_spec
 from kiro_crew.mcp_cleanup import (
     KIROCREW_BIN_MCP_SERVERS,
     MCP_REGISTRY_TYPE,
@@ -162,7 +163,9 @@ _PSEUDO_FS_ROOTS = ("/proc", "/sys", "/dev")
 #: is what kept ``hooks`` written off as unsupported. KAS runs pre/post-tool-use
 #: hooks natively and loads them from an agent profile ON DISK (it even accepts
 #: Crew's object form), so what is lost here is a delivery path, not a feature:
-#: an agent injected over the wire cannot carry them.
+#: an agent injected over the wire cannot carry them. Crew's turn loop fires the
+#: spec's ``hooks`` for such a session instead (:mod:`kiro_crew.agent_sdk.spec_hooks`), so of
+#: these keys only :data:`SPEC_KEYS_WITHOUT_CARRIER` is actually lost.
 #:
 #: ``allowedTools`` is deliberately NOT in this set. It has no slot either, but
 #: :mod:`kiro_crew.acp.kas_permissions` translates it into ``permissions``, so
@@ -174,6 +177,16 @@ UNSUPPORTED_SPEC_KEYS = frozenset(
         "toolsSettings",
     }
 )
+
+
+#: The keys in :data:`UNSUPPORTED_SPEC_KEYS` that nothing carries to a KAS session,
+#: so an agent that sets one runs without it. The user is told once per session.
+SPEC_KEYS_WITHOUT_CARRIER = UNSUPPORTED_SPEC_KEYS - {"hooks"}
+
+
+def spec_keys_without_carrier(spec: dict[str, Any]) -> list[str]:
+    """The keys of :data:`SPEC_KEYS_WITHOUT_CARRIER` that *spec* sets, sorted."""
+    return sorted(k for k in SPEC_KEYS_WITHOUT_CARRIER if spec.get(k))
 
 
 class KasAgentTranslationError(ValueError):
@@ -752,11 +765,11 @@ def to_client_custom_agent(
 
     dropped = sorted(k for k in UNSUPPORTED_SPEC_KEYS if spec.get(k))
     if dropped:
-        # Says WHY the key is dropped, because the previous wording ("no KAS
-        # equivalent") reads as "KAS cannot do this" and sent readers looking for
-        # a missing feature instead of a missing wire field. Debug, not warning:
-        # this fires on every session/new with a constant payload, so at WARNING
-        # it drowns the log without ever telling anyone something new.
+        # Says WHY the key is dropped: a missing wire field, not a missing KAS
+        # feature. Debug, not warning: this fires on every session/new with a
+        # constant payload. The user learns of it from the session-start notice
+        # the turn loop posts for SPEC_KEYS_WITHOUT_CARRIER, and ``hooks`` still
+        # runs, fired by that loop.
         logger.debug(
             "agent %r: spec keys the customAgents wire schema cannot carry, "
             "so an injected agent runs without them: %s",
@@ -971,9 +984,19 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
         # user-writable, so a symlink here must not be followed to a sensitive
         # target or an oversized file slurped into the projection.
         raw = read_agent_spec_strict(path, operation="kas_agent_projection", source="unknown")
-    except OSError as exc:
-        raise KasAgentTranslationError(f"agent spec {path} is unreadable: {exc}") from exc
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
+        if is_markdown_spec(path) and plain_markdown_document(path):
+            # ``<agent_id>.md`` with no opening fence and no JSON twin is a
+            # prose document sharing the name, not this agent's spec: it is
+            # skipped, which leaves the agent with no spec at all -- the same
+            # answer as no candidate file. A FENCED document that fails to
+            # parse falls through and raises as a broken spec.
+            raise KasAgentTranslationError(
+                f"agent {agent_id!r} has no spec: {path} has no frontmatter fence, "
+                "so it is a plain markdown document, not an agent spec"
+            ) from None
+        if isinstance(exc, OSError):
+            raise KasAgentTranslationError(f"agent spec {path} is unreadable: {exc}") from exc
         raise KasAgentTranslationError(f"agent spec {path} is not a valid spec: {exc}") from exc
     if not isinstance(raw, dict):
         raise KasAgentTranslationError(f"agent spec {path} is not an object")
