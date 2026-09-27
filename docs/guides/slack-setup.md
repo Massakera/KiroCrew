@@ -167,10 +167,28 @@ Under **User Token Scopes**, add:
 `im:history`, `im:read`, `mpim:history`, `mpim:read`, `search:read`, and
 `users:read`.
 
-These scopes belong to the installing user's `xoxp-...` token. The Kiro Crew
-gateway itself uses the bot token; the user token is for a separately configured
-Slack MCP/search integration that lets an agent search Slack as that user. Store
-and configure that token only in the integration that consumes it.
+These scopes belong to the installing user's `xoxp-...` token. The gateway
+itself talks to Slack as the bot; the user token is what lets the agent **read
+Slack as you** — search your messages and read your DMs, group DMs, channels
+and threads — without adding the bot to any conversation. It is optional and
+read-only: the built-in `slack_search`, `slack_read` and
+`slack_list_conversations` tools only ever read, only when a session asks, and
+never in the background.
+
+After installing the app, copy the **User OAuth Token** (`xoxp-...`) from
+**OAuth & Permissions** and store it with `kirocrew setup --slack` (the wizard
+offers it after the bot tokens and checks it with Slack), or under
+**Settings → Secrets** as `SLACK_USER_TOKEN`. It is kept in the encrypted vault,
+not in `.env`, and takes effect without a restart. Some workspaces require an
+admin to approve user scopes; if yours does, the install asks for approval and
+the tools report `missing_scope` until it is granted.
+
+Only your dashboard tabs, `kirocrew chat`, and your own 1:1 DM with the bot may
+use these tools. Scheduled runs, app sessions and shared channel conversations
+are refused, because what they read would reach other people. An enterprise
+policy can switch the capability off with
+`{"capabilities": {"slack_user_read": {"enabled": false}}}`. Delete the secret to
+revoke access; revoking the token in Slack does the same.
 
 ### Step 5. Subscribe to Events
 

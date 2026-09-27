@@ -2304,6 +2304,10 @@ default on; a deny makes the tool refuse outright, and it does NOT fall back to
 the `commands` scope, so denying browsing wholesale means denying both this
 capability AND the `playwright-cli` command),
 `capabilities.publish` (artifact publish chokepoint — see below),
+`capabilities.slack_user_read` (reading Slack with the operator's user token —
+opt-in row, enforced fail-closed at the `/api/slack-user/*` gateway routes before
+the token is read; see
+[slack-gateway](slack-gateway.md#reading-slack-as-the-operator-user-token)),
 `capabilities.agentcore` (opt-in agent workload identity + Gateway MCP —
 see below),
 `capabilities.theme_persona` / `capabilities.theme_install`,

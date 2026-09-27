@@ -483,6 +483,13 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/slack/pins",
         "/api/slack/reactions",
         "/api/slack-profile",  # MCP-only (slack_profile tool); no browser caller
+        # MCP-only (slack_search / slack_read / slack_list_conversations, which
+        # read Slack with the OPERATOR's user token); no browser caller. Prefix
+        # matching covers the three routes under it. STRICT, not mixed: these
+        # read the owner's DMs, so a forwarded browser must be hard-denied, and
+        # handlers/slack_user.py re-checks ``internal_auth`` itself because a
+        # loopback request without the secret still falls through to cookie auth.
+        "/api/slack-user",
         "/api/sessions/summarize",  # MCP-only (list_sessions summarize leg); internal-secret, no browser caller
         # MCP-only (session_ledger_read / session_ledger_record tools); no
         # browser caller. Prefix matching covers "/api/session-ledger/record".
@@ -1941,6 +1948,12 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/session-directive", handlers.api_session_directive)
     app.router.add_get("/api/session-tool-policy", handlers.api_session_tool_policy)
     app.router.add_post("/api/slack-profile", handlers.api_slack_profile)
+    # Read Slack as the operator (user token). Here rather than in the
+    # dashboard-only block so the headless ``--slack-only`` server serves the
+    # kirocrew-core tools too; authorization is in the handler module.
+    from kiro_crew.dashboard.handlers import slack_user as _slack_user_handlers
+
+    _slack_user_handlers.register(app)
     app.router.add_get("/api/notifications", handlers.api_notifications)
     app.router.add_post("/api/notifications/push", handlers.api_push_notification)
     app.router.add_post("/api/notifications/clear", handlers.api_notifications_clear)

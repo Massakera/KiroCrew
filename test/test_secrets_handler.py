@@ -72,8 +72,15 @@ class TestApiSecretsList:
     """Tests for GET /api/secrets."""
 
     def test_fixed_vault_consumer_registry_drives_catalog(self) -> None:
-        catalog = _managed_secret_catalog([], ["example.com"], True, True)
+        catalog = _managed_secret_catalog([], ["example.com"], True, True, slack_connected=True)
         assert {entry["name"] for entry in catalog} == set(MANAGED_VAULT_FIXED_CONSUMERS)
+
+    def test_slack_user_token_offered_when_slack_connected_or_stored(self) -> None:
+        slack = {"name": "SLACK_USER_TOKEN", "kind": "slack_user_token"}
+        assert slack not in _managed_secret_catalog([], [], False, False)
+        assert slack in _managed_secret_catalog([], [], False, False, slack_connected=True)
+        # Once stored it stays visible (and removable) even with the channel off.
+        assert slack in _managed_secret_catalog(["SLACK_USER_TOKEN"], [], False, False)
 
     def test_unused_stored_reasons_follow_runtime_applicability(self) -> None:
         assert _unused_stored_secrets(["WAKATIME_API_KEY"], [], False, False) == [

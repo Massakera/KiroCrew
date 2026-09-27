@@ -1774,6 +1774,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # bound for a third party -- so it is defensive input hygiene, not an egress
         # sink.
         "mcp_tools/browser.py",
+        # Inbound sanitization, same shape as the browser tool: the read-only
+        # user-token Slack reader scrubs message text, names and topics that
+        # OTHER PEOPLE wrote in Slack before the answer returns into the agent's
+        # context. It scrubs what comes IN, and nothing it produces leaves the
+        # machine -- so it is input hygiene, not an egress sink.
+        "slack/user_read.py",
         # Comparison-only: applies the redactors to compute a match identity and
         # discards the result. The two files being merged can hold the same
         # message with and without redaction, so a raw comparison would keep both

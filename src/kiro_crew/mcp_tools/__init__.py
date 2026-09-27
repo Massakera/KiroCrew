@@ -23,6 +23,7 @@ DOMAIN_MODULES: tuple[str, ...] = (
     "logs",
     "control",
     "messaging",
+    "slack",
     "artifacts",
     "knowledge",
     "sessions",

@@ -1317,6 +1317,16 @@ answers `tools/list` from):
     climbs process ancestors, so a sub-agent would resolve to its parent and
     deliver into the parent's chat window. An unresolvable identity refuses the
     call rather than guessing.
+- **Slack as the user (read-only):** `slack_search`, `slack_read`,
+  `slack_list_conversations` (`mcp_tools/slack.py`). Thin forwarders under the
+  strict identity gate to `/api/slack-user/*`, where the gateway holds the
+  operator's vault-stored user token, admits only caller classes whose answer
+  lands with the operator, and returns fenced untrusted content. In core rather
+  than an opt-in server because the model needs them unprompted ("what did we
+  agree on Slack?"), and because a new core tool rides whatever projection each
+  harness already has for `kirocrew-core` (a mirror, or the broker-only stubs for
+  droid and the like), so no mirror changes. Contract:
+  [slack-gateway](../system-specs/modules/slack-gateway.md#reading-slack-as-the-operator-user-token).
 - **Session-bound directives** (`session_directive.DIRECTIVE_TOOLS`):
   `ask_question`, `suggest_followup`, `monitor_start`, `monitor_watch`,
   `monitor_update`, `monitor_stop`, `autonudge_stop`, `set_project`,

@@ -514,6 +514,7 @@ export const SCOPE_LABEL_KEY: Record<string, string> = {
   'capabilities.cron': 'pages.settings.securityPanel.gov_scope_cron',
   'capabilities.spawn': 'pages.settings.securityPanel.gov_scope_spawn',
   'capabilities.messaging': 'pages.settings.securityPanel.gov_scope_messaging',
+  'capabilities.slack_user_read': 'pages.settings.securityPanel.gov_scope_slack_user_read',
   'capabilities.memory_writes': 'pages.settings.securityPanel.gov_scope_memory_writes',
   'capabilities.script_hooks': 'pages.settings.securityPanel.gov_scope_script_hooks',
   'capabilities.theme_persona': 'pages.settings.securityPanel.gov_scope_theme_persona',

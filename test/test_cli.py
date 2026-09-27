@@ -5406,6 +5406,7 @@ class TestSetupChannelGating:
         ):
             monkeypatch.setattr(cs, name, lambda *a, **k: None)
         monkeypatch.setattr(cs, "_setup_slack_tokens", lambda: calls.append("slack_tokens"))
+        monkeypatch.setattr(cs, "_setup_slack_user_token", lambda: calls.append("slack_user_token"))
         monkeypatch.setattr(cs, "_setup_slash_command", lambda: calls.append("slash_command"))
         monkeypatch.setattr(cs, "_setup_whatsapp", lambda: calls.append("whatsapp"))
         # Conductor-skill step catches Exception and continues.
@@ -5429,7 +5430,7 @@ class TestSetupChannelGating:
     def test_slack_flag_opts_into_slack_steps(self, tmp_path, monkeypatch):
         """--slack runs the guided Slack credential + slash-command steps in order."""
         calls = self._run_setup(monkeypatch, tmp_path, slack=True)
-        assert calls == ["slack_tokens", "slash_command"]
+        assert calls == ["slack_tokens", "slack_user_token", "slash_command"]
 
     def test_agent_only_with_slack_warns_and_skips_slack_steps(self, tmp_path, monkeypatch, capsys):
         """--agent-only --slack: no Slack steps run, but a notice explains why."""
@@ -5465,7 +5466,7 @@ class TestSetupChannelGating:
 
     def test_both_flags_run_both_guided_setups(self, tmp_path, monkeypatch):
         calls = self._run_setup(monkeypatch, tmp_path, slack=True, whatsapp=True)
-        assert calls == ["slack_tokens", "slash_command", "whatsapp"]
+        assert calls == ["slack_tokens", "slack_user_token", "slash_command", "whatsapp"]
 
     def test_the_whatsapp_flag_reaches_setup_from_the_command_line(self):
         """The wizard-level tests call ``_setup_impl`` directly, so the argparse

@@ -519,3 +519,69 @@ class TestRejectedOwnerIdKeepsVerifiedTokens:
             encoding="utf-8"
         ), "a still-valid owner ID was deleted because the operator mistyped once"
         assert "Keeping the saved member ID" in capsys.readouterr().out
+
+
+# ── Optional user token (read Slack as the operator) ─────────────────────────
+
+_USER_TOKEN = "xoxp-1111-2222-3333-abcdef"
+
+
+@pytest.fixture()
+def vault_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the vault the step writes at a tmp data home."""
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: tmp_path)
+    return tmp_path
+
+
+def _stored(home: Path) -> str | None:
+    from kiro_crew.secrets import SecretVault
+
+    secret = SecretVault(home).get("SLACK_USER_TOKEN")
+    return secret.reveal() if secret is not None else None
+
+
+def test_user_token_is_verified_and_stored_in_the_vault_not_env(
+    monkeypatch, fake_slack, vault_home, env_file, capsys
+):
+    _tty(monkeypatch, True)
+    _answers(monkeypatch, "y", _USER_TOKEN)
+    cs._setup_slack_user_token()
+    assert _stored(vault_home) == _USER_TOKEN
+    assert ("auth_test", _USER_TOKEN) in fake_slack.calls
+    assert not env_file.exists()
+    assert "Zibble Corp" in capsys.readouterr().out
+
+
+def test_a_bot_token_is_refused_and_re_asked(monkeypatch, fake_slack, vault_home):
+    _tty(monkeypatch, True)
+    _answers(monkeypatch, "y", "xoxb-1-2-3-bot", _USER_TOKEN)
+    cs._setup_slack_user_token()
+    assert _stored(vault_home) == _USER_TOKEN
+    assert ("auth_test", "xoxb-1-2-3-bot") not in fake_slack.calls
+
+
+def test_a_rejected_user_token_is_never_stored(monkeypatch, vault_home):
+    class Refusing(_FakeWebClient):
+        def auth_test(self) -> dict[str, object]:
+            raise _api_error("invalid_auth")
+
+    _install(monkeypatch, Refusing)
+    _tty(monkeypatch, True)
+    _answers(monkeypatch, "y", *([_USER_TOKEN] * cs._SLACK_VERIFY_ATTEMPTS))
+    cs._setup_slack_user_token()
+    assert _stored(vault_home) is None
+
+
+def test_declining_writes_nothing(monkeypatch, fake_slack, vault_home):
+    _tty(monkeypatch, True)
+    _answers(monkeypatch, "")
+    cs._setup_slack_user_token()
+    assert _stored(vault_home) is None and fake_slack.calls == []
+
+
+def test_off_a_terminal_the_step_asks_nothing(monkeypatch, fake_slack, vault_home, capsys):
+    _tty(monkeypatch, False)
+    _answers(monkeypatch)  # any input() call fails the test
+    cs._setup_slack_user_token()
+    assert _stored(vault_home) is None
+    assert "Settings → Secrets" in capsys.readouterr().out

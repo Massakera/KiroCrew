@@ -192,11 +192,12 @@ your own workspace.
    `app_mentions:read`, `channels:history`, `channels:read`, `chat:write`,
    `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`,
    `im:history`, `im:read`, `im:write`, `reactions:write`, and `users:read`.
-3. **Add User Token Scopes** if the same app supplies a user token to a
-   separately configured Slack MCP/search integration: `channels:history`,
-   `channels:read`, `groups:history`, `groups:read`, `im:history`, `im:read`,
-   `mpim:history`, `mpim:read`, `search:read`, and `users:read`. The gateway
-   does not consume this `xoxp-...` token.
+3. **Add User Token Scopes** (optional) so the agent can read Slack as you:
+   `channels:history`, `channels:read`, `groups:history`, `groups:read`,
+   `im:history`, `im:read`, `mpim:history`, `mpim:read`, `search:read`, and
+   `users:read`. After installing, store the User OAuth Token (`xoxp-...`) with
+   `kirocrew setup --slack` or as `SLACK_USER_TOKEN` under Settings → Secrets;
+   see [Reading Slack as you](#reading-slack-as-you).
 4. **Subscribe to bot events**: `message.im`, `message.channels`,
    `message.groups`, `app_mention`, `app_home_opened`, `file_change`, and
    `member_joined_channel`. Install or reinstall the app to grant the scopes and
@@ -205,6 +206,25 @@ your own workspace.
 6. **Slash command** (optional) — the command name is configurable via
    `slack.command` in config.json (default: `kirocrew`). Each app instance
    should use a unique name.
+
+## Reading Slack as you
+
+With a user token stored, the agent has three read-only tools that act as
+**you**, not the bot, so nobody is mentioned and no bot joins a conversation:
+
+- `slack_search` — Slack search across everything you can see, with the usual
+  syntax (`from:@name`, `in:#channel`, `in:@name`, `after:2026-09-01`,
+  `"exact phrase"`).
+- `slack_read` — a channel (`#name` or id), a DM (the person's `U…` id), or a
+  thread (paste the message link).
+- `slack_list_conversations` — the channels, DMs and group DMs you belong to.
+
+Ask naturally — "summarize the thread <link>", "what did we agree with Ana about
+the migration?" — and the agent looks it up. Reads happen only when a session
+asks; nothing is indexed or collected in the background. Message text is treated
+as untrusted content written by other people. Only your dashboard tabs, the CLI
+and your own 1:1 DM with the bot can use the tools; cron jobs, app sessions and
+shared channels are refused so a private DM is never republished to others.
 
 ## Settings page
 

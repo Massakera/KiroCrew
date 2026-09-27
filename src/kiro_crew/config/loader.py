@@ -411,12 +411,18 @@ CRED_FEISHU_APP_ID = "FEISHU_APP_ID"  # Feishu custom-app id (developer console)
 CRED_FEISHU_APP_SECRET = "FEISHU_APP_SECRET"
 CRED_JIRA_API_TOKEN = "JIRA_API_TOKEN"  # Jira Cloud/Server API token (resolved from .env)
 CRED_WAKATIME_API_KEY = "WAKATIME_API_KEY"  # vault-only; never loaded from .env
+# The operator's Slack USER token (xoxp-), read by the gateway's read-only Slack
+# tools (``slack/user_read.py``). Vault-only for the WakaTime reason: a value in
+# .env propagates into the gateway environment, and this token reads every DM
+# its owner can see.
+CRED_SLACK_USER_TOKEN = "SLACK_USER_TOKEN"
 CRED_AZURE_DEVOPS_EXT_PAT = "AZURE_DEVOPS_EXT_PAT"
 CRED_BITBUCKET_EMAIL = "BITBUCKET_EMAIL"
 CRED_BITBUCKET_API_TOKEN = "BITBUCKET_API_TOKEN"
 MANAGED_VAULT_FIXED_CONSUMERS = {
     CRED_JIRA_API_TOKEN: "jira_api_token",
     CRED_WAKATIME_API_KEY: "wakatime_api_key",
+    CRED_SLACK_USER_TOKEN: "slack_user_token",
 }
 # kiro-cli's OWN model credential. Unlike the gateway-owned channel tokens
 # above, its rightful consumer is the agent subprocess itself (and the whoami

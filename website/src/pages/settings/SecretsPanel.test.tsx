@@ -304,6 +304,24 @@ describe('SecretsPanel', () => {
     expect(screen.getByRole('button', { name: 'Add secret' })).toBeEnabled()
   })
 
+  it('labels the Slack user token slot and saves it under its canonical name', async () => {
+    const user = userEvent.setup()
+    listManaged = [{ name: 'SLACK_USER_TOKEN', kind: 'slack_user_token' } as unknown as ManagedSecret]
+    mount()
+    await screen.findByText('Slack user token')
+    expect(
+      screen.getByText(/Lets the agent search and read your DMs and channels on request, read-only/),
+    ).toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('Slack user token'), 'xoxp-test-value')
+    await user.click(screen.getByRole('button', { name: 'Save SLACK_USER_TOKEN' }))
+
+    await waitFor(() => {
+      const post = calls.find(c => c.method === 'POST')
+      expect(post?.body).toEqual({ name: 'SLACK_USER_TOKEN', value: 'xoxp-test-value' })
+    })
+  })
+
   it('clears Saved feedback when deletion starts', async () => {
     const user = userEvent.setup()
     listNames = ['JIRA_API_TOKEN']

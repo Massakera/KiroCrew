@@ -82,6 +82,12 @@ function resetIfAuthExpired(mutation: { error: unknown; reset: () => void }): vo
 }
 
 function managedCopy(kind: string) {
+  if (kind === 'slack_user_token') {
+    return {
+      label: i18nT('settings.secrets.slack_user_token_label'),
+      description: i18nT('settings.secrets.slack_user_token_description'),
+    }
+  }
   if (kind === 'wakatime_api_key') {
     return {
       label: i18nT('settings.secrets.wakatime_api_key_label'),
