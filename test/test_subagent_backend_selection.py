@@ -35,6 +35,20 @@ def _probe(state: str, command: str = "npm i -g x"):
     return probe
 
 
+@pytest.fixture
+def deepseek_dormant(monkeypatch):
+    """Take deepseek out of the selectable set for one test.
+
+    Upstream moved deepseek into the baseline and droid's selectability follows
+    ``KIROCREW_EXPERIMENTAL_BACKENDS`` on the host, so neither is dormant by
+    itself. Narrowing the live set keeps "a known but unselectable harness"
+    independent of both.
+    """
+    from kiro_crew.agent_sdk import backends as backends_mod
+
+    monkeypatch.setattr(backends_mod, "_selectable", set(backends_mod._selectable) - {"deepseek"})
+
+
 # ── vocabulary ──
 
 
@@ -59,6 +73,7 @@ class TestVocabulary:
         assert sb.check_spawn_backend("kiro") is None
 
     @pytest.mark.parametrize("name", ["nope", "deepseek"])
+    @pytest.mark.usefixtures("deepseek_dormant")
     def test_unknown_or_dormant_backend_is_refused_with_the_roster(self, name):
         refusal = sb.check_spawn_backend(name)
         assert refusal is not None
@@ -108,6 +123,7 @@ class TestSelectionGate:
         assert select_provider_backend("subagent:a1", "claude", "codex") == "codex"
         assert select_provider_backend("subagent:a1", "claude", "codex", None) == "codex"
 
+    @pytest.mark.usefixtures("deepseek_dormant")
     def test_unselectable_override_degrades_through_the_gate_and_says_so(self, caplog):
         from kiro_crew.members import select_provider_backend
 
@@ -141,10 +157,13 @@ class _Req:
         self.query: dict[str, str] = {}
         self.headers: dict[str, str] = {}
         self.remote = "127.0.0.1"
-        self._extra = {"app": ""}
+        self._extra = {"app": "", "user": "owner"}
 
     def __contains__(self, key: str) -> bool:
         return key in self._extra
+
+    def __getitem__(self, key: str) -> Any:
+        return self._extra[key]
 
     async def json(self) -> Any:
         return self._body
@@ -158,6 +177,7 @@ def _spawn_state() -> tuple[Any, MagicMock]:
     mgr.max_concurrent = 4
     mgr.spawn.return_value = SimpleNamespace(id="a9", done=False, error="", error_code="")
     state = MagicMock()
+    state.owner_id = "owner"
     state.subagents = mgr
     state.slack_client = None
     return state, mgr

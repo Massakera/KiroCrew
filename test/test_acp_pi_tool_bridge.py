@@ -228,6 +228,7 @@ class TestSpawnWiring:
         client._tool_call_tool_name = {}
         client._permission_options = {}
         client._pi_gate_asked_ids = set()
+        client._pi_gate_denied_ids = set()
         client._pi_gate_request_tool = {}
         client._pi_bridge_identity = BRIDGE
         frame = _frame(_bridge_envelope())

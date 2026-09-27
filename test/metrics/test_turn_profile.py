@@ -414,7 +414,10 @@ class TestServedBackendAttribution:
         from kiro_crew.dashboard import chat_runner
 
         src = inspect.getsource(chat_runner._run_chat)
-        assert "_provider_name = capabilities_of(client).provider_seam" in src
+        # The seam is still read off the client's capabilities; the fork folds a
+        # droid backend onto its own label via ``provider_for_completed_turn``.
+        assert "_caps = capabilities_of(client)" in src
+        assert "_provider_name = provider_for_completed_turn(_caps.provider_seam" in src
         assert "_provider_name = cfg.agent.provider" not in src
 
     def test_chat_runner_does_not_import_provider_label(self):
