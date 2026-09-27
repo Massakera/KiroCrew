@@ -26,6 +26,7 @@ from kiro_crew.config.loader import (
     CRED_OWNER_ID,
     CRED_SLACK_APP_TOKEN,
     CRED_SLACK_BOT_TOKEN,
+    CRED_SLACK_USER_TOKEN,
     ConfigReadError,
     _default_workspace_base,
     _workspace_dir_file,
@@ -440,6 +441,7 @@ def _setup_impl(
     if slack or whatsapp:
         if slack:
             _setup_slack_tokens()
+            _setup_slack_user_token()
 
             # 3b. Slash command name (Slack-only concept)
             _setup_slash_command()
@@ -885,6 +887,74 @@ def _setup_slack_tokens() -> None:
     # one command, and it could drop every in-flight session or spawn a gateway
     # nobody asked this wizard to start.
     print("  Restart the gateway to pick them up: kirocrew restart\n")
+
+
+def _setup_slack_user_token() -> None:
+    """Optionally store the operator's Slack USER token (``xoxp-``) in the vault.
+
+    The token is what lets the ``slack_search`` / ``slack_read`` /
+    ``slack_list_conversations`` tools read Slack as the operator, without a bot
+    in the conversation. It goes to the encrypted vault, never ``.env``: a
+    ``.env`` value is propagated into the gateway's environment, and this token
+    reads every DM its owner can see. The gateway reads it per request, so no
+    restart is needed.
+
+    Interactive only. Off a terminal (``kirocrew update`` re-runs setup with
+    stdin on ``/dev/null``) there is nobody to consent to granting the agent a
+    read of their DMs, so the step says how to do it later and stops.
+    """
+    from kiro_crew.config.paths import config_dir
+    from kiro_crew.secrets.vault import SecretVault
+    from kiro_crew.slack.user_read import is_user_token
+
+    print("── Read Slack as you (optional) ──\n")
+    if not _stdio_is_interactive():
+        print(
+            "  ⏭  Skipped (not a terminal). Run 'kirocrew setup --slack' interactively, "
+            "or add SLACK_USER_TOKEN under Settings → Secrets.\n"
+        )
+        return
+    vault = SecretVault(config_dir())
+    try:
+        stored = vault.get(CRED_SLACK_USER_TOKEN) is not None
+    except Exception:
+        stored = False
+    print(
+        "  With your User OAuth Token (xoxp-…, Slack app → OAuth & Permissions), the\n"
+        "  agent can search and read your DMs and channels on request, as you —\n"
+        "  read-only, and never in the background. It is stored in the encrypted vault.\n"
+    )
+    status = " (a token is already stored)" if stored else ""
+    answer = input(f"  Store a Slack user token{status}? [y/N]: ").strip().lower()
+    if answer not in ("y", "yes"):
+        print("  ⏭  Skipped.\n")
+        return
+    for _attempt in range(_SLACK_VERIFY_ATTEMPTS):
+        token = input("  User Token (xoxp-...): ").strip()
+        if not token:
+            print("  ⏭  Nothing entered; no change.\n")
+            return
+        if not is_user_token(token):
+            print("  ❌ That is not a user token — it must start with xoxp-.")
+            continue
+        verdict, detail = _verify_slack_secret(CRED_SLACK_USER_TOKEN, token)
+        if verdict is False:
+            print(f"  ❌ Slack rejected the user token: {detail}")
+            continue
+        if verdict is None:
+            print(f"  ⚠️  Could not reach Slack to check the token ({detail}) — saved as typed.")
+        elif detail:
+            print(f"  ✅ User token verified — workspace: {detail}")
+        try:
+            vault.set_sync(CRED_SLACK_USER_TOKEN, token)
+        except Exception as exc:
+            print(f"  ⚠️  Could not write the vault ({type(exc).__name__}); token not saved.\n")
+            return
+        print("  ✅ Stored in the vault. Remove it any time under Settings → Secrets.\n")
+        return
+    print(
+        f"  ⚠️  No valid user token after {_SLACK_VERIFY_ATTEMPTS} attempts — nothing was saved.\n"
+    )
 
 
 def _setup_whatsapp() -> None:

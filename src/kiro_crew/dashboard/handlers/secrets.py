@@ -10,6 +10,7 @@ from aiohttp import web
 
 from kiro_crew.config.loader import (
     CRED_JIRA_API_TOKEN,
+    CRED_SLACK_USER_TOKEN,
     CRED_WAKATIME_API_KEY,
     MANAGED_VAULT_FIXED_CONSUMERS,
     KiroCrewConfig,
@@ -99,6 +100,8 @@ def _managed_secret_catalog(
     jira_hosts: list[str],
     jira_global_applicable: bool,
     wakatime_enabled: bool,
+    *,
+    slack_connected: bool = False,
 ) -> list[dict[str, str]]:
     """Describe managed vault names the current integration config can consume.
 
@@ -107,9 +110,20 @@ def _managed_secret_catalog(
     stored, because the runtime gives it precedence over the global fallback.
     Values and configured state are not duplicated here: callers already receive
     the complete ``names`` membership list in the same response.
+
+    The Slack user token is offered once the Slack channel is connected, since
+    that is the app whose User OAuth Token it is, and always listed once stored
+    so an operator who set it up without the bot can still see and remove it.
     """
     name_set = set(names)
     catalog: list[dict[str, str]] = []
+    if slack_connected or CRED_SLACK_USER_TOKEN in name_set:
+        catalog.append(
+            {
+                "name": CRED_SLACK_USER_TOKEN,
+                "kind": MANAGED_VAULT_FIXED_CONSUMERS[CRED_SLACK_USER_TOKEN],
+            }
+        )
     if wakatime_enabled:
         catalog.append(
             {
@@ -257,6 +271,7 @@ async def api_secrets_list(request: web.Request) -> web.Response:
             jira_hosts,
             jira_global_applicable,
             wakatime_enabled,
+            slack_connected=bool(getattr(request.app["state"], "slack_client", None)),
         ),
     }
     unused = _unused_stored_secrets(

@@ -941,6 +941,7 @@ REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
         "mcp_tools/messaging.py",
         "mcp_tools/sessions.py",
         "mcp_tools/skills.py",
+        "mcp_tools/slack.py",
         "mcp_tools/workflows.py",
     }
 )

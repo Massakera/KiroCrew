@@ -3253,6 +3253,43 @@ READ_SLACK_PROFILE_SCHEMA = ToolSchema(
     ],
 )
 
+# The read-only "Slack as the user" tools (mcp_tools/slack.py). Bounds mirror
+# the gateway's own clamps in slack/user_read.py, so a malformed call is refused
+# before the HTTP hop rather than silently clamped behind it.
+_SLACK_KIND_RE = re.compile(r"^(channel|private_channel|dm|group_dm)$")
+
+SLACK_SEARCH_SCHEMA = ToolSchema(
+    tool_name="slack_search",
+    fields=[
+        FieldSpec("query", str, required=True, max_len=500),
+        FieldSpec("count", int, min_val=1, max_val=50),
+        FieldSpec("page", int, min_val=1, max_val=100),
+        FieldSpec("sort", str, allowed=frozenset({"score", "timestamp"})),
+    ],
+)
+
+SLACK_READ_SCHEMA = ToolSchema(
+    tool_name="slack_read",
+    fields=[
+        FieldSpec("conversation", str, required=True, max_len=500),
+        FieldSpec("thread_ts", str, max_len=32),
+        FieldSpec("limit", int, min_val=1, max_val=200),
+        FieldSpec("since", str, max_len=64),
+        FieldSpec("until", str, max_len=64),
+        FieldSpec("cursor", str, max_len=512),
+    ],
+)
+
+SLACK_LIST_CONVERSATIONS_SCHEMA = ToolSchema(
+    tool_name="slack_list_conversations",
+    fields=[
+        FieldSpec("query", str, max_len=80),
+        FieldSpec("types", list, item_type=str, item_pattern=_SLACK_KIND_RE, max_items=4),
+        FieldSpec("limit", int, min_val=1, max_val=200),
+        FieldSpec("cursor", str, max_len=512),
+    ],
+)
+
 WAIT_SCHEMA = ToolSchema(
     tool_name="wait",
     fields=[
@@ -3485,6 +3522,9 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "send_message": SEND_MESSAGE_SCHEMA,
     "send_notification": SEND_NOTIFICATION_SCHEMA,
     "read_slack_profile": READ_SLACK_PROFILE_SCHEMA,
+    "slack_search": SLACK_SEARCH_SCHEMA,
+    "slack_read": SLACK_READ_SCHEMA,
+    "slack_list_conversations": SLACK_LIST_CONVERSATIONS_SCHEMA,
     "wait": WAIT_SCHEMA,
     "register_hook": REGISTER_HOOK_SCHEMA,
     "file_send": FILE_SEND_SCHEMA,

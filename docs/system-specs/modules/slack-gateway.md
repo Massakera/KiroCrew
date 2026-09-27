@@ -162,10 +162,78 @@ turns and thread continuation are delivered.
 
 The manifest also requests user scopes `channels:history`, `channels:read`,
 `groups:history`, `groups:read`, `im:history`, `im:read`, `mpim:history`,
-`mpim:read`, `search:read`, and `users:read`. These scopes apply only to a
-separately configured Slack MCP/search integration's `xoxp-...` token. The
-gateway constructs every Slack client with `SLACK_BOT_TOKEN`; it does not read
-or store the user token.
+`mpim:read`, `search:read`, and `users:read`. They belong to the installing
+user's `xoxp-...` token, which only the read-only user-token reader consumes
+(see [Reading Slack as the operator](#reading-slack-as-the-operator-user-token)).
+The Socket Mode gateway, the renderer and every bot-side call are constructed
+with `SLACK_BOT_TOKEN` and never touch the user token.
+
+### Reading Slack as the operator (user token)
+
+The bot sees only conversations it was invited to. `slack/user_read.py` reads
+with the operator's own user token instead, so an agent can find context the
+operator already has — DMs, group DMs, channels they belong to, workspace
+search — without a bot being added anywhere. Three `kirocrew-core` tools
+(`mcp_tools/slack.py`) forward to three strict-internal gateway routes
+(`dashboard/handlers/slack_user.py`, registered in `_register_mcp_routes` so the
+headless server serves them too):
+
+| Tool | Route | Slack methods |
+|---|---|---|
+| `slack_search` | `POST /api/slack-user/search` | `search.messages` |
+| `slack_read` | `POST /api/slack-user/read` | `conversations.info`, `conversations.history` / `conversations.replies`, `users.conversations` (name / DM lookup) |
+| `slack_list_conversations` | `POST /api/slack-user/conversations` | `users.conversations` |
+
+`users.info` names authors and mentions for all three. Contract:
+
+- **Read-only by construction.** Every request goes through one `_call` that
+  refuses any method outside `user_read.READ_METHODS`; that set is the whole
+  write-surface review, and a test asserts none of its verbs writes.
+- **On demand.** No cache, index, poll or persisted copy. Name lookups are
+  memoized for one answer only, and a fresh reader is built per request.
+- **Token custody.** `SLACK_USER_TOKEN` lives only in the encrypted vault
+  (`MANAGED_VAULT_FIXED_CONSUMERS` kind `slack_user_token`), read per request,
+  never from `.env` or the environment (a `.env` value propagates into the
+  gateway environment). It must be a user token (`xoxp-` / `xoxe.xoxp-`); a bot
+  token is refused. Stored by `kirocrew setup --slack` (interactive only, verified
+  with `auth.test`) or under Settings → Secrets, which offers the slot once Slack
+  is connected and always lists it once stored.
+- **Who may read.** The routes are on `_STRICT_INTERNAL_API_PATHS` and re-check
+  `internal_auth`. The caller is the `X-Session-Key` the strict MCP identity gate
+  resolved; a subagent is judged by the root of its dispatch chain. Admitted: the
+  owner's dashboard tabs, `cli_chat`, and the owner's own 1:1 DM with the bot
+  (`session_control.owner_dm_refusal`: roster names the peer as sole owner and the
+  mirror is the DM itself). Refused: unattended runs (cron, workflow, taskrunner),
+  app-owned sessions and app-spawned subagents, any other channel session, a tab
+  linked to a channel that is not that DM, a tab mirrored to a channel, and any
+  key the gateway cannot place. The reasons are about where the answer lands: a
+  channel conversation would republish a private DM to its audience.
+- **Governance.** `capabilities.slack_user_read` (opt-in capability row) is
+  consulted fail-closed after the caller check and before the token is read.
+- **Egress.** The client is pinned to `https://slack.com/api/`; a permalink is
+  accepted only on a `*.slack.com/archives/` URL.
+- **Bounds.** Search 1–50 per page; history/thread 1–200 messages; per-message
+  text 3000 chars; 40k chars of text per answer; 40 name lookups per answer.
+  Every cut sets `truncated`. History is returned oldest-first and
+  `next_cursor` pages toward older messages.
+- **Rate limits.** A 429 whose `Retry-After` is ≤ 10 s is waited out once;
+  a longer one answers 429 with `retry_after` for the agent to relay.
+- **Untrusted content.** Text is run through `redact_credentials` and
+  `redact_exfiltration_urls` at the gateway. The MCP tools return it inside a
+  per-call nonce fence (`<<<BEGIN_UNTRUSTED_SLACK_<nonce>>>`) preceded by a notice
+  that it is data written by other people, and defang directive markers inside it.
+- **Audit.** Every outcome is a SEL `tool_invocation` with
+  `downstream_service="slack"`; resources carry the conversation id and counts,
+  never query text or message content.
+- **Error codes** (JSON `code`): `forbidden`, `caller_not_permitted`,
+  `governance_denied`, `invalid_json`, `invalid_argument`,
+  `slack_user_token_missing`, `slack_user_token_invalid`,
+  `slack_user_token_rejected`, `missing_scope`, `conversation_not_found`,
+  `rate_limited`, `slack_api_error`, `slack_unreachable`.
+
+Whether a workspace lets a member grant user scopes without admin approval is a
+workspace setting, not something this module can detect; a refused install
+surfaces as `missing_scope` or `not_allowed_token_type` at the first call.
 
 ### `run_gateway(cfg: KiroCrewConfig, *, no_dashboard=False, no_crons=False) -> None`
 Starts the Socket Mode listener. Blocks until SIGINT/SIGTERM. When `no_crons=True`, the `CronService` is instantiated but not started — cron jobs are visible in the dashboard but not executed. Use for multi-instance setups where a single primary instance handles cron execution. On shutdown, calls `dashboard_state.close_all_ws()` before `AppRunner.cleanup()` to prevent 30s hang from blocked WebSocket `async for msg` loops.

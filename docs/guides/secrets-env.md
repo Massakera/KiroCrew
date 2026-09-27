@@ -51,7 +51,10 @@ be read, stored names are still returned and `managed_error` is `true`; the
 dashboard surfaces that non-fatal warning instead of misrepresenting the empty
 catalog as “no managed integrations enabled.”
 `WAKATIME_API_KEY` is advertised only when `config.wakatime.enabled` is true,
-matching the client-construction gate. With exactly one raw configured Jira
+matching the client-construction gate. `SLACK_USER_TOKEN` (kind `slack_user_token`, the
+token the read-only Slack tools use to read Slack as you) is advertised once the
+Slack channel is connected and stays listed whenever it is stored; it is
+vault-only, so a same-named `.env` line is not read. With exactly one raw configured Jira
 entry whose normalized host is non-empty, the global `JIRA_API_TOKEN` slot is
 advertised.
 With multiple entries, only each normalized host's exact `JIRA_TOKEN_<HEX>` slot

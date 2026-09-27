@@ -1343,6 +1343,17 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     "capabilities.script_hooks": ScopeSpec(CAPABILITY, capability_default=False),
     "capabilities.cron": ScopeSpec(CAPABILITY, capability_default=False),
     "capabilities.messaging": ScopeSpec(CAPABILITY, capability_default=False),
+    # Reading Slack AS THE OPERATOR (``slack_search`` / ``slack_read`` /
+    # ``slack_list_conversations``, served by ``dashboard/handlers/slack_user.py``
+    # with the operator's own user token). An ingestion surface rather than an
+    # egress one: it puts the operator's DMs and channels -- text anyone in the
+    # workspace can author -- into the model's context. Opt-in like messaging, so
+    # a policy that names the row to configure it without stating ``enabled``
+    # resolves to denied; an unnamed row stays ungoverned and permitted (see the
+    # CAPABILITY-DEFAULT CONTRACT above), and the feature is still inert until the
+    # operator stores a token. Enforced fail-closed at the gateway route. Data row
+    # only — CONTRACT_VERSION and the evaluator are untouched.
+    "capabilities.slack_user_read": ScopeSpec(CAPABILITY, capability_default=False),
     # Agent workload identity + Gateway MCP (opt-in, like messaging/publish).
     # Inner ``posture`` is policy data (``workload`` | ``login``), not a second
     # scope and not an evaluator input. An ``enabled: true`` document with a

@@ -2722,6 +2722,11 @@ dashboard token auth.
 `allowed_users` / `open_channels` are intentionally not exposed while the
 runtime enforces owner-only access.
 
+Reading Slack **as the operator** (the user token, not the bot) is not a
+transport concern and has no settings panel: it is three read-only
+`kirocrew-core` tools behind `/api/slack-user/*`, specified in
+[slack-gateway](slack-gateway.md#reading-slack-as-the-operator-user-token).
+
 ## Discord channel
 
 **Transport (`kiro_crew/discord/`).** A concrete `MessagingTransport` over a
