@@ -295,7 +295,7 @@ class TestRosterIsAdvertisedOnSpawnRun:
         many = _agents(*[f"agent-{i:02d}" for i in range(spawn_tools._MAX_ROSTER_NAMES + 4)])
         desc = self._schema(many)["spawn_run"]["inputSchema"]["properties"]["agent"]["description"]
         assert "+4 more" in desc
-        assert "agent-11" not in desc
+        assert f"agent-{spawn_tools._MAX_ROSTER_NAMES:02d}" not in desc
 
     def test_an_unreadable_agents_dir_still_advertises_the_tool(self) -> None:
         with patch.object(spawn_tools.mcp_core, "list_agents", side_effect=OSError("boom")):

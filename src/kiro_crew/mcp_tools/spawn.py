@@ -34,6 +34,7 @@ from kiro_crew.execution_context import read_session_execution
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.session_directive import neutralize_markers
 from kiro_crew.solo_spawn import (
     SOLO_SPAWN_REASON_GLOSS,
     SOLO_SPAWN_REASONS,
@@ -69,8 +70,15 @@ logger = logging.getLogger(__name__)
 
 # Roster carried in the spawn_run parameter descriptions. Kept small on purpose:
 # a tool description is always-on context in every session, so this buys
-# self-correction for a few dozen characters, not a full agent listing.
-_MAX_ROSTER_NAMES = 8
+# self-correction for a bounded few hundred characters, not a full agent
+# listing (spawn_list is that).
+_MAX_ROSTER_NAMES = 12
+
+# Per-entry bounds on the purpose line an agent's spec contributes to a roster.
+# The description is free text from a shared directory, so it is flattened to
+# one line and capped before it reaches a model.
+_MAX_PURPOSE_CHARS = 160
+_MAX_PURPOSE_MODEL_CHARS = 48
 
 _BACKEND_REFUSAL_CODES = frozenset({UNKNOWN_BACKEND_CODE, BACKEND_UNAVAILABLE_CODE})
 
@@ -143,8 +151,78 @@ def _parent_allowlist_filter(names: Iterable[str]) -> tuple[list[str], bool]:
     return [n for n in names if all(agent_matches_allowlist(n, al) for al in allowlists)], True
 
 
-def _agent_roster_hint() -> str:
+def _one_line(text: object, limit: int) -> str:
+    """*text* flattened to one printable, marker-free, redacted line of at most *limit*."""
+    if not isinstance(text, str):
+        return ""
+    flat = " ".join("".join(c if c.isprintable() else " " for c in text).split())
+    flat = redact(neutralize_markers(flat))
+    if len(flat) > limit:
+        flat = flat[: limit - 1].rstrip() + "…"
+    return flat
+
+
+def _agent_purpose(info: Any) -> str:
+    """What an installed agent is for, from its spec's description and model, or ``""``."""
+    desc = _one_line(getattr(info, "description", ""), _MAX_PURPOSE_CHARS)
+    model = _one_line(getattr(info, "model", ""), _MAX_PURPOSE_MODEL_CHARS)
+    if model.lower() == "auto":
+        model = ""
+    return " ".join(part for part in (desc, f"[{model}]" if model else "") if part)
+
+
+def _roster_order(agents: Iterable[Any]) -> list[Any]:
+    """Operator-authored agents first, then Kiro Crew's own specs, each by declared name.
+
+    A bounded roster sorted by name alone spends its slots on Kiro Crew's helper
+    specs (``kirocrew-guest``, ``kirocrew-lite``, ...), which no delegated task is
+    routed to, and withholds the operator's own profiles behind "+N more".
+    """
+    return sorted(
+        (a for a in agents if getattr(a, "name", "")),
+        key=lambda a: (bool(getattr(a, "kirocrew_owned", False)), a.name),
+    )
+
+
+def _roster_purposes(
+    declared: Iterable[str],
+    infos: Mapping[str, Any],
+    count: int | None,
+    *,
+    exclude: Iterable[str] | None = None,
+) -> list[str]:
+    """``"<name>: <purpose>"`` for the first *count* renderable names that have one.
+
+    Each name goes through :func:`visible_agent_names` on its own, so a purpose is
+    rendered under exactly the name (grammar-filtered, redacted) the roster shows,
+    and the filter is not re-implemented here.
+    """
+    lines: list[str] = []
+    kept = 0
+    for name in declared:
+        if count is not None and kept >= count:
+            break
+        rendered = (
+            visible_agent_names([name])[0]
+            if exclude is None
+            else visible_agent_names([name], exclude=frozenset(exclude))[0]
+        )
+        if not rendered:
+            continue
+        kept += 1
+        purpose = _agent_purpose(infos.get(name))
+        if purpose:
+            lines.append(f"{rendered[0]}: {purpose}")
+    return lines
+
+
+def _agent_roster_hint(*, with_purposes: bool = False) -> str:
     """Valid agent names, for the ``agent``/``agents`` parameter descriptions.
+
+    *with_purposes* appends one line per shown agent saying what it is for (its
+    spec's description and model). Without it the caller that most needs a
+    specialist -- one delegating a read-only investigation -- sees only names,
+    omits ``agent``, and gets the general default agent with every tool.
 
     The roster is otherwise reachable only through ``spawn_list``'s OUTPUT, so a
     caller that goes straight to ``spawn_run`` never sees it and invents
@@ -184,15 +262,17 @@ def _agent_roster_hint() -> str:
     else:
         return ""
     try:
-        # Sorted by DECLARED name, before redaction, so the order matches the
-        # refusal roster's and a credential-shaped name is rewritten in place
+        # Sorted by DECLARED name (operator agents first, see _roster_order),
+        # before redaction, so a credential-shaped name is rewritten in place
         # rather than re-sorted into a different slot. Names the parent agent's
         # spec forbids spawning are dropped FIRST: advertising them would send
         # the model straight into the gate's refusal.
-        names, restricted = _parent_allowlist_filter(
-            sorted(a.name for a in mcp_core.list_agents() if a.name)
-        )
+        infos = _roster_order(mcp_core.list_agents())
+        names, restricted = _parent_allowlist_filter(a.name for a in infos)
         shown, withheld = visible_agent_names(names, limit=_MAX_ROSTER_NAMES)
+        purposes = (
+            _roster_purposes(names, {a.name: a for a in infos}, len(shown)) if with_purposes else []
+        )
     except Exception:
         return ""  # never let a directory read break the tool advertisement
     if not shown:
@@ -210,7 +290,14 @@ def _agent_roster_hint() -> str:
         hint += f" (+{withheld} more)"
     if restricted:
         hint += " (restricted by this agent's toolsSettings.subagent.availableAgents)"
-    return hint + "."
+    hint += "."
+    if purposes:
+        hint += (
+            " Name the agent whose purpose fits the task; omitting agent runs the "
+            "general default agent with its full tool set. What each is for:\n- "
+            + "\n- ".join(purposes)
+        )
+    return hint
 
 
 def _backend_roster_hint() -> str:
@@ -272,6 +359,9 @@ def schemas() -> list[dict[str, Any]]:
     # The valid agent names, read once and shared by every agent-taking field
     # below, so a caller that never called spawn_list still sees them.
     _agent_hint = _agent_roster_hint()
+    # Purposes ride spawn_run's ``agent`` field only: both spawn tools sit in the
+    # same tool list, so one copy informs either call without doubling the cost.
+    _agent_purpose_hint = _agent_roster_hint(with_purposes=True)
     _backend_hint = _backend_roster_hint()
     # Context-scope switches, shared by spawn_run and spawn_sub_agents so the
     # rule cannot drift between them. The model reads these descriptions at
@@ -374,7 +464,7 @@ def schemas() -> list[dict[str, Any]]:
                             "never silently replaced by the default, so use a name from "
                             "this list (or spawn_list) instead of guessing."
                         )
-                        + _agent_hint,
+                        + _agent_purpose_hint,
                     },
                     "crew": {
                         "type": "string",
@@ -1264,10 +1354,16 @@ def spawn_list(name: str, args: dict[str, Any]) -> str:
     # elsewhere because it is reached by omitting ``agent`` -- but it is still a
     # name the gateway accepts, so a full listing shows it.
     try:
-        names, restricted = _parent_allowlist_filter(a.name or "" for a in mcp_core.list_agents())
-        names, _ = visible_agent_names(names, exclude=())
+        infos = list(mcp_core.list_agents())
+        declared, restricted = _parent_allowlist_filter(a.name or "" for a in infos)
+        names, _ = visible_agent_names(declared, exclude=())
         if names:
             lines.append(f"\nAvailable agents: {', '.join(names)}")
+            purposes = _roster_purposes(
+                declared, {a.name: a for a in infos if a.name}, None, exclude=()
+            )
+            if purposes:
+                lines.append("What each is for:\n- " + "\n- ".join(purposes))
         if restricted:
             lines.append(
                 "(restricted to this agent's toolsSettings.subagent.availableAgents; "

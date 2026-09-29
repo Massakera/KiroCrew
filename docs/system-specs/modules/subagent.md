@@ -635,6 +635,19 @@ declaration forbids and say so
 server resolves its own session's template best-effort and filters nothing
 when it cannot — and the gate above is the decision.
 
+The bounded roster (`_MAX_ROSTER_NAMES`) lists operator-authored agents before
+Kiro Crew's own specs (`AgentInfo.kirocrew_owned`, `_roster_order`), so the
+helper specs no task is routed to do not push the operator's profiles into
+"+N more". `spawn_run`'s `agent` field also carries a "What each is for" line
+per shown agent (`_roster_purposes`): the spec's `description` plus its
+`model` when it is not `auto`, flattened to one printable line, with session
+markers defanged, redacted and capped (`_MAX_PURPOSE_CHARS`). A name that
+fails the roster grammar never carries its description in. A caller that
+sees only names tends to omit `agent` and get the default agent with its full
+tool set. `spawn_sub_agents` keeps the names-only roster because both tools
+are in the same tool list. `spawn_list` prints the same purpose lines for
+every listed agent.
+
 Spawn flow:
 1. **YOLO mode**: skips approval, runs immediately
 2. **Parent trusted**: parent session has `approval_policy="auto"` (set by
