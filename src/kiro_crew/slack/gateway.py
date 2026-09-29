@@ -11772,6 +11772,11 @@ class GatewayOrchestrator:
         agents_source_dir = kiro_agents_dir()
         workspace_default = _session_work_dir(None)
 
+        from kiro_crew.investigations import prepublish_readonly_spec
+
+        await asyncio.get_running_loop().run_in_executor(
+            maintenance_executor(), prepublish_readonly_spec
+        )
         try:
             # rewrite_agents() walks ~/.kiro/agents, parses every JSON spec and
             # rewrites the overlay — pure-sync file I/O.  Offload to the bounded

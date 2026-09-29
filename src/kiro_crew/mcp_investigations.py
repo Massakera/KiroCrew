@@ -1,16 +1,25 @@
-"""Stateless MCP client for the optional local investigations extension."""
+"""Stateless MCP server for the optional local service investigations app.
+
+Served as the opt-in managed server ``kirocrew-investigations``. The routes it
+calls belong to the ``service-investigations`` app, so with the app disabled every
+call returns the gateway's refusal.
+"""
 
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from kiro_crew.mcp_core import _post, require_strict_session_key
 from kiro_crew.mcp_shared import run_mcp_stdio_loop
 
 SERVER_NAME = "kirocrew-investigations"
+SERVER_VERSION = "1.0.0"
+ADVERTISE_CALLER_IDENTITY = True
+_ROUTE = "/api/apps/service-investigations/investigations"
 
 
-def list_tools() -> list[dict]:
+def _list_tools() -> list[dict[str, Any]]:
     return [
         {
             "name": "investigation",
@@ -43,7 +52,7 @@ def list_tools() -> list[dict]:
     ]
 
 
-def call_tool(name: str, args: dict) -> str:
+def _call_tool(name: str, args: dict[str, Any]) -> str:
     if name != "investigation":
         return json.dumps({"error": "Unknown tool."})
     key, error = require_strict_session_key(
@@ -51,7 +60,7 @@ def call_tool(name: str, args: dict) -> str:
     )
     if not key:
         return json.dumps({"error": error})
-    payload = _post("/api/apps/service-investigations/investigations", args, session_key=key)
+    payload = _post(_ROUTE, args, session_key=key)
     if "error" not in payload:
         if args.get("action") == "list":
             payload = {
@@ -73,5 +82,16 @@ def call_tool(name: str, args: dict) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def run_mcp_server() -> None:
+    """Run the MCP stdio server -- reads JSON-RPC from stdin, writes to stdout."""
+    run_mcp_stdio_loop(
+        SERVER_NAME,
+        SERVER_VERSION,
+        _list_tools,
+        _call_tool,
+        advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
+    )
+
+
 if __name__ == "__main__":
-    run_mcp_stdio_loop(SERVER_NAME, "1.0.0", list_tools, call_tool, advertise_caller_identity=True)
+    run_mcp_server()

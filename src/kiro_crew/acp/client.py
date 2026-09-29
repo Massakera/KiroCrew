@@ -704,6 +704,9 @@ _PI_MANAGED_BRIDGE_TOOLS: dict[str, tuple[str, ...]] = {
         "chat_folder_create",
         "chat_folder_file_self",
     ),
+    # The service investigator reports through it, and a session granted the set
+    # starts and follows investigations.
+    "kirocrew-investigations": ("investigation",),
 }
 # Named once per process: a gateway whose broker does not stub Crew's server says
 # why pi sessions carry no Crew tools once, not on every spawn.

@@ -366,6 +366,50 @@ async def test_prepare_refuses_other_harness_without_switching(policy_run, monke
     assert cfg.agent.acp_backend == "codex"
 
 
+def test_pi_runs_investigations_only_when_managed():
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO, ACP_BACKEND_PI
+    from kiro_crew.investigations import backend_refusal
+
+    assert backend_refusal(SimpleNamespace(acp_backend=ACP_BACKEND_KIRO)) == ""
+    assert backend_refusal(SimpleNamespace(acp_backend=ACP_BACKEND_PI, pi_managed=True)) == ""
+    assert "pi_managed" in backend_refusal(
+        SimpleNamespace(acp_backend=ACP_BACKEND_PI, pi_managed=False)
+    )
+    assert "has not been changed" in backend_refusal(
+        SimpleNamespace(acp_backend="codex", pi_managed=True)
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "enabled", "published"),
+    [("pi", True, True), ("pi", False, False), ("codex", True, False)],
+)
+def test_prepublish_readonly_spec_follows_backend_and_app(monkeypatch, backend, enabled, published):
+    from kiro_crew import investigations
+
+    calls = []
+    monkeypatch.setattr(
+        "kiro_crew.config.loader.KiroCrewConfig.load",
+        lambda: SimpleNamespace(agent=SimpleNamespace(acp_backend=backend, pi_managed=True)),
+    )
+    monkeypatch.setattr("kiro_crew.apps.manager.is_app_enabled", lambda name: enabled)
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.side_readonly_spec.publish_readonly_spec", calls.append
+    )
+    investigations.prepublish_readonly_spec()
+    assert calls == ([investigations.INVESTIGATOR_AGENT] if published else [])
+
+
+def test_prepublish_readonly_spec_never_raises(monkeypatch):
+    from kiro_crew import investigations
+
+    def boom():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", boom)
+    investigations.prepublish_readonly_spec()
+
+
 def test_installed_agent_derives_with_mcp_mounted_and_no_grants(tmp_path, monkeypatch):
     from kiro_crew import agent
     from kiro_crew.apps import bridges
@@ -380,11 +424,7 @@ def test_installed_agent_derives_with_mcp_mounted_and_no_grants(tmp_path, monkey
     monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", registry)
     monkeypatch.setattr(bridges, "_mcp_json_path", lambda: tmp_path / "mcp.json")
     monkeypatch.setattr(bridges, "_agent_mcp_policy", lambda name: {})
-    monkeypatch.setattr(
-        bridges,
-        "_own_mcp_servers",
-        lambda name: {f"{name}:investigations": manifest.mcpServers["investigations"]},
-    )
+    monkeypatch.setattr(bridges, "_own_mcp_servers", lambda name: {})
     monkeypatch.setattr(bridges, "schedule_materialized_agents_refresh", lambda: None)
     monkeypatch.setattr(side_readonly_spec, "_refresh_materialized_snapshot", lambda: None)
     assert manifest.validate(root) == []
@@ -393,8 +433,8 @@ def test_installed_agent_derives_with_mcp_mounted_and_no_grants(tmp_path, monkey
     spec = json.loads((registry / f"{published.name}.json").read_text())
     assert spec["allowedTools"] == []
     assert spec["includeMcpJson"] is False
-    assert "@service-investigations:investigations" in spec["tools"]
-    assert "service-investigations:investigations" in spec["mcpServers"]
+    assert "@kirocrew-investigations" in spec["tools"]
+    assert "kirocrew-investigations" in spec["mcpServers"]
     assert all("autoApprove" not in server for server in spec["mcpServers"].values())
 
 

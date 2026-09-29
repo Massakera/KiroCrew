@@ -332,6 +332,12 @@ OPERATOR_LINES: Tuple[_LineSpec, ...] = (
 #: DEFECT rather than an absent feature, and a card that listed defect classes in
 #: front of someone choosing a harness would be worse than one line shorter.
 OFF_CARD_SETS: Mapping[str, str] = {
+    "ACP_BACKENDS_INVESTIGATIONS": (
+        "whether the optional service-investigations app may run an investigation. "
+        "It serves one installed app, not every user choosing a harness, and pi's "
+        "membership also depends on agent.pi_managed, which a static card line cannot "
+        "state; the app refuses the turn itself, naming what to change"
+    ),
     "ACP_BACKENDS_MEMBER_PANEL": (
         "whether a member DM session may mount its own webview. Its membership is the "
         "same as ACP_BACKENDS_MEMBER_DISPATCH's, and the member-thread-tools line "

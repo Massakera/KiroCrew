@@ -933,6 +933,10 @@ _MIXED_INTERNAL_API_PATHS = frozenset(
         # anything holding the internal secret. This route is local-only triage
         # state — no forge write, no shared ledger.
         "/api/apps/issue-radar/investigation",
+        # The ``kirocrew-investigations`` MCP tool. The handler binds an
+        # internal caller to its own live slot (``X-Session-Key``) and refuses
+        # a private-owner surface itself, so the secret alone opens nothing.
+        "/api/apps/service-investigations/investigations",
         # Ops Mission Control agent surface — the routes the app's SOP-driven
         # crons and investigation slots call through the ``ops_mission_control_api``
         # MCP tool (the app's ONLY credentialed agent path; same trust model as

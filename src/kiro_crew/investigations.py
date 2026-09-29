@@ -20,6 +20,55 @@ class InvestigationError(ValueError):
     pass
 
 
+INVESTIGATOR_AGENT = "service-investigator"
+
+
+def backend_refusal(agent_cfg: Any) -> str:
+    """Why the configured backend cannot run an investigation, or ``""`` when it can.
+
+    pi asks about every tool call, so the host gate sees each one; it still needs
+    managed mode, because only the managed bridge carries the investigation tool.
+    """
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_PI, ACP_BACKENDS_INVESTIGATIONS
+
+    backend = agent_cfg.acp_backend
+    if backend not in ACP_BACKENDS_INVESTIGATIONS:
+        return (
+            "Investigations require the Kiro CLI backend or pi in managed mode. "
+            "Your selected backend has not been changed."
+        )
+    if backend == ACP_BACKEND_PI and not agent_cfg.pi_managed:
+        return (
+            "Investigations on pi require agent.pi_managed: true. "
+            "Your selected backend has not been changed."
+        )
+    return ""
+
+
+def prepublish_readonly_spec() -> None:
+    """Publish the investigator's read-only spec before the MCP gateway overlay is built.
+
+    The overlay and the broker's server targets are computed once at gateway
+    start, so a spec first published by a turn would carry no broker stubs until
+    the next restart -- and a pi session without the stub has no investigation
+    tool. Best-effort: a failure here resurfaces, with its reason, on the turn.
+    """
+    import logging
+
+    from kiro_crew.apps.manager import is_app_enabled
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.side_readonly_spec import publish_readonly_spec
+
+    try:
+        if backend_refusal(KiroCrewConfig.load().agent) or not is_app_enabled(APP_NAME):
+            return
+        publish_readonly_spec(INVESTIGATOR_AGENT)
+    except Exception:  # noqa: BLE001 -- startup must not fail on an app's spec
+        logging.getLogger(__name__).warning(
+            "Could not pre-publish the investigator read-only spec", exc_info=True
+        )
+
+
 def clean(value: str) -> str:
     value, _ = redact_credentials(value)
     value, _ = redact_exfiltration_urls(value)
@@ -278,7 +327,6 @@ class Engine:
         return slot
 
     async def prepare_turn(self, slot: Any, *, preparing: bool = False) -> None:
-        from kiro_crew.agent_sdk.backends import ACP_BACKENDS_SIDE_READONLY
         from kiro_crew.apps.manager import is_app_enabled
         from kiro_crew.config.loader import KiroCrewConfig
         from kiro_crew.dashboard.chat_utils import slot_history_key
@@ -305,16 +353,14 @@ class Engine:
                 "Wait for target identity verification before sending a message."
             )
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        if cfg.agent.acp_backend not in ACP_BACKENDS_SIDE_READONLY:
-            raise InvestigationError(
-                "V1 investigations require the Kiro CLI backend, whose tool pre-approvals "
-                "can be removed. Your selected backend has not been changed."
-            )
+        refusal = backend_refusal(cfg.agent)
+        if refusal:
+            raise InvestigationError(refusal)
         if not await asyncio.to_thread(is_app_enabled, APP_NAME):
             raise InvestigationError("The investigations extension is disabled.")
         published = await asyncio.to_thread(
             publish_readonly_spec,
-            "service-investigator",
+            INVESTIGATOR_AGENT,
             slot.project,
         )
         signature = (published.name, published.digest)

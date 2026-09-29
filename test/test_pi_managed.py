@@ -198,7 +198,7 @@ class TestManagedLedgerSurface:
         client = _stubbed_client(tmp_path, monkeypatch, managed=True, spec=CONDUCTOR_SPEC)
         bridged = _bridged(client)
         assert {k: set(v) for k, v in bridged.items()} == {
-            k: set(v) for k, v in acp_client._PI_MANAGED_BRIDGE_TOOLS.items()
+            k: set(v) for k, v in acp_client._PI_MANAGED_BRIDGE_TOOLS.items() if k in LEDGER_SERVERS
         }
         prepared = client._prepare_pi_tool_bridge()
         assert prepared is not None and prepared[2].servers == frozenset(LEDGER_SERVERS)
@@ -209,6 +209,20 @@ class TestManagedLedgerSurface:
         assert "kirocrew-dashboard" not in bridged
         assert set(bridged["kirocrew-work"]) >= {"work_brief", "work_report"}
         assert {"write", "edit", "bash"} <= set(client._pi_managed_tools or ())
+
+    def test_the_investigator_spec_gets_only_the_investigation_tool(self, tmp_path, monkeypatch):
+        spec = {
+            "tools": ["execute_bash", "fs_read", "grep", "glob", "@kirocrew-investigations"],
+        }
+        client = _stubbed_client(
+            tmp_path,
+            monkeypatch,
+            managed=True,
+            stubs=(*LEDGER_SERVERS, "kirocrew-investigations"),
+            spec=spec,
+        )
+        assert _bridged(client) == {"kirocrew-investigations": ["investigation"]}
+        assert "write" not in set(client._pi_managed_tools or ())
 
     def test_an_exact_grant_narrows_a_ledger_server(self, tmp_path, monkeypatch):
         spec = {"tools": ["@kirocrew-work/work_brief", "@kirocrew-work/work_report"]}
@@ -228,12 +242,13 @@ class TestManagedLedgerSurface:
         assert "kirocrew-dashboard, kirocrew-work" in notes[0]
 
     def test_every_managed_bridge_tool_exists_on_its_server(self):
-        from kiro_crew import mcp_core, mcp_dashboard, mcp_work
+        from kiro_crew import mcp_core, mcp_dashboard, mcp_investigations, mcp_work
 
         served = {
             "kirocrew-core": mcp_core._list_tools(),
             "kirocrew-work": mcp_work._list_tools(),
             "kirocrew-dashboard": mcp_dashboard._list_tools(),
+            "kirocrew-investigations": mcp_investigations._list_tools(),
         }
         assert set(acp_client._PI_MANAGED_BRIDGE_TOOLS) == set(served)
         for server, tools in acp_client._PI_MANAGED_BRIDGE_TOOLS.items():

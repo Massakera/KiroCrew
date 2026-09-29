@@ -177,6 +177,10 @@ with no row here.
      - pre-session registry query (whether a side-chat turn may execute
        read-only tools under the derived ``<agent>--readonly`` spec; asked
        about the configured backend id before the side session is created)
+   * - ``ACP_BACKENDS_INVESTIGATIONS``
+     - pre-session registry query (whether a service investigation may run;
+       asked about the configured backend id, with ``agent.pi_managed`` for pi,
+       before the investigation session is prepared)
    * - ``ACP_BACKENDS_HARNESS_OWNED_SESSIONS``
      - driver-internal (whether ``session/load`` is gated on a Crew-side transcript)
    * - ``ACP_BACKENDS_LOAD_WITHOUT_MODES``
@@ -2152,6 +2156,18 @@ ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD = frozenset({ACP_BACKEND_KIRO})
 # than asks, so no call reaches the host gate and no SEL row is written. A side turn
 # on it runs ``REJECT_ALL``.
 ACP_BACKENDS_SIDE_READONLY = frozenset({ACP_BACKEND_KIRO})
+
+# Backends a service investigation may run on. An investigation reads freely and
+# must still ask before every change, so the harness has to bring every tool call
+# to ``session/request_permission`` with its real arguments (the diagnostic
+# reviewer classifies those) and must not carry pre-approvals of its own.
+#
+# kiro qualifies through the derived ``--readonly`` spec, exactly as for a side
+# turn. pi qualifies through Crew's gate extension, which asks about every call,
+# but ONLY in managed mode (``agent.pi_managed``): an ambient pi loads the user's
+# own extensions, which can add tools the host never sees. That second condition
+# is config, not identity, so the investigation engine checks it beside this set.
+ACP_BACKENDS_INVESTIGATIONS = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_PI})
 
 # Backends whose model-side REFUSAL arrives with a structured reason, not just a
 # stop reason. When the Kiro service's content filter declines a turn, kiro-cli

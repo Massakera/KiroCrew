@@ -7,9 +7,6 @@
   "tags": ["operations", "investigations"],
   "agents": ["agents/investigator.json"],
   "backend": {"hooks": {"routes": "backend.routes:register_routes"}},
-  "mcpServers": {
-    "investigations": {"command": "python", "args": ["-m", "kiro_crew.mcp_investigations"]}
-  },
   "ui": {
     "entry": "dist/index.mjs",
     "pages": [{"route": "/apps/service-investigations", "label": "Investigações", "icon": "Search"}]

@@ -1,7 +1,9 @@
 # MCP Server Architecture
 
-The optional `service-investigations` App Kit package contributes
-`kiro_crew.mcp_investigations` through its manifest. Its single `investigation`
+The optional `service-investigations` App Kit package mounts the opt-in managed
+server `kirocrew-investigations` (`kirocrew mcp-investigations`,
+`mcp_investigations.py`) through `@kirocrew-investigations` in its agent's
+`tools`. Its single `investigation`
 tool is a stateless HTTP proxy with strict caller identity support, including
 pooled MCP transports. The app routes own caller eligibility, run state and
 authorization. `list`, `start`, `status`, `cancel` and `resume` serve eligible
@@ -1274,6 +1276,7 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | `kirocrew-crew-log` | `kirocrew mcp-crew-log` (`mcp_crew_log.py`) | `crew_log_list`, `crew_log_read`, `crew_log_projection` |
 | `kirocrew-debug` | `kirocrew mcp-debug` (`mcp_debug.py`) | `debug_gateway`, `debug_refusals`, `debug_threads`, `debug_processes`, `debug_snapshots` |
 | `kirocrew-panel` | `kirocrew mcp-panel` (`mcp_panel.py`) | `panel_publish`, `panel_templates` |
+| `kirocrew-investigations` | `kirocrew mcp-investigations` (`mcp_investigations.py`) | `investigation` |
 
 `kirocrew-panel` is opt-in and reaches a crew member's DM session the way
 `kirocrew-dashboard` does: as a session-level `mcpServers` entry carrying that
@@ -1284,6 +1287,14 @@ it -- that list is built from configured connections, and an opt-in managed
 server is not one -- so this mount is the only path to it. The operator ceiling
 is `agent.crew_panel`; see the session-control module spec for the grant
 reasoning and the fail-closed behaviour.
+
+`kirocrew-investigations` is opt-in too: only the `service-investigator` app
+agent references it, and `apps.bridges._materialize_managed_refs` copies its
+spec into that agent. On managed pi it reaches the session through the tool
+bridge, so it must be named in `mcp_gateway.stub_servers`; the investigator's
+`--readonly` spec is published before the gateway builds its overlay
+(`investigations.prepublish_readonly_spec`), because the overlay and the
+broker's targets are computed once at gateway start.
 
 `kirocrew-dashboard` is one transport carrying **two** authorization models, which is
 what makes its assignment decision larger than its name suggests. The

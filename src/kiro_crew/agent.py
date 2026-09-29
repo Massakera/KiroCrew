@@ -1341,6 +1341,15 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
         "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-panel"),
         "opt_in": True,
     },
+    # Service investigations (list, start, follow, report). ``opt_in``: only the
+    # investigator agent, and an agent the operator grants the set, mount it. A
+    # core server rather than the app's own so the managed pi tool bridge, which
+    # carries only Kiro Crew's servers, can reach it too. No ``autoApprove``, for
+    # the reason every server above gives.
+    "kirocrew-investigations": {
+        "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-investigations"),
+        "opt_in": True,
+    },
 }
 
 
