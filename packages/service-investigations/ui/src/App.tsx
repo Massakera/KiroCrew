@@ -2,7 +2,11 @@ import React, { useState } from 'react'
 import { ChatPanel, useAppApi, useNavBadge } from '@kirocrew/app-sdk'
 import { Badge, Btn, Card, ErrorNotice, Input, PageHeader } from '@kirocrew/app-sdk/ui'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Search, Settings2, Square, Play, KeyRound } from 'lucide-react'
+// The host's lucide-react vendor stub names only a few icons; the rest are
+// reachable through its default export.
+import Lucide from 'lucide-react'
+
+const { ArrowLeft, Search, Settings2, Square, Play, KeyRound } = Lucide
 
 const endpoint = '/api/apps/service-investigations/investigations'
 const queryKey = ['service-investigations', 'index']
