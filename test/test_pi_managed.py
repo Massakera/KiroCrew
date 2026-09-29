@@ -224,6 +224,14 @@ class TestManagedLedgerSurface:
         assert _bridged(client) == {"kirocrew-investigations": ["investigation"]}
         assert "write" not in set(client._pi_managed_tools or ())
 
+    def test_a_core_spec_gets_the_slack_read_tools(self, tmp_path, monkeypatch):
+        client = _stubbed_client(
+            tmp_path, monkeypatch, managed=True, spec={"tools": ["@kirocrew-core"]}
+        )
+        assert {"slack_search", "slack_read", "slack_list_conversations"} <= set(
+            _bridged(client)["kirocrew-core"]
+        )
+
     def test_an_exact_grant_narrows_a_ledger_server(self, tmp_path, monkeypatch):
         spec = {"tools": ["@kirocrew-work/work_brief", "@kirocrew-work/work_report"]}
         client = _stubbed_client(tmp_path, monkeypatch, managed=True, spec=spec)

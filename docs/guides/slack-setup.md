@@ -173,7 +173,8 @@ Slack as you** — search your messages and read your DMs, group DMs, channels
 and threads — without adding the bot to any conversation. It is optional and
 read-only: the built-in `slack_search`, `slack_read` and
 `slack_list_conversations` tools only ever read, only when a session asks, and
-never in the background.
+never in the background. On the pi backend they reach the session only in managed
+mode (`agent.pi_managed`), with `kirocrew-core` in `mcp_gateway.stub_servers`.
 
 After installing the app, copy the **User OAuth Token** (`xoxp-...`) from
 **OAuth & Permissions** and store it with `kirocrew setup --slack` (the wizard

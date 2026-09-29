@@ -686,6 +686,11 @@ _PI_MANAGED_BRIDGE_TOOLS: dict[str, tuple[str, ...]] = {
         "session_ledger_record",
         "ask_question",
         "send_notification",
+        # Read-only Slack as the operator; the gateway's own caller admission and
+        # the slack_user_read governance row still decide each call.
+        "slack_search",
+        "slack_read",
+        "slack_list_conversations",
     ),
     "kirocrew-work": (
         "work_brief",

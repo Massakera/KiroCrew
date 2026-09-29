@@ -1557,7 +1557,10 @@ ambient `_PI_BRIDGE_TOOLS`: it adds the whole `kirocrew-work` ledger surface, th
 three `chat_folder_*` placement verbs), and the `kirocrew-core` verbs the conductor
 procedure patrols with (`monitor_start`, `monitor_update`, `autonudge_stop`,
 `wait`, `list_sessions`, `session_ledger_read`, `session_ledger_record`,
-`ask_question`, `send_notification`). It is reached only through the projection
+`ask_question`, `send_notification`), the read-only Slack-as-the-operator verbs
+(`slack_search`, `slack_read`, `slack_list_conversations`, still admitted per call
+by the gateway and the `slack_user_read` governance row), and the service
+investigator's `kirocrew-investigations` `investigation` tool. It is reached only through the projection
 above, so a spec that does not mount a server gets none of its tools, and each
 server still needs its own `mcp_gateway.stub_servers` entry. A managed spec that
 mounts a server the broker does not stub starts without those tools and logs the
