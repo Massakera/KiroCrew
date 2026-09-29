@@ -304,7 +304,7 @@ def test_a_worker_may_be_rebound_once_its_prior_item_is_terminal():
     first = _new_item(title="first")
     second = _new_item(title="second")
     wl.apply_conductor_action(CONDUCTOR, "bind", item_id=first, worker_session_key=WORKER)
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=first, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=first, state="rejected")
     wl.apply_conductor_action(CONDUCTOR, "bind", item_id=second, worker_session_key=WORKER)
     assert wl.read_binding(WORKER) == (CONDUCTOR, second)
 
@@ -339,7 +339,7 @@ def test_a_failed_item_write_during_bind_restores_the_prior_binding(monkeypatch)
     first = _new_item(title="first")
     second = _new_item(title="second")
     wl.apply_conductor_action(CONDUCTOR, "bind", item_id=first, worker_session_key=WORKER)
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=first, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=first, state="rejected")
     binding_before = wl.binding_path(WORKER).read_bytes()
     item_before = wl.item_path(CONDUCTOR, second).read_bytes()
     real_write = wl._write_record
@@ -394,11 +394,11 @@ def test_decide_verdict_and_close_each_move_one_field_and_log_one_event():
     assert mid is not None
     assert (mid.decision, mid.verdict, mid.fails, mid.state) == ("retry once", "fail", 1, "open")
     wl.apply_conductor_action(
-        CONDUCTOR, "close", item_id=item_id, state="accepted", decision="landed"
+        CONDUCTOR, "close", item_id=item_id, state="rejected", decision="landed"
     )
     closed = wl.read_work_item(CONDUCTOR, item_id)
     assert closed is not None
-    assert (closed.state, closed.decision) == ("accepted", "landed")
+    assert (closed.state, closed.decision) == ("rejected", "landed")
     assert closed.closed_at
     assert [e.kind for e in wl.read_events(CONDUCTOR, item_id)] == [
         "create",
@@ -776,7 +776,7 @@ def test_accept_batch_drops_terminal_items_and_items_with_no_bar():
     kept = _new_item(acceptance={"kind": "human_approval"})
     bare = _new_item(acceptance={})
     closed = _new_item(acceptance={"kind": "human_approval"})
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=closed, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=closed, state="rejected")
     ids = [entry["id"] for entry in wl.accept_batch(wl.list_work_items(CONDUCTOR))["items"]]
     assert ids == [kept]
     assert bare not in ids
@@ -1095,14 +1095,14 @@ def test_a_failed_item_write_rolls_the_event_log_back(monkeypatch):
 
     monkeypatch.setattr(wl, "_write_record", boom_on_item)
     with pytest.raises(OSError):
-        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     with pytest.raises(OSError):
         wl.apply_worker_report(CONDUCTOR, item_id, status="done", summary="x")
     assert _bytes_on_disk(item_id) == (item_before, log_before)
     item = wl.read_work_item(CONDUCTOR, item_id)
     assert item is not None and item.state == "open" and item.status is None
     monkeypatch.setattr(wl, "_write_record", real_write)
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     assert [e.kind for e in wl.read_events(CONDUCTOR, item_id)] == ["create", "close"]
 
 
@@ -1477,7 +1477,7 @@ def test_round_number_is_refused_on_actions_that_do_not_take_it():
     for action, kwargs in (
         ("bind", {"worker_session_key": WORKER}),
         ("verdict", {"verdict": "pass"}),
-        ("close", {"state": "accepted"}),
+        ("close", {"state": "rejected"}),
     ):
         before = _bytes_on_disk(item_id)
         with pytest.raises(wl.WorkLedgerError) as caught:
@@ -1524,7 +1524,7 @@ def test_orphaned_is_derived_and_is_never_a_stored_field():
 
 def test_a_terminal_item_is_neither_orphaned_nor_stale():
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     item = wl.read_work_item(CONDUCTOR, item_id)
     assert item is not None
     assert wl.is_orphaned(item, conductor_slot_exists=False) is False
@@ -2055,7 +2055,7 @@ def test_purge_retention_uses_actual_latest_activity(monkeypatch, residue, age, 
         (directory / "conductor.json").unlink()
     else:
         item_id = _new_item()
-        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
         directory = wl.conductor_dir(CONDUCTOR)
     before = {
         path.relative_to(directory): path.read_bytes()
@@ -2085,7 +2085,7 @@ def test_purge_retention_skips_the_age_gate_when_there_is_no_activity_to_read(mo
     ``None`` only if every candidate is unavailable.
     """
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     monkeypatch.setattr(wl, "_newest_activity", lambda *a, **k: None)
 
@@ -2124,7 +2124,7 @@ def test_purge_conductor_removes_the_ledger_under_the_conductor_lock(monkeypatch
     directory and return the same value.
     """
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     assert (directory / "items" / f"{item_id}.json").exists()
     _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
@@ -2172,7 +2172,7 @@ def test_newest_activity_falls_back_to_the_directory_when_the_header_is_gone(mon
     from datetime import timedelta
 
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     path = wl.item_path(CONDUCTOR, item_id)
     record = json.loads(path.read_text(encoding="utf-8"))
@@ -2194,7 +2194,7 @@ def test_purge_conductor_refuses_a_torn_header_unless_the_caller_asks(monkeypatc
     check -- the one the sweep's scanner uses -- so the recheck cannot trust a
     report over the store's account of itself."""
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     (directory / "conductor.json").write_text("[]", encoding="utf-8")
     _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
@@ -2218,7 +2218,7 @@ def test_census_reads_an_item_shaped_file_with_a_foreign_stem_as_unreadable(monk
         CONDUCTOR, "create", title="second", acceptance={"kind": "human_approval"}
     )["item"].item_id
     for each in (item_id, other):
-        wl.apply_conductor_action(CONDUCTOR, "close", item_id=each, state="accepted")
+        wl.apply_conductor_action(CONDUCTOR, "close", item_id=each, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     stray = directory / "items" / "renamed-by-hand.json"
     wl.item_path(CONDUCTOR, item_id).rename(stray)
@@ -2370,7 +2370,7 @@ def test_a_late_report_on_a_purged_ledger_refuses_and_rebuilds_nothing(monkeypat
     sweep keeps forever -- so the lock is taken non-creating and a missing lock
     file IS the missing item."""
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
     assert wl.purge_conductor(CONDUCTOR, allow_unreadable=False, idle_for=timedelta(0)) is True
@@ -2404,7 +2404,7 @@ def test_the_lost_lock_recreate_loses_a_purge_race_without_rebuilding_the_store(
     in the removed store; the locked recreate finds no ledger and touches
     nothing."""
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     wl._item_lock_path(CONDUCTOR, item_id).unlink()
     _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
@@ -2439,7 +2439,7 @@ def test_a_goal_on_a_purged_ledger_refuses_and_rebuilds_nothing(monkeypatch):
     item_id = wl.apply_conductor_action(
         CONDUCTOR, "create", title="t", acceptance={"kind": "human_approval"}
     )["item"].item_id
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
     assert wl.purge_conductor(CONDUCTOR, allow_unreadable=False, idle_for=timedelta(0)) is True
@@ -2480,7 +2480,7 @@ def test_census_reads_a_misnamed_item_as_unreadable_not_closed(monkeypatch):
     hand-moved file would count as closed and a plain purge would delete a record
     the store itself refuses to read."""
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     path = wl.item_path(CONDUCTOR, item_id)
     record = json.loads(path.read_text(encoding="utf-8"))
     record["item_id"] = "it_00000000"
@@ -2501,7 +2501,7 @@ def test_purge_conductor_keeps_the_header_when_any_content_survives(monkeypatch)
     gone -- so a failed removal leaves an identifiable store, never a header-less
     pile of items."""
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
     original = Path.unlink
@@ -2524,7 +2524,7 @@ def test_purge_conductor_removal_failures_are_counted_not_ignored(monkeypatch):
     """``rmtree(ignore_errors=True)`` would report success over a subtree it left
     standing; the count is what the header decision depends on."""
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     (directory / "stray.txt").write_text("x", encoding="utf-8")
     real_unlink = Path.unlink
@@ -2546,7 +2546,7 @@ def test_purge_conductor_keeps_the_breadcrumb_until_the_header_is_gone(monkeypat
     later purge can still be aimed at it. Deleting the breadcrumb first would
     strand the ledger: header present, no key, no primitive that can reach it."""
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
     original = Path.unlink
@@ -2628,7 +2628,7 @@ def test_purge_conductor_refuses_while_a_worker_holds_an_item_lock(monkeypatch):
     import os
 
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     # Torn on disk, as a mid-write record looks, AND its lock held by "the writer".
     wl.item_path(CONDUCTOR, item_id).write_text("{mid-wr", encoding="utf-8")
     lock_path = wl._item_lock_path(CONDUCTOR, item_id)
@@ -2659,7 +2659,7 @@ def test_purge_conductor_holds_every_item_lock_through_the_removal(monkeypatch):
         )["item"].item_id
     )
     for item_id in ids:
-        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
 
@@ -2704,7 +2704,7 @@ def test_purge_never_unlinks_a_lock_file_while_its_handle_is_held(monkeypatch):
         )["item"].item_id
     )
     for item_id in ids:
-        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
 
@@ -2790,7 +2790,7 @@ def test_every_lock_inode_is_unlinked_inside_the_holds(monkeypatch):
     writer queued on any of them acquires a detached inode and refuses; nothing is
     handed a second inode while a first is held."""
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     _pin_purge_clock(monkeypatch, directory, age=timedelta(seconds=1))
     conductor_lock_path = directory / ".lock"
@@ -2855,7 +2855,7 @@ def test_census_tolerates_a_naive_closed_at_beside_an_aware_one():
         CONDUCTOR, "create", title="second", acceptance={"kind": "human_approval"}
     )["item"].item_id
     for item_id in (first, second):
-        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+        wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     stamps = {first: "2026-01-10T09:00:00", second: "2026-01-10T09:00:00+00:00"}
     for item_id, stamp in stamps.items():
         path = wl.item_path(CONDUCTOR, item_id)
@@ -2877,7 +2877,7 @@ def test_a_purge_racing_a_finished_purge_recreates_nothing(monkeypatch):
     import shutil
 
     item_id = _new_item()
-    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
+    wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="rejected")
     directory = wl.conductor_dir(CONDUCTOR)
     real_lock = wl.conductor_lock
 

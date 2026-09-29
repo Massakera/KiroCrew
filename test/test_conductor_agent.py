@@ -433,7 +433,7 @@ class TestConductorInstaller:
             "@kirocrew-work",
             "action=create",
             "action=bind",
-            "action=verdict",
+            "action=evaluate",
             "action=accept",
             "action=close",
             "Bind before you seed",
@@ -457,11 +457,14 @@ class TestConductorInstaller:
         filter, because the agent copies whichever it read last.
         """
         prompt = self._install(tmp_path, monkeypatch)["prompt"]
-        assert "Filter the returned" in prompt
-        assert "whose status is `done`" in prompt
+        # The filter is now the gateway's, so both texts must say it is enforced
+        # there (``not_evaluable``) rather than asking the model to apply it.
+        assert "action=evaluate" in prompt
+        assert "whose status is `done`" in " ".join(prompt.split())
+        assert "not_evaluable" in prompt
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
-        assert "keep only the entries whose item is currently `status: done`" in body
-        assert "Never pipe the unfiltered document" in body
+        assert "Only `done` items are evaluable, and the gateway enforces it" in body
+        assert "not_evaluable" in body
 
     def test_prompt_and_skill_make_a_nested_conductor_report_upward(self, tmp_path, monkeypatch):
         """A second-level conductor is bound as its parent's worker, and the parent
@@ -536,7 +539,10 @@ class TestConductorInstaller:
         heredoc is the one form the shell copies to stdin without interpreting.
         """
         body = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
-        assert "<<'ACCEPT_BATCH'" in body
+        # Acceptance no longer crosses a shell at all: the gateway evaluates, so no
+        # acceptance document is ever piped and there is nothing to quote.
+        assert "<<'ACCEPT_BATCH'" not in body
+        assert "action=evaluate" in body
         assert "printf '%s' '<" not in body
         assert "printf '%s' '{" not in body
 
@@ -839,7 +845,7 @@ class TestConductorInstaller:
         text = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
         assert "Reads and creates do not prompt" in text
         assert "`session_send` and `session_stop` are deliberately NOT auto-approved" in text
-        assert "accept_eval.py` invocation" in text
+        assert "Verifying needs no approval" in text
 
     def test_skill_keeps_item_state_in_the_store_and_not_in_artifacts(self):
         """One record per item, in the one place the evaluator batch reads.

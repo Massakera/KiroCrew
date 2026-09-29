@@ -747,6 +747,35 @@ async def _start_api(tmp_path: Path, monkeypatch, **kwargs: Any) -> Any:
 
 class TestStartApiServerResidualPaths:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
+    async def test_broker_start_failure_cleans_runner_before_ready(
+        self, tmp_path, monkeypatch, error
+    ) -> None:
+        runners = []
+        real_builder = srv.build_hardened_runner
+
+        def build(app, **kwargs):
+            runner = real_builder(app, **kwargs)
+            runners.append(runner)
+            return runner
+
+        monkeypatch.setattr(srv, "build_hardened_runner", build)
+        monkeypatch.setattr(srv, "_start_unix_site", AsyncMock(return_value=None))
+        schedule_memory = MagicMock()
+        broker = AsyncMock(side_effect=error("broker startup interrupted"))
+        with pytest.raises(error, match="broker startup interrupted"):
+            await _start_api(
+                tmp_path,
+                monkeypatch,
+                start_mcp_gateway=broker,
+                schedule_memory_preparation=schedule_memory,
+            )
+        broker.assert_awaited_once_with()
+        schedule_memory.assert_not_called()
+        assert runners[0].server is None
+        assert runners[0].app["state"].ready is False
+
+    @pytest.mark.asyncio
     async def test_secret_persistence_failure_tears_the_listener_down(
         self, tmp_path, monkeypatch
     ) -> None:

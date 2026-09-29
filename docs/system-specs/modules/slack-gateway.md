@@ -17,6 +17,13 @@ alone never grants a mode. Origin-chat injection keeps the chat's own policy.
 Cron execution binding is published off the event loop before mode admission
 and provider allocation, using the run's already captured execution context.
 
+Startup defers the MCP broker to the dashboard/API factory's post-bind callback,
+so the daemon and pooled MCP children inherit the actual callback port before
+any session uses the broker overlay. Both server surfaces finish that callback
+before readiness; the dashboard also does so before starting app backends.
+No session identity or policy checks are bypassed. See
+[mcp-gateway-daemon-lifecycle](mcp-gateway-daemon-lifecycle.md#callback-port-inheritance).
+
 Startup wires memory objects behind one gateway-lifetime in-process barrier.
 Both dashboard and API-only servers receive the orchestrator's existing context
 builder. Post-bind workflow initialization uses that same object for essentials

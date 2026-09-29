@@ -642,6 +642,7 @@ _DSH_GATE_MARKER_MAX_BYTES = 64 * 1024
 # every pi session there. ``.gitattributes`` pins the checkout LF as well; the
 # normalization here is what keeps the property from resting on a repo-config line.
 PI_GATE_EXTENSION_SHA256 = "5634db295d39cb5a92a825651fe1c0f3b3cc527be39f1b60d24f46d558d594f0"
+PI_MANAGED_EXTENSION_SHA256 = "3d804e72b3a9696c8760c2f0b80ca7f157e028dc5f4f3c7a1b518a0c3cf4cd44"
 # The tool bridge (``gate_extensions/pi/kiro_crew_tool_bridge.ts``) is sealed the
 # same way and for the same reason: a bridged tool is governed under the MCP
 # identity it claims only when the gate reports it came from the sealed copy, so
@@ -650,6 +651,7 @@ PI_BRIDGE_EXTENSION_SHA256 = "10200bd1c89e7f61eb165dd87a59df48426580fd42ac8dea4f
 # The server list the bridge reads, as JSON: ``{"servers": [{name, command, args,
 # env, tools}]}``. Only the pooled broker stubs of the servers below go in it.
 _ENV_PI_BRIDGE_SERVERS = "KIROCREW_PI_BRIDGE_SERVERS"
+_ENV_PI_MANAGED_TOOLS = "KIROCREW_PI_MANAGED_TOOLS"
 # What the bridge carries into a pi session: Crew's control-plane server, and of
 # it only the subagent tools, which is what replaces the harness's own subagent
 # extension, plus the Knowledge Library search, which pi has no other way to
@@ -664,6 +666,43 @@ _PI_BRIDGE_TOOLS: dict[str, tuple[str, ...]] = {
         "spawn_status",
         "spawn_sub_agents",
         "local_knowledge_search",
+    ),
+}
+# A Crew-managed session also carries the work-ledger conductor/worker surface:
+# the ledger server, the session-control verbs a conductor dispatches through, and
+# the core verbs its patrol procedure calls. Managed mode projects every entry
+# through the session's own spec (``managed_pi_tools``) before the child sees it,
+# so a spec that does not mount a server gets none of it; an ambient session,
+# which has no such narrowing, keeps the spawn-only set above.
+_PI_MANAGED_BRIDGE_TOOLS: dict[str, tuple[str, ...]] = {
+    "kirocrew-core": _PI_BRIDGE_TOOLS["kirocrew-core"]
+    + (
+        "monitor_start",
+        "monitor_update",
+        "autonudge_stop",
+        "wait",
+        "list_sessions",
+        "session_ledger_read",
+        "session_ledger_record",
+        "ask_question",
+        "send_notification",
+    ),
+    "kirocrew-work": (
+        "work_brief",
+        "work_report",
+        "work_ledger_read",
+        "work_ledger_record",
+        "work_ledger_rebuild",
+    ),
+    "kirocrew-dashboard": (
+        "session_create",
+        "session_send",
+        "session_read_message",
+        "session_stop",
+        "session_close",
+        "chat_folder_tree",
+        "chat_folder_create",
+        "chat_folder_file_self",
     ),
 }
 # Named once per process: a gateway whose broker does not stub Crew's server says
@@ -1254,7 +1293,7 @@ def _opencode_readback_remedy() -> str:
 
 _pi_acp_argv_cache: tuple[list[str] | None, str] | object = _UNRESOLVED
 _pi_bin_cache: tuple[str | None, str] | object = _UNRESOLVED
-_pi_gate_launcher_cache: dict[tuple[str, str, tuple[str, ...]], str] = {}
+_pi_gate_launcher_cache: dict[tuple[str, str, tuple[str, ...], bool, str], str] = {}
 
 
 def _resolve_pi_acp_bin() -> tuple[list[str] | None, str]:
@@ -1381,6 +1420,22 @@ def pi_gate_extension_path() -> str:
 def pi_bridge_extension_path() -> str:
     """The absolute path of the tool bridge extension Kiro Crew ships for pi."""
     return str(Path(pi_gate_extension_path()).with_name("kiro_crew_tool_bridge.ts"))
+
+
+def pi_managed_extension_path() -> str:
+    """The opt-in resource/tool profile, separate from the unchanged legacy gate."""
+    return str(Path(pi_gate_extension_path()).with_name("kiro_crew_managed_profile.ts"))
+
+
+def _seal_pi_managed_extension() -> str:
+    return _seal_gate_extension(
+        pi_managed_extension_path(),
+        PI_MANAGED_EXTENSION_SHA256,
+        artifact_dir=_pi_gate_artifact_dir(),
+        sealed_name=f"kirocrew_pi_gate_{os.getpid()}_managed.ts",
+        stage_prefix=f"kirocrew_pi_gate_{os.getpid()}_managed_",
+        label="pi managed profile",
+    )
 
 
 def _pi_gate_artifact_dir() -> str:
@@ -1780,7 +1835,11 @@ def _publish_gate_artifact(
 
 
 def _pi_gate_launcher_body(
-    pi_bin: str, extension_path: str, extra_extensions: tuple[str, ...] = ()
+    pi_bin: str,
+    extension_path: str,
+    extra_extensions: tuple[str, ...] = (),
+    managed: bool = False,
+    managed_extension: str = "",
 ) -> str:
     """The launcher pi-acp is told to run in place of ``pi``.
 
@@ -1790,16 +1849,24 @@ def _pi_gate_launcher_body(
     A shell script on POSIX; a ``.cmd`` on Windows, where the adapter itself uses a
     shell for exactly that extension.
     """
-    paths = (extension_path, *extra_extensions)
+    paths = ((managed_extension,) if managed_extension else ()) + (
+        extension_path,
+        *extra_extensions,
+    )
+    resources = " --no-extensions --no-skills --no-prompt-templates" if managed else ""
     if platform_compat.IS_WINDOWS:
         flags = " ".join(f'{_PI_EXTENSION_FLAG} "{p}"' for p in paths)
-        return f'@echo off\r\n"{pi_bin}" %* {flags}\r\n'
+        return f'@echo off\r\n"{pi_bin}" %*{resources} {flags}\r\n'
     flags = " ".join(f"{_PI_EXTENSION_FLAG} {shlex.quote(p)}" for p in paths)
-    return f'#!/bin/sh\nexec {shlex.quote(pi_bin)} "$@" {flags}\n'
+    return f'#!/bin/sh\nexec {shlex.quote(pi_bin)} "$@"{resources} {flags}\n'
 
 
 def _ensure_pi_gate_launcher(
-    pi_bin: str, extension_path: str, extra_extensions: tuple[str, ...] = ()
+    pi_bin: str,
+    extension_path: str,
+    extra_extensions: tuple[str, ...] = (),
+    managed: bool = False,
+    managed_extension: str = "",
 ) -> str:
     """Write (once per process and inputs) the launcher and return its path.
 
@@ -1812,7 +1879,7 @@ def _ensure_pi_gate_launcher(
 
     Blocking (writes a file); callers run it off the loop.
     """
-    key = (pi_bin, extension_path, tuple(extra_extensions))
+    key = (pi_bin, extension_path, tuple(extra_extensions), managed, managed_extension)
     cached = _pi_gate_launcher_cache.get(key)
     if cached and os.path.isfile(cached):
         return cached
@@ -1823,7 +1890,11 @@ def _ensure_pi_gate_launcher(
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-            fh.write(_pi_gate_launcher_body(pi_bin, extension_path, tuple(extra_extensions)))
+            fh.write(
+                _pi_gate_launcher_body(
+                    pi_bin, extension_path, tuple(extra_extensions), managed, managed_extension
+                )
+            )
         if not platform_compat.IS_WINDOWS:
             os.chmod(tmp, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501  # fmt: skip
     except OSError:
@@ -5815,6 +5886,7 @@ class AcpClient:
         permission_mode: str | None = None,
         shared_scratch: Path | None = None,
         reasoning_effort: str | None = None,
+        pi_managed: bool = False,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -5838,6 +5910,10 @@ class AcpClient:
         self._sandbox_mode = sandbox_mode
         self.memory_mode = "persistent"
         self._acp_backend = acp_backend
+        self._pi_managed = pi_managed is True and acp_backend == ACP_BACKEND_PI
+        self._pi_managed_tools: tuple[str, ...] | None = None
+        self._pi_managed_grants: frozenset[str] = frozenset()
+        self._pi_managed_extension = ""
         # Claude backend permission mode (Auto-mode / permission-UI parity).
         # Inert on the kiro-cli path. None = the backend's own default
         # ("default", i.e. every tool decision is forwarded to the host), which is
@@ -6437,6 +6513,10 @@ class AcpClient:
             self._stub_session_token,
         )
 
+    def _pi_bridge_inventory(self) -> dict[str, tuple[str, ...]]:
+        """The servers and tools the bridge may offer this session, by mode."""
+        return _PI_MANAGED_BRIDGE_TOOLS if self._pi_managed else _PI_BRIDGE_TOOLS
+
     def _prepare_pi_tool_bridge(self) -> tuple[str, str, GateBridgeIdentity] | None:
         """Seal the tool bridge and build its server list, or ``None`` to run without it.
 
@@ -6459,10 +6539,17 @@ class AcpClient:
         except Exception:
             logger.warning("pi tool bridge: could not read the broker stubs", exc_info=True)
             return None
+        inventory = self._pi_bridge_inventory()
         servers: list[dict[str, Any]] = []
         for element in stubs:
             name = element.get("name")
-            tools = _PI_BRIDGE_TOOLS.get(name) if isinstance(name, str) else None
+            tools = inventory.get(name) if isinstance(name, str) else None
+            if self._pi_managed and tools:
+                tools = tuple(
+                    tool
+                    for tool in tools
+                    if f"mcp__{name}__{tool}" in (self._pi_managed_tools or ())
+                )
             command = element.get("command")
             if not tools or not isinstance(command, str) or not command:
                 continue
@@ -6487,8 +6574,33 @@ class AcpClient:
                     "tools": list(tools),
                 }
             )
+        if self._pi_managed:
+            # A spec that mounts a server the broker does not stub would otherwise
+            # start with those tools silently absent, which reads as a model that
+            # ignores its instructions rather than as a config gap.
+            granted = self._pi_managed_tools or ()
+            unstubbed = sorted(
+                server
+                for server in inventory
+                if server not in {s["name"] for s in servers}
+                and any(tool.startswith(f"mcp__{server}__") for tool in granted)
+            )
+            note = f"managed:{self._agent}:{','.join(unstubbed)}"
+            if unstubbed and note not in _pi_bridge_off_noted:
+                _pi_bridge_off_noted.add(note)
+                logger.warning(
+                    "pi tool bridge: agent %r mounts %s, but mcp_gateway.stub_servers "
+                    "does not name %s, so its managed pi sessions carry none of those tools",
+                    self._agent,
+                    ", ".join(unstubbed),
+                    "it" if len(unstubbed) == 1 else "them",
+                )
         if not servers:
-            missing = ", ".join(sorted(_PI_BRIDGE_TOOLS))
+            if self._pi_managed and not any(
+                tool.startswith("mcp__") for tool in (self._pi_managed_tools or ())
+            ):
+                return None
+            missing = ", ".join(sorted(inventory))
             if missing not in _pi_bridge_off_noted:
                 _pi_bridge_off_noted.add(missing)
                 logger.warning(
@@ -7295,6 +7407,56 @@ class AcpClient:
                 )
         return "", ""
 
+    def _prepare_pi_managed_profile(self, pi_bin: str) -> None:
+        """Resolve only an opted-in pi session's tool contract before it starts."""
+        self._pi_managed_tools = None
+        self._pi_managed_grants = frozenset()
+        if not self._pi_managed:
+            return
+        installed = _pi_installed_version(pi_bin)
+        if installed is None or installed[0] < (0, 87, 1):
+            raise AcpError(
+                "Crew-managed pi requires a verifiable pi installation at version 0.87.1 "
+                "or newer; no session was started"
+            )
+        from kiro_crew.agent_sdk.pi_profile import managed_pi_grants, managed_pi_tools
+        from kiro_crew.platform.governance import may_skip_gate_now
+
+        try:
+            self._pi_managed_tools = managed_pi_tools(
+                self._mcp_ref_spec, self._pi_bridge_inventory()
+            )
+        except ValueError as exc:
+            raise AcpError(str(exc)) from None
+        # The same ceiling filter every kiro allowedTools writer applies, so a
+        # grant the policy would strip from a kiro agent file is not honoured here.
+        self._pi_managed_grants = frozenset(
+            ref
+            for ref in managed_pi_grants(self._mcp_ref_spec, self._pi_managed_tools)
+            if may_skip_gate_now(ref)
+        )
+
+    def managed_pi_grant(self, event: AcpEvent) -> bool:
+        """Whether this managed pi session's spec pre-approves the bridged call *event* names.
+
+        Only a call whose identity the sealed bridge proved counts; a native pi tool
+        or an identity from any other channel never matches.
+        """
+        if not (self._pi_managed and getattr(event, "bridge_verified", False)):
+            return False
+        server = getattr(event, "mcp_server_name", "") or ""
+        tool = getattr(event, "tool_name", "") or ""
+        return bool(server and tool) and f"@{server}/{tool}" in self._pi_managed_grants
+
+    def _apply_pi_managed_env(self, env: dict[str, str]) -> None:
+        # An ambient parent may carry another session's projection. Only this
+        # client's opt-in and captured spec can select the managed contract.
+        env.pop(_ENV_PI_MANAGED_TOOLS, None)
+        if self._pi_managed:
+            if self._pi_managed_tools is None:
+                raise AcpError("Crew-managed pi tool profile has not been prepared")
+            env[_ENV_PI_MANAGED_TOOLS] = json.dumps(self._pi_managed_tools)
+
     def _verify_pi_gate(self, argv: list[str], extension_path: str) -> tuple[str, str]:
         """Ask the harness's own command registry whether Crew's gate extension loaded.
 
@@ -7329,6 +7491,7 @@ class AcpClient:
         # The bridge loads here with no servers, so the probe answers without
         # starting any MCP child.
         env.pop(_ENV_PI_BRIDGE_SERVERS, None)
+        self._apply_pi_managed_env(env)
         # Offline for the read-back only: pi's startup network work (update checks,
         # package refresh) has no bearing on which extensions loaded, and a probe
         # that waits on the network is a probe that can stall the spawn.
@@ -7373,6 +7536,19 @@ class AcpClient:
         )
         if issue:
             return issue, acp_tool_gate.remediation_for(self.backend)
+        if self._pi_managed:
+            from kiro_crew.agent_sdk.pi_profile import managed_profile_issue
+
+            issue = managed_profile_issue(
+                _same_file_spelling_all(commands),
+                (
+                    _same_file_spelling(self._pi_managed_extension)
+                    if self._pi_managed_extension
+                    else ""
+                ),
+            )
+            if issue:
+                return issue, "Reinstall Kiro Crew's managed pi profile before enabling this mode."
         return "", ""
 
     @staticmethod
@@ -9233,6 +9409,7 @@ class AcpClient:
             pi_version_issue = await asyncio.to_thread(_pi_version_issue, pi_bin)
             if pi_version_issue:
                 raise AcpError(pi_version_issue)
+            await asyncio.to_thread(self._prepare_pi_managed_profile, pi_bin)
             argv = pi_acp_argv
             spawn_label = _adapter_spawn_label(
                 argv, PI_ACP_BIN, pkg_entry=_PI_ACP_PKG_ENTRY, override_env=_ENV_PI_ACP_BIN
@@ -9254,6 +9431,9 @@ class AcpClient:
             # probe to be sourced from it, so a rewritten package file is refused
             # here rather than loaded. Off-loop: a file read and possibly a write.
             extension_path = await asyncio.to_thread(_seal_pi_gate_extension)
+            self._pi_managed_extension = (
+                await asyncio.to_thread(_seal_pi_managed_extension) if self._pi_managed else ""
+            )
             self._pi_gate_nonce = uuid.uuid4().hex
             # The tool bridge rides the same launcher. Optional where the gate is
             # not: without it the session holds no Crew tools, which is where pi
@@ -9267,11 +9447,22 @@ class AcpClient:
                 bridge = await asyncio.to_thread(self._prepare_pi_tool_bridge)
                 if bridge is not None:
                     bridge_path, self._pi_bridge_servers_env, self._pi_bridge_identity = bridge
+            if (
+                self._pi_managed
+                and not bridge_path
+                and any(tool.startswith("mcp__") for tool in (self._pi_managed_tools or ()))
+            ):
+                raise AcpError(
+                    "Crew-managed pi requires the Crew tool bridge for this agent; "
+                    "check mcp_gateway.enabled and mcp_gateway.stub_servers"
+                )
             self._pi_gate_launcher = await asyncio.to_thread(
                 _ensure_pi_gate_launcher,
                 pi_bin,
                 extension_path,
                 (bridge_path,) if bridge_path else (),
+                managed=self._pi_managed,
+                managed_extension=self._pi_managed_extension,
             )
             # Wrapped in the SAME sandbox with the SAME credential mask as the
             # session spawn below, for the same reason the opencode read-back is:
@@ -9722,6 +9913,7 @@ class AcpClient:
             # an operator's own value for this variable was already honoured by
             # ``_resolve_pi_bin`` and is what the launcher execs.
             env[_ENV_PI_ACP_PI_COMMAND] = self._pi_gate_launcher
+            self._apply_pi_managed_env(env)
             # Reaches the pi process through the adapter, which spawns it with its
             # own environment; the extension echoes it in every dialog.
             env[_ENV_PI_GATE_SESSION] = self._pi_gate_nonce

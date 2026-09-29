@@ -2013,7 +2013,7 @@ async def test_a_rebuild_never_reclaims_a_worker_another_board_now_holds(monkeyp
     status, body = await _report(WORKER, {"status": "done", "summary": "finished"})
     assert status == 200, body
     status, body = await _record(
-        CONDUCTOR, {"action": "close", "item_id": item_id, "state": "accepted"}
+        CONDUCTOR, {"action": "close", "item_id": item_id, "state": "rejected"}
     )
     assert status == 200, body
     assert wl.read_work_item(CONDUCTOR, item_id).is_terminal
@@ -2427,7 +2427,7 @@ async def test_a_reused_slot_is_not_overwritten_when_its_first_goal_never_append
 
     # Board A finishes and the sweep reaps its directory. Its ENTRIES remain.
     status, body = await _record(
-        CONDUCTOR, {"action": "close", "item_id": item_id, "state": "accepted"}
+        CONDUCTOR, {"action": "close", "item_id": item_id, "state": "rejected"}
     )
     assert status == 200, body
     assert wl.purge_conductor(CONDUCTOR, allow_unreadable=False, idle_for=timedelta(0))

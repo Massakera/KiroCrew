@@ -35,8 +35,8 @@ The `spawn_run` tool accepts:
 - `agent` / `agents` — optional agent name(s) for each task
 - `include_memory` / `include_lessons` / `include_project` — booleans (default `true`) switching off a context group the sub-agent would otherwise inherit
 - `max_turns` — per-spawn tool-call budget override (0 = unset, max 1000)
-- `model` — model override for this spawn (e.g. `deepseek-3.2`)
-- `reasoning_effort` — `low` / `medium` / `high` / `xhigh` / `max`, batch-wide
+- `model` — model override for this spawn (e.g. `deepseek-3.2`, or on pi a provider-qualified id such as `openai-codex/gpt-6-sol`; one `/` at most)
+- `reasoning_effort` — `low` / `medium` / `high` / `xhigh` / `max`, batch-wide; `off` / `minimal` only when the run is on pi (an explicit `backend: "pi"`, or pi as the configured default with no crew target), otherwise refused with `effort_unsupported_backend`
 - `keep` — make the run a continuable conversation with guaranteed resumability and longer retention
 - `cwd` — absolute launch directory, which must be under a configured `subagent_cwd_allowed_roots` entry
 

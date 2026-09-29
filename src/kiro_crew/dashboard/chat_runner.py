@@ -266,6 +266,7 @@ from kiro_crew.hooks import (
     fire_tool_hooks,
     hook_gate_kwargs,
     identity_grant_covers_child,
+    managed_pi_allowed_grant,
     safe_read_file,
     safe_read_file_bytes_nolink,
     validate_file_path,
@@ -14545,6 +14546,9 @@ async def _run_chat(
                             if _diagnostic_grant
                             else ToolHookResult(action=TOOL_ALLOW)
                         )
+                    tool_result = managed_pi_allowed_grant(
+                        tool_result, event, client, classifier_only=_investigation
+                    )
                     if _child_low_fidelity:
                         # Backend-subagent origin whose tool_call frames never
                         # reached us (cache miss): command bytes are absent, so

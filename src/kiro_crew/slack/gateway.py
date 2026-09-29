@@ -11275,6 +11275,7 @@ class GatewayOrchestrator:
             assume_kiro_ready=self._test_mode,
             defer_channel_agent_resume=True,
             schedule_memory_preparation=self._schedule_memory_preparation,
+            start_mcp_gateway=self._init_mcp_gateway,
         )
         # When --port auto was requested, read the OS-assigned ephemeral port
         # back from the runner so subsequent URL building and the READY line
@@ -11318,6 +11319,7 @@ class GatewayOrchestrator:
             assume_kiro_ready=self._test_mode,
             conversation_log=self.conv_log,
             schedule_memory_preparation=self._schedule_memory_preparation,
+            start_mcp_gateway=self._init_mcp_gateway,
         )
         if dashboard_port == 0 and self._dashboard_runner is not None:
             addresses = self._dashboard_runner.addresses
@@ -12052,10 +12054,10 @@ class GatewayOrchestrator:
     def _wire_mcp_gateway_dashboard(self) -> None:
         """Publish the broker + apply callbacks onto DashboardState.
 
-        _init_mcp_gateway runs at boot before dashboard_state exists, so
-        the manager and the enable/poolable callbacks are attached here
-        (post dashboard init). The /api/mcp-gateway/* handlers read these
-        off ``request.app['state']``.
+        The dashboard/API factory starts the broker after binding, before
+        returning dashboard_state to this orchestrator. Attach the manager
+        and the enable/poolable callbacks here after that return. The
+        /api/mcp-gateway/* handlers read these off ``request.app['state']``.
         """
         if self.dashboard_state is None:
             return
@@ -13957,12 +13959,8 @@ class GatewayOrchestrator:
 
         # Auto-migration starts only after deferred restore and memory init.
 
-        # Start MCP gateway sidecar before any ACP session can spawn.  The
-        # rewriter writes the agent-JSON overlay first so kiro-cli picks up
-        # the broker-wired MCP entries the moment a session starts.  No-op
-        # when ``mcp_gateway.enabled`` is False.
-        await cautious_boot.pause_before("MCP gateway sidecar")
-        await self._init_mcp_gateway()
+        # Dashboard/API startup starts the MCP broker after exporting its bound
+        # port, still before readiness and memory-backed session dispatch.
 
         # Loading the cron scheduler reads and reconciles durable jobs. Under
         # cautious boot this pause keeps that work out of the app/MCP launch
@@ -14010,7 +14008,7 @@ class GatewayOrchestrator:
             logger.debug("Gateway run-marker write skipped", exc_info=True)
 
         # Publish the MCP-gateway broker + apply callbacks onto
-        # DashboardState now that it exists (the broker started earlier).
+        # DashboardState now that dashboard/API startup has returned.
         self._wire_mcp_gateway_dashboard()
 
         # Emit machine-readable READY line for test harnesses (--json-ready).

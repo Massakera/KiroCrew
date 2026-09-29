@@ -43,8 +43,10 @@ An item is the unit of dispatch. It holds:
 | `acceptance` | conductor | the completion condition, stored verbatim |
 | `round` | conductor | which dispatch round the item belongs to |
 | `decision` | conductor | what the conductor decided and why |
-| `verdict` | conductor | the acceptance evaluator's answer |
-| `fails` | conductor | how many acceptance attempts came back `fail` |
+| `evidence` | gateway | the current acceptance evaluation, bound to the condition, the worker's latest report and the exact revision observed |
+| `verdict` | gateway | `evidence`'s verdict, mirrored |
+| `fails` | gateway | how many evaluations came back `fail` |
+| `acceptance_proof` | gateway | on an `accepted` close: the evidence and revision it was decided on |
 | `state` | conductor | `open`, or terminal: `accepted` / `rejected` / `abandoned` |
 | `status` | worker | `progress` / `done` / `blocked` / `question` |
 | `summary` | worker | the worker's own account, up to 500 chars |
@@ -52,7 +54,7 @@ An item is the unit of dispatch. It holds:
 | `pr` | worker | a pull-request number it produced |
 
 The conductor writes its half with `work_ledger_record` (one action per call:
-`goal`, `create`, `bind`, `decide`, `verdict`, `accept`, `close`) and reads the
+`goal`, `create`, `bind`, `decide`, `evaluate`, `accept`, `close`) and reads the
 whole ledger back with `work_ledger_read`. A worker writes its half with
 `work_report` and reads its own item with `work_brief`. A conductor whose ledger
 files read as damaged or missing rewrites them from the crew log with
@@ -78,9 +80,13 @@ operator sets it. Set it before the first conductor runs, rather than discoverin
 the refusal from a worker that cannot report.
 
 **The acceptance condition is named before dispatch, not after.** It is one of
-three kinds: `pr_checks` (a pull request's checks are all green), `file` (a path
-exists), or `human_approval` (you accept it — legitimate for a design review,
-and never machine-evaluated). There is deliberately no "run this command" kind,
+three kinds: `pr_checks` (every check on the pull request's head commit is green;
+the condition names the repository as owner/name), `file` (a path exists inside
+the worker session's project directory), or `human_approval` (you decide —
+legitimate for a design review, never machine-evaluated, and not closable as
+accepted through the ledger, because there is no authenticated way yet for the
+ledger to record that you approved; the conductor records your answer and closes
+the item as rejected or abandoned). There is deliberately no "run this command" kind,
 so "the tests pass" is expressed as `pr_checks` on the pull request that carries
 the work, and CI's verdict is the one that counts.
 
@@ -140,28 +146,69 @@ Reports belong at real milestones, not on a timer.
 when longer, so a report that lands is a report that landed whole. Evidence goes in `artifacts` as
 pointers — a branch, a commit, a path, a pull request number.
 
-## Why `done` is a claim
+## Why `done` is a claim, and who judges it
 
-A worker's `done` never closes an item. The conductor reads its whole ledger
-with `work_ledger_read` — every item, its own derived staleness flags, and a
-ready-to-evaluate batch — runs the acceptance evaluator against the item's own
-condition, and records the answer with `work_ledger_record` as a `verdict`:
+A worker's `done` never closes an item, and neither does anything the conductor
+writes. The conductor asks the **gateway** to judge it: `work_ledger_record`
+`action=evaluate`. The gateway reads the item's condition as stored — never one
+supplied with the request — and observes the exact revision:
 
-- `pass` / `fail` — final for that cycle.
-- `pending` — the condition is not true yet; keep waiting.
+For a pull request it reads the head commit, then every check run and commit
+status **of that commit**, and every row must name that commit. A pass needs a
+complete, counted reading with at least one check that concluded success, and
+none failing, pending or in a state the evaluator does not recognise. A cancelled
+or stale attempt counts as failing unless a later attempt of the same check in the
+same check suite replaced it. The revision it records is the commit plus a digest
+of that exact set of checks, so a check that disappears, appears or re-runs before
+the close is a different revision. For a file it reads only inside the worker's
+project directory as it was when the item was bound — pinned by inode, so a
+directory swapped or linked away afterwards reads nothing — refusing any link on
+the way and sensitive paths, and records a digest of the bytes it read.
+
+Only an item whose worker currently reports `done`, with a concrete condition, is
+evaluated — a world-state check can pass on unfinished work (a stub written
+early, a pull request green before its last commit). Before observing the target,
+the gateway compares the cached criterion, report and worker binding with their
+crew-log projection under the board lock, then releases that lock for the external
+read. A cache-only change left by an interrupted write is refused with
+`crew_log_incomplete`; a new evaluation cannot legitimise an input absent from
+the record. Restore the missing record, or explicitly record the criterion/report
+again before evaluating. This check does not discard cached data or mark missing
+history safe to overwrite. An accepted close also requires its evidence in the
+canonical projection, not just a cached acknowledgement stamp.
+
+A `file` criterion is refused on platforms without descriptor-relative no-follow
+reads; the gateway does not fall back to an unconfined reader.
+
+The answer lands in the item's `evidence`:
+
+- `pass` / `fail` — the condition holds or it does not, for that revision.
+- `pending` — not true yet (checks running, or none reported yet); keep waiting.
 - `refused` — the evaluator will not answer the condition as written, and no
-  amount of waiting changes that. A **draft** pull request whose checks have not
-  finished lands here, because a draft is the author's own "not ready" and a
-  readiness gate on the draft flag never resolves — so a `pr_checks` item is
-  opened non-draft, or marked ready before the worker reports. A condition that
-  names a command to run lands here too.
-- `error` — a broken condition or environment, including a bar still set to `TBD`.
+  amount of waiting changes that: a condition that names a command, a path
+  outside the worker's project, a pull request that already merged or closed, or
+  a **draft** pull request whose checks have not finished (a draft is its author's
+  own "not ready", so a `pr_checks` item is opened non-draft or marked ready
+  before the worker reports).
+- `error` — a broken condition or an unreadable target, including a bar still set
+  to `TBD` or a check board that could not be read whole.
 
-So the strongest true thing a worker can say is that it believes the bar is met.
-The conductor's own read is also filtered: only items currently reporting `done`
-are evaluated, because a world-state check can return a genuine `pass` on
-unfinished work — a stub written before the real content, a pull request green
-before the last commit.
+**`accepted` means that revision was accepted.** Closing an item `accepted` needs
+the current evidence to be a `pass` that the crew log is confirmed to hold, and
+the gateway observes the target once more at close: a new push, a re-run that is pending or failing, or changed file
+bytes leave the item open (`target_changed`). A new worker report or a new
+condition makes the earlier evidence stale (`evaluation_stale`), and the
+conductor evaluates again. The item keeps the evidence it was accepted on in
+`acceptance_proof`; nothing watches the pull request afterwards, so a later push
+is not covered by that acceptance. `rejected` and `abandoned` remain the
+conductor's own decisions.
+
+A passing check is still only as independent as the check itself: CI that the
+worker could edit measures the worker's claim. For work where that matters, the
+condition should point at checks the worker cannot change.
+
+Items accepted before gateway evaluation existed keep their state and their
+recorded `verdict`; they carry no `evidence`, and none is invented for them.
 
 A conductor stops when every item is accepted, when one item has failed
 acceptance three times, when the round or time budget is spent, or when a
@@ -212,6 +259,18 @@ An explicit model pick on the worker file is the one thing carried across.
 `work_brief` and `work_report` are auto-approved: a worker that must ask
 permission to say it is blocked will not say it, and an unattended dispatch is
 exactly the case the ledger exists for.
+
+On the pi backend the ledger works only with `agent.pi_managed` on and with
+`kirocrew-work` and `kirocrew-dashboard` (plus `kirocrew-core`) listed in
+`mcp_gateway.stub_servers`. Ambient pi sessions do not receive these tools. pi
+itself has no `allowedTools`, so Crew applies the spec's list for it, narrowly:
+a managed pi session runs a Crew tool unprompted only when the spec's
+`allowedTools` names it as an `@server` or `@server/tool` ref, the call came
+through Crew's sealed tool bridge, and the governance ceiling permits it. The
+worker's `work_brief` and `work_report` therefore run unattended, as they do on
+kiro-cli. pi's own `read`, `edit`, `write` and `bash` still ask, whatever the
+spec grants, and so does a Crew tool the spec does not pre-approve. An
+unanswered prompt is declined when the approval window ends.
 
 ## No dashboard page
 

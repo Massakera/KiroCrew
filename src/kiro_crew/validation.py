@@ -42,10 +42,11 @@ from kiro_crew.constants import (
 )
 
 # Reasoning-effort vocabulary: ``effort.py`` is the single source of truth for
-# the valid levels; EFFORT_VALUES additionally admits ``""`` ("unset — defer to
-# the role pin / provider default"). Import-safe: ``effort`` pulls in only
-# ``model_registry`` (stdlib-only), so no cycle back into validation.
-from kiro_crew.effort import EFFORT_VALUES
+# the valid levels; SPAWN_EFFORT_VALUES additionally admits ``""`` ("unset — defer
+# to the role pin / provider default") and pi's own ``off``/``minimal``.
+# Import-safe: ``effort`` pulls in only ``model_registry`` (stdlib-only), so no
+# cycle back into validation.
+from kiro_crew.effort import SPAWN_EFFORT_VALUES
 from kiro_crew.lesson_validation import LESSON_APPLIES_VALUES
 from kiro_crew.monitoring.limits import MAX_RUNTIME_CEILING_SECS, validate_runtime_secs
 from kiro_crew.monitoring.models import (
@@ -228,6 +229,10 @@ ARTIFACT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?\Z")
 
 # Valid model name pattern — alphanumerics, hyphens, dots (e.g. "claude-opus-4.8", "deepseek-3.2")
 _MODEL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+# A spawn may also name a harness's provider-qualified id (pi's
+# "openai-codex/gpt-6-sol"): at most one separator, each side a plain model name,
+# so no empty, dot-leading or multi-segment path shape passes.
+_SPAWN_MODEL_NAME_RE = re.compile(r"^(?:[a-zA-Z0-9][a-zA-Z0-9._-]*/)?[a-zA-Z0-9][a-zA-Z0-9._-]*\Z")
 BACKEND_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 # Content-bound theme-persona consent hash: sha256 rendered as EXACTLY 64
@@ -1131,13 +1136,15 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # absolute, exist, and be under subagent_cwd_allowed_roots. Validated
         # in SubagentManager.spawn.
         FieldSpec("cwd", str, max_len=MAX_MEDIUM_STRING),
-        # Optional model override for the subagent (e.g. "deepseek-3.2").
+        # Optional model override for the subagent (e.g. "deepseek-3.2", or a
+        # provider-qualified pi id such as "openai-codex/gpt-6-sol").
         # When set, the subagent runs on this model instead of the gateway default.
-        FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
+        FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_SPAWN_MODEL_NAME_RE),
         # Optional per-call reasoning-effort override for the subagent(s).
         # Batch-wide, like ``model``. ``""`` (in EFFORT_VALUES) means "unset —
         # defer to the role_efforts['subagent'] pin, else the provider default".
-        FieldSpec("reasoning_effort", str, allowed=EFFORT_VALUES),
+        # ``off``/``minimal`` pass here and are refused off pi at the gateway.
+        FieldSpec("reasoning_effort", str, allowed=SPAWN_EFFORT_VALUES),
         # keep=True makes the run a continuable conversation: its session
         # persists (hibernated on disk) after completion, and spawn_continue
         # can dispatch follow-up turns into it with full prior context.
@@ -3937,7 +3944,11 @@ _WORK_VERDICTS = frozenset(WORK_VERDICTS)
 _WORK_ITEM_STATES = frozenset(WORK_ITEM_STATES)
 #: A superset of the store's six conductor actions: ``accept`` promotes a worker's
 #: claimed ``pr`` into ``acceptance`` and is served by its own store function.
-_WORK_RECORD_ACTIONS = frozenset({"create", "bind", "decide", "verdict", "close", "goal", "accept"})
+# ``verdict`` stays admitted HERE only so the route can answer it with its own
+# ``verdict_retired`` refusal naming the replacement, instead of a bare schema error.
+_WORK_RECORD_ACTIONS = frozenset(
+    {"create", "bind", "decide", "verdict", "close", "goal", "accept", "evaluate"}
+)
 
 WORK_BRIEF_SCHEMA = ToolSchema(tool_name="work_brief")
 

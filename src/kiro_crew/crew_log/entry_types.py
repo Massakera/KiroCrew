@@ -1703,6 +1703,42 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
             ),
             Field("pr", JSON_INT, note="The pull request number, set by report."),
             Field(
+                "evidence",
+                JSON_OBJECT,
+                note=(
+                    "The gateway's acceptance evaluation, set by evaluate: evaluator and "
+                    "policy identity, verdict, the observed revision and its sources, bound "
+                    "to the criterion and worker-submission digests it was captured "
+                    "against. Produced by the gateway, never by a caller."
+                ),
+            ),
+            Field(
+                "criterion_version",
+                JSON_INT,
+                note="The item's acceptance-write count after create or accept.",
+            ),
+            Field(
+                "submission_version",
+                JSON_INT,
+                note="The item's worker-report count after report.",
+            ),
+            Field(
+                "admitted_root",
+                JSON_OBJECT,
+                note=(
+                    "Set by bind: the worker's project directory as path, device and "
+                    "inode, the only tree the file evaluator may read."
+                ),
+            ),
+            Field(
+                "acceptance_proof",
+                JSON_OBJECT,
+                note=(
+                    "Set by an accepted close: the evidence id and the revision accepted, "
+                    "plus the fresh observation the close was decided on."
+                ),
+            ),
+            Field(
                 "event_id",
                 JSON_STRING,
                 note="The store's content-addressed id of the event this write appended.",

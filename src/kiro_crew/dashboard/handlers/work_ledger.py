@@ -42,13 +42,14 @@ against a binding that exists.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import logging
 from typing import Any
 
 from aiohttp import web
 
-from kiro_crew import session_ledger, work_ledger
+from kiro_crew import session_ledger, work_acceptance, work_ledger
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.crew_log.errors import CrewLogError
 from kiro_crew.crew_log.resolve import UNKNOWN, unit_for_session_key
@@ -98,6 +99,13 @@ _CODE_STATUS: dict[str, int] = {
     # from degrading to 400 unnoticed. 409 is its class: the ledger is not in a
     # state where the operation is allowed, exactly like ``item_closed``.
     work_ledger.CODE_LEDGER_NOT_FINISHED: 409,
+    # Acceptance evaluation. All 409: each names a state of the item (not ready,
+    # moved, unproven, unsupported) rather than a malformed argument.
+    work_ledger.CODE_NOT_EVALUABLE: 409,
+    work_ledger.CODE_EVALUATION_STALE: 409,
+    work_ledger.CODE_EVIDENCE_REQUIRED: 409,
+    work_ledger.CODE_TARGET_CHANGED: 409,
+    work_ledger.CODE_HUMAN_APPROVAL_UNSUPPORTED: 409,
 }
 
 #: Codes this LAYER owns, above the store's own. Each names a condition the store
@@ -124,6 +132,7 @@ ROUTE_CODES: frozenset[str] = frozenset(
         "crew_log_unrecorded",
         "work_entry_too_large",
         "work_item_too_large",
+        "verdict_retired",
     }
 )
 
@@ -138,7 +147,7 @@ CODE_NOT_BOUND = "not_bound"
 #: ``pr`` into the item's ``acceptance`` and is served by
 #: :func:`work_ledger.apply_acceptance_update`, which is deliberately not a
 #: seventh member of that frozenset (see its docstring).
-RECORD_ACTIONS: frozenset[str] = work_ledger.CONDUCTOR_ACTIONS | {"accept"}
+RECORD_ACTIONS: frozenset[str] = work_ledger.CONDUCTOR_ACTIONS | {"accept", "evaluate"}
 
 
 def _sel():
@@ -540,6 +549,7 @@ async def api_work_report(request: web.Request) -> web.Response:
         artifacts=cleaned.get("artifacts") or {},
         pr=work_ledger.MAX_PR,
         last_report_at=_WIDEST_STAMP,
+        submission_version=_WIDEST_COUNTER,
         event=_WIDEST_EVENT_TEXT,
         event_kind="report",
         event_id=_WIDEST_HEX_ID,
@@ -631,6 +641,7 @@ async def api_work_report(request: web.Request) -> web.Response:
                     artifacts=item.artifacts,
                     pr=item.pr,
                     last_report_at=item.last_report_at,
+                    submission_version=item.submission_version,
                     event=getattr(result.get("event"), "text", None),
                     event_kind="report",
                     event_id=getattr(result.get("event"), "id", None) or None,
@@ -712,6 +723,14 @@ def _mark_goal_recorded(slot: str) -> None:
         logger.debug("work ledger: could not mark the header recorded", exc_info=True)
 
 
+def _mark_evidence_recorded(slot: str, item_id: str, evidence_id: str) -> None:
+    """Stamp the evaluation as held by the log; a failure only costs a re-evaluation."""
+    try:
+        work_ledger.mark_evidence_recorded(slot, item_id, evidence_id)
+    except (WorkLedgerError, OSError):
+        logger.debug("work ledger: could not stamp %s's evidence recorded", item_id, exc_info=True)
+
+
 def _mark_recorded(slot: str, item_id: str) -> None:
     """Stamp the item as held whole by the log; a failure only costs one more baseline."""
     try:
@@ -751,6 +770,7 @@ _WORKER_REPORT_FIELDS: tuple[str, ...] = (
     "pr",
     "round",
     "last_report_at",
+    "submission_version",
 )
 
 
@@ -823,6 +843,11 @@ def _baseline_fields(item: Any, header: Any) -> dict[str, Any]:
         "created_at": item.created_at or None,
         "last_report_at": item.last_report_at or None,
         "closed_at": item.closed_at or None,
+        "evidence": getattr(item, "evidence", None),
+        "acceptance_proof": getattr(item, "acceptance_proof", None),
+        "criterion_version": getattr(item, "criterion_version", None),
+        "submission_version": getattr(item, "submission_version", None),
+        "admitted_root": getattr(item, "admitted_root", None),
     }
 
 
@@ -1108,6 +1133,9 @@ async def api_work_ledger_get(request: web.Request) -> web.Response:
         # it a conductor sees an item it dispatched simply missing from the batch and
         # has no way to tell "bar not filled in yet" from "the read dropped it".
         row["acceptance_concrete"] = work_ledger.is_acceptance_concrete(item.acceptance)
+        # Whether the stored evaluation still describes this criterion and this
+        # claim. An accepted close needs it true AND a fresh passing observation.
+        row["evidence_current"] = work_ledger.evidence_is_current(item)
         events = event_tails[item.item_id]
         row["events"] = [event.to_dict() for event in events]
         rows.append(row)
@@ -1220,6 +1248,18 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
             work_ledger.CODE_INVALID_ACTION,
             f"unknown action {action!r}; expected one of: {', '.join(sorted(RECORD_ACTIONS))}",
         )
+    if action == "verdict":
+        # Retired, not merely discouraged: a verdict a model writes is not evidence,
+        # and keeping it as a write would leave a caller that predates evaluate
+        # believing it had recorded an acceptance. Refused before anything is read.
+        _audit(key, "work_ledger_record", "denied", resources=action, error="verdict_retired")
+        return _refuse_400(
+            "verdict_retired",
+            "action=verdict is retired: the gateway evaluates acceptance itself. Use "
+            "work_ledger_record action=evaluate item_id=<id>, then close with "
+            "state=accepted once it passes",
+            field="action",
+        )
 
     state: DashboardState = request.app["state"]
     unit, urefusal = _acting_unit(state, key, "work_ledger_record", action)
@@ -1230,11 +1270,49 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
         return dirty
     assert unit is not None
 
+    bind_root: dict[str, Any] | None = None
     if action == "bind":
         refusal = _refuse_unowned_worker(request, key, cleaned.get("worker_session_key"))
         if refusal is not None:
             return refusal
+        # Pinned NOW, while the worker has not run: the project directory it may be
+        # judged on, by path AND inode. Taken from the gateway's own slot table,
+        # never from the request, and read off the loop (realpath and stat).
+        worker_slot = _find_slot(state, str(cleaned.get("worker_session_key") or ""))
+        bind_root = await asyncio.to_thread(
+            work_acceptance.admitted_root_for, getattr(worker_slot, "project", None)
+        )
 
+    if action == "evaluate" or (action == "close" and cleaned.get("state") == "accepted"):
+        # One evaluation or accepted close per item at a time, held across the
+        # external observation AND the commit: two evaluations finishing out of
+        # order cannot publish the older one last, and an evaluation cannot land
+        # between a close's observation and its commit. Per item, not the board
+        # lock, so a CI read never stalls every other write on the board; the store
+        # still revalidates under its own lock, which is what a second gateway
+        # would race.
+        async with _item_eval_lock(key, str(cleaned.get("item_id") or "")):
+            gate, grefusal = await _gateway_observation(request, key, action, cleaned)
+            if grefusal is not None:
+                return grefusal
+            return await _record_write(key, action, cleaned, unit, gate)
+    return await _record_write(key, action, cleaned, unit, None, bind_root=bind_root)
+
+
+async def _record_write(
+    key: str,
+    action: str,
+    cleaned: dict[str, Any],
+    unit: str,
+    gate: "_Gate | None",
+    *,
+    bind_root: dict[str, Any] | None = None,
+) -> web.Response:
+    """The write half of ``work_ledger_record``: fit probe, commit, record, undo.
+
+    *gate* carries the gateway's own observation for ``evaluate`` and an accepted
+    ``close``; it never comes from the request body.
+    """
     # Refused BEFORE the ledger is even bootstrapped: the widest entry this action
     # can produce,
     # with the store-generated fields at their widest, must fit one log line. The
@@ -1264,9 +1342,17 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
         acceptance=cleaned.get("acceptance"),
         worker_session_key=cleaned.get("worker_session_key"),
         decision=probe_decision,
-        verdict=cleaned.get("verdict"),
+        verdict=cleaned.get("verdict") or (gate.observation.get("verdict") if gate else None),
         state="abandoned",
         fails=_WIDEST_COUNTER,
+        evidence=gate.probe_evidence() if gate is not None and action == "evaluate" else None,
+        acceptance_proof=(gate.probe_proof() if gate is not None and action == "close" else None),
+        criterion_version=_WIDEST_COUNTER,
+        admitted_root=(
+            {"path": bind_root["path"], "dev": _WIDEST_COUNTER, "ino": 2**63 - 1}
+            if bind_root
+            else None
+        ),
         event=_WIDEST_EVENT_TEXT,
         event_kind="decision",
         event_id=_WIDEST_HEX_ID,
@@ -1338,7 +1424,7 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
                 return lrefusal
 
         try:
-            result = await asyncio.to_thread(_write, key, action, cleaned)
+            result = await asyncio.to_thread(_write, key, action, cleaned, gate, bind_root)
         except WorkLedgerError as exc:
             _audit(key, "work_ledger_record", "denied", resources=action, error=exc.code)
             return _refuse_store_error(exc)
@@ -1398,6 +1484,18 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
                 verdict=getattr(item, "verdict", None) if "verdict" in sets else None,
                 state=getattr(item, "state", None) if "state" in sets else None,
                 fails=getattr(item, "fails", None) if "fails" in sets else None,
+                evidence=getattr(item, "evidence", None) if "evidence" in sets else None,
+                criterion_version=(
+                    getattr(item, "criterion_version", None)
+                    if "criterion_version" in sets
+                    else None
+                ),
+                admitted_root=(
+                    getattr(item, "admitted_root", None) if "admitted_root" in sets else None
+                ),
+                acceptance_proof=(
+                    getattr(item, "acceptance_proof", None) if "acceptance_proof" in sets else None
+                ),
                 event=getattr(event, "text", None),
                 event_kind=getattr(event, "kind", None),
                 event_id=getattr(event, "id", None) or None,
@@ -1418,6 +1516,13 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
             )
         if item is not None:
             await asyncio.to_thread(_mark_recorded, key, item.item_id)
+        if action == "evaluate" and item is not None and isinstance(item.evidence, dict):
+            # Only now is the evidence in the record, so only now may it authorise
+            # an accepted close. A failure here leaves it unstamped: one more
+            # evaluation, never an acceptance the record cannot justify.
+            await asyncio.to_thread(
+                _mark_evidence_recorded, key, item.item_id, str(item.evidence.get("evidence_id"))
+            )
         if action == "goal":
             await asyncio.to_thread(_mark_goal_recorded, key)
         crew_store = _crew_store(key) if action == "bind" else ""
@@ -1697,8 +1802,149 @@ def _ensure(key: str, depth: int, parent_item: str | None) -> work_ledger.Conduc
     return work_ledger.ensure_conductor(key, depth=depth, parent_item=parent_item)
 
 
-def _write(key: str, action: str, cleaned: dict[str, Any]) -> dict[str, Any]:
+@dataclasses.dataclass(frozen=True)
+class _Gate:
+    """The gateway's own observation for ``evaluate`` or an accepted ``close``.
+
+    Built by :func:`_gateway_observation` from the PERSISTED item, never from the
+    request: ``context`` is what the evaluation was captured against, and
+    ``observation`` is :meth:`work_acceptance.Observation.to_dict`, already passed
+    through the crew log's redaction so the cache and the entry hold one value.
+    """
+
+    context: dict[str, Any]
+    observation: dict[str, Any]
+    expected_evidence_id: str | None = None
+
+    def probe_evidence(self) -> dict[str, Any]:
+        """The widest evidence record :func:`work_ledger.apply_evaluation` can commit."""
+        return {
+            "evidence_id": _WIDEST_HEX_ID,
+            "item_id": _WIDEST_ITEM_ID,
+            "generation": _WIDEST_HEX_ID,
+            "criterion_kind": "human_approval",
+            "criterion_version": _WIDEST_COUNTER,
+            "criterion_digest": "f" * 64,
+            "submission_version": _WIDEST_COUNTER,
+            "submission_digest": "f" * 64,
+            **self.observation,
+        }
+
+    def probe_proof(self) -> dict[str, Any]:
+        """The widest acceptance proof an accepted close can commit."""
+        return {
+            "evidence_id": _WIDEST_HEX_ID,
+            "evaluator": self.observation.get("evaluator"),
+            "policy": self.observation.get("policy"),
+            "criterion_version": _WIDEST_COUNTER,
+            "criterion_digest": "f" * 64,
+            "submission_version": _WIDEST_COUNTER,
+            "submission_digest": "f" * 64,
+            "revision": self.observation.get("revision"),
+            "closing_observation": {
+                "observed_at": _WIDEST_STAMP,
+                "verdict": "refused",
+                "revision": self.observation.get("revision"),
+                "board_digest": "f" * 64,
+            },
+        }
+
+
+#: One asyncio lock per (board, item) for evaluate and accepted close. Lives beside
+#: :data:`_BOARD_LOCKS` for the same reason: every such request runs on this loop.
+_EVAL_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def _item_eval_lock(slot: str, item_id: str) -> asyncio.Lock:
+    lock = _EVAL_LOCKS.get((slot, item_id))
+    if lock is None:
+        lock = _EVAL_LOCKS[(slot, item_id)] = asyncio.Lock()
+    return lock
+
+
+async def _gateway_observation(
+    request: web.Request, key: str, action: str, cleaned: dict[str, Any]
+) -> "tuple[_Gate, None] | tuple[None, web.Response]":
+    """Observe a criterion whose inputs agree with the canonical record.
+
+    Capture under the board lock so an in-flight cache commit and append cannot
+    look like a missing record. Release it before external I/O; the store rechecks
+    the captured context when publishing the result.
+    """
+    item_id = str(cleaned.get("item_id") or "")
+    async with _board_lock(key):
+        dirty = await _refuse_if_dirty(key, key, "work_ledger_record")
+        if dirty is not None:
+            return None, dirty
+        _record, lrefusal = await _own_ledger(key, "work_ledger_record")
+        if lrefusal is not None:
+            return None, lrefusal
+        try:
+            item = await asyncio.to_thread(work_ledger.read_work_item, key, item_id)
+            if item is None:
+                raise WorkLedgerError(
+                    f"unknown item {item_id!r}", code=work_ledger.CODE_UNKNOWN_ITEM, field="item_id"
+                )
+            early = (
+                work_ledger.evaluable_refusal(item)
+                if action == "evaluate"
+                else work_ledger.accepted_close_refusal(item)
+            )
+            if early is not None:
+                raise early
+            await asyncio.to_thread(
+                functools.partial(
+                    work_ledger.require_recorded_evaluation_context,
+                    key,
+                    item,
+                    accepting=action == "close",
+                )
+            )
+        except WorkLedgerError as exc:
+            _audit(
+                key, "work_ledger_record", "denied", resources=f"{action} {item_id}", error=exc.code
+            )
+            return None, _refuse_store_error(exc)
+        except (CrewLogError, OSError):
+            logger.warning("could not verify the recorded work item %s", item_id, exc_info=True)
+            return None, _refuse_409(
+                "crew_log_unreadable",
+                "the crew log could not be read; try again once it is readable",
+            )
+        context = work_ledger.evaluation_context(item)
+    expected = context["prior_evidence_id"] if action == "close" else None
+    observed = await asyncio.to_thread(
+        functools.partial(work_acceptance.observe, item.acceptance, file_root=item.admitted_root)
+    )
+    try:
+        observation = crew_log_emit.safe_work_fields({"evidence": observed.to_dict()})["evidence"]
+    except crew_log_emit.WorkFieldError as exc:
+        return None, _refuse_400(work_ledger.CODE_INVALID_VALUE, str(exc))
+    return _Gate(context=context, observation=observation, expected_evidence_id=expected), None
+
+
+def _write(
+    key: str,
+    action: str,
+    cleaned: dict[str, Any],
+    gate: "_Gate | None" = None,
+    bind_root: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Route one validated action to the store call that owns it."""
+    if action == "evaluate":
+        if gate is None:  # pragma: no cover - the route always observes first
+            raise WorkLedgerError(
+                "evaluate needs the gateway's observation",
+                code=work_ledger.CODE_EVIDENCE_REQUIRED,
+            )
+        header = work_ledger.read_conductor(key)
+        return work_ledger.apply_evaluation(
+            key,
+            str(cleaned.get("item_id") or ""),
+            context=gate.context,
+            observation=gate.observation,
+            generation=getattr(header, "generation", "") or "",
+        )
     if action == "accept":
         return work_ledger.apply_acceptance_update(
             key,
@@ -1723,6 +1969,11 @@ def _write(key: str, action: str, cleaned: dict[str, Any]) -> dict[str, Any]:
         goal=cleaned.get("goal"),
         round_number=cleaned.get("round"),
         fails=cleaned.get("fails"),
+        close_observation=gate.observation if gate is not None and action == "close" else None,
+        expected_evidence_id=(
+            gate.expected_evidence_id if gate is not None and action == "close" else None
+        ),
+        admitted_root=bind_root if action == "bind" else None,
     )
 
 

@@ -336,7 +336,8 @@ async def _start_dashboard(tmp_path: Path, monkeypatch, **kwargs: Any) -> Any:
     sessions.remove = AsyncMock()
     sessions.get_pid = MagicMock(return_value=None)
     sessions.any_active_turn = MagicMock(return_value=False)
-    runner, state = await srv.start_dashboard(
+    factory = kwargs.pop("_server_factory", srv.start_dashboard)
+    runner, state = await factory(
         sessions=sessions,
         crons=MagicMock(
             list_jobs=MagicMock(return_value=[]),
@@ -870,6 +871,7 @@ class TestStartDashboardWiring:
         sessions.remove = AsyncMock()
         sessions.get_pid = MagicMock(return_value=None)
         sessions.any_active_turn = MagicMock(return_value=False)
+        start_broker = AsyncMock()
         try:
             with pytest.raises(SystemExit):
                 await srv.start_dashboard(
@@ -881,7 +883,9 @@ class TestStartDashboardWiring:
                     ),
                     lessons=MagicMock(load_all=MagicMock(return_value=[])),
                     port=18321,
+                    start_mcp_gateway=start_broker,
                 )
+            start_broker.assert_not_awaited()
             spies["start_enabled_app_backends"].assert_not_called()
         finally:
             await _cancel_stray_tasks()
@@ -1112,6 +1116,40 @@ class TestStartDashboardWiring:
 
             assert backend_mod.DEV_FLEET_APP_NAME == "dev-fleet"
             assert spies["start_deferred_app_backends"].called
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("headless", [False, True])
+    async def test_mcp_broker_inherits_bound_port_before_memory_and_readiness(
+        self, tmp_path, monkeypatch, headless
+    ) -> None:
+        from kiro_crew.port_resolution import resolve_client_port_src
+
+        monkeypatch.delenv("KIROCREW_PORT", raising=False)
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "12345")
+        if headless:
+            # TCPSite is inert in this harness; supply its resolved address to
+            # the real export helper rather than replacing that helper.
+            monkeypatch.setattr(
+                web.AppRunner, "addresses", property(lambda _runner: [("127.0.0.1", 18321)])
+            )
+        schedule_memory = MagicMock(return_value=None)
+        seen = []
+
+        async def start_broker():
+            schedule_memory.assert_not_called()
+            seen.append(resolve_client_port_src(None))
+
+        factory = srv.start_api_server if headless else srv.start_dashboard
+        async with _dashboard(
+            tmp_path,
+            monkeypatch,
+            _server_factory=factory,
+            start_mcp_gateway=start_broker,
+            schedule_memory_preparation=schedule_memory,
+        ) as (_runner, state, _spies):
+            assert seen == [(18321, "bound")]
+            assert state.ready is True
+            schedule_memory.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_gateway_launch_can_defer_restored_channel_agents(

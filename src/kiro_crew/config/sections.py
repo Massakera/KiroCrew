@@ -1056,6 +1056,17 @@ class AgentConfig:
             # renders. See harness-parity H4.
         ),
     )
+    pi_managed: bool = field(
+        default=False,
+        metadata=_meta(
+            "Crew-managed pi",
+            "Opt in to Crew-owned pi tools and instructions. Disables ambient pi "
+            "extensions, skills and prompt templates; preserves repository context "
+            "files. Tool access comes from the selected Crew agent spec. Requires "
+            "pi 0.87.1 or newer. Does not change other backends or standalone pi.",
+            restart=True,
+        ),
+    )
     member_acp_backend: str = field(
         default="kas",
         metadata=_meta(

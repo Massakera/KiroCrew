@@ -298,6 +298,30 @@ class TestApprovalModes:
         client.approve_tool.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_managed_pi_spec_grant_auto_approves_a_bridged_call(self, tmp_path):
+        """A normal-mode slot runs a managed pi spec's allowed bridged tool unprompted."""
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        client.managed_pi_grant = MagicMock(return_value=True)
+        slot = _make_slot()
+        bridged = LLMEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            title="mcp__kirocrew-work__work_brief",
+            request_id="req-1",
+            mcp_server_name="kirocrew-work",
+            tool_name="work_brief",
+            mcp_identity_trusted=True,
+            bridge_verified=True,
+        )
+        _set_stream(client, [bridged, _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        assert not any(m["role"] == "permission" for m in _tool_messages(slot))
+        client.approve_tool.assert_called_once()
+        client.managed_pi_grant.assert_called_once_with(bridged)
+
+    @pytest.mark.asyncio
     async def test_trust_mode_auto_approves(self, tmp_path):
         """Trust mode must auto-approve without interactive prompt."""
         state, client = _make_state(tmp_path, context_builder=_context_builder())

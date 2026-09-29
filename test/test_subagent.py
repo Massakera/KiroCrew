@@ -2451,6 +2451,65 @@ class TestIdentityTrustedChildHookIdentityGrant:
         provider.reject_tool.assert_awaited_once_with(7101)
 
 
+class TestManagedPiAllowedToolsGrant:
+    """A managed pi run's spec-allowed bridged call is approved without a card;
+    the gate's deny still wins, and a provider that grants nothing asks as before."""
+
+    _helper = TestIdentityTrustedChildHookIdentityGrant
+
+    def _run(self, hook_result, granted):
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+        event = LLMEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            title="mcp__kirocrew-work__work_brief",
+            request_id=7201,
+            is_shell=False,
+            mcp_server_name="kirocrew-work",
+            tool_name="work_brief",
+            mcp_identity_trusted=True,
+            bridge_verified=True,
+            raw_params_trusted=True,
+            shell_classified=True,
+        )
+        helper = self._helper()
+        manager, info, provider = helper._manager_and_stream(event, hook_result)
+        provider.managed_pi_grant = MagicMock(return_value=granted)
+        return manager, info, provider, helper
+
+    @pytest.mark.asyncio
+    async def test_spec_allowed_bridged_call_is_approved(self) -> None:
+        from kiro_crew.hooks import ToolHookResult
+
+        manager, info, provider, helper = self._run(ToolHookResult.allow(), True)
+        p1, p2, p3, p4 = helper._patches()
+        with p1, p2, p3, p4:
+            await manager._run_inner(info, "subagent:idhook01")
+        provider.approve_tool.assert_awaited_once_with(7201)
+        provider.reject_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_gate_deny_wins(self) -> None:
+        from kiro_crew.hooks import ToolHookResult
+
+        manager, info, provider, helper = self._run(ToolHookResult.deny("policy"), True)
+        p1, p2, p3, p4 = helper._patches()
+        with p1, p2, p3, p4:
+            await manager._run_inner(info, "subagent:idhook01")
+        provider.approve_tool.assert_not_awaited()
+        provider.reject_tool.assert_awaited_once_with(7201)
+
+    @pytest.mark.asyncio
+    async def test_no_grant_is_not_an_approval(self) -> None:
+        from kiro_crew.hooks import ToolHookResult
+
+        manager, info, provider, helper = self._run(ToolHookResult.allow(), False)
+        p1, p2, p3, p4 = helper._patches()
+        with p1, p2, p3, p4:
+            await manager._run_inner(info, "subagent:idhook01")
+        provider.approve_tool.assert_not_awaited()
+
+
 class TestChildEscalationLimit:
     """Child-origin permission escalations get their own volume bound, and the
     bail must ANSWER the triggering request before tombstoning — a return

@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMappin
 from dataclasses import MISSING, asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit as _urlsplit  # noqa: F401 - compatibility facade
 
 # Module alias for post-split helpers. The `from ... import` list below is a
@@ -44,6 +44,7 @@ from kiro_crew import (
     windows_acl,
 )
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_PI,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     resolve_cc_permission_mode,
 )
@@ -356,7 +357,7 @@ from kiro_crew.constants import (
     SUBAGENT_TIMEOUT_MIN,
     SUBAGENT_TIMEOUT_SECS,
 )
-from kiro_crew.effort import is_valid_effort, model_supports_effort
+from kiro_crew.effort import PI_ONLY_EFFORT_LEVELS, is_valid_effort, model_supports_effort
 from kiro_crew.instances.constants import DEFAULT_CONNECT_TIMEOUT_SECS as _DEFAULT_CONNECT_TIMEOUT
 from kiro_crew.instances.constants import DEFAULT_MAX_RECOVERY_ATTEMPTS as _DEFAULT_MAX_RECOVERY
 from kiro_crew.instances.constants import DEFAULT_MINT_TIMEOUT_SECS as _DEFAULT_MINT_TIMEOUT
@@ -2739,6 +2740,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
             agent_data.get("mcp_quarantine_after_failures", 3), 3
         ),
         acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
+        pi_managed=_safe_bool(agent_data.get("pi_managed", False), False),
         member_acp_backend=_normalize_acp_backend(agent_data.get("member_acp_backend", "kas")),
         subagent_backend_fallback=_sections.coerce_backend_fallback(
             agent_data.get("subagent_backend_fallback")
@@ -5529,10 +5531,14 @@ class KiroCrewConfig:
         key = resolve_crew_identity(self, agent, crew_agent)
         return self.agents.get(key) if key else None
 
-    def resolve_session_effort(self, agent: str | None, crew_agent: str | None = None) -> str:
+    def resolve_session_effort(
+        self, agent: str | None, crew_agent: str | None = None, backend: str | None = None
+    ) -> str:
         """The effort a NEW session resolves to, short of an explicit override.
 
-        The crew's own pin first, then the role-aware default: a background
+        The crew's own pin first, then the bound agent spec's own
+        ``reasoning_effort`` (judged for *backend*, the configured default when
+        omitted), then the role-aware default: a background
         worker agent (``kirocrew-lite`` / ``kirocrew-heartbeat``) takes the
         ``background`` role effort, everything else the chat default. A pin the
         operator typed on the crew therefore outranks BOTH defaults, including
@@ -5560,9 +5566,33 @@ class KiroCrewConfig:
             if pinned:
                 return pinned
         template = crew.kiro_agent if crew is not None else (agent or "")
+        spec_effort = self._resolve_named_agent_effort(
+            template, backend if backend is not None else self.agent.acp_backend
+        )
+        if spec_effort:
+            return spec_effort
         if template in BACKGROUND_WORKER_AGENTS:
             return self.agent.resolve_effort("background")
         return self.agent.reasoning_effort
+
+    @classmethod
+    def _resolve_named_agent_effort(
+        cls, agent: str, backend: str, agents_dir: Path | None = None
+    ) -> str:
+        """A named agent spec's own ``reasoning_effort``, or ``""``.
+
+        ``off``/``minimal`` exist only in pi's vocabulary, so they count only
+        when *backend* is pi; anywhere else, and for any unknown value, the spec
+        pins nothing and the next tier decides.
+        """
+        if not agent or agent == "kirocrew":
+            return ""
+        value = cls._named_agent_spec_value(agent, "reasoning_effort", agents_dir)
+        if is_valid_effort(value):
+            return str(value)
+        if value in PI_ONLY_EFFORT_LEVELS and backend == ACP_BACKEND_PI:
+            return str(value)
+        return ""
 
     @staticmethod
     def _resolve_named_agent_model(agent: str, agents_dir: Path | None = None) -> str:
@@ -5594,8 +5624,17 @@ class KiroCrewConfig:
         lists JSON entries first). Never raises -- a failure to import, walk or
         parse is "no pin here", never an exception into model resolution.
         """
+        return KiroCrewConfig._named_agent_spec_value(agent, "model", agents_dir) or ""
+
+    @staticmethod
+    def _named_agent_spec_value(agent: str, key: str, agents_dir: Path | None = None) -> Any:
+        """One field of a named agent's spec, read the way the model pin is read.
+
+        See :meth:`_resolve_named_agent_model` for the snapshot, loop-safety and
+        JSON-first rules. Never raises; a missing spec or field is ``None``.
+        """
         if not agent:
-            return ""
+            return None
         base = agents_dir if agents_dir is not None else kiro_agents_dir()
         try:
             # Deferred import: agent_discovery imports kiro_crew.hooks, whose
@@ -5609,14 +5648,14 @@ class KiroCrewConfig:
             else:
                 rows = cached_agent_specs(base, operation="load_config", source="unknown")
         except Exception:
-            return ""
+            return None
         # Stable sort: JSON rows first, filename order preserved within each group.
         rows.sort(key=lambda row: row[1].suffix.lower() != ".json")
         for ad, af in rows:
             # Skip stray non-object JSON a user may have dropped in the dir.
             if isinstance(ad, dict) and (ad.get("name") == agent or af.stem == agent):
-                return ad.get("model") or ""
-        return ""
+                return ad.get(key)
+        return None
 
     def load_credentials(self, *, propagate: bool = True) -> dict[str, str]:
         """Load credentials from ~/.kiro/crew/.env and environment variables.
@@ -5838,7 +5877,9 @@ class KiroCrewConfig:
             # crews API also serves its readout from. An explicit override (the
             # dashboard slot's effort, or a sub-agent's resolved "subagent"
             # effort) still wins over all of it.
-            _eff = reasoning_effort_override or self.resolve_session_effort(agent, crew_agent)
+            _eff = reasoning_effort_override or self.resolve_session_effort(
+                agent, crew_agent, _backend
+            )
             # On a harness whose effort capability and vocabulary come from the
             # option it ADVERTISES, neither check below can answer here. This
             # factory runs before any session exists, the registry carries none of
@@ -5895,6 +5936,7 @@ class KiroCrewConfig:
                 channel_id=channel_id,
                 extra_env=extra_env,
                 acp_backend=_backend,
+                pi_managed=self.agent.pi_managed,
                 effort_per_model=_eff_per_model,
                 tool_search=tool_search,
                 tool_search_min_pct=tool_search_min_pct,

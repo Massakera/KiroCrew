@@ -1510,6 +1510,97 @@ exposes per-child cancel/resume is integrated by adding a row adapter. On a
 shared runtime, recovery of the parent rebuilds only that session handle, never
 the runtime shared with unrelated sessions.
 
+### Crew-managed pi (opt-in)
+
+`agent.pi_managed` is an opt-in, restart-required pilot; the default remains the
+ambient pi integration. It affects only the pi spawn arm (H13). No operator pi
+file, credential location, sandbox scope or other backend is changed. A managed
+spawn requires a verifiable pi installation at least 0.87.1, because its prompt
+hook uses that version's structured system-prompt options. An unknown wrapper
+version or older installation refuses this mode before starting a session.
+
+The managed launcher disables discovered/configured extensions, skills and prompt
+templates, while explicitly loading Crew's separately sealed managed-profile
+extension, the unchanged permission gate and, when granted, the existing tool
+bridge, in that order. Both the profile and gate must pass command-registry
+provenance read-back. Keeping the legacy gate byte-identical avoids invalidating
+its pinned digest in a gateway already running from an editable checkout.
+Repository and ancestor `AGENTS.md`/`CLAUDE.md` context remains; the profile removes
+the standalone pi agent-directory context and pi's custom/append system-prompt
+overrides before each model turn. It uses pi's own `getAgentDir()` normalization,
+including supported file URLs, rather than interpreting the environment itself. Crew supplies the
+agent prompt and skill context through its existing context path. Models,
+authentication and session storage retain their existing pi locations. Providers
+implemented by ambient extensions are not loaded in this mode; migrating a profile
+that depends on one requires a separate supported provider path.
+
+`agent_sdk.pi_profile.managed_pi_tools` projects the captured spec's explicit
+`tools` list: `fs_read` grants `read`, `grep`, `find`, `ls`; `fs_write` grants
+`edit`, `write`; `execute_bash` grants `bash`; and `glob` grants `find`. Those pi
+names can also be named directly. `@builtin` grants these built-ins only; `*`
+also grants the existing bridge inventory. Unknown native names grant nothing.
+Missing/malformed tool lists refuse the managed spawn rather than inheriting pi's
+write-capable defaults. This is not a projection of every agent-spec field.
+
+Bridge refs are narrowed to the existing sealed bridge's inventory, including
+exact `@server/tool` grants, whole-server disables and `disabledTools` patterns.
+A read-only profile mounts no bridge tools unless it explicitly grants them;
+`allowedTools` remains an approval setting, never the tool inventory. An agent
+requesting bridge tools cannot start managed mode when the bridge cannot be
+prepared. This checks preparation, not live MCP readiness after launch: the
+bridge's existing connection-failure behavior still applies.
+
+The managed bridge's inventory is `_PI_MANAGED_BRIDGE_TOOLS`, a superset of the
+ambient `_PI_BRIDGE_TOOLS`: it adds the whole `kirocrew-work` ledger surface, the
+`kirocrew-dashboard` verbs a conductor dispatches through (`session_create`,
+`session_send`, `session_read_message`, `session_stop`, `session_close` and the
+three `chat_folder_*` placement verbs), and the `kirocrew-core` verbs the conductor
+procedure patrols with (`monitor_start`, `monitor_update`, `autonudge_stop`,
+`wait`, `list_sessions`, `session_ledger_read`, `session_ledger_record`,
+`ask_question`, `send_notification`). It is reached only through the projection
+above, so a spec that does not mount a server gets none of its tools, and each
+server still needs its own `mcp_gateway.stub_servers` entry. A managed spec that
+mounts a server the broker does not stub starts without those tools and logs the
+missing names once per agent. Ambient sessions keep the spawn-only set.
+
+pi has no pre-approval list, so a managed session applies the spec's
+`allowedTools` on the host side, for bridged Crew tools only.
+`agent_sdk.pi_profile.managed_pi_grants` expands the spec's `@server`,
+`@server/`, `@server/*` and `@server/<glob>` entries against the mounted bridge
+tools into concrete `@server/tool` refs; a native name or a bare `*` grants
+nothing, so pi's `read`, `edit`, `write` and `bash` always ask.
+`_prepare_pi_managed_profile` then drops every ref `may_skip_gate_now` withholds,
+the same ceiling filter each kiro `allowedTools` writer applies.
+`AcpClient.managed_pi_grant(event)` answers true only for a managed session and an
+event with `bridge_verified` set, which `build_permission_event` sets only when
+`gate_bridged_mcp_call` proved the envelope's source is the sealed bridge copy
+(narrower than `mcp_identity_trusted`, which a tool_call cache hit also earns).
+`hooks.managed_pi_allowed_grant` upgrades only a `TOOL_ALLOW` verdict, the one left
+after the deny floor and governance judged the concrete call, so a deny still
+wins; it skips under `classifier_only`. The dashboard runner applies it before the
+child-fidelity downgrade and the auto-approve arm (which still fires PreToolUse
+script hooks and writes the SEL row); the subagent runner approves with the
+`managed_pi_allowed_tools` reason. The webhook runner does not apply it: its
+payload is untrusted external input, and it keeps approving only on the gate's own
+verdict.
+
+The managed-profile extension captures the projected tool names at load, selects
+them at session start and blocks any other tool before asking for host approval. Allowed
+calls still go through Crew's normal gate. The projection is rebuilt per spawn;
+ambient sessions discard an inherited managed projection. The launcher cache
+includes the mode and profile path, so ambient and managed sessions cannot share
+the wrong flags or profile copy.
+No read-only claim follows from a prompt or from the legacy `allowed_tools`
+argument, which the ACP provider factory does not consume.
+
+`test_pi_managed` exercises the projection, launcher separation, environment
+isolation, both shipped TypeScript handlers and real pi startup without a model
+call. Real SDK context/extension-loader regressions cover absolute, tilde and
+file-URL agent-directory spellings while retaining repository instructions.
+This does not yet establish a live `spawn_run` review, model/effort parity for
+imported pi-subagents profiles, continuation parity, or dashboard worktree/output
+visibility. Those are rollout gates before making managed mode the fork's default.
+
 ### Model-substitution advisory
 
 kiro can return a `-32603` error that is an *advisory* that it substituted a different model, not a fatal failure. `_is_model_substitution_advisory()` (with `_extract_advisory_detail()` for the human-readable reason) recognizes this shape, and the session stays alive and continues the turn instead of tearing down — a real fatal error still propagates.
@@ -1527,7 +1618,7 @@ kiro can return a `-32603` error that is an *advisory* that it substituted a dif
 
 **Per-turn kiro billing credits.** `_track_metadata()` parses each `_kiro.dev/metadata` notification via the shared `parse_metadata()`, capturing `meteringUsage` entries with `unit=="credit"` (kiro bills in credits; token fields are 0 for the acp provider) into `AcpPromptStats.credits`, accumulated across the turn and surfaced on `EVENT_COMPLETE`.
 
-**Pi tool bridge.** pi-acp never forwards the `session/new` `mcpServers` array, so a pi session reaches Crew's subagent tools and `local_knowledge_search` through a second sealed extension instead (`agent_sdk/gate_extensions/pi/kiro_crew_tool_bridge.ts`, `ACP_BACKENDS_EXTENSION_TOOL_BRIDGE`). `AcpClient._prepare_pi_tool_bridge()` runs on the spawn path after the pooled broker stubs are built: when `mcp_gateway.stub_servers` names `kirocrew-core`, it seals the bridge beside the gate (`kirocrew_pi_gate_<pid>_bridge.ts`, pinned by `PI_BRIDGE_EXTENSION_SHA256`), adds it to the gate launcher, and puts that session's stub command lines, each with the tools of `_PI_BRIDGE_TOOLS` it may register, in `KIROCREW_PI_BRIDGE_SERVERS`. The bridge speaks MCP over stdio to each stub and registers the named tools as `mcp__kirocrew-core__<tool>`; gatewayd runs the real server outside the sandbox. The gate extension adds `source` (pi's `sourceInfo.path` for the tool) to every envelope, and `build_permission_event(gate_bridge=...)` grants the trusted MCP identity only when that path is the sealed bridge copy (`_dispatch.gate_bridged_mcp_call`). The bridge is optional and the gate is not: no stub (logged once per process), a failed seal or a bridge that cannot start leaves the session running without Crew tools, and never refuses it. `_verify_pi_gate` runs its read-back without the variable, so the probe never starts a stub.
+**Pi tool bridge.** pi-acp never forwards the `session/new` `mcpServers` array, so a pi session reaches Crew's subagent tools and `local_knowledge_search` through a second sealed extension instead (`agent_sdk/gate_extensions/pi/kiro_crew_tool_bridge.ts`, `ACP_BACKENDS_EXTENSION_TOOL_BRIDGE`). `AcpClient._prepare_pi_tool_bridge()` runs on the spawn path after the pooled broker stubs are built: when `mcp_gateway.stub_servers` names `kirocrew-core`, it seals the bridge beside the gate (`kirocrew_pi_gate_<pid>_bridge.ts`, pinned by `PI_BRIDGE_EXTENSION_SHA256`), adds it to the gate launcher, and puts that session's stub command lines, each with the tools of `_PI_BRIDGE_TOOLS` (a managed session: `_PI_MANAGED_BRIDGE_TOOLS`, see [Crew-managed pi](#crew-managed-pi-opt-in)) it may register, in `KIROCREW_PI_BRIDGE_SERVERS`. The bridge speaks MCP over stdio to each stub and registers the named tools as `mcp__kirocrew-core__<tool>`; gatewayd runs the real server outside the sandbox. The gate extension adds `source` (pi's `sourceInfo.path` for the tool) to every envelope, and `build_permission_event(gate_bridge=...)` grants the trusted MCP identity only when that path is the sealed bridge copy (`_dispatch.gate_bridged_mcp_call`). Outside managed mode, the bridge is optional and the gate is not: no stub (logged once per process), a failed seal or a bridge that cannot start leaves the session running without Crew tools, and never refuses it. `_verify_pi_gate` runs its read-back without the variable, so the probe never starts a stub.
 
 **Per-turn cost and token counts (claude seam).** The `claude-agent-acp` adapter bills in cost/tokens instead of credits: a session-cumulative `cost: {amount, currency}` rides `usage_update`, and turn-scoped token counts (`inputTokens`/`outputTokens`/`cachedReadTokens`/`cachedWriteTokens`) ride the PromptResponse. Both are validated at the shared `_dispatch.py` chokepoints (`parse_usage_cost`, `parse_prompt_token_usage` — same defensive posture as `parse_usage_update`). `parse_usage_cost` additionally drops the whole cost when a `currency` is present and not exactly `"USD"`, since every consumer stores the result in USD-denominated fields; an absent currency stays accepted for adapters that omit it. and folded into `AcpPromptStats`: the cumulative cost is converted to a per-turn delta by `apply_cost_cumulative` (monotonic guard — a reading below the stored baseline means the adapter's counter reset, so the new total is taken whole rather than emitting a negative delta; the baseline survives `carry_over()` like the context fields and is dropped by `reset_context_state()`), and the token counts accumulate via `apply_prompt_token_usage` (`_track_prompt_usage` on both `AcpClient` and `AcpSessionHandle`). Every `EVENT_COMPLETE` construction site builds its `TurnUsage` through the single `AcpPromptStats.to_turn_usage()` helper, so `cost_usd` and the token dimensions populate uniformly and the per-turn persist gate fires on the claude seam. kiro-cli sends neither signal, so on the kiro path the new dimensions stay 0 and `credits` flows exactly as before (harness parity — no `_is_claude` branch anywhere on this wiring).
 

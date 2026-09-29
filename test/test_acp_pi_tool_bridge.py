@@ -136,8 +136,7 @@ def _stub(name: str) -> dict:
 
 
 def _client_with_stubs(monkeypatch, stubs: list[dict]) -> AcpClient:
-    client = AcpClient.__new__(AcpClient)
-    client._agent = "kirocrew"
+    client = AcpClient(acp_backend=ACP_BACKEND_PI, agent="kirocrew")
     monkeypatch.setattr(AcpClient, "_pooled_broker_stubs", lambda self: stubs)
     return client
 
@@ -315,6 +314,7 @@ class TestBridgedIdentity:
         assert event.mcp_server_name == "kirocrew-core"
         assert event.tool_name == "spawn_run"
         assert event.mcp_identity_trusted is True
+        assert event.bridge_verified is True
         assert event.is_shell is False
         assert event.raw_tool_params == {"task": "review the diff", "backend": "codex"}
 
@@ -327,6 +327,7 @@ class TestBridgedIdentity:
         assert event.title == "mcp__kirocrew-core__spawn_run"
         assert event.mcp_server_name == ""
         assert event.mcp_identity_trusted is False
+        assert event.bridge_verified is False
 
     def test_without_the_nonce_nothing_is_read_at_all(self):
         event, _ = build_permission_event(
@@ -334,6 +335,7 @@ class TestBridgedIdentity:
         )
         assert event.mcp_server_name == ""
         assert event.mcp_identity_trusted is False
+        assert event.bridge_verified is False
 
 
 # ── The extensions under Node ───────────────────────────────────────────────

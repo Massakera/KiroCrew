@@ -246,6 +246,26 @@ de-duplicated. `_work_step` filters every retained entry by the bound board slot
 so a worker unit shared by several boards contributes only entries that name this
 board.
 
+An item's `evidence` and `acceptance_proof` are gateway-produced records and fold
+only through `WORK_CONDUCTOR_FIELDS`: `evidence` from an `evaluate` entry,
+`acceptance_proof` from a `close` entry, or either from a baseline that carries a
+committed item. A legacy `verdict` entry sets `verdict` and `fails` and nothing
+else, so a rebuild never promotes a copied verdict into evidence
+(`test_work_ledger_acceptance.py::test_a_legacy_verdict_is_never_promoted_to_evidence_by_the_fold`,
+`::test_an_accepted_item_rebuilds_with_the_same_evidence_and_proof`). The
+acceptance contract itself is in [work-ledger](../../../src/kiro_crew/docs/work-ledger.md).
+
+The gateway checks evaluation inputs against this fold before observing a target:
+board generation, criterion and submission versions/content, item state, worker
+binding and admitted file root must agree with the cache. An accepted close also
+requires the same evidence in the fold. The board lock covers this comparison so
+an in-flight cache commit cannot be mistaken for a missing append; it is released
+before external I/O, and publication revalidates the captured context. A mismatch
+refuses with `crew_log_incomplete` without repairing the cache: a stranded write
+and a pruned log are not distinguishable here. A logged evaluation alone cannot
+make an unrecorded predecessor canonical. A fresh evaluation may replace an
+unrecorded evaluation when its inputs are recorded.
+
 `_Fold.bind_slot` is the optional fourth fold operation. The `work` fold registers
 `_work_bind_slot`, and `fold_slot_checkpoint` invokes it before the first entry.
 The board identity therefore comes from the reader's slot rather than from the

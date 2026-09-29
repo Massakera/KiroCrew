@@ -232,9 +232,15 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "acceptance; 'bind' attaches a worker session key to an item — do this "
                 "BEFORE seeding that session, so the worker never starts unbound; "
                 "'decide' records what you decided and why (the one field a worker reads "
-                "as an instruction); 'verdict' records accept_eval.py's verdict and the "
-                "fail count; 'accept' promotes a worker's claimed pr into the item's "
-                "acceptance once you have checked it; 'close' stamps a terminal state. "
+                "as an instruction); 'evaluate' has the GATEWAY evaluate the item's stored "
+                "acceptance against the exact revision (a pull request's head SHA, a file's "
+                "bytes) and records that evidence -- only for an item whose worker "
+                "currently reports done; 'accept' promotes a worker's claimed pr into the "
+                "item's acceptance once you have checked it; 'close' stamps a terminal "
+                "state, and state=accepted is refused unless the item's current evaluation "
+                "passed AND a fresh gateway check at close still shows that same revision "
+                "passing (it answers target_changed after a new push or a re-run). "
+                "'verdict' is retired: you cannot write a verdict, you ask for one. "
                 "Caps refuse rather than truncate, naming the field. The whole write is "
                 "one 64 KB crew-log line as JSON (a non-ASCII character can count up to twelve "
                 "bytes), so a write at every field cap with non-ASCII text can be "
@@ -252,7 +258,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "create",
                             "bind",
                             "decide",
-                            "verdict",
+                            "evaluate",
                             "close",
                             "goal",
                             "accept",
@@ -273,7 +279,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "acceptance": {
                         "type": "object",
                         "description": (
-                            "create / accept: the accept_eval.py condition object, stored "
+                            "create / accept: the acceptance condition object, stored "
                             'verbatim — e.g. {"kind": "pr_checks", "pr": 123, '
                             '"repo": "owner/name"}.'
                         ),
@@ -289,11 +295,6 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "worker reads this as an instruction."
                         ),
                     },
-                    "verdict": {
-                        "type": "string",
-                        "enum": ["pass", "fail", "pending", "refused", "error"],
-                        "description": "verdict: accept_eval.py's own five-value answer.",
-                    },
                     "state": {
                         "type": "string",
                         "enum": ["accepted", "rejected", "abandoned"],
@@ -306,10 +307,6 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "round": {
                         "type": "integer",
                         "description": "goal / decide / create: the patrol round counter.",
-                    },
-                    "fails": {
-                        "type": "integer",
-                        "description": "verdict: acceptance attempts that came back fail.",
                     },
                 },
                 "required": ["action"],

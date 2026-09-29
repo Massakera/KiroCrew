@@ -25,11 +25,13 @@ all** — not `fs_write`, and not `code` either, which governance classes as a
 filesystem write because it writes files and can shell out. `grep`, `glob` and
 `web_search` are unmounted as well; `fs_read` and `web_fetch` are what you read
 the world with. That is deliberate. If a task needs a file written, it is a work
-item, not something you do. `execute_bash` IS granted, for exactly one purpose:
-running the acceptance evaluator this skill bundles
-(`scripts/accept_eval.py`). It is deliberately kept out of `allowedTools`, so
-every call prompts for approval — see "Known limits" for what that costs per
-patrol cycle.
+item, not something you do. **Acceptance is evaluated by the gateway, not by
+you:** `work_ledger_record` `action=evaluate` makes the gateway read the item's
+stored condition against the exact revision and record the evidence, and only
+that evidence can let you close an item `accepted`. `execute_bash` is still
+granted and still prompts, but nothing it produces reaches the ledger — the
+bundled `scripts/accept_eval.py` is a local diagnostic now, and its output is not
+evidence.
 
 ## What is a work item
 
@@ -38,10 +40,17 @@ A candidate qualifies only if **all three** hold:
 1. **Independent** — it does not consume another candidate's output. Two
    candidates that hand off to each other are one sequence inside a single item.
 2. **Assertable** — you can name its completion condition *now*, before
-   dispatching, as one of the evaluator's kinds: `pr_checks` (a PR's checks all
-   green via `gh`), `file` (a path existing), or `human_approval` (the user
-   accepts it — legitimate for design reviews and go/no-go gates, but never
-   machine-evaluated). **There is deliberately no "run this command" kind**, so
+   dispatching, as one of the evaluator's kinds: `pr_checks` (every check run and
+   commit status on the PR's head commit green, at least one of them a real
+   success, and no cancelled attempt left unreplaced — name `"repo": "owner/name"`,
+   because the gateway has no working directory to infer it from), `file` (a path
+   existing inside the worker's project directory as it was when you bound the
+   item — so dispatch the worker session with its project already set), or `human_approval` (the user
+   decides — legitimate for design reviews and go/no-go gates, never
+   machine-evaluated, and **not closable as `accepted` through the ledger**: there is
+   no authenticated approval channel, so record the person's answer with
+   `action=decide` and close the item `rejected` or `abandoned`, saying so in your
+   report). **There is deliberately no "run this command" kind**, so
    "the test suite passes" is expressed as `pr_checks` on the PR that carries the
    work — CI runs the suite, and its verdict is the one that counts. If an item's
    completion genuinely cannot be stated as one of these, it is not assertable:
@@ -144,7 +153,7 @@ beats more parallelism: every open item is a session the user may have to read.
 For each item in the round, in **exactly this order**:
 
 1. `work_ledger_record` `action=create`, with the item's `title` and its
-   `acceptance` condition — the same condition object `accept_eval.py` parses,
+   `acceptance` condition — the condition object the gateway evaluates,
    stored verbatim. It returns the `item_id`.
 2. `session_create` with a title that says what the item is FOR, `folder` set to
    `<goal folder>/<agent>` — the goal's folder from Round 0 with the agent name
@@ -215,9 +224,9 @@ Then end your turn.
 Each cycle:
 
 1. **`work_ledger_read` first, every cycle.** It returns the conductor record,
-   every item with all its fields, each item's derived `orphaned`, `stale` and
-   `acceptance_concrete` flags, the newest events per item, and a ready-to-pipe
-   `accept_batch`. This one read replaces the whole transcript-reading cycle, and
+   every item with all its fields, each item's derived `orphaned`, `stale`,
+   `acceptance_concrete` and `evidence_current` flags, and the newest events per
+   item. This one read replaces the whole transcript-reading cycle, and
    it is O(record) — which is why this loop's cost does not grow with its own
    history. An item is never `stale` on the strength of silence alone: its worker
    also has to be not running, and its last word has to have left the next move
@@ -233,76 +242,61 @@ Each cycle:
 
    `blocked` and `question` differ by who must act. That is why they are separate
    values, and why you must not treat one as the other.
-3. **Verify every `done` with the evaluator — never by reading the child's
-   transcript and judging, and never by believing the claim.** Take the
-   `accept_batch` that `work_ledger_read` already built, **keep only the entries
-   whose item is currently `status: done`** — each entry carries that status, so
-   the filter is a read of the document you already have — and pipe that filtered
-   document through a **quoted heredoc**:
+3. **Verify every `done` by asking the gateway — never by reading the child's
+   transcript and judging, never by believing the claim, and never by writing a
+   verdict yourself.** For each item currently `status: done`, call
+   `work_ledger_record` `action=evaluate` with its `item_id`. The gateway reads
+   the condition AS STORED — nothing you pass alongside replaces it — observes the
+   exact revision (the PR's head SHA and the checks of that SHA, or the bytes of
+   the file), and records the result as the item's `evidence`. `action=verdict` is
+   retired and answers `verdict_retired`.
 
-   ```bash
-   python3 <this skill's dir>/scripts/accept_eval.py <<'ACCEPT_BATCH'
-   <the accept_batch document, with every non-done and every placeholder entry removed>
-   ACCEPT_BATCH
-   ```
+   **Only `done` items are evaluable, and the gateway enforces it.** An item whose
+   worker is still `progress`, `blocked` or `question`, or whose condition still
+   holds a placeholder, answers `not_evaluable`. That is the filter you used to
+   apply by hand: a world-state check can return a genuine `pass` on unfinished
+   work — a stub written before the real content, a PR green before the last
+   commit — so an item is judged only once its worker says it is finished.
 
-   **The filter is yours to apply, and it is not optional.** `accept_batch` is
-   composed from every open item whose `acceptance` is not empty — whatever its
-   status, and whether or not the condition's own values are filled in yet. It is
-   the two-phase promotion seam, not a verdict gate. The evaluator
-   answers a world-state question ("does this file exist", "are this PR's checks
-   green"), and a worker that is still `progress` can have made that true early:
-   a stub written before the real content, a PR that is green before the last
-   commit. Evaluating that item returns a genuine `pass` on unfinished work, and
-   recording it with `action=verdict` then `action=close` closes the item under
-   the worker. A `done` is the worker saying the world-state now means what the
-   condition says; only then is the evaluator's answer an acceptance. Never pipe
-   the unfiltered document.
+   Verdicts (in `evidence.verdict`, mirrored in `verdict`): `pass` — close it
+   (step 4). `fail` — the gateway counts it in `fails`; tell the worker what
+   failed with `action=decide`. `pending` means keep waiting (checks still
+   running, or none reported yet). `refused` means the condition asks for
+   something the evaluator will not do — naming a command, a path outside the
+   worker's project, a draft PR whose checks have not finished, or a PR that has
+   already merged or closed. Re-express the condition; never route around a
+   refusal. `error` is a broken condition or an unreadable target (a partial
+   check board, a missing `repo`) — fix the condition or retry later.
 
-   **The heredoc is load-bearing, not style.** `acceptance` holds text you built
-   from ingested content — an issue title, a file path a worker named — and a
-   `file` path carrying a single quote would end a `'...'` string early and hand
-   the rest of the value to the shell as a command, which `execute_bash` then runs
-   after one approval. A heredoc whose delimiter is quoted (`<<'ACCEPT_BATCH'`) is
-   the one form the shell copies to stdin without interpreting anything inside it.
-   Never paste the document into a `printf '%s' '...'` or `echo '...'` argument,
-   and never let the document contain a line that is exactly `ACCEPT_BATCH`.
+   **Evidence goes stale, and the read says when.** Each item row carries
+   `evidence_current`. A new worker report, or a new condition promoted with
+   `action=accept`, retires the evidence taken before it: evaluate again. So does
+   an evaluation whose record did not land: an item answering `evidence_required`
+   after a `pass` needs one more `evaluate`. A
+   request that raced such a change answers `evaluation_stale` and records
+   nothing.
 
-   **Resolve `<this skill's dir>` from where this SKILL.md was actually loaded
-   from** — the skill index names its absolute path. Do NOT hardcode a path under
-   the default skills root: a `KIROCREW_HOME` override moves it, so on such an
-   install that path does not exist and every evaluator call would fail before
-   patrol ever ran.
+   **Two-phase acceptance.** A condition may name a value that only exists after
+   the item starts — a PR number for `pr_checks` is the common case. Store the
+   condition with the value marked TBD at `create`, tell the child in its seed to
+   report the number through `work_report`'s `pr`, and evaluate it only after you
+   have promoted the real value. **The worker's claimed `pr` is never read as the
+   bar.** Promote it yourself with `work_ledger_record` `action=accept` once you
+   have looked at it, then evaluate. A worker that could fill in its own
+   acceptance could point it at anybody's already-green pull request, which is
+   exactly why the claim and the condition are separate fields.
 
-   Evaluate **every `done` item in ONE call** — each invocation costs one
-   approval prompt — then record each answer with `work_ledger_record`
-   `action=verdict` (with `fails` when you are counting retries).
-
-   Verdicts: `pass` / `fail` are final for this cycle. `pending` means keep
-   waiting. `refused` means the spec asked for something the evaluator will not
-   do — most often naming a command, which it does not accept from a spec at all.
-   Re-express the condition as `pr_checks` (or ask the user for a purpose-built
-   kind); never try to route around a refusal. `error` is a broken spec or
-   environment — fix the spec or ask.
-
-   **Two-phase acceptance is a manual omission, not a server filter.** A condition may
-   name a value that only exists after the item starts — a PR number for
-   `pr_checks` is the common case. Store the condition with the value marked TBD
-   at `create`, tell the child in its seed to report the number through
-   `work_report`'s `pr`, and **drop that item from the batch yourself until you have
-   promoted the real value** — the server does not omit it, and a `pr` that is still
-   `TBD` is an `error` verdict, not `pending`. **The worker's claimed `pr` is
-   never read as the bar.** Promote it yourself with `work_ledger_record`
-   `action=accept` once you have looked at it, and verify on the next cycle. A
-   worker that could fill in its own acceptance could point it at anybody's
-   already-green pull request, which is exactly why the claim and the condition
-   are separate fields.
-
-   **A `human_approval` item is verified by asking, and the ask is fragile.** The evaluator answers `pending` for it forever, so slow patrol FIRST — `monitor_update` `interval_secs=1800`, or the largest interval the goal tolerates — and only then put the decision to the user with `ask_question`, which ends your turn. Restore the interval on the cycle that reads the answer.
+   **A `human_approval` item is decided by asking, and the ask is fragile.** The evaluator answers `pending` for it forever, so slow patrol FIRST — `monitor_update` `interval_secs=1800`, or the largest interval the goal tolerates — and only then put the decision to the user with `ask_question`, which ends your turn. Restore the interval on the cycle that reads the answer.
 
    If the user says the card is gone, re-issue it. A report that the card vanished is not an answer.
 4. `work_ledger_record` `action=close` with the item's `state` when an item is
-   finally done with — that is what ends it. **Closing the item and closing
+   finally done with — that is what ends it. **`state=accepted` needs the
+   gateway's current `pass`**, and the gateway checks the target once more at
+   close: a push since the evaluation, or a re-run of a check on the same commit
+   that is pending or failing, answers `target_changed` and the item stays open —
+   evaluate again. `accepted` records the revision that was accepted (in
+   `acceptance_proof`), not every later push. `rejected` and `abandoned` are your
+   decisions and need no evaluation, but never report them as verified work. **Closing the item and closing
    its session happen together.** When a work item reaches a terminal verdict
    (accepted, rejected, abandoned/void) and its loop is stopped,
    `session_close` that child session in the same cycle — a finished worker
@@ -317,11 +311,11 @@ Each cycle:
 6. **Say nothing unless there is a real signal.** An item passing acceptance,
    failing it, asking a question, or stalling. Never post "nothing changed".
 
-**Shell exists for the evaluator, not for work.** `execute_bash` is granted
-so patrol can run `accept_eval.py`. Running a work item's build, test, or fix
-yourself through it is the boundary violation this skill exists to prevent — if
-you need a command run to MAKE something true, that is a work item; the evaluator
-only CHECKS what is already true.
+**Shell is not for work, and not for acceptance.** Running a work item's build,
+test, or fix yourself through `execute_bash` is the boundary violation this skill
+exists to prevent — if you need a command run to MAKE something true, that is a
+work item; `action=evaluate` only CHECKS what is already true, and nothing a shell
+command prints can close an item.
 
 ### Close the round
 
@@ -380,8 +374,8 @@ Depth is capped at 2, so your own children may be workers only — a
 Stop and report when ANY of these fire. Do not push past one.
 
 1. Every item is accepted — the goal is met.
-2. The same item has failed acceptance three times. The `fails` counter you
-   record with `action=verdict` is what survives compaction and feeds this.
+2. The same item has failed acceptance three times. The `fails` counter the
+   gateway keeps on each `fail` evaluation is what survives compaction and feeds this.
 3. The round or time budget the user set is spent.
 4. **A decision is needed that no acceptance condition can settle.** Stopping to
    ask is correct here. Guessing is the failure.
@@ -399,8 +393,9 @@ Two records, and confusing them is the mistake this section exists to prevent.
 
 **The work ledger** (`work_ledger_read` / `work_ledger_record`) holds the items:
 each one's `title`, `acceptance`, `round`, your `decision`, the worker's reported
-`status` and `summary`, its claimed `artifacts` and `pr`, your recorded `verdict`
-and `fails`, and its `state`. It is keyed to your session, it survives
+`status` and `summary`, its claimed `artifacts` and `pr`, the gateway's
+`evidence` (with `verdict` and `fails` mirrored from it), and its `state` — plus
+`acceptance_proof` once it is accepted. It is keyed to your session, it survives
 compaction, and it is the only place an item's acceptance condition lives.
 
 **Your own session ledger** (`session_ledger_read` / `session_ledger_record`)
@@ -507,9 +502,9 @@ what the composer renders:
   question you answer, and one if you ever stop an item. `session_close` sits on
   the same footing — it writes to a session that is not yours, even though it
   archives rather than deletes — so budget one approval per child you close out.
-  `execute_bash` also still prompts, so **each patrol cycle that verifies
-  anything blocks on one approval for the `accept_eval.py` invocation**. Size
-  the nudge interval for that, and batch. On a host with a governance ceiling
+  Verifying needs no approval: `action=evaluate` is a ledger write like any
+  other, so a patrol cycle that evaluates several `done` items does not block on
+  a prompt. On a host with a governance ceiling
   even the granted verbs prompt; if you see approvals where this says you
   should not, that is why.
 - **`session_send` reports delivery, not completion.** `started: true` means the
@@ -517,7 +512,7 @@ what the composer renders:
   says the work succeeded — acceptance is still the evaluator's job.
 - **A worker's `summary` is text you read, and the only bound on it is its cap.**
   It is 500 characters of agent-authored prose, separated by design from every
-  field you decide on. Decide from `verdict`, `status` and the evaluator; read
+  field you decide on. Decide from `evidence`, `status` and the evaluator; read
   `summary` for context. A conductor that decides from prose is misbehaving
   against this skill, and no store can prevent that.
 - **An orphaned item keeps accumulating writes.** `orphaned` is derived at read
@@ -528,15 +523,13 @@ what the composer renders:
   app-scoped sessions, channel-linked or mirrored sessions,
   and sessions in another workspace are all refused by the shared guard. Plan
   work items onto plain persistent dashboard sessions only.
-- **Shell is for the evaluator only, and the evaluator runs no command you
-  name.** `execute_bash` exists so patrol can run `accept_eval.py`; every call is
-  audit-logged and every call prompts. The evaluator accepts **no command, argv
-  array, or shell string from a spec** — it builds every argv it runs from a
-  fixed template, so `pr_checks` becomes `gh pr checks <n>` and nothing else
-  executes. That is deliberate and load-bearing: this script is invoked as an
-  approved wrapper, so a spec that could name a command would turn it into a
-  general way to run one, and Kiro Crew's denied-command floor cannot see inside
-  it (the floor reads the `execute_bash` string, which says
-  `python3 accept_eval.py`). Widening happens by adding a purpose-built kind that
-  constructs its own argv — never by accepting one. A `refused` verdict is a spec
-  to re-express, never a list to route around.
+- **The evaluator runs no command you name, and reads nothing outside the
+  worker's project.** It runs on the gateway and builds every read it makes itself:
+  `pr_checks` reads the pull request's head SHA and then that commit's check runs
+  and statuses through the gateway's own GitHub transport; `file` reads only
+  inside the worker session's project directory, through a descriptor that
+  refuses links. A condition that names a command is `refused` — a spec that could
+  name one would turn the evaluator into a general way to run one, outside the
+  denied-command floor. Widening happens by adding a purpose-built kind, never by
+  accepting one. A `refused` verdict is a condition to re-express, never a list to
+  route around.

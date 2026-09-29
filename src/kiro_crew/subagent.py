@@ -92,6 +92,7 @@ from kiro_crew.hooks import (
     fire_tool_hooks,
     hook_gate_kwargs,
     identity_grant_covers_child,
+    managed_pi_allowed_grant,
 )
 from kiro_crew.llm_helpers import (
     FALLBACK_CANDIDATE_ATTEMPTS,
@@ -5055,6 +5056,7 @@ class SubagentManager:
         *,
         _execution_context=None,
         _captured_state=...,
+        _conversation_key: str = "",
         _stage_boundary_owner: str = "",
     ) -> "SubagentInfo | dict[str, Any] | None":
         return self._continuation._continue_prelude_impl(
@@ -5070,6 +5072,7 @@ class SubagentManager:
             _crew_log_asked,
             _execution_context=_execution_context,
             _captured_state=_captured_state,
+            _conversation_key=_conversation_key,
             _stage_boundary_owner=_stage_boundary_owner,
         )
 
@@ -5699,6 +5702,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     has_dashboard_surface,
     list_orphans,
     maintenance_executor,
+    managed_pi_allowed_grant,
     mark_delivered,
     name_grant,
     os,

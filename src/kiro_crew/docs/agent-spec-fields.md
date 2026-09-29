@@ -118,6 +118,19 @@ Four cases, and the difference between them is the whole answer:
   carries an entry for every backend precisely so absence is a statement rather
   than a lookup miss — `MIRRORS` is the four above, `PROJECTIONS` is all eight.
 
+**Opt-in pi tool projection.** With `agent.pi_managed=true`, pi is an explicit
+exception to the ambient behavior above: Crew reads the captured spec's `tools`
+list to select pi built-ins and narrow the existing sealed tool bridge. A
+`tools: ["fs_read"]` profile receives `read`, `grep`, `find`, and `ls`, with no
+shell, mutation or delegation tool. The gate enforces that selection, not the
+prompt. Its `allowedTools` is read too, for one thing only: an `@server` or
+`@server/tool` entry pre-approves the matching bridged Crew tool, once the
+governance ceiling permits it; a native name or a bare `*` pre-approves nothing,
+so pi's own read, edit, write and shell tools still ask. This does not add a
+general spec mirror or carry every spec field. Ambient pi remains unchanged. See
+[the managed pi contract](../../../docs/system-specs/modules/acp-client.md#crew-managed-pi-opt-in)
+for the version floor, resource isolation, MCP restrictions and rollout limits.
+
 **Where the mirror runs.** At session establishment, on both ACP seams, over the
 shared translation in `acp/session_mcp.py` (`session_mcp_projection`):
 
@@ -151,7 +164,7 @@ underneath.
 | `codex` | `codex.py` | `mcpServers`, narrowed three ways [4]; `model` [5] | `tools` → the array's allowlist [3]; `disabledTools` → the server is withheld whole, except Crew's control plane [7] | `availableModels` — harness-owns-the-vocabulary; `permissions.defaultMode` — fixed-by-governance (`mode=read-only`); `autoApprove` — gate-preserving; `prompt` — context-instead; `resources` — no-reader [6]; `hooks` — no channel |
 | `opencode` | `opencode.py` | `mcpServers`, no transport filter; `model` [5] | `tools` → the array's allowlist [3]; `disabledTools` → the server is withheld whole, control plane INCLUDED [7] | as `codex`, with `permissions.defaultMode` fixed at `ask` and read back off the harness's own resolved config |
 | `goose` | `goose.py` | `mcpServers`, the one channel measured as a round trip rather than as an accepted element; `model` [5] | `tools` → the array's allowlist [3]; `disabledTools` → the server is withheld whole, control plane included [7] | as `codex`, with `permissions.defaultMode` carried as `GOOSE_MODE` in the child's environment |
-| `pi` | none | — | — | no projection at all — kind `no-channel` [8]; `model` and `prompt` still arrive [9] |
+| `pi` | none | — | managed opt-in: built-in/bridge tool selection (see above) | ambient: no spec projection — kind `no-channel` [8]; `model` and `prompt` still arrive [9] |
 | `deepseek` | none | — | — | no projection of the spec — kind `broker-only` [8]; `model` and `prompt` still arrive [9] |
 
 1. Delivered ONLY when Crew authored `<work_dir>/.claude/settings.local.json`.
@@ -419,6 +432,7 @@ pins) refuse the rewrite.
 | Field | Type | Effect |
 |---|---|---|
 | `model` | str | The pin. `"auto"` means "no pin, defer to the tier below". `spec_model` coerces a non-string to `"auto"` — the same rule the execution path applies — so a foreign `{"id": "..."}` value reads as no pin rather than as a provider-prefixed id kiro-cli would reject. Not projected on the KAS wire. |
+| `reasoning_effort` | str | Crew-only effort pin for sessions started on this agent: `low`, `medium`, `high`, `xhigh` or `max`, plus `off` and `minimal` when the session runs on pi. It ranks below an explicit override (a dashboard slot's effort, a `spawn_run` `reasoning_effort` or `agent.role_efforts.subagent`) and a crew's own pin, and above the role and chat defaults (`KiroCrewConfig.resolve_session_effort`). Any other value, or a pi-only level on another harness, pins nothing. Quote `"off"` in markdown frontmatter: YAML reads a bare `off` as `false`. kiro-cli refuses unknown JSON keys, so put it in a markdown spec (or one that never runs on the kiro backend). |
 
 Two sidecar values in `~/.kiro/crew/agent_model_state.json` travel with `model`
 and must never be written into the spec (`lift_and_strip_bookkeeping` lifts and

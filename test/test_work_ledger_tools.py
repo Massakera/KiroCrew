@@ -230,7 +230,10 @@ async def test_a_report_writes_no_conductor_owned_field():
     escaping it.
     """
     ids = await two_by_two()
-    worker_owned = {"status", "summary", "artifacts", "pr", "last_report_at"}
+    # ``submission_version`` is the report's own server-kept counter, like
+    # ``last_report_at``: every report bumps it so acceptance evidence can tell one
+    # submission from the next. It is not a conductor field.
+    worker_owned = {"status", "summary", "artifacts", "pr", "last_report_at", "submission_version"}
     before = (wl.read_work_item(CONDUCTOR_A, ids["item_a"]) or wl.WorkItem()).to_dict()
 
     status, _ = await _report(
@@ -280,7 +283,7 @@ async def test_dispatch_table_binding_only_is_a_worker():
     assert status == 404
     assert body["code"] == wl.CODE_NO_LEDGER
     status, body = await _record(
-        WORKER_A, {"action": "verdict", "item_id": "it_00000000", "verdict": "pass"}
+        WORKER_A, {"action": "decide", "item_id": "it_00000000", "decision": "x"}
     )
     assert status == 404
     assert body["code"] == wl.CODE_NO_LEDGER
@@ -404,6 +407,12 @@ async def test_every_store_code_maps_to_the_status_the_rfc_tabulates():
         # Maintenance-only: raised by ``purge_conductor``, reachable from no
         # route. Mapped so the exhaustiveness property above keeps its meaning.
         "ledger_not_finished": 409,
+        # Acceptance evaluation: every one names a state of the item.
+        "not_evaluable": 409,
+        "evaluation_stale": 409,
+        "evidence_required": 409,
+        "target_changed": 409,
+        "human_approval_unsupported": 409,
     }
 
 
@@ -433,7 +442,7 @@ async def test_already_bound_is_409():
 async def test_item_closed_is_409_for_both_halves():
     ids = await two_by_two()
     status, _ = await _record(
-        CONDUCTOR_A, {"action": "close", "item_id": ids["item_a"], "state": "accepted"}
+        CONDUCTOR_A, {"action": "close", "item_id": ids["item_a"], "state": "rejected"}
     )
     assert status == 200
     status, body = await _report(WORKER_A, {"status": "done", "summary": "too late"})
@@ -664,7 +673,8 @@ async def test_accept_is_a_route_action_not_a_store_action():
     """The store's six are pinned by Phase 1, so the seventh lives one layer up."""
     assert "accept" not in wl.CONDUCTOR_ACTIONS
     assert "accept" in routes.RECORD_ACTIONS
-    assert routes.RECORD_ACTIONS == wl.CONDUCTOR_ACTIONS | {"accept"}
+    # ``evaluate`` joins ``accept`` one layer up: each has its own store function.
+    assert routes.RECORD_ACTIONS == wl.CONDUCTOR_ACTIONS | {"accept", "evaluate"}
     assert routes.RECORD_ACTIONS == validation._WORK_RECORD_ACTIONS
 
 
@@ -984,7 +994,7 @@ async def test_a_worker_session_is_bound_once_and_never_rebound():
     ids = await two_by_two()
     # Close A's item, so the STORE would now allow the binding to be replaced.
     status, _ = await _record(
-        CONDUCTOR_A, {"action": "close", "item_id": ids["item_a"], "state": "accepted"}
+        CONDUCTOR_A, {"action": "close", "item_id": ids["item_a"], "state": "rejected"}
     )
     assert status == 200
     status, body = await _record(

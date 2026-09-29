@@ -3361,7 +3361,13 @@ WORK_EVENT_TEXT_LIMIT: Final[int] = 500
 #: Fields a conductor entry may set on an item, by action; a worker's are fixed.
 #: One table, shared with the write route through ``kiro_crew.work_vocab``.
 _WORK_CONDUCTOR_FIELDS: Final[dict[str, tuple[str, ...]]] = WORK_CONDUCTOR_FIELDS
-_WORK_WORKER_FIELDS: Final[tuple[str, ...]] = ("status", "summary", "artifacts", "pr")
+_WORK_WORKER_FIELDS: Final[tuple[str, ...]] = (
+    "status",
+    "summary",
+    "artifacts",
+    "pr",
+    "submission_version",
+)
 #: Every item field a baseline entry may carry: the conductor's and the worker's.
 _WORK_BASELINE_FIELDS: Final[tuple[str, ...]] = (
     "title",
@@ -3376,6 +3382,11 @@ _WORK_BASELINE_FIELDS: Final[tuple[str, ...]] = (
     "summary",
     "artifacts",
     "pr",
+    "evidence",
+    "acceptance_proof",
+    "criterion_version",
+    "submission_version",
+    "admitted_root",
 )
 
 
@@ -3433,6 +3444,11 @@ def _work_new_item(item_id: str, stamp_ms: int) -> dict[str, Any]:
         "last_report_at": None,
         "created_at": _work_iso(stamp_ms),
         "closed_at": None,
+        "evidence": None,
+        "acceptance_proof": None,
+        "criterion_version": 0,
+        "submission_version": 0,
+        "admitted_root": None,
         "events": [],
     }
 
@@ -3680,13 +3696,19 @@ def _work_apply(item: dict[str, Any], data: Mapping[str, Any], stamp_ms: int) ->
 
 def _work_field(name: str, value: Any) -> Any:
     """*value* in the shape the record holds for *name*; the fold's own shape gate."""
+    if name in ("evidence", "acceptance_proof", "admitted_root"):
+        # Gateway-produced records, applied only from the actions whose field table
+        # names them (evaluate, close) or from a baseline of a committed item. A
+        # legacy ``verdict`` entry never carries one, so a rebuild cannot promote a
+        # copied verdict into evidence.
+        return dict(value) if isinstance(value, dict) else None
     if name in ("acceptance", "artifacts"):
         if not isinstance(value, dict):
             return {}
         if name == "artifacts":
             return {str(k): v for k, v in value.items() if isinstance(v, str)}
         return dict(value)
-    if name in ("round", "fails", "pr"):
+    if name in ("round", "fails", "pr", "criterion_version", "submission_version"):
         return _as_int(value) if value is not None else None
     if name in ("verdict", "worker_session_key", "status"):
         return _work_text(name, value) if value is not None else None

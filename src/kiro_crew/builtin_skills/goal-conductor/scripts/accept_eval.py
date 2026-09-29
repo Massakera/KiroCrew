@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """AcceptSpec evaluator - the deterministic half of the conductor's patrol.
 
+A LOCAL DIAGNOSTIC since gateway evaluation landed. The ledger no longer takes a
+verdict from a conductor: ``work_ledger_record action=evaluate`` has the gateway
+evaluate the stored condition against an exact revision
+(``kiro_crew.work_acceptance``), and only that evidence can close an item
+``accepted``. What this script prints is not evidence. It stays because its kind
+dispatch is the reference vocabulary the store's ``ACCEPTANCE_READ_FIELDS`` and
+the docs are pinned against, and because its security invariant below is the
+reasoning the gateway evaluator inherits.
+
 The conductor NEVER judges whether a work item succeeded; this script does,
 and the conductor only reads its verdicts. Script-first: the decision is an
 exit code and a JSON document, not a model's impression of a transcript.

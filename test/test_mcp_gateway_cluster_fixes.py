@@ -87,6 +87,45 @@ class TestEnableRebuildsFactory:
                 await orch._apply_mcp_gateway_enabled(True)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headless", [False, True])
+async def test_orchestrator_starts_broker_through_bound_server_callback(monkeypatch, headless):
+    from kiro_crew.slack.gateway import GatewayOrchestrator
+
+    orch = GatewayOrchestrator.__new__(GatewayOrchestrator)
+    for name in ("sessions", "cron_svc", "subagent_mgr", "ctx_builder", "task_runner"):
+        setattr(orch, name, MagicMock())
+    orch.conv_log = None
+    orch.consolidator = None
+    orch.slack = None
+    orch._slack_enabled = False
+    orch._owner_id = ""
+    orch._test_mode = True
+    orch._no_crons = True
+    orch._port_override = "auto"
+    orch._cfg = SimpleNamespace(dashboard=SimpleNamespace(url="http://localhost:5476"))
+    orch._schedule_memory_preparation = MagicMock()
+    orch._init_mcp_gateway = AsyncMock()
+    monkeypatch.setattr("kiro_crew.slack.gateway.LessonStore", MagicMock())
+
+    async def start_server(**kwargs):
+        assert kwargs["port"] == 0
+        orch._init_mcp_gateway.assert_not_awaited()
+        assert kwargs["start_mcp_gateway"] is orch._init_mcp_gateway
+        await kwargs["start_mcp_gateway"]()
+        return SimpleNamespace(addresses=[("127.0.0.1", 18321)]), SimpleNamespace()
+
+    target = (
+        "kiro_crew.dashboard.start_api_server"
+        if headless
+        else "kiro_crew.slack.gateway.start_dashboard"
+    )
+    monkeypatch.setattr(target, start_server)
+    await (orch._init_api_server() if headless else orch._init_dashboard())
+    orch._init_mcp_gateway.assert_awaited_once_with()
+    assert orch._dashboard_port == 18321
+
+
 # ── #927: injection precedence is robustly tested ───────────────────────────
 
 

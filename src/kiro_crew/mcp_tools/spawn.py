@@ -423,9 +423,10 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": (
                             "Optional model override for the subagent (e.g. 'deepseek-3.2', "
-                            "'claude-haiku-4.5'). When set, the subagent runs on this model "
-                            "instead of the gateway default. To discover available models, "
-                            "run: kiro-cli chat --list-models --format json"
+                            "'claude-haiku-4.5'), or on the pi backend a provider-qualified "
+                            "id ('openai-codex/gpt-6-sol'). When set, the subagent runs on "
+                            "this model instead of the gateway default. To discover "
+                            "available models, run: kiro-cli chat --list-models --format json"
                         ),
                     },
                     "backend": {
@@ -452,7 +453,8 @@ def schemas() -> list[dict[str, Any]]:
                         "description": (
                             "Optional reasoning-effort override for the subagent(s): "
                             "'low', 'medium', 'high', 'xhigh', or 'max' (empty/absent "
-                            "= unset). Batch-wide — applies to every task in this "
+                            "= unset); 'off' and 'minimal' only with backend 'pi'. "
+                            "Batch-wide — applies to every task in this "
                             "call and wins over the configured subagent role pin. "
                             "Setting it forces the dedicated-process path: each "
                             "subagent runs its own process (~3-5s start, ~400MB) "

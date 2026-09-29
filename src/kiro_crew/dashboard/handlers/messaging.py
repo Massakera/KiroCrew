@@ -17,6 +17,7 @@ from typing import Any, Callable, cast
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.acp_backends import ACP_BACKEND_PI
 from kiro_crew.agent_sdk.drivers.acp_vocab import NATIVE_CHILD_NOT_RESUMABLE
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser.command_bus import (
@@ -77,6 +78,7 @@ from kiro_crew.dashboard.state import (
     stage_boundary_for,
 )
 from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot
+from kiro_crew.effort import PI_ONLY_EFFORT_LEVELS
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink
 from kiro_crew.messaging.renderer import (
@@ -744,6 +746,24 @@ async def api_spawn(request: web.Request) -> web.Response:
     cwd = cleaned.get("cwd") or ""
     model = cleaned.get("model") or ""
     reasoning_effort = cleaned.get("reasoning_effort") or ""
+    if reasoning_effort in PI_ONLY_EFFORT_LEVELS:
+        # A member may route to a harness other than the configured default, so
+        # only an explicit backend or the unmembered default can establish pi.
+        effort_backend = acp_backend or (
+            "" if crew else (await asyncio.to_thread(KiroCrewConfig.load)).agent.acp_backend
+        )
+        if effort_backend != ACP_BACKEND_PI:  # harness-ok: a refusal, fail-closed for new harnesses
+            return web.json_response(
+                {
+                    "error": (
+                        f"reasoning_effort '{reasoning_effort}' is available only on the "
+                        "pi backend; pass backend 'pi' or choose low, medium, high, "
+                        "xhigh or max"
+                    ),
+                    "code": "effort_unsupported_backend",
+                },
+                status=400,
+            )
     # SOLO GATE, gateway half. ``solo`` is a transport-layer marker only the
     # MCP spawn tools send for a one-task call (the SDK and apps never do, so
     # they are never gated). The tool side already refused a solo call that

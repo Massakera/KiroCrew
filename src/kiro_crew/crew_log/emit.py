@@ -2570,7 +2570,10 @@ def _safe_text(text: Any) -> str:
 
 
 _WORK_PLAIN_TEXT_FIELDS = frozenset({"title", "goal", "decision", "summary", "event"})
-_WORK_NESTED_TEXT_FIELDS = frozenset({"acceptance", "artifacts"})
+# ``evidence`` and ``acceptance_proof`` are gateway-built, but carry third-party text
+# (check names, a reader's error): the route redacts them before the cache commit,
+# and walking them again here is idempotent, so both copies stay byte-identical.
+_WORK_NESTED_TEXT_FIELDS = frozenset({"acceptance", "artifacts", "evidence", "acceptance_proof"})
 
 
 class WorkFieldError(ValueError):

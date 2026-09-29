@@ -1706,9 +1706,11 @@ def build_permission_event(
     # pi-acp's own ``tool_call`` frame names no server, so the caches above hold
     # nothing (or an empty server) for it.
     _bridged = gate_bridged_mcp_call(envelope, gate_bridge)
+    _bridge_verified = False
     if _bridged is not None and not _mcp_server_name:
         _mcp_server_name, _tool_name = _bridged
         _mcp_identity_trusted = True
+        _bridge_verified = True
 
     # The path the preceding tool_call's diff CONTENT BLOCK named, cached by the
     # same scoped toolCallId as the params. An edit backend may stream trusted
@@ -1743,6 +1745,7 @@ def build_permission_event(
         mcp_server_name=_mcp_server_name,
         tool_name=_tool_name,
         mcp_identity_trusted=_mcp_identity_trusted,
+        bridge_verified=_bridge_verified,
         diff_path=_diff_path,
         spawn_target=_spawn_target,
         harness_tool_id=_harness_tool_id,

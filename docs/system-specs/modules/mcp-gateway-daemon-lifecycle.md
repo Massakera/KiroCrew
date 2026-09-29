@@ -4,6 +4,19 @@ The MCP gateway daemon (`mcp_gateway/gatewayd.py`) pools MCP backends across ses
 
 This module states the contract that closes it. Two gateways deliberately sharing one data home are not a supported configuration (they contend for the dashboard port, `.local_secret` and `config.json` before the daemon is ever reached), so the design is **one daemon, one owner**: the daemon belongs to the gateway process that spawned it, dies with it, and is never adopted across a code revision.
 
+## Callback-port inheritance
+
+The orchestrator starts the MCP sidecar through the dashboard/API factory's
+`start_mcp_gateway` callback, after that factory has bound or reserved its TCP
+listener and exported `KIROCREW_BOUND_PORT`. The daemon and its pooled backends
+therefore inherit the actual callback port, including `--port auto`, rather than
+starting before the export and relying on config/default or optional run-marker
+discovery. The dashboard invokes it before app backends; both factories await it
+before publishing readiness and scheduling memory preparation. Session dispatch
+retains its existing memory barrier. A failed bind never starts the broker.
+This changes startup ordering only: session attestation, tool-policy refusal,
+credential selection and client port-resolution precedence are unchanged.
+
 ## Code fingerprint
 
 `code_fingerprint.code_fingerprint()` is one opaque token naming WHICH Kiro Crew code a process imported, computed once per process. Git is resolved through `platform_compat.trusted_git_bin` (fixed system directories, never `PATH`) and run with global and system config disabled, inherited `GIT_*` variables dropped and `--no-ext-diff --no-textconv`, because this runs in the gateway process on a tree an agent can write to; no trusted git means the mtime rule. Inside a git worktree it is the HEAD commit plus `+<sha256 of the tracked diff>` when tracked files differ — the diff TEXT, not a dirty bit, because two uncommitted edits to one HEAD are different code, and a bare `+dirty` would let a daemon from the first edit be adopted by a gateway on the second. Otherwise it is `mtime:<digest>` over the installed distribution version and the newest `*.py` mtime under the package, since a wheel is immutable until replaced and replacing it moves the mtimes. The only contract is *equal iff the same code*. The first computation runs `git` or walks the package tree, so the two async owners — `run_gatewayd` before it binds, `GatewayManager._start_locked` before its election loop — await `warm_code_fingerprint()` (`asyncio.to_thread`) once; every later synchronous read on their event loops (the pong, the stand-down handler, `_code_drift`) is a cache hit. The stub computes it inside `build_register_payload`, which already runs on the subprocess executor.

@@ -409,6 +409,7 @@ class AcpProvider(LLMProvider):
         on_gate_acquired: Callable[[float], None] | None = None,
         on_gate_queued: Callable[[], None] | None = None,
         disposable_work_dir: bool = False,
+        pi_managed: bool = False,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -436,6 +437,8 @@ class AcpProvider(LLMProvider):
             # process; None for a session that starts its own tree.
             "shared_scratch": shared_scratch,
         }
+        if acp_backend == ACP_BACKEND_PI:
+            kwargs["pi_managed"] = pi_managed
         if agent:
             kwargs["agent"] = agent
         self.member_context = member_context
@@ -532,6 +535,11 @@ class AcpProvider(LLMProvider):
     def client(self) -> AcpClient:
         """Expose underlying client for backward compat (e.g. is_ready check)."""
         return self._client
+
+    def managed_pi_grant(self, event: LLMEvent) -> bool:
+        """See :meth:`AcpClient.managed_pi_grant`; ``False`` for any other client shape."""
+        grant = getattr(self._client, "managed_pi_grant", None)
+        return bool(callable(grant) and grant(event) is True)
 
     @property
     def work_scratch_dir(self) -> Path | None:
@@ -2211,6 +2219,7 @@ class AcpProvider(LLMProvider):
             spawn_target=e.spawn_target,
             tool_identity_trusted=e.tool_identity_trusted,
             mcp_identity_trusted=e.mcp_identity_trusted,
+            bridge_verified=e.bridge_verified,
             server_name=e.server_name,
             oauth_url=e.oauth_url,
             subagents=e.subagents,

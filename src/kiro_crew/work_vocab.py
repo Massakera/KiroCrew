@@ -22,6 +22,10 @@ WORK_ACTIONS: tuple[str, ...] = (
     "close",
     "accept",
     "report",
+    # Gateway-run acceptance evaluation. Its entry carries the evidence record the
+    # gateway produced; ``verdict`` above stays in the vocabulary so entries written
+    # before it was retired still validate and fold, but no route writes it now.
+    "evaluate",
 )
 WORK_ITEM_STATES: tuple[str, ...] = ("open", "accepted", "rejected", "abandoned")
 WORK_VERDICTS: tuple[str, ...] = ("pass", "fail", "pending", "refused", "error")
@@ -31,12 +35,13 @@ WORK_EVENT_KINDS: tuple[str, ...] = ("create", "bind", "report", "decision", "ve
 #: the committed item is what the fold applies to the rebuilt one; the two read
 #: this one table so they cannot drift apart. A worker's fields are fixed.
 WORK_CONDUCTOR_FIELDS: dict[str, tuple[str, ...]] = {
-    "create": ("title", "acceptance", "round"),
-    "bind": ("worker_session_key",),
+    "create": ("title", "acceptance", "round", "criterion_version"),
+    "bind": ("worker_session_key", "admitted_root"),
     "decide": ("decision", "round"),
     "verdict": ("verdict", "fails"),
-    "close": ("state", "decision"),
-    "accept": ("acceptance",),
+    "evaluate": ("verdict", "fails", "evidence"),
+    "close": ("state", "decision", "acceptance_proof"),
+    "accept": ("acceptance", "criterion_version"),
 }
 
 

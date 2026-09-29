@@ -73,7 +73,10 @@ def test_the_record_tool_advertises_the_seven_actions():
     assert set(actions) == set(mcp_work.__dict__.get("_RECORD_ACTIONS", set())) or True
     from kiro_crew.dashboard.handlers import work_ledger as routes
 
-    assert set(actions) == routes.RECORD_ACTIONS
+    # ``verdict`` is retired: the route still recognises it only to refuse it with
+    # verdict_retired, so the tool no longer offers it.
+    assert set(actions) == routes.RECORD_ACTIONS - {"verdict"}
+    assert "evaluate" in actions and "verdict" not in actions
 
 
 def test_the_two_halves_are_enumerable_without_parsing_the_definitions():

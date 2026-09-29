@@ -43,6 +43,14 @@ EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 # sentinel for "provider default".  Single source for ``_REASONING_EFFORT_VALUES``.
 EFFORT_VALUES: frozenset[str] = frozenset({""} | set(EFFORT_LEVELS))
 
+# Levels only pi's advertised ``thought_level`` option offers below ``low``. They
+# are accepted solely for a session that runs on pi; every other harness refuses
+# them rather than receiving a value its vocabulary does not contain.
+PI_ONLY_EFFORT_LEVELS: tuple[str, ...] = ("off", "minimal")
+
+# What a spawn request and an agent spec may name before the backend is known.
+SPAWN_EFFORT_VALUES: frozenset[str] = EFFORT_VALUES | frozenset(PI_ONLY_EFFORT_LEVELS)
+
 
 def is_valid_effort(level: object) -> bool:
     """True if *level* is one of the concrete effort levels (excludes "")."""

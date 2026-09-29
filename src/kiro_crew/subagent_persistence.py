@@ -297,9 +297,13 @@ def publish_live_cleanup_hint(agent_id: str) -> None:
 def trusted_cleanup_identity_record(
     agent_id: str,
     session_id: str,
-    conversation_key: str,
+    conversation_key: str | None,
 ) -> dict[str, object] | None:
     """Return the trusted generation matching restart state, or ``None``.
+
+    A ``None`` key looks up the host-recorded owner by SID for continuation;
+    a protected run with no matching SID refuses rather than becoming legacy.
+    A concrete key retains the exact-match contract used by cleanup.
 
     Agent-folder state may request registry rebuild, but it cannot choose the SID,
     owner, provider, or CWD that the TTL release path will later clean. Those
@@ -313,8 +317,12 @@ def trusted_cleanup_identity_record(
     for record in records:
         record_sid = record.get("session_id")
         record_key = record.get("conversation_key") or default_key
-        if record_sid == session_id and record_key == conversation_key:
+        if record_sid == session_id and (
+            conversation_key is None or record_key == conversation_key
+        ):
             return record
+    if records and conversation_key is None:
+        raise ValueError("the session does not match the protected run generation")
     return None
 
 

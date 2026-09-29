@@ -295,9 +295,11 @@ async def test_api_only_gateway_forwards_existing_context_builder(monkeypatch):
         conv_log=None,
         _schedule_memory_preparation=lambda: None,
         _no_crons=True,
+        _init_mcp_gateway=AsyncMock(),
     )
     await GatewayOrchestrator._init_api_server(host)
     assert start.await_args.kwargs["context_builder"] is builder
+    assert start.await_args.kwargs["start_mcp_gateway"] is host._init_mcp_gateway
 
 
 @pytest.mark.asyncio

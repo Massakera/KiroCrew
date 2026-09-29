@@ -135,6 +135,91 @@ def _stop_reason(info: SubagentInfo) -> str:
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cold", [False, True])
+@pytest.mark.parametrize("busy", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_followup_run_id_retains_conversation_owner(monkeypatch, cold, busy, asynchronous):
+    sessions = _mock_sessions(resumed=True)
+    manager = _manager(sessions)
+    manager._spawn_stagger_secs = 0
+    with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+        original = manager.spawn("first", keep=True)
+        assert original is not None and not original.error
+        await asyncio.wait_for(manager._tasks[original.id], 10)
+        followup = await manager.continue_conversation_async(original.id, "second")
+        assert followup is not None and not followup.error
+        await asyncio.wait_for(manager._tasks[followup.id], 10)
+        owner_key = f"subagent:{original.id}"
+        assert followup.conversation_key == owner_key
+        if cold:
+            manager = _manager(_mock_sessions(resumed=True))
+            manager._spawn_stagger_secs = 0
+        if busy:
+            manager._agents["active-owner"] = SubagentInfo(
+                id="active-owner", task="in progress", conversation_key=owner_key
+            )
+        identity_reads = []
+        if cold and asynchronous:
+            from kiro_crew import subagent_persistence as persistence
+
+            loop_thread = threading.get_ident()
+            real_lookup = persistence.trusted_cleanup_identity_record
+
+            def lookup(run_id, sid, key):
+                if run_id == followup.id and key is None:
+                    identity_reads.append(threading.get_ident())
+                    assert threading.get_ident() != loop_thread
+                return real_lookup(run_id, sid, key)
+
+            monkeypatch.setattr(persistence, "trusted_cleanup_identity_record", lookup)
+        if asynchronous:
+            next_run = await manager.continue_conversation_async(followup.id, "third")
+        else:
+            next_run = manager.continue_conversation(followup.id, "third")
+        assert next_run is not None
+        if cold and asynchronous:
+            assert identity_reads
+        task = manager._tasks.get(next_run.id)
+        if task is not None:
+            await asyncio.wait_for(task, 10)
+        if busy:
+            assert next_run.error and next_run.error.startswith("conversation_busy")
+        else:
+            assert not next_run.error
+            assert next_run.conversation_key == owner_key
+
+
+@pytest.mark.parametrize("hint", ["", "subagent:alias", "subagent:foreign", None])
+def test_continuation_owner_comes_from_host_generation_not_state_hint(monkeypatch, hint):
+    from kiro_crew import subagent_persistence as persistence
+
+    monkeypatch.setattr(persistence, "_LIVE_CLEANUP_IDENTITIES", {})
+    persistence.remember_live_cleanup_identity(
+        "alias", session_id="sid-original", conversation_key="subagent:original"
+    )
+    state = {"session_id": "sid-original", "conversation_key": hint}
+    assert _manager()._continuation._recorded_conversation_key("alias", state) == (
+        "subagent:original"
+    )
+
+
+def test_unverified_continuation_alias_is_refused():
+    state = {"session_id": "sid-unknown", "conversation_key": "subagent:foreign"}
+    with pytest.raises(ValueError, match="owner could not be verified"):
+        _manager()._continuation._recorded_conversation_key("unverified-alias", state)
+
+
+def test_unreadable_continuation_identity_is_not_legacy_fallback(monkeypatch):
+    import kiro_crew.subagent_persistence as persistence
+
+    monkeypatch.setattr(
+        persistence, "trusted_cleanup_identity_record", MagicMock(side_effect=OSError("unreadable"))
+    )
+    with pytest.raises(OSError, match="unreadable"):
+        _manager()._continuation._recorded_conversation_key("alias", {"session_id": "sid-original"})
+
+
 # ── SessionManager continuable override (real SessionManager, no processes) ──
 
 
@@ -547,7 +632,7 @@ class TestContinuationAgentInheritance:
                 await asyncio.wait_for(manager._tasks[followup.id], timeout=10)
                 assert not followup.error
                 call = sessions.get_or_create.call_args
-                assert call.args[0] == f"subagent:{target.id}"
+                assert call.args[0] == f"subagent:{original.id}"
                 assert call.kwargs["agent"] == (override or original_agent or None)
                 state = await asyncio.to_thread(sp.read_state, followup.id)
                 assert state is not None and state["agent"] == (override or original_agent)
@@ -1175,6 +1260,254 @@ def continuation_runtime(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("mutation", ["unknown", "missing", "foreign"])
+async def test_protected_alias_cannot_fall_back_to_legacy_owner(
+    continuation_runtime, asynchronous, mutation
+):
+    import json
+
+    from kiro_crew import subagent_persistence as sp
+
+    world = continuation_runtime
+    sessions, manager = world.new_manager()
+    try:
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            original = manager.spawn(
+                "original",
+                parent_session_key=world.parent,
+                agent="worker",
+                memory_store=world.store,
+                keep=True,
+                cwd=world.project,
+            )
+            assert original is not None and not original.error
+            await asyncio.wait_for(manager._tasks[original.id], 10)
+            followup = await manager.continue_conversation_async(
+                original.id, "second", parent_session_key=world.parent, cwd=world.project
+            )
+            assert followup is not None and not followup.error
+            await asyncio.wait_for(manager._tasks[followup.id], 10)
+            assert not followup.error
+            state = await asyncio.to_thread(sp.read_state, followup.id)
+            assert state is not None
+            assert await asyncio.to_thread(
+                sp.trusted_cleanup_identity_record,
+                followup.id,
+                state["session_id"],
+                f"subagent:{original.id}",
+            )
+            if mutation == "foreign":
+                other = manager.spawn(
+                    "other",
+                    parent_session_key=world.parent,
+                    agent="worker",
+                    memory_store=world.store,
+                    keep=True,
+                    cwd=world.project,
+                )
+                assert other is not None and not other.error
+                await asyncio.wait_for(manager._tasks[other.id], 10)
+                other_state = await asyncio.to_thread(sp.read_state, other.id)
+                assert other_state and other_state["session_id"] != state["session_id"]
+                state.update(
+                    session_id=other_state["session_id"], conversation_key=f"subagent:{followup.id}"
+                )
+            elif mutation == "unknown":
+                state.update(session_id="unknown", conversation_key=f"subagent:{followup.id}")
+            else:
+                state.pop("session_id", None)
+                state.pop("conversation_key", None)
+            # Mutate only the diagnostic row, not its protected generation.
+            path = sp._agent_dir(followup.id) / "state.json"
+            await asyncio.to_thread(path.write_text, json.dumps(state), encoding="utf-8")
+            await asyncio.wait_for(sessions.close_all(drain_timeout=0), 10)
+            sessions, manager = world.new_manager()
+            manager._agents["active-owner"] = SubagentInfo(
+                id="active-owner", task="active", conversation_key=f"subagent:{original.id}"
+            )
+            before = dict(sessions._session_map._data)
+            if asynchronous:
+                result = await manager.continue_conversation_async(
+                    followup.id, "third", parent_session_key=world.parent, cwd=world.project
+                )
+            else:
+                result = manager.continue_conversation(
+                    followup.id, "third", parent_session_key=world.parent, cwd=world.project
+                )
+            assert result is not None
+            after = dict(sessions._session_map._data)
+            admitted = result.id in manager._tasks
+            task = manager._tasks.get(result.id)
+            if task is not None:
+                await asyncio.wait_for(task, 10)
+            assert not admitted
+            assert result.error
+            assert after == before
+    finally:
+        await asyncio.wait_for(sessions.close_all(drain_timeout=0), 10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_alias_keeps_requested_canonical_execution(continuation_runtime, asynchronous):
+    import json
+
+    from kiro_crew import subagent_persistence as sp
+
+    world = continuation_runtime
+    sessions, manager = world.new_manager()
+    try:
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            original = manager.spawn(
+                "original",
+                parent_session_key=world.parent,
+                agent="worker",
+                memory_store=world.store,
+                keep=True,
+                cwd=world.project,
+            )
+            assert original is not None and not original.error
+            await asyncio.wait_for(manager._tasks[original.id], 10)
+            followup = await manager.continue_conversation_async(
+                original.id, "second", parent_session_key=world.parent, cwd=world.project
+            )
+            assert followup is not None and not followup.error
+            await asyncio.wait_for(manager._tasks[followup.id], 10)
+            prior = await asyncio.to_thread(sp.read_run_execution, followup.id)
+            selected = prior.with_template("alternate-worker", "alternate-worker")
+            # Explicit host fixture update, NOT a normal one-turn agent override.
+            await asyncio.to_thread(
+                sp.update_execution_context, followup.id, selected, expected=prior
+            )
+            await asyncio.to_thread(
+                (world.specs / "alternate-worker.json").write_text,
+                json.dumps({"name": "alternate-worker", "prompt": "alternate", "tools": []}),
+                encoding="utf-8",
+            )
+            await asyncio.wait_for(sessions.close_all(drain_timeout=0), 10)
+            sessions, manager = world.new_manager()
+            if asynchronous:
+                result = await manager.continue_conversation_async(
+                    followup.id, "third", parent_session_key=world.parent, cwd=world.project
+                )
+            else:
+                result = manager.continue_conversation(
+                    followup.id, "third", parent_session_key=world.parent, cwd=world.project
+                )
+            assert result is not None and not result.error
+            await asyncio.wait_for(manager._tasks[result.id], 10)
+            assert not result.error
+            assert result.execution_context == selected
+    finally:
+        await asyncio.wait_for(sessions.close_all(drain_timeout=0), 10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("mutation", ["empty", "swap_after_lookup"])
+async def test_protected_owner_uses_one_state_snapshot(
+    continuation_runtime, monkeypatch, asynchronous, mutation
+):
+    import json
+
+    from kiro_crew import subagent_persistence as sp
+
+    world = continuation_runtime
+    sessions, manager = world.new_manager()
+    try:
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            original = manager.spawn(
+                "original",
+                parent_session_key=world.parent,
+                agent="worker",
+                memory_store=world.store,
+                keep=True,
+                cwd=world.project,
+            )
+            assert original is not None and not original.error
+            await asyncio.wait_for(manager._tasks[original.id], 10)
+            followup = await manager.continue_conversation_async(
+                original.id, "second", parent_session_key=world.parent, cwd=world.project
+            )
+            assert followup is not None and not followup.error
+            await asyncio.wait_for(manager._tasks[followup.id], 10)
+            state = await asyncio.to_thread(sp.read_state, followup.id)
+            assert state is not None
+            sid = state["session_id"]
+            key = f"subagent:{original.id}"
+            if mutation == "swap_after_lookup":
+                foreign = manager.spawn(
+                    "foreign",
+                    parent_session_key=world.parent,
+                    agent="worker",
+                    memory_store=world.store,
+                    keep=True,
+                    cwd=world.project,
+                )
+                assert foreign is not None and not foreign.error
+                await asyncio.wait_for(manager._tasks[foreign.id], 10)
+                foreign_state = await asyncio.to_thread(sp.read_state, foreign.id)
+                assert foreign_state and foreign_state["session_id"] != sid
+                real_lookup = sp.trusted_cleanup_identity_record
+                path = sp._agent_dir(followup.id) / "state.json"
+
+                def lookup(run_id, session_id, owner):
+                    identity = real_lookup(run_id, session_id, owner)
+                    if run_id == followup.id and owner is None:
+                        assert identity is not None
+                        changed = dict(state, session_id=foreign_state["session_id"])
+                        path.write_text(json.dumps(changed), encoding="utf-8")
+                    return identity
+
+                monkeypatch.setattr(sp, "trusted_cleanup_identity_record", lookup)
+                target = followup.id
+            else:
+                path = sp._agent_dir(original.id) / "state.json"
+                await asyncio.to_thread(path.write_text, "{}", encoding="utf-8")
+                target = original.id
+            await asyncio.wait_for(sessions.close_all(drain_timeout=0), 10)
+            sessions, manager = world.new_manager()
+            if mutation == "swap_after_lookup":
+                sessions._session_map.delete(key)
+            before = dict(sessions._session_map._data)
+            if asynchronous:
+                result = await manager.continue_conversation_async(
+                    target, "third", parent_session_key=world.parent, cwd=world.project
+                )
+            else:
+                result = manager.continue_conversation(
+                    target, "third", parent_session_key=world.parent, cwd=world.project
+                )
+            assert result is not None
+            admitted = result.id in manager._tasks
+            mapped_sid = sessions.resumable_sid(key)
+            print(
+                json.dumps(
+                    {
+                        "mutation": mutation,
+                        "async": asynchronous,
+                        "admitted": admitted,
+                        "error": result.error,
+                        "verified_sid": sid,
+                        "mapped_sid": mapped_sid,
+                    }
+                )
+            )
+            task = manager._tasks.get(result.id)
+            if task is not None:
+                await asyncio.wait_for(task, 10)
+            if mutation == "empty":
+                assert not admitted and result.error
+                assert sessions._session_map._data == before
+            else:
+                assert admitted and not result.error
+                assert mapped_sid == sid
+    finally:
+        await asyncio.wait_for(sessions.close_all(drain_timeout=0), 10)
+
+
 class TestContinuationTemplateNamespace:
     def test_parent_selection_snapshot_keeps_allocation_namespace(self):
         from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
@@ -1622,7 +1955,7 @@ class TestContinuationTemplateNamespace:
                     if restart:
                         await asyncio.wait_for(sessions.close_all(drain_timeout=0), timeout=10)
                         sessions, manager = world.new_manager()
-                    key = f"subagent:{target.id}"
+                    key = f"subagent:{original.id}"
                     followup = manager.continue_conversation(
                         target.id,
                         "member follow-up",

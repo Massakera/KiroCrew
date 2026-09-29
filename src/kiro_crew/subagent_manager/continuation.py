@@ -401,6 +401,24 @@ class ContinuationCoordinator(ManagerComponent):
             return prelude
         return self._manager.spawn(**prelude)
 
+    def _recorded_conversation_key(self, conv_id: str, state: dict[str, Any]) -> str:
+        """Resolve a follow-up alias only against a host-published generation."""
+        own_key = f"subagent:{conv_id}"
+        sid = state.get("session_id")
+        identity = self._persistence.trusted_cleanup_identity_record(
+            conv_id, sid if isinstance(sid, str) else "", None
+        )
+        if identity is not None:
+            key = identity.get("conversation_key") or own_key
+            if isinstance(key, str) and self._persistence.subagent_id_from_conversation_key(key):
+                return key
+            raise ValueError("the recorded conversation owner is invalid")
+        # Legacy first runs name themselves. A writable alias alone must not
+        # redirect a continuation onto a different owner's session or lock.
+        if (state.get("conversation_key") or own_key) == own_key:
+            return own_key
+        raise ValueError("the recorded conversation owner could not be verified")
+
     async def continue_conversation_async_impl(
         self,
         conv_id: str,
@@ -422,7 +440,10 @@ class ContinuationCoordinator(ManagerComponent):
         # immutable record is read by the worker, then the prelude rechecks busy.
         from kiro_crew.execution_context import stricter_memory_mode
 
-        conv_key = f"subagent:{conv_id}"
+        original = self._manager._agents.get(conv_id)
+        conv_key = (original.conversation_key if original is not None else "") or (
+            f"subagent:{conv_id}"
+        )
         if self._manager._conversation_busy(conv_key) is not None:
             busy_result = self._manager._continue_prelude(
                 conv_id,
@@ -434,10 +455,10 @@ class ContinuationCoordinator(ManagerComponent):
                 cwd,
                 _preassigned_id,
                 _memory_mode,
+                _conversation_key=conv_key,
             )
             assert not isinstance(busy_result, dict)
             return busy_result
-        original = self._manager._agents.get(conv_id)
         execution = original.execution_context if original is not None else None
         state = ...
         try:
@@ -455,10 +476,17 @@ class ContinuationCoordinator(ManagerComponent):
                         if row is not None
                         else None
                     )
-                    return row or {}, captured
+                    key = (
+                        conv_key
+                        if original is not None
+                        else self._recorded_conversation_key(conv_id, row or {})
+                    )
+                    return row or {}, captured, key
 
-                state, restored = await asyncio.to_thread(read_snapshot)
+                state, restored, recorded_key = await asyncio.to_thread(read_snapshot)
                 execution = execution or restored
+                if original is None:
+                    conv_key = recorded_key
             if execution is not None:
                 execution = self._manager._admission.resolve_spawn_execution(
                     conversation_key=conv_key,
@@ -487,6 +515,7 @@ class ContinuationCoordinator(ManagerComponent):
             _crew_log_asked,
             _execution_context=execution,
             _captured_state=state,
+            _conversation_key=conv_key,
             _stage_boundary_owner=_stage_boundary_owner,
         )
         if not isinstance(prelude, dict):
@@ -508,6 +537,7 @@ class ContinuationCoordinator(ManagerComponent):
         *,
         _execution_context=None,
         _captured_state=...,
+        _conversation_key: str = "",
         _stage_boundary_owner: str = "",
     ) -> "SubagentInfo | dict[str, Any] | None":
         """Dispatch a follow-up *task* into conversation *conv_id*.
@@ -533,7 +563,31 @@ class ContinuationCoordinator(ManagerComponent):
         - ``conversation_busy`` — a run is in flight; use spawn_steer.
         - ``conversation_gone`` — no resumable session files remain.
         """
-        conv_key = f"subagent:{conv_id}"
+        original = self._manager._agents.get(conv_id)
+        state_snapshot = _captured_state
+
+        def run_state():
+            nonlocal state_snapshot
+            if state_snapshot is ...:
+                state_snapshot = read_state(conv_id) or {}
+            return state_snapshot
+
+        try:
+            if _conversation_key:
+                conv_key = _conversation_key
+            elif original is not None:
+                conv_key = original.conversation_key or f"subagent:{conv_id}"
+            else:
+                conv_key = self._recorded_conversation_key(conv_id, run_state())
+        except (OSError, ValueError) as exc:
+            return SubagentInfo(
+                id=_preassigned_id or self._manager._mint_agent_id(),
+                task=_redact(task),
+                done=True,
+                parent_session_key=parent_session_key,
+                _stage_boundary_owner=_stage_boundary_owner,
+                error=f"memory_unavailable: {exc}",
+            )
         busy = self._manager._conversation_busy(conv_key)
         if busy is not None:
             info = SubagentInfo(
@@ -558,7 +612,7 @@ class ContinuationCoordinator(ManagerComponent):
         # exists yet (default runs never write one at spawn; the map is also
         # in-memory-lost across gateway restarts while state.json persists).
         if not self._manager._sessions.resumable_sid(conv_key):
-            state = (read_state(conv_id) or {}) if _captured_state is ... else _captured_state
+            state = run_state()
             sid = str(state.get("session_id") or "")
             if sid:
                 self._manager._sessions.seed_conversation(
@@ -611,6 +665,21 @@ class ContinuationCoordinator(ManagerComponent):
                 memory_store = _execution_context.store.legacy_name
             elif _captured_state is not ...:
                 raise ValueError("run record is unavailable")
+            elif conv_key != f"subagent:{conv_id}":
+                from kiro_crew.execution_context import stricter_memory_mode
+
+                execution = original.execution_context if original is not None else None
+                if execution is None:
+                    execution = self._persistence.read_run_execution(conv_id, state=run_state())
+                _execution_context = self._manager._admission.resolve_spawn_execution(
+                    conversation_key=conv_key,
+                    agent=agent,
+                    _memory_mode=stricter_memory_mode(
+                        execution.memory_mode, _memory_mode or "persistent"
+                    ),
+                    _record=execution,
+                )
+                memory_store = _execution_context.store.legacy_name
             else:
                 memory_store = self._manager._inherited_memory_store(conv_id)
         except (OSError, ValueError) as exc:
@@ -657,8 +726,9 @@ class ContinuationCoordinator(ManagerComponent):
         # The facade forwards the enum result directly. Legacy tests and external
         # monkeypatches that return None/non-enum retain the historical promoted
         # behavior; only an explicit RETRYABLE outcome alters dispatch.
+        owner_id = self._persistence.subagent_id_from_conversation_key(conv_key) or conv_id
         promotion = self._manager._promote_conversation(  # type: ignore[func-returns-value]
-            conv_id, conv_key
+            owner_id, conv_key
         )
         if promotion is self._persistence.RetentionPromotionResult.RETRYABLE:
             if not was_continuable:
@@ -680,15 +750,11 @@ class ContinuationCoordinator(ManagerComponent):
             )
         inc_memory, inc_lessons, inc_project = (
             self._manager._inherited_context_groups(conv_id)
-            if _captured_state is ...
-            else self._inherited_context_groups_impl(conv_id, state=_captured_state)
+            if state_snapshot is ...
+            else self._inherited_context_groups_impl(conv_id, state=state_snapshot)
         )
         delegation = (
-            original.delegation
-            if original is not None
-            else ((read_state(conv_id) or {}) if _captured_state is ... else _captured_state).get(
-                "delegation", {}
-            )
+            original.delegation if original is not None else run_state().get("delegation", {})
         )
         # The harness owns the conversation's session record (kiro-cli's
         # transcript, the thread under CODEX_HOME), so a follow-up must resume on
@@ -701,7 +767,7 @@ class ContinuationCoordinator(ManagerComponent):
         live_backend = original.acp_backend if original is not None else ""
         recorded_backend = ""
         if not live_backend:
-            recorded = (read_state(conv_id) or {}) if _captured_state is ... else _captured_state
+            recorded = run_state()
             if isinstance(recorded, dict):
                 recorded_backend = str(recorded.get("acp_backend") or "")
         acp_backend = resume_backend_name(live_backend, recorded_backend)

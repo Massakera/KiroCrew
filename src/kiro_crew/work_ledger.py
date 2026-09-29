@@ -77,6 +77,7 @@ from kiro_crew.session_ledger import (
     resolved_within,
     unlink_lock_in_hold,
 )
+from kiro_crew.work_acceptance import ADMITTED_POLICIES, canonical_digest
 from kiro_crew.work_vocab import (
     WORK_ITEM_STATES,
     WORK_VERDICTS,
@@ -205,6 +206,20 @@ CODE_INVALID_ACTION = "invalid_action"
 CODE_INVALID_STATUS = "invalid_status"
 CODE_INVALID_VALUE = "invalid_value"
 CODE_LEDGER_NOT_FINISHED = "ledger_not_finished"
+#: ``evaluate`` asked of an item that cannot produce acceptance evidence yet: not the
+#: worker's current ``done`` claim, or no concrete criterion.
+CODE_NOT_EVALUABLE = "not_evaluable"
+#: A result or a close raced a change: the criterion, the worker's submission, or
+#: the current evaluation moved after it was captured. Re-evaluate.
+CODE_EVALUATION_STALE = "evaluation_stale"
+#: ``close(state="accepted")`` with no current gateway ``pass`` behind it.
+CODE_EVIDENCE_REQUIRED = "evidence_required"
+#: The fresh observation taken at close no longer shows the evaluated revision
+#: passing: a new head, new bytes, or a re-run that is pending or failing.
+CODE_TARGET_CHANGED = "target_changed"
+#: ``human_approval`` has no authenticated approval channel, so it cannot be
+#: accepted through the ledger at all.
+CODE_HUMAN_APPROVAL_UNSUPPORTED = "human_approval_unsupported"
 
 
 class WorkLedgerError(Exception):
@@ -331,6 +346,34 @@ class WorkItem:
     #: baseline its first recorded mutation carried). Empty until then: the write
     #: routes carry the whole item on the next entry, so a lost file rebuilds.
     recorded_at: str = ""
+    #: The CURRENT gateway evaluation (``work_acceptance``), bound to the criterion
+    #: digest and the worker-submission digest it was captured against. Written only
+    #: by :func:`apply_evaluation`; no tool parameter reaches it. ``None`` on items
+    #: from before gateway evaluation, and a legacy ``verdict`` is never promoted
+    #: into it -- by a rebuild, a migration or a close.
+    evidence: dict[str, Any] | None = None
+    #: What an ``accepted`` close was decided on: the evidence id, the accepted
+    #: revision, and the fresh observation taken at close. ``accepted`` means THIS
+    #: revision was accepted, not every later head of the same pull request.
+    acceptance_proof: dict[str, Any] | None = None
+    #: Counts every write of ``acceptance`` (create is 1, each ``accept`` one more).
+    #: Evidence binds to the COUNT, not only to the content, so a criterion changed
+    #: and then changed back is a new criterion: the evidence taken before the first
+    #: change does not come back to life.
+    criterion_version: int = 0
+    #: Counts every worker report. Evidence binds to it, so a second report in the
+    #: same second with the same words is still a new submission.
+    submission_version: int = 0
+    #: The worker's project directory as the conductor bound it: canonical path,
+    #: device and inode, taken before the worker's first turn. The only tree the
+    #: ``file`` evaluator reads; a root swapped later is detected by its inode.
+    admitted_root: dict[str, Any] | None = None
+    #: CACHE-ONLY stamp, like ``recorded_at``: the ``evidence_id`` the crew log is
+    #: confirmed to hold. Set once the ``evaluate`` entry has landed, or by a rebuild
+    #: (which reads the evidence FROM the log). An accepted close requires it to name
+    #: the current evidence, so evidence the cache holds but the log never saw -- a
+    #: gateway that died between the two writes -- can never authorise acceptance.
+    evidence_recorded: str = ""
 
     @property
     def is_terminal(self) -> bool:
@@ -356,6 +399,12 @@ class WorkItem:
             "created_at": self.created_at,
             "closed_at": self.closed_at,
             "recorded_at": self.recorded_at,
+            "evidence": self.evidence,
+            "acceptance_proof": self.acceptance_proof,
+            "criterion_version": self.criterion_version,
+            "submission_version": self.submission_version,
+            "admitted_root": self.admitted_root,
+            "evidence_recorded": self.evidence_recorded,
         }
 
     @classmethod
@@ -391,6 +440,16 @@ class WorkItem:
             closed_at=_as_opt_str(raw.get("closed_at")),
             recorded_at=_as_str(raw.get("recorded_at")),
             schema=_as_int(raw.get("schema"), SCHEMA_VERSION),
+            evidence=raw["evidence"] if isinstance(raw.get("evidence"), dict) else None,
+            acceptance_proof=(
+                raw["acceptance_proof"] if isinstance(raw.get("acceptance_proof"), dict) else None
+            ),
+            criterion_version=_as_int(raw.get("criterion_version"), 0),
+            submission_version=_as_int(raw.get("submission_version"), 0),
+            admitted_root=(
+                raw["admitted_root"] if isinstance(raw.get("admitted_root"), dict) else None
+            ),
+            evidence_recorded=_as_str(raw.get("evidence_recorded")),
         )
 
 
@@ -1591,6 +1650,9 @@ def apply_conductor_action(
     goal: Any = None,
     round_number: Any = None,
     fails: Any = None,
+    close_observation: dict[str, Any] | None = None,
+    expected_evidence_id: str | None = None,
+    admitted_root: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the fields the CONDUCTOR owns, and append the one event that explains it.
 
@@ -1607,6 +1669,11 @@ def apply_conductor_action(
     ``decide``  ``item_id``, ``decision``, optional ``round_number``.
     ``verdict`` ``item_id``, ``verdict``, optional ``fails``.
     ``close``   ``item_id``, ``state``, optional ``decision`` — stamps ``closed_at``.
+                ``state="accepted"`` is guarded here, not at the route: it needs a
+                current gateway ``pass`` (:func:`accepted_close_refusal`) and a
+                *close_observation* the ROUTE took from :mod:`kiro_crew.work_acceptance`
+                showing the same revision still passing. No tool parameter maps to
+                either argument; they come from the gateway's own evaluator.
     ``goal``    ``goal``, optional ``round_number`` — the conductor record only.
 
     Returns ``{"conductor", "item", "event"}``; ``item`` and ``event`` are ``None``
@@ -1643,6 +1710,9 @@ def apply_conductor_action(
         state=state,
         round_number=round_number,
         fails=fails,
+        close_observation=close_observation,
+        expected_evidence_id=expected_evidence_id,
+        admitted_root=admitted_root,
     )
 
 
@@ -1767,6 +1837,7 @@ def _create_item(
             state="open",
             round=checked_round,
             created_at=_now_iso(),
+            criterion_version=1,
         )
         with item_lock(slot_key, item_id):
             event = _commit_item_locked(slot_key, item, "create", checked_title)
@@ -1785,6 +1856,9 @@ def _write_item_action(
     state: Any,
     round_number: Any,
     fails: Any,
+    close_observation: dict[str, Any] | None = None,
+    expected_evidence_id: str | None = None,
+    admitted_root: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """``bind``, ``decide``, ``verdict`` and ``close``, each one item lock deep.
 
@@ -1866,6 +1940,7 @@ def _write_item_action(
                 _write_binding(checked_worker, slot_key, checked_id)
                 try:
                     item.worker_session_key = checked_worker
+                    item.admitted_root = admitted_root
                     event = _commit_item_locked(slot_key, item, "bind", _store_name(checked_worker))
                 except BaseException:
                     _restore_binding_text(checked_worker, prior_binding)
@@ -1882,6 +1957,14 @@ def _write_item_action(
             event = _commit_item_locked(slot_key, item, "verdict", checked_verdict)
         else:
             assert checked_state is not None
+            if checked_state == "accepted":
+                # Decided HERE, under the item lock, against the record as it stands
+                # now -- after the route's external observation returned. A criterion,
+                # submission or evaluation that moved while CI was being read is what
+                # this revalidation exists to catch.
+                item.acceptance_proof = _accepted_proof(
+                    item, close_observation, expected_evidence_id
+                )
             item.state = checked_state
             if checked_decision is not None:
                 item.decision = checked_decision
@@ -1942,6 +2025,7 @@ def apply_worker_report(
         if checked_pr is not None:
             item.pr = checked_pr
         item.last_report_at = _now_iso()
+        item.submission_version += 1
         event = _commit_item_locked(
             slot_key, item, "report", checked_summary, status=checked_status
         )
@@ -1967,6 +2051,376 @@ def read_work_brief(slot_key: str, item_id: str) -> dict[str, Any] | None:
         "status": item.status,
         "summary": item.summary,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Gateway evaluation and evidence (SPEC work-ledger acceptance)
+#
+# The conductor may REQUEST an evaluation and a close; it can no longer supply a
+# verdict that authorises one. Evidence is produced by the gateway's evaluator
+# (:mod:`kiro_crew.work_acceptance`), bound here to the item, the criterion digest
+# and the worker-submission digest it was captured against, and persisted through
+# the same crew-log entry as every other write, so a rebuild restores it whole.
+# --------------------------------------------------------------------------- #
+
+#: Longest event line an evaluation writes, before the store's own event cap.
+_EVALUATE_EVENT_CHARS = 200
+
+
+def criterion_digest(item: WorkItem) -> str:
+    """The CONTENT of *item*'s current criterion (the version says which write it is)."""
+    return canonical_digest(item.acceptance)
+
+
+def submission_digest(item: WorkItem) -> str:
+    """The identity of the worker's CURRENT claim.
+
+    Every worker-owned field plus ``last_report_at``, so any new report -- even one
+    repeating the same words -- is a new submission, and evidence captured against
+    the old one stops being current. That is the conservative reading of "the
+    relevant submission changed": the worker said something after the evaluation.
+    """
+    return canonical_digest(
+        {
+            "status": item.status,
+            "summary": item.summary,
+            "artifacts": item.artifacts,
+            "pr": item.pr,
+            "last_report_at": item.last_report_at,
+        }
+    )
+
+
+def evaluation_context(item: WorkItem) -> dict[str, Any]:
+    """What an evaluation is captured against, taken BEFORE the external observation.
+
+    :func:`apply_evaluation` and an accepted close compare it against the record as
+    it stands when they publish, so a result that finished after its criterion,
+    submission or the current evaluation moved is never published as current.
+    """
+    prior = item.evidence.get("evidence_id") if isinstance(item.evidence, dict) else None
+    return {
+        "item_id": item.item_id,
+        "criterion_version": item.criterion_version,
+        "criterion_digest": criterion_digest(item),
+        "submission_version": item.submission_version,
+        "submission_digest": submission_digest(item),
+        "prior_evidence_id": prior if isinstance(prior, str) else None,
+    }
+
+
+def require_recorded_evaluation_context(
+    slot_key: str, item: WorkItem, *, accepting: bool = False
+) -> None:
+    """Require the evaluation's inputs to be held by the canonical work fold.
+
+    The caller holds the gateway's board lock through this read, not through the
+    external observation. A cache commit can survive a death before its append;
+    recording an evaluation of that cache must not legitimise the missing input.
+    Re-evaluation may replace an unrecorded evaluation, but an accepted close also
+    needs its existing evidence in the fold. Nothing here repairs or discards data:
+    a missing write and a pruned log cannot be distinguished from this comparison.
+    """
+    from kiro_crew.crew_log.projection import read_slot_projection
+
+    workers = (item.worker_session_key,) if item.worker_session_key else ()
+    folded = read_slot_projection(slot_key, "work", also_slots=workers).value
+    header = read_conductor(slot_key)
+    recorded_header = folded.get("conductor") or {}
+    raw = next(
+        (row for row in folded.get("items", ()) if row.get("item_id") == item.item_id),
+        None,
+    )
+    if (
+        header is None
+        or not recorded_header.get("entries")
+        or recorded_header.get("generation", "") != header.generation
+        or raw is None
+    ):
+        raise WorkLedgerError(
+            "the crew log does not hold this board and item; restore the missing "
+            "record before evaluating or accepting it",
+            code=CODE_CREW_LOG_INCOMPLETE,
+        )
+    recorded = WorkItem.from_dict(raw)
+    cached_context = evaluation_context(item)
+    recorded_context = evaluation_context(recorded)
+    if (
+        any(
+            cached_context[key] != recorded_context[key]
+            for key in cached_context
+            if key != "prior_evidence_id"
+        )
+        or item.state != recorded.state
+        or item.worker_session_key != recorded.worker_session_key
+        or item.admitted_root != recorded.admitted_root
+        or (accepting and item.evidence != recorded.evidence)
+    ):
+        raise WorkLedgerError(
+            "the item's evaluation inputs or evidence do not match the crew log; "
+            "restore the missing record, or record its criterion and worker report "
+            "again before evaluating. Rebuild only from a complete record",
+            code=CODE_CREW_LOG_INCOMPLETE,
+        )
+
+
+def evaluable_refusal(item: WorkItem) -> WorkLedgerError | None:
+    """Why *item* cannot yield acceptance evidence right now, or ``None``.
+
+    Open, the worker's CURRENT claim is ``done``, and the criterion is concrete. A
+    file that already exists, or a pull request green before the last commit, is a
+    world-state ``pass`` on unfinished work -- the reason the batch was filtered to
+    ``done`` by hand, now enforced.
+    """
+    if item.is_terminal:
+        return WorkLedgerError(f"item {item.item_id!r} is {item.state}", code=CODE_ITEM_CLOSED)
+    if item.status != "done":
+        return WorkLedgerError(
+            f"item {item.item_id!r} is not claimed done (worker status: {item.status!r}); "
+            "evaluate once the worker reports done",
+            code=CODE_NOT_EVALUABLE,
+            field="status",
+        )
+    if not is_acceptance_concrete(item.acceptance):
+        return WorkLedgerError(
+            f"item {item.item_id!r} has no concrete acceptance condition; promote one "
+            "with action=accept first",
+            code=CODE_NOT_EVALUABLE,
+            field="acceptance",
+        )
+    return None
+
+
+def evidence_is_current(item: WorkItem) -> bool:
+    """Whether *item*'s evidence still describes its current criterion and claim.
+
+    Derived, like :func:`is_stale`: the answer changes when the conductor promotes a
+    bar or the worker reports again, and a stored flag would lag the change.
+    """
+    evidence = item.evidence
+    if not isinstance(evidence, dict):
+        return False
+    return (
+        evidence.get("item_id") == item.item_id
+        and evidence.get("criterion_version") == item.criterion_version
+        and evidence.get("criterion_digest") == criterion_digest(item)
+        and evidence.get("submission_version") == item.submission_version
+        and evidence.get("submission_digest") == submission_digest(item)
+    )
+
+
+def accepted_close_refusal(item: WorkItem) -> WorkLedgerError | None:
+    """Why ``close(state="accepted")`` must be refused on the record alone, or ``None``.
+
+    The half of the guard that needs no external read, so the route can refuse
+    before it spends a CI round trip, and the store repeats it under the lock.
+    """
+    if item.is_terminal:
+        return WorkLedgerError(f"item {item.item_id!r} is {item.state}", code=CODE_ITEM_CLOSED)
+    if isinstance(item.acceptance, dict) and item.acceptance.get("kind") == "human_approval":
+        return WorkLedgerError(
+            "a human_approval item cannot be accepted through the ledger: there is no "
+            "authenticated approval channel, and the conductor may not declare one. "
+            "Close it rejected or abandoned, or re-express the condition",
+            code=CODE_HUMAN_APPROVAL_UNSUPPORTED,
+            field="state",
+        )
+    if item.status != "done":
+        return WorkLedgerError(
+            f"item {item.item_id!r} is not claimed done, so it cannot be accepted",
+            code=CODE_EVIDENCE_REQUIRED,
+            field="state",
+        )
+    evidence = item.evidence
+    if not isinstance(evidence, dict) or evidence.get("verdict") != "pass":
+        return WorkLedgerError(
+            f"item {item.item_id!r} has no gateway evaluation that passed; run "
+            "work_ledger_record action=evaluate first. A verdict written by a model is "
+            "not evidence",
+            code=CODE_EVIDENCE_REQUIRED,
+            field="state",
+        )
+    if (evidence.get("evaluator"), evidence.get("policy")) not in ADMITTED_POLICIES:
+        return WorkLedgerError(
+            f"item {item.item_id!r}'s evidence came from an evaluator or policy this "
+            "gateway no longer admits; evaluate again",
+            code=CODE_EVALUATION_STALE,
+            field="state",
+        )
+    if not evidence_is_current(item):
+        return WorkLedgerError(
+            f"item {item.item_id!r}'s evidence was taken against an earlier criterion "
+            "or an earlier worker report; evaluate again",
+            code=CODE_EVALUATION_STALE,
+            field="state",
+        )
+    if not item.evidence_recorded or item.evidence_recorded != evidence.get("evidence_id"):
+        return WorkLedgerError(
+            f"item {item.item_id!r}'s evidence is not confirmed in the crew log (its "
+            "evaluation may not have been recorded); evaluate again",
+            code=CODE_EVIDENCE_REQUIRED,
+            field="state",
+        )
+    return None
+
+
+def _accepted_proof(
+    item: WorkItem, observation: dict[str, Any] | None, expected_evidence_id: str | None
+) -> dict[str, Any]:
+    """Validate an accepted close under the item lock and return its proof record."""
+    refusal = accepted_close_refusal(item)
+    if refusal is not None:
+        raise refusal
+    evidence = item.evidence
+    assert isinstance(evidence, dict)
+    if (
+        not isinstance(expected_evidence_id, str)
+        or evidence.get("evidence_id") != expected_evidence_id
+    ):
+        raise WorkLedgerError(
+            f"item {item.item_id!r} was re-evaluated while the close was being checked; "
+            "close again",
+            code=CODE_EVALUATION_STALE,
+            field="state",
+        )
+    if not isinstance(observation, dict):
+        raise WorkLedgerError(
+            "an accepted close needs the gateway's fresh observation of the target",
+            code=CODE_EVIDENCE_REQUIRED,
+            field="state",
+        )
+    recorded = evidence.get("revision")
+    if (
+        observation.get("verdict") != "pass"
+        or observation.get("policy") != evidence.get("policy")
+        or observation.get("evaluator") != evidence.get("evaluator")
+        or not isinstance(recorded, dict)
+        or not recorded
+        or observation.get("revision") != recorded
+    ):
+        raise WorkLedgerError(
+            f"item {item.item_id!r}'s target no longer shows the evaluated revision "
+            f"passing (now: {observation.get('verdict')!r}, "
+            f"{_revision_label(observation.get('revision'))}); it was not accepted. "
+            "Evaluate again to judge the current revision",
+            code=CODE_TARGET_CHANGED,
+            field="state",
+        )
+    raw_sources = observation.get("sources")
+    sources: dict[str, Any] = raw_sources if isinstance(raw_sources, dict) else {}
+    return {
+        "evidence_id": evidence.get("evidence_id"),
+        "evaluator": evidence.get("evaluator"),
+        "policy": evidence.get("policy"),
+        "criterion_version": evidence.get("criterion_version"),
+        "criterion_digest": evidence.get("criterion_digest"),
+        "submission_version": evidence.get("submission_version"),
+        "submission_digest": evidence.get("submission_digest"),
+        "revision": recorded,
+        "closing_observation": {
+            "observed_at": observation.get("observed_at"),
+            "verdict": observation.get("verdict"),
+            "revision": observation.get("revision"),
+            "board_digest": sources.get("board_digest"),
+        },
+    }
+
+
+def _revision_label(revision: Any) -> str:
+    if not isinstance(revision, dict) or not revision:
+        return "no revision observed"
+    if revision.get("kind") == "git_sha":
+        return f"head {str(revision.get('sha'))[:12]}"
+    if revision.get("kind") == "file_sha256":
+        return f"sha256 {str(revision.get('sha256'))[:12]}"
+    return str(revision.get("kind"))
+
+
+def apply_evaluation(
+    slot_key: str,
+    item_id: str,
+    *,
+    context: dict[str, Any],
+    observation: dict[str, Any],
+    generation: str = "",
+) -> dict[str, Any]:
+    """Publish one gateway evaluation as *item_id*'s current evidence.
+
+    *context* is :func:`evaluation_context` as the route captured it before the
+    external observation, and *observation* is
+    :meth:`kiro_crew.work_acceptance.Observation.to_dict`. Refused as
+    ``evaluation_stale`` when anything it was captured against moved meanwhile --
+    the criterion, the worker's submission, or the current evaluation (a later
+    request published first) -- so an old result that finished late never replaces
+    the current one. Refused as ``item_closed`` on a terminal item: a result that
+    lands after ``rejected``/``abandoned`` does not reopen it.
+
+    ``verdict`` mirrors the evidence for the readers that already key on it
+    (:func:`is_stale`, the batch), and ``fails`` counts ``fail`` results.
+    """
+    checked_id = _require_item_id(item_id)
+    verdict = observation.get("verdict") if isinstance(observation, dict) else None
+    if verdict not in VERDICTS:
+        raise WorkLedgerError(
+            "an evaluation must carry one of the five verdicts",
+            code=CODE_INVALID_VALUE,
+            field="verdict",
+        )
+    with item_lock(slot_key, checked_id, create=False):
+        item = read_work_item(slot_key, checked_id)
+        if item is None:
+            raise WorkLedgerError(
+                f"unknown item {checked_id!r}", code=CODE_UNKNOWN_ITEM, field="item_id"
+            )
+        if item.is_terminal:
+            raise WorkLedgerError(f"item {checked_id!r} is {item.state}", code=CODE_ITEM_CLOSED)
+        if evaluation_context(item) != context:
+            raise WorkLedgerError(
+                f"item {checked_id!r} changed while it was being evaluated (its criterion, "
+                "its worker's report, or a newer evaluation); the result was not "
+                "published. Evaluate again",
+                code=CODE_EVALUATION_STALE,
+                field="item_id",
+            )
+        evidence = {
+            "evidence_id": secrets.token_hex(8),
+            "item_id": checked_id,
+            "generation": generation or "",
+            # The criterion is referenced by digest, not copied: the acceptance object
+            # itself is already durable in the crew log (its create/accept entries),
+            # and a copy could push this entry past one log line.
+            "criterion_kind": (
+                item.acceptance.get("kind") if isinstance(item.acceptance, dict) else None
+            ),
+            "criterion_version": context["criterion_version"],
+            "criterion_digest": context["criterion_digest"],
+            "submission_version": context["submission_version"],
+            "submission_digest": context["submission_digest"],
+            **{
+                name: observation.get(name)
+                for name in (
+                    "evaluator",
+                    "policy",
+                    "verdict",
+                    "observed_at",
+                    "target",
+                    "revision",
+                    "sources",
+                    "diagnostic",
+                )
+            },
+        }
+        item.evidence = evidence
+        # The new evidence is not in the log yet; the route stamps it once it is.
+        item.evidence_recorded = ""
+        item.verdict = verdict
+        if verdict == "fail":
+            item.fails += 1
+        text = f"evaluated {verdict}: {observation.get('diagnostic') or ''}".strip()
+        event = _commit_item_locked(
+            slot_key, item, "verdict", text[:_EVALUATE_EVENT_CHARS].rstrip(": ")
+        )
+        return {"item": item, "event": event}
 
 
 def accept_batch(items: list[WorkItem]) -> dict[str, Any]:
@@ -2049,6 +2503,7 @@ def apply_acceptance_update(
         if item.is_terminal:
             raise WorkLedgerError(f"item {checked_id!r} is {item.state}", code=CODE_ITEM_CLOSED)
         item.acceptance = checked_acceptance
+        item.criterion_version += 1
         event = _commit_item_locked(
             slot_key, item, "decision", "acceptance promoted by the conductor"
         )
@@ -3101,6 +3556,11 @@ def _rebuild_locked(
             item.recorded_at = cached_item.recorded_at
         else:
             item.recorded_at = _now_iso()
+        # The evidence on a rebuilt item came FROM the log, so the log holds it by
+        # construction -- the one place the stamp is set without a landed append.
+        # Evidence the fold does not carry cannot be stamped, which is the point.
+        evidence_id = item.evidence.get("evidence_id") if isinstance(item.evidence, dict) else None
+        item.evidence_recorded = evidence_id if isinstance(evidence_id, str) else ""
         parsed = (WorkEvent.from_dict(entry) for entry in raw.get("events") or ())
         events = [event for event in parsed if event is not None][-MAX_EVENTS_PER_ITEM:]
         # Every lock these writes need is held by the caller for the whole rebuild
@@ -3398,6 +3858,26 @@ def mark_goal_recorded(slot_key: str) -> None:
             return
         record.recorded_at = _now_iso()
         _write_record(conductor_dir(slot_key) / _CONDUCTOR_FILE, record.to_dict())
+
+
+def mark_evidence_recorded(slot_key: str, item_id: str, evidence_id: str) -> bool:
+    """Stamp *evidence_id* as held by the crew log. Only the CURRENT evidence.
+
+    Called by the ``evaluate`` route once its entry has landed. If a newer
+    evaluation replaced the evidence meanwhile, nothing is stamped -- the newer one
+    has its own entry and its own stamp to earn. A failure here costs one more
+    evaluation, never a false acceptance. Returns whether the stamp was written.
+    """
+    checked_id = _require_item_id(item_id)
+    with item_lock(slot_key, checked_id, create=False):
+        item = read_work_item(slot_key, checked_id)
+        if item is None or not isinstance(item.evidence, dict):
+            return False
+        if item.evidence.get("evidence_id") != evidence_id or item.evidence_recorded == evidence_id:
+            return False
+        item.evidence_recorded = evidence_id
+        _write_record(item_path(slot_key, checked_id), item.to_dict())
+        return True
 
 
 def mark_item_recorded(slot_key: str, item_id: str) -> None:

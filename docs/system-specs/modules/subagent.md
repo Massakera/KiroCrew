@@ -81,6 +81,24 @@ active continuation for that conversation; queued or completed runs cannot suppl
 a live caller. The frozen record supplies memory and app scope independently of
 that liveness check.
 
+A continuation may name a completed follow-up's run ID. It reuses that run's
+recorded conversation owner for the busy/queue checks, session mapping and
+retention promotion, instead of creating a second key for the same provider
+session. Live run identity supplies the owner; after eviction or restart, the
+host-published protected session generation supplies it by SID. Writable
+`state.json` owner hints cannot redirect that lookup. An alias without a verified
+generation is refused; legacy first runs may still name their own key. A run
+with protected generations is never downgraded to legacy when its writable SID
+is missing or mismatched, even if that SID has resumable files elsewhere. Async
+continuation reads the protected identity off-loop with the existing state
+snapshot and rechecks the owner's busy state before admission. Sync
+continuation likewise reads `state.json` once and uses that one snapshot for
+the owner lookup, the session-map seed and execution-context recovery, so a
+write between those steps cannot map an unverified SID under the verified
+owner. Both sync and
+async admission use the requested run's captured execution context and context
+groups; resolving the conversation owner does not substitute its persona.
+
 Every backend records the provider's actual working directory alongside its
 session id. The next continuation uses this directory even when its target is
 itself a completed follow-up and the gateway has restarted. This uses the common

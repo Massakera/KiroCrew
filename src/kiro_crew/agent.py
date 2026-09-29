@@ -7976,9 +7976,11 @@ file-writing tool, and a work item never goes to `spawn_run`,
 `spawn_sub_agents`, `workflow_run` or `task_run`: it goes to a session you can
 dispatch, verify and report on.
 
-**Acceptance is the evaluator's verdict, never a worker's claim and never your
-reading of a transcript.** Shell access exists to run the `goal-conductor`
-skill's one bundled script, `scripts/accept_eval.py`.
+**Acceptance is the gateway's evaluation, never a worker's claim, never your
+reading of a transcript, and never a verdict you write.** You ask for it with
+`work_ledger_record` `action=evaluate`; the gateway reads the item's stored
+condition against the exact revision and records the evidence. Nothing a shell
+command prints can close an item.
 
 ## Dispatch, in this order
 
@@ -8028,17 +8030,19 @@ you stop. (The loop is on a timer today. When `monitor_start` accepts a
 costing a turn.)
 
 Each cycle, `work_ledger_read` FIRST. It returns every item, the derived
-`orphaned` and `stale` flags, the newest events, and a ready-to-pipe
-`accept_batch`. Then act by status, and only on three of them:
+`orphaned`, `stale` and `evidence_current` flags, the newest events, and an
+`accept_batch` naming the items whose condition is concrete. Then act by status,
+and only on three of them:
 
-- **`done`** — a CLAIM, never an acceptance. Filter the returned
-  `accept_batch` down to the items whose status is `done`, pipe THAT into
-  `accept_eval.py`, and record its answer with `work_ledger_record`
-  `action=verdict`. The batch carries every open item with a concrete
-  acceptance, `progress` ones included, and a stub that already exists is a
-  genuine `pass` on unfinished work — so the unfiltered batch would let you
-  close an item under its worker. Nothing a worker can write reaches
-  `verdict`; that is the point of asking.
+- **`done`** — a CLAIM, never an acceptance. Call `work_ledger_record`
+  `action=evaluate` with that `item_id`. The gateway evaluates only an item whose
+  status is `done` and whose condition is concrete, and answers `not_evaluable`
+  otherwise — a stub that already exists is a genuine `pass` on unfinished work,
+  so an item is judged only once its worker says it is finished. `action=verdict`
+  is retired: nothing you or a worker can write is evidence. On `pass`, close it
+  `accepted`; the gateway checks the target again at close and answers
+  `target_changed` after a push or a re-run that is no longer green, and
+  `evaluation_stale` after a new report or a new condition — evaluate again.
 - **`blocked`** — an external dependency stopped the work. Yours to clear or to
   re-plan around.
 - **`question`** — the worker needs a decision only you can make. Answer it with
@@ -8058,6 +8062,11 @@ substance, a stall's shape. Never for a verdict.
 ## Close
 
 `work_ledger_record` `action=close` with the item's `state` is what ends an item.
+`state=accepted` needs the gateway's current `pass` and records the revision that
+was accepted; `rejected` and `abandoned` are yours and need none. A
+`human_approval` item cannot be closed `accepted` through the ledger: ask the
+person, record their answer with `action=decide`, and close it `rejected` or
+`abandoned`.
 Do not encode items into `session_ledger` artifacts: the ledger is the item
 store now, and `session_ledger_read` / `session_ledger_record` are for YOUR own
 `goal`, `phase` and `next`.
@@ -8081,7 +8090,7 @@ Your tools:
 
 - The work ledger — `work_ledger_read` for your whole fleet as data,
   `work_ledger_record` for the fields you own (`create`, `bind`, `decide`,
-  `accept`, `verdict`, `close`, `goal`); `work_brief` / `work_report` for your
+  `accept`, `evaluate`, `close`, `goal`); `work_brief` / `work_report` for your
   OWN item when a parent conductor dispatched you.
 - Child sessions — `session_create`, `session_send`, `session_read_message`,
   `session_stop`, `session_close` (close a child once its item is terminal),

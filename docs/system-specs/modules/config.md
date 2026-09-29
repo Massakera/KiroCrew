@@ -30,6 +30,17 @@ surfaces, out-of-range values are clamped with a warning rather than raising, an
 a malformed section degrades to defaults so a hand-edited file cannot prevent the
 gateway from starting.
 
+## Crew-managed pi pilot
+
+`agent.pi_managed` defaults to `false` and is marked `restart=True`. The opt-in
+applies only to the pi backend; it neither rewrites the operator's pi configuration
+nor changes other harnesses. The factory carries the flag into the pi client.
+An enabled session selects tools from its captured Crew agent spec and suppresses
+ambient pi orchestration resources. This is a staged runtime capability, not an
+automatic import of pi-subagents agents or a migration of existing conversations.
+The version floor, resource policy and tool projection are specified in
+[acp-client](acp-client.md#crew-managed-pi-opt-in).
+
 ## Orchestration prompt contract
 
 `config/prompt.md` and `config/prompt-orchestrator.md` guide direct work and

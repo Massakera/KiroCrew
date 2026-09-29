@@ -80,6 +80,7 @@ if TYPE_CHECKING:
         join_failures,
         kill_set,
         logger,
+        managed_pi_allowed_grant,
         name_grant,
         process_survived_async,
         provider_fallback_active,
@@ -2169,6 +2170,20 @@ class RunEventCoordinator(ManagerComponent):
                 if tool_result.action == TOOL_DENY:
                     await self._manager._reject_and_log(
                         client, event.request_id, session_key, event, error="hook_deny"
+                    )
+                    continue
+                if managed_pi_allowed_grant(tool_result, event, client) is not tool_result:
+                    await self._manager._approve_and_log(
+                        client,
+                        event.request_id,
+                        session_key,
+                        event,
+                        metadata={
+                            "subagent_id": info.id,
+                            "reason": "managed_pi_allowed_tools",
+                            "mcp_identity": f"{event.mcp_server_name}/{event.tool_name}",
+                        },
+                        info=info,
                     )
                     continue
                 if event.child_low_fidelity:

@@ -904,6 +904,12 @@ class AcpEvent:
     #: fails CLOSED (identity not counted as verified) instead of silently
     #: passing on non-emptiness alone.
     mcp_identity_trusted: bool = False
+    #: bridge_verified: the identity above came from a pi gate envelope whose
+    #: registering source is this session's sealed tool-bridge copy
+    #: (``_dispatch.gate_bridged_mcp_call``). Narrower than
+    #: ``mcp_identity_trusted``, which a tool_call cache hit also earns: only
+    #: this flag licenses the managed-pi ``allowedTools`` grant.
+    bridge_verified: bool = False
     # Canonical, NON-model-authored tool identity from adapter-authored
     # ``_meta.kiro`` or ``_meta.goose`` (see ``_dispatch._kiro_tool_name``).
     # ``title`` is LLM-authored prose — for shell tools ``select_tool_title``

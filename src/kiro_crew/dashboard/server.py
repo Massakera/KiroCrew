@@ -4795,6 +4795,7 @@ async def start_dashboard(
     assume_kiro_ready: bool = False,
     defer_channel_agent_resume: bool = False,
     schedule_memory_preparation: "Callable[[], asyncio.Task[None] | None] | None" = None,
+    start_mcp_gateway: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[web.AppRunner, DashboardState]:
     """Start the dashboard web server.  Returns ``(runner, state)``."""
     # Channels retain this same runner on the gateway, independently of state.
@@ -5223,6 +5224,12 @@ async def start_dashboard(
             os.environ.pop("KIROCREW_BOUND_HOST", None)
         else:
             os.environ["KIROCREW_BOUND_HOST"] = _bind_ip
+
+        # The broker and its pooled children must inherit the actual callback
+        # port, including --port auto, before any session can use their overlay.
+        if start_mcp_gateway is not None:
+            await cautious_boot.pause_before("MCP gateway sidecar")
+            await start_mcp_gateway()
 
         # Start backends for enabled apps on the subprocess_executor bulkhead:
         # the startup stale-reap shells out to `ps` per orphan and may SIGTERM→
@@ -6371,6 +6378,7 @@ async def start_api_server(
     conversation_log: Any = None,
     schedule_memory_preparation: "Callable[[], asyncio.Task[None] | None] | None" = None,
     context_builder: ContextBuilder | None = None,
+    start_mcp_gateway: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[web.AppRunner, DashboardState]:
     """Start a minimal API-only server for MCP tool transport (no UI).
 
@@ -6721,7 +6729,10 @@ async def start_api_server(
             _resolved_bound_port(runner, port),
             _internal_secret,
         )
-    except OSError:
+        if start_mcp_gateway is not None:
+            await cautious_boot.pause_before("MCP gateway sidecar")
+            await start_mcp_gateway()
+    except BaseException:
         await runner.cleanup()
         raise
 

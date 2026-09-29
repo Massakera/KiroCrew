@@ -2526,6 +2526,35 @@ def identity_grant_covers_child(result: ToolHookResult, event: object) -> bool:
     )
 
 
+def managed_pi_allowed_grant(
+    result: ToolHookResult, event: object, client: object, *, classifier_only: bool = False
+) -> ToolHookResult:
+    """Upgrade an undecided hook verdict to an auto-approve a managed pi spec granted.
+
+    kiro-cli runs its agent's ``allowedTools`` without asking; pi has no such list,
+    so a Crew-managed pi session would otherwise prompt for every Crew tool its spec
+    pre-approved. Only ``TOOL_ALLOW`` is upgraded, which is the verdict left AFTER
+    the deny floor and governance ran on this concrete call, so a deny still wins.
+    The client decides the match (:meth:`AcpClient.managed_pi_grant`): a
+    sealed-bridge identity whose ``@server/tool`` the captured spec allows,
+    ceiling-filtered. ``classifier_only`` keeps its meaning — it skips grant tiers.
+    """
+    if classifier_only or result.action != TOOL_ALLOW:
+        return result
+    if getattr(event, "bridge_verified", False) is not True:
+        return result
+    grant = getattr(client, "managed_pi_grant", None)
+    if not callable(grant):
+        return result
+    try:
+        granted = grant(event) is True
+    except Exception:
+        logger.debug("managed pi grant check failed; asking instead", exc_info=True)
+        return result
+    # Built directly, not through the factory: the gate's verdict was already counted.
+    return ToolHookResult(action=TOOL_AUTO_APPROVE, identity_grant=True) if granted else result
+
+
 def _normalize_tool_name(tool_name: str) -> str:
     """Strip display prefixes so hook patterns match the actual tool/command name."""
     for prefix in _TOOL_TITLE_PREFIXES:
