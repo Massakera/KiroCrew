@@ -1811,19 +1811,21 @@ export default function DevFleetPage() {
   // Make live, provisioning and pods all build or run Kiro Crew itself.
   const kirocrewRepo = fleet?.main_repo_kirocrew !== false
   const podsAvailable = kirocrewRepo && fleet?.pods_available !== false
-  const podsReason = fleet?.pods_unavailable_reason || null
+  // The three notices below explain Kiro Crew build/serve/pod state, which a
+  // generic repository has none of.
+  const podsReason = kirocrewRepo ? (fleet?.pods_unavailable_reason || null) : null
   // Why Restart / Make live are unavailable, when they are. Rendered rather
   // than swallowed: hiding these controls with no explanation is what left a
   // macOS user with a successful Pull+Build and no way to apply it. Server-
   // provided prose, same as podsReason.
-  const gatewayReason = fleet?.gateway_service_active === false
+  const gatewayReason = kirocrewRepo && fleet?.gateway_service_active === false
     ? (fleet?.gateway_service_reason || null)
     : null
   // Why the code being managed is not the code being run, when they differ.
   // Rendered ABOVE the other two notices because it explains them: an older
   // serving install is also what makes the Restart eligibility and the staged
   // bundle wrong, so reading those first sends you down the wrong trail.
-  const servingReason = fleet?.serving_install_reason || null
+  const servingReason = kirocrewRepo ? (fleet?.serving_install_reason || null) : null
   const isDiscoveryError = !fleetError && !!fleet?.error
   // Its own state, not an error: the backend found no Kiro Crew checkout to
   // manage, which on a first run is simply a question nobody has answered yet.
@@ -2585,7 +2587,7 @@ export default function DevFleetPage() {
                 </div>
               </div>
             )}
-            {!podsAvailable && (
+            {kirocrewRepo && !podsAvailable && (
               <div
                 role="note"
                 className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed"
@@ -2613,9 +2615,9 @@ export default function DevFleetPage() {
                 claim about a fleet that was never read, which is the same
                 false certainty the discovery fix exists to remove. */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 my-3.5">
-              <StatCard label={i18nT('pages.devFleetPage.running_pods')} value={noFleet ? '—' : running} accent={!noFleet} />
+              <StatCard label={i18nT('pages.devFleetPage.running_pods')} value={noFleet || !kirocrewRepo ? '—' : running} accent={!noFleet && kirocrewRepo} />
               <StatCard label={i18nT('pages.devFleetPage.worktrees')} value={noFleet ? '—' : wts.length} />
-              <StatCard label={i18nT('pages.devFleetPage.needs_provision')} value={noFleet ? '—' : needsProv} />
+              <StatCard label={i18nT('pages.devFleetPage.needs_provision')} value={noFleet || !kirocrewRepo ? '—' : needsProv} />
               <StatCard label={i18nT('pages.devFleetPage.disk_worktrees')} value={noFleet || diskFailed ? '—' : diskGb} />
             </div>
             {/* A failed /disk read shows "—" in the card (not the "…" that reads

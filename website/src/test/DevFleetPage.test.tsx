@@ -892,6 +892,11 @@ describe('DevFleetPage', () => {
   it('offers only the git actions for a main checkout that is not Kiro Crew', async () => {
     mockFleet({
       main_repo_kirocrew: false,
+      serving_install_reason: 'served by another install',
+      gateway_service_active: false,
+      gateway_service_reason: 'gateway is not the user service',
+      pods_available: false,
+      pods_unavailable_reason: 'no pods here',
       worktrees: [
         { name: 'main', is_main: true, running: false, has_dist: false, behind: 0 },
         { name: 'feature-x', is_main: false, running: false, has_dist: false, behind: 0, path: '/wt/feature-x' },
@@ -901,6 +906,9 @@ describe('DevFleetPage', () => {
     await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
     expect(screen.queryByText('Pull+Build')).toBeNull()
     expect(screen.queryByText('Provision')).toBeNull()
+    for (const notice of ['served by another install', 'gateway is not the user service', 'no pods here']) {
+      expect(screen.queryByText(notice)).toBeNull()
+    }
     fireEvent.click(screen.getByLabelText('More actions'))
     expect(await screen.findByText('Rebase onto main')).toBeInTheDocument()
     const menu = within(await screen.findByRole('menu'))
