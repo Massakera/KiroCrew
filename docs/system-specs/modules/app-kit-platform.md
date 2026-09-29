@@ -15,6 +15,10 @@ The page and tool share durable IDs, saved service context, findings and native
 app-owned chat slots. Service context stores local repository, AWS profile and
 expected account, Kubernetes context and expected API server/namespaces, log
 sources, database references and instructions; never credential values.
+A service may also name an investigator model (empty or `auto` inherits the
+normal model chain). It pins only a freshly created investigation slot, so a
+model picked in that conversation survives a resume, and a pin the account
+cannot run is withheld like any other slot pin.
 The UI uses the host's native conversation and exact pending approval cards.
 Services are configured through the page; investigators report only on their
 own live run. Eligible owner conversations may start, inspect, resume and cancel
@@ -24,8 +28,8 @@ Investigations are on demand. V1 adds no scheduled monitoring, release babysit,
 automatic remediation, IAM/RBAC provisioning or cloud-hosted runtime.
 The gateway must stay running. AWS device sign-in exposes a local sign-in prompt
 without opening a browser automatically, then re-verifies identity before resume.
-V1 execution requires the Kiro CLI backend; other harnesses are refused without
-switching the configured backend. The app uses a dedicated investigator spec with
+Execution requires the Kiro CLI backend or pi in managed mode; other harnesses
+are refused without switching the configured backend. The app uses a dedicated investigator spec with
 harness pre-approvals removed, leaving the operator's normal agent unchanged.
 
 Everything here is **generic App Kit surface**, not one app's arrangement: each

@@ -87,10 +87,16 @@ def service_config(data: dict) -> dict:
         "log_sources",
         "database",
         "instructions",
+        "model",
     )
     result = {key: str(data.get(key, "")).strip() for key in fields}
     if not result["name"] or len(result["name"]) > 100:
         raise InvestigationError("Service name is required (up to 100 characters).")
+    from kiro_crew.config.sections import normalize_agent_model
+
+    result["model"] = normalize_agent_model(result["model"])
+    if result["model"] and not re.fullmatch(r"[\w.:/\[\]@+-]{1,128}", result["model"]):
+        raise InvestigationError("Invalid model ID.")
     if any(len(value) > 12000 for value in result.values()):
         raise InvestigationError("Service context is too large.")
     if clean(json.dumps(result)) != json.dumps(result):
@@ -319,7 +325,11 @@ class Engine:
             slot = await rehydrate_slot_from_history_async(self.state, key, adopt_closed=True)
         if slot is not None and slot._app != APP_NAME:
             raise InvestigationError("The investigation session belongs to another context.")
-        slot = slot or self.state.get_or_create_slot(name=key, app=APP_NAME)
+        if slot is None:
+            slot = self.state.get_or_create_slot(name=key, app=APP_NAME)
+            # Only a fresh slot takes the service's pin, so a model picked in the
+            # conversation survives a resume.
+            slot.model = row["service"].get("model", "") or slot.model
         slot.project = row["service"]["repository"] or row["scratch"]
         slot.title = f"{row['service']['name']}: {row['question'][:70]}"
         slot._titled = True

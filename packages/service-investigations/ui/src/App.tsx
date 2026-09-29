@@ -20,7 +20,7 @@ type Run = {
 type Index = { services: Service[]; runs: Run[] }
 const emptyService: Service = {
   name: '', repository: '', aws_profile: '', aws_account: '', kube_context: '',
-  kube_server: '', namespaces: '', log_sources: '', database: '', instructions: '',
+  kube_server: '', namespaces: '', log_sources: '', database: '', instructions: '', model: '',
 }
 const pt = {
   title: 'Investigações', subtitle: 'Entenda o que está acontecendo. Decida o que mudar.',
@@ -33,11 +33,12 @@ const pt = {
   findings: 'Achados', noFindings: 'O agente está reunindo evidências. Acompanhe a conversa abaixo.',
   access: 'Use os acessos locais que você já tem. Informe referências de conexão, nunca senhas ou tokens.',
   policy: 'Leituras passam por avaliação automática. Mudanças e operações ambíguas pedem aprovação. Essa avaliação é best effort; não é um bloqueio de escrita na infraestrutura.',
-  local: 'V1 · Kiro CLI. A execução continua ao sair desta página; mantenha o gateway ligado.',
+  local: 'Kiro CLI ou pi gerenciado. A execução continua ao sair desta página; mantenha o gateway ligado.',
   auth: 'Abra o endereço abaixo no navegador e use o código exibido. A investigação retoma após o login.',
   name: 'Nome do serviço', repository: 'Repositório local', aws_profile: 'Perfil AWS', aws_account: 'Conta AWS esperada',
   kube_context: 'Contexto Kubernetes', kube_server: 'API server esperado (https://…)', namespaces: 'Namespaces',
   log_sources: 'Fontes de logs', database: 'Referência local do banco', instructions: 'Instruções de investigação',
+  model: 'Modelo do investigador (vazio = padrão)',
   summary: 'Resumo', evidence: 'Evidências', hypotheses: 'Hipóteses', gaps: 'O que falta confirmar',
   recommendation: 'Recomendação', decisions: 'Decisões que precisam de você', verified: 'Identidade verificada',
   checking: 'Conferindo acesso', running: 'Investigando', waiting_approval: 'Aguardando aprovação',
@@ -55,11 +56,12 @@ const en: typeof pt = {
   findings: 'Findings', noFindings: 'The agent is gathering evidence. Follow the conversation below.',
   access: 'Use your existing local access. Enter connection references, never passwords or tokens.',
   policy: 'Reads receive automatic review. Changes and ambiguous operations need approval. Review is best effort; it does not enforce read-only infrastructure access.',
-  local: 'V1 · Kiro CLI. Execution continues after leaving this page; keep the gateway running.',
+  local: 'Kiro CLI or managed pi. Execution continues after leaving this page; keep the gateway running.',
   auth: 'Open the address below in your browser and enter the displayed code. Investigation resumes after sign-in.',
   name: 'Service name', repository: 'Local repository', aws_profile: 'AWS profile', aws_account: 'Expected AWS account',
   kube_context: 'Kubernetes context', kube_server: 'Expected API server (https://…)', namespaces: 'Namespaces',
   log_sources: 'Log sources', database: 'Local database reference', instructions: 'Investigation instructions',
+  model: 'Investigator model (empty = default)',
   summary: 'Summary', evidence: 'Evidence', hypotheses: 'Hypotheses', gaps: 'Unconfirmed',
   recommendation: 'Recommendation', decisions: 'Decisions needing you', verified: 'Verified identity',
   checking: 'Checking access', running: 'Investigating', waiting_approval: 'Awaiting approval',
@@ -149,8 +151,8 @@ export default function Investigations() {
           <form className="stack" onSubmit={e => { e.preventDefault(); action.mutate({ action: 'save_service', service: draft }) }}>
             <div className="grid">{Object.keys(emptyService).map(key => <label key={key}>{label(key)}
               {['instructions', 'log_sources', 'database'].includes(key)
-                ? <textarea value={draft[key]} onChange={e => setDraft({ ...draft, [key]: e.target.value })} />
-                : <Input required={key === 'name'} value={draft[key]} onChange={e => setDraft({ ...draft, [key]: e.target.value })} />}
+                ? <textarea value={draft[key] ?? ''} onChange={e => setDraft({ ...draft, [key]: e.target.value })} />
+                : <Input required={key === 'name'} placeholder={key === 'model' ? 'provider/model' : undefined} value={draft[key] ?? ''} onChange={e => setDraft({ ...draft, [key]: e.target.value })} />}
             </label>)}</div>
             <div><Btn primary disabled={action.isPending} type="submit">{t.save}</Btn></div>
           </form>

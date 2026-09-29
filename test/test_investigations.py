@@ -41,6 +41,40 @@ def test_service_requires_identity_pins():
     assert service_config({"name": "API", "database": "local pg_service entry"})["name"] == "API"
 
 
+def test_service_model_inherits_on_auto_and_rejects_junk():
+    assert service_config({"name": "API"})["model"] == ""
+    assert service_config({"name": "API", "model": "auto"})["model"] == ""
+    assert service_config({"name": "API", "model": " prov/m-1.5[high] "})["model"] == (
+        "prov/m-1.5[high]"
+    )
+    with pytest.raises(InvestigationError, match="model"):
+        service_config({"name": "API", "model": "m; rm -rf /"})
+
+
+@pytest.mark.asyncio
+async def test_fresh_slot_takes_service_model_and_resume_keeps_the_pick(engine, monkeypatch):
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.chat_persistence.rehydrate_slot_from_history_async",
+        AsyncMock(return_value=None),
+    )
+
+    def create(name, app):
+        slot = SimpleNamespace(key=name, _app=app, model="")
+        engine.state._slots[name] = slot
+        return slot
+
+    engine.state.get_or_create_slot = create
+    row = {"id": "a" * 32, "slot_key": "investigation-a", "question": "Q", "scratch": "/tmp"}
+    row["service"] = service_config({"name": "API", "model": "prov/pinned"})
+    slot = await engine.ensure_slot(row)
+    assert slot.model == "prov/pinned"
+    slot.model = "prov/picked-in-chat"
+    assert (await engine.ensure_slot(row)).model == "prov/picked-in-chat"
+    legacy = {**row, "id": "b" * 32, "slot_key": "investigation-b"}
+    legacy["service"] = {k: v for k, v in row["service"].items() if k != "model"}
+    assert (await engine.ensure_slot(legacy)).model == ""
+
+
 @pytest.mark.asyncio
 async def test_start_snapshot_survives_restart_and_service_edit(engine, monkeypatch):
     monkeypatch.setattr(engine, "launch", Mock())
