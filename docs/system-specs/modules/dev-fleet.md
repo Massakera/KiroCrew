@@ -86,6 +86,29 @@ is the worst available outcome. "Not replaced by a discovered checkout" and "not
 only the first is wanted: a readable-but-wrong configured path would otherwise be operated
 on rather than reported.
 
+An operator-configured path (tiers 1–2) that is a git checkout but NOT a Kiro Crew
+checkout is valid: the fleet lists, creates, rebases and prunes its worktrees. What it
+cannot do is build or run Kiro Crew from it, so every Kiro-only surface — Pull+Build,
+Make Live, provisioning, pods, `build_pending` — goes through `_kirocrew_repo()`, which
+raises `RepoNotKiroCrew` (HTTP 409 `repo_not_kirocrew`) unless `MAIN_REPO_KIROCREW` is
+set. The `/fleet` payload carries `main_repo_kirocrew`, and the page hides those
+controls when it is false. An inferred path (tiers 3–5) still has to pass the marker
+test, so an unconfigured host never adopts an unrelated repository.
+
+`BASE_BRANCH` — the branch rebase and "behind" are measured against — is
+`dev_fleet.base_branch` when set, else the checkout's `origin/HEAD` for a
+non-Kiro-Crew repository, else `main`.
+
+Worktrees Kiro Crew itself creates (the task runner's isolated runs, Spec Builder's
+per-spec worktrees, an Issue Radar crew's per-issue worktrees) land under ONE root,
+`dev_fleet.worktrees_root` (default `~/worktrees`), laid out `<root>/<repo>/<name>`;
+see `kiro_crew/worktree_layout.py`. A name that is not a single safe path segment
+falls back to the producer's legacy location.
+
+The "recent" sort reads `last_updated_at`, the later of the HEAD commit time and the
+mtime of the worktree's `HEAD` / `logs/HEAD`, so a checkout, reset or new commit counts
+as use. The index is excluded because `git status` itself refreshes it.
+
 Module import evaluates tiers 1, 3 and 4 — two env reads and a handful of stats — because
 the module is imported from the async route-registration path. Tier 2 (a config-file read)
 and tier 5 (up to 30 candidate directories x 3 markers) run only on the subprocess executor

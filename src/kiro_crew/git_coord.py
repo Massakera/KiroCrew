@@ -17,7 +17,7 @@ try:  # Windows-only module; absent on POSIX.
 except ImportError:  # pragma: no cover - POSIX
     msvcrt = None  # type: ignore[assignment]
 
-from kiro_crew import platform_compat
+from kiro_crew import platform_compat, worktree_layout
 from kiro_crew.sandbox import (
     create_subprocess_limited,
     sandboxed_spawn_argv,
@@ -54,13 +54,38 @@ async def init_workspace(run: Project) -> None:
 
     run.base_branch = (await _git(orig_dir, "rev-parse", "--abbrev-ref", "HEAD")).strip()
     repo_root = (await _git(orig_dir, "rev-parse", "--show-toplevel")).strip()
-    wt_dir = str(Path(repo_root).parent / ".kirocrew-work" / run.task_id)
+    wt_dir = await _run_worktree_dir(repo_root, run.task_id)
     await _git(orig_dir, "worktree", "add", wt_dir, "-b", branch)
     run.work_dir = wt_dir
     run.worktree_path = wt_dir
     run.repo_root = repo_root
     run.branch_name = branch
     run.git_enabled = True
+
+
+async def _run_worktree_dir(repo_root: str, task_id: str) -> str:
+    """Where a run's isolated worktree goes: ``<worktrees root>/<repo>/task-<id>``.
+
+    Grouped by the PRIMARY checkout's name, so a run started from inside a linked
+    worktree still lands beside the repository's other worktrees. Falls back to
+    the historical ``<repo parent>/.kirocrew-work/<id>`` only when the names cannot
+    form a safe path, so an unusual repository name never fails the run.
+    """
+    primary = repo_root
+    try:
+        common = (
+            await _git(repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        ).strip()
+        if common and Path(common).name == ".git":
+            primary = str(Path(common).parent)
+    except (RuntimeError, OSError):
+        pass
+    try:
+        return str(
+            await asyncio.to_thread(worktree_layout.worktree_path, primary, f"task-{task_id}")
+        )
+    except ValueError:
+        return str(Path(repo_root).parent / ".kirocrew-work" / task_id)
 
 
 async def commit_step(run: Project, step: Task) -> str:
@@ -657,7 +682,7 @@ async def reinit_workspace_for_retry(run: Project) -> bool:
                 run.worktree_path,
                 doomed,
             )
-    wt_dir = run.worktree_path or str(Path(run.repo_root).parent / ".kirocrew-work" / run.task_id)
+    wt_dir = run.worktree_path or await _run_worktree_dir(run.repo_root, run.task_id)
     try:
         await _git(run.repo_root, "worktree", "add", wt_dir, run.branch_name)
     except Exception:

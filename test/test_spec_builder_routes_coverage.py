@@ -1686,15 +1686,19 @@ class TestRepoInfo:
 
 class TestWorktreeCreation:
     @pytest.mark.asyncio
-    async def test_it_refuses_to_reuse_an_existing_path(self, tmp_path):
+    async def test_it_refuses_to_reuse_an_existing_path(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KIROCREW_WORKTREES_ROOT", str(tmp_path / "wt"))
         root = tmp_path / "repo"
         root.mkdir()
-        (tmp_path / "repo-wt-demo").mkdir()
+        (tmp_path / "wt" / "repo" / "spec-demo").mkdir(parents=True)
         result = await r._create_worktree(str(root), "demo")
         assert isinstance(result, str) and "already exists" in result
 
     @pytest.mark.asyncio
-    async def test_a_successful_creation_returns_the_sibling_path_and_branch(self, tmp_path):
+    async def test_a_successful_creation_lands_under_the_worktrees_root(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("KIROCREW_WORKTREES_ROOT", str(tmp_path / "wt"))
         root = tmp_path / "repo"
         root.mkdir()
         seen: list[tuple] = []
@@ -1710,11 +1714,12 @@ class TestWorktreeCreation:
             ),
         ):
             result = await r._create_worktree(str(root), "demo")
-        assert result == (str(tmp_path / "repo-wt-demo"), "spec/demo")
+        expected = tmp_path / "wt" / "repo" / "spec-demo"
+        assert result == (str(expected), "spec/demo")
         assert seen[-1] == (
             "worktree",
             "add",
-            str(tmp_path / "repo-wt-demo"),
+            str(expected),
             "-b",
             "spec/demo",
             "origin/main",

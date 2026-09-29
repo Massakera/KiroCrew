@@ -1301,6 +1301,12 @@ async def _make_live(
                 "/api/apps/dev-fleet/make-live), not in the Dev Fleet backend"
             ),
         }
+    if repository.MAIN_REPO and not repository.MAIN_REPO_KIROCREW:
+        return {
+            "ok": False,
+            "code": "repo_not_kirocrew",
+            "error": "Make Live runs Kiro Crew from a worktree; this fleet's repository is not Kiro Crew",
+        }
     if dry_run:
         return await _make_live_inner(
             path, dry_run=True, expected_staged=expected_staged, undo=undo

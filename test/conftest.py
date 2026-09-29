@@ -937,6 +937,21 @@ def _disable_dev_fleet_background_tasks(_floor_monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _restore_dev_fleet_repo_kind(_floor_monkeypatch):
+    """Undo a test's discovery writes to Dev Fleet's repository-kind globals.
+
+    Booting the app runs ``ensure_main_repo_discovered``, which rewrites
+    ``MAIN_REPO_KIROCREW`` and ``BASE_BRANCH`` for the whole process. Left in
+    place, one test's generic-repo verdict makes a later pod or build test in
+    the same worker refuse with ``repo_not_kirocrew``.
+    """
+    mod = sys.modules.get("kiro_crew.apps.builtins.dev_fleet.repository")
+    if mod is not None:
+        for name in ("MAIN_REPO_KIROCREW", "BASE_BRANCH"):
+            _floor_monkeypatch.setattr(mod, name, getattr(mod, name))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_kiro_window_cache():
     """Give every test an EMPTY ``model_registry._KIRO_WINDOWS``, then restore it.
 

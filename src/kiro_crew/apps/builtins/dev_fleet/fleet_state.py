@@ -35,7 +35,7 @@ def _build_pending() -> bool:
     try:
         # Path("") is Path("."), which would stat this process's own tree —
         # no checkout means nothing can be pending.
-        dist = Path(repository._repo()) / "src" / "kiro_crew" / "static" / "dist"
+        dist = Path(repository._kirocrew_repo()) / "src" / "kiro_crew" / "static" / "dist"
         if not dist.exists():
             return False
         # stat() follows a symlink on purpose: a source-tree install points
@@ -1170,7 +1170,8 @@ async def _build_fleet() -> dict:
     staged_path = pointer.staged
     previous_path = Path(pointer.previous) if pointer.previous is not None else None
     worktrees = await repository._discover_worktrees()
-    cfg = runtime._load_cfg()
+    # A generic repository has no pods and no Kiro Crew build to report on.
+    cfg = runtime._load_cfg() if repository.MAIN_REPO_KIROCREW else None
     loop = asyncio.get_running_loop()
     active_pod_names: set[str] = set()
     if runtime._POD_AVAILABLE and cfg and any(not wt.get("is_main", False) for wt in worktrees):
@@ -1208,7 +1209,7 @@ async def _build_fleet() -> dict:
         # surface a human checks, and reporting main as unprovisioned reads as
         # "the cutover failed". The ``not is_main`` restriction belongs to the
         # POD-state check below (pods never run on main), not to these probes.
-        if runtime._POD_IMPORTED:
+        if runtime._POD_IMPORTED and repository.MAIN_REPO_KIROCREW:
             try:
                 has_venv = await loop.run_in_executor(
                     subprocess_executor(), runtime.prov.has_venv, Path(path)
@@ -1402,6 +1403,9 @@ async def _build_fleet() -> dict:
         "worktrees": wts,
         "main_repo": runtime._redact(repository._repo()),
         "main_repo_inferred": repository.MAIN_REPO_INFERRED,
+        # False for a generic repository: the page hides Pull+Build, pods and
+        # Make Live, which `_kirocrew_repo()` refuses there anyway.
+        "main_repo_kirocrew": repository.MAIN_REPO_KIROCREW,
         "base_branch": repository.BASE_BRANCH,
         "build_pending": _build_pending(),
         "gateway_service_active": await live._gateway_service_active(),

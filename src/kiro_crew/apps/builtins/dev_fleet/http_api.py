@@ -586,6 +586,11 @@ async def hmac_proxy_middleware(request: web.Request, handler) -> web.Response:
 
     try:
         return await handler(request)
+    except repository.RepoNotKiroCrew as exc:
+        return web.json_response(
+            {"ok": False, "code": "repo_not_kirocrew", "error": runtime._redact(str(exc))},
+            status=409,
+        )
     except repository.RepoUnreadable as exc:
         # Ordered before RepoNotConfigured: it is a SUBCLASS of the same base, so
         # a broader handler first would swallow it and report the wrong code.

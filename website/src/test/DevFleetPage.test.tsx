@@ -889,6 +889,26 @@ describe('DevFleetPage', () => {
     expect(menu.getByText('Make live')).toBeInTheDocument()
   })
 
+  it('offers only the git actions for a main checkout that is not Kiro Crew', async () => {
+    mockFleet({
+      main_repo_kirocrew: false,
+      worktrees: [
+        { name: 'main', is_main: true, running: false, has_dist: false, behind: 0 },
+        { name: 'feature-x', is_main: false, running: false, has_dist: false, behind: 0, path: '/wt/feature-x' },
+      ],
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    expect(screen.queryByText('Pull+Build')).toBeNull()
+    expect(screen.queryByText('Provision')).toBeNull()
+    fireEvent.click(screen.getByLabelText('More actions'))
+    expect(await screen.findByText('Rebase onto main')).toBeInTheDocument()
+    const menu = within(await screen.findByRole('menu'))
+    for (const gone of ['Make live', 'Spin up pod', 'QA + video']) {
+      expect(menu.queryByText(gone)).toBeNull()
+    }
+  })
+
   it('keeps Provision available without pods (pod provision never touches systemd)', async () => {
     mockFleet({
       ...FLEET_NO_PODS,

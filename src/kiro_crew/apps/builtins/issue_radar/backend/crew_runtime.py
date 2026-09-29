@@ -46,6 +46,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from kiro_crew import worktree_layout
 from kiro_crew.apps import teardown
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.apps.teardown import register_slot_close_hook, register_slot_close_undo_hook
@@ -292,6 +293,7 @@ def build_snapshot(
         "writable_labels": list(writable_labels(settings)),
         "open_count": crew_store.open_slot_count(owner, repo, crew_id, root),
         "max_open": int(crew.get("max_open") or 0),
+        "worktree_root": _crew_worktree_root(crew, repo),
         "items": [
             {
                 "number": it.get("number"),
@@ -302,6 +304,21 @@ def build_snapshot(
             for it in items
         ],
     }
+
+
+def _crew_worktree_root(crew: dict[str, Any], repo: str) -> str:
+    """The crew's own ``worktree_root``, else ``<shared worktrees root>/<repo>``.
+
+    Blocking (config read). Empty when neither yields a usable absolute path, so
+    the nudge omits the line rather than naming a directory the crew cannot use.
+    """
+    own = str(crew.get("worktree_root") or "").strip()
+    if own:
+        return own
+    try:
+        return str(worktree_layout.worktrees_root() / worktree_layout.segment(repo))
+    except ValueError:
+        return ""
 
 
 def compose_nudge(snapshot: dict[str, Any]) -> str:
@@ -346,6 +363,8 @@ def compose_nudge(snapshot: dict[str, Any]) -> str:
         "Writable labels: " + ", ".join(f"`{lab}`" for lab in allowed) + " — no others, ever.",
         f"Open {snapshot.get('open_count')}/{snapshot.get('max_open')}",
     ]
+    if snapshot.get("worktree_root"):
+        lines.append(f"Worktree root: {snapshot['worktree_root']}")
     items = snapshot.get("items") or []
     if items:
         # "Work item" here is the LEDGER's own word for a crew's tracked slot (see

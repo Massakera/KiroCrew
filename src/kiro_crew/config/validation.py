@@ -45,9 +45,11 @@ import threading
 # Crew's own instructions. Private to this module because that warning is the
 # only consumer; a second member is the point at which this wants to become an
 # app-declared registration rather than a longer literal.
-#   * dev_fleet -- ``dev_fleet.repo_path`` names the Kiro Crew checkout Dev Fleet
-#     manages; read by apps/builtins/dev_fleet/repository.py::_load_dev_fleet_cfg
-#     and prescribed by the dashboard's "no checkout found" banner.
+#   * dev_fleet -- ``dev_fleet.repo_path`` names the checkout Dev Fleet manages
+#     and ``dev_fleet.base_branch`` its trunk; read by
+#     apps/builtins/dev_fleet/repository.py::_load_dev_fleet_cfg and prescribed by
+#     the dashboard's "no checkout found" banner. ``dev_fleet.worktrees_root`` is
+#     read by kiro_crew/worktree_layout.py.
 _APP_OWNED_TOP_KEYS: frozenset = frozenset({"dev_fleet"})
 
 try:
@@ -537,8 +539,7 @@ def validate_config_data(data: dict) -> dict:
                 actual = _actual_type_name(value)
                 removed = _apply_field_default(data, dot_path)
                 logger.warning(
-                    "Config: type mismatch at '%s': "
-                    "expected %s, got %s (value: %s); %s",
+                    "Config: type mismatch at '%s': " "expected %s, got %s (value: %s); %s",
                     dot_path,
                     expected,
                     actual,

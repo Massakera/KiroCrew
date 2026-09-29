@@ -96,7 +96,7 @@ async def _prune_dead_sync_base_refs(repo: str) -> None:
 
 def _pod_env() -> dict:
     """Environment for pod CLI subprocesses (allowlisted base + pod repo)."""
-    return {**runtime._build_env(), "KIROCREW_POD_REPO": repository._repo()}
+    return {**runtime._build_env(), "KIROCREW_POD_REPO": repository._kirocrew_repo()}
 
 
 def _read_pin_strict(cfg: Any, name: str) -> tuple[bool, str | None]:
@@ -143,6 +143,8 @@ async def _pod_checkout_guard(name: str) -> str | None:
     land on an unrelated repository's pod (stop it, delete its isolated HOME,
     or provision the wrong checkout). Returns an error string to refuse, or
     None to proceed. Fail closed on any uncertainty."""
+    if not repository.MAIN_REPO_KIROCREW:
+        return "pods run only from a Kiro Crew checkout; this repository is not one"
     target, ferr = await repository._find_worktree(name)
     if target is None:
         return ferr or f"unknown worktree: {name!r}"
@@ -299,7 +301,7 @@ async def _pod_up(name: str) -> dict:
     await runtime._warm_build_path()
     cmd = runtime._find_cli() + ["pod", "up", name, "--json"]
     rc, stdout, stderr = await runtime._run_cmd(
-        cmd, cwd=repository._repo(), env=_pod_env(), timeout=180
+        cmd, cwd=repository._kirocrew_repo(), env=_pod_env(), timeout=180
     )
     if rc != 0:
         return {"ok": False, "error": runtime._redact(stderr or stdout)}
@@ -334,7 +336,7 @@ async def _pod_down(name: str) -> dict:
         await runtime._warm_build_path()
         cmd = runtime._find_cli() + ["pod", "down", name]
         rc, stdout, stderr = await runtime._run_cmd(
-            cmd, cwd=repository._repo(), env=_pod_env(), timeout=30
+            cmd, cwd=repository._kirocrew_repo(), env=_pod_env(), timeout=30
         )
         if rc != 0:
             return {"ok": False, "error": runtime._redact(stderr or stdout)}
@@ -436,7 +438,7 @@ async def _pod_status(name: str) -> dict:
     await runtime._warm_build_path()
     rc, stdout, stderr = await runtime._run_cmd(
         runtime._find_cli() + ["pod", "status", name, "--json"],
-        cwd=repository._repo(),
+        cwd=repository._kirocrew_repo(),
         env=_pod_env(),
         timeout=30,
     )
@@ -467,7 +469,7 @@ async def _pod_ls() -> dict:
     await runtime._warm_build_path()
     rc, stdout, stderr = await runtime._run_cmd(
         runtime._find_cli() + ["pod", "ls", "--json"],
-        cwd=repository._repo(),
+        cwd=repository._kirocrew_repo(),
         env=_pod_env(),
         timeout=30,
     )
@@ -508,7 +510,7 @@ async def _pod_provision(name: str) -> dict:
         rid = await runtime._start_run(
             "provision " + name,
             p_argv,
-            cwd=repository._repo(),
+            cwd=repository._kirocrew_repo(),
             env=p_env,
             cleanup_paths=[p_cleanup] if p_cleanup else None,
             # Provisioning builds .venv and the SPA dist INSIDE the worktree
@@ -1729,7 +1731,7 @@ async def _sync_start_locked() -> dict:
     global _SYNC_RID  # noqa: F824 (assigned below after await)
 
     try:
-        repo = repository._repo()
+        repo = repository._kirocrew_repo()
     except repository.RepoUnavailable as exc:
         # Sync answers a UI action, so the unresolved state degrades to the
         # same {"ok": False} shape every other refusal here uses.

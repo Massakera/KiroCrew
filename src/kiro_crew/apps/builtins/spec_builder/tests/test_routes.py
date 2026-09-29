@@ -3331,10 +3331,11 @@ def test_no_async_function_touches_the_filesystem_inline():
 @pytest.mark.asyncio
 async def test_create_worktree_still_refuses_an_existing_path(tmp_path, monkeypatch):
     """Non-vacuous: offloading the probe must not lose the guard — an existing
-    sibling path still aborts before git runs."""
+    worktree path still aborts before git runs."""
+    monkeypatch.setenv("KIROCREW_WORKTREES_ROOT", str(tmp_path / "wt"))
     repo = Path(os.path.realpath(tmp_path)) / "repo"
     repo.mkdir()
-    (repo.parent / "repo-wt-taken").mkdir()
+    (tmp_path / "wt" / "repo" / "spec-taken").mkdir(parents=True)
 
     ran: list[tuple] = []
 

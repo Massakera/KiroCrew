@@ -401,6 +401,8 @@ has to look it up again.
 git worktree add -b crew/<name>/issue-<n> <worktree-root>/<name>-<n> origin/<default-branch>
 ```
 
+`<worktree-root>` is the `Worktree root:` line of your turn message.
+
 Install dependencies **only when the change actually needs them** — when a test
 suite, a build or a type-checker you are about to run cannot run without them. A
 full install can cost several minutes and hundreds of megabytes per worktree, so

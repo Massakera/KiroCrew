@@ -76,6 +76,15 @@ class RepoUnreadable(RepoUnavailable):
     """
 
 
+class RepoNotKiroCrew(RepoUnavailable):
+    """The managed checkout is a plain git repository, not a Kiro Crew checkout.
+
+    Worktree operations (list, remove, prune, rebase) work on it; the actions that
+    build, run or cut over Kiro Crew itself (Pull+Build, pods, Make Live) do not,
+    and ``_kirocrew_repo()`` raises this for them.
+    """
+
+
 #: Set at startup when the resolved checkout does not carry the Kiro Crew markers,
 #: to the message ``_repo()`` raises. Tiers 1-2 (env var, config) are taken
 #: verbatim, so a configured path can be a readable directory that is not this
@@ -104,6 +113,33 @@ def _repo() -> str:
     if _REPO_INVALID_MSG:
         raise RepoUnreadable(_REPO_INVALID_MSG)
     return MAIN_REPO
+
+
+def _kirocrew_repo() -> str:
+    """``_repo()``, restricted to a checkout that carries the Kiro Crew markers.
+
+    The gate for every action that runs Kiro Crew's own build or runtime inside
+    the checkout (``pip install -e``, the SPA build, pods, cutover). An
+    operator-configured generic repository passes ``_repo()`` for worktree
+    operations and is refused here, so those steps never run in an unrelated
+    project.
+    """
+    repo = _repo()
+    if not MAIN_REPO_KIROCREW:
+        raise RepoNotKiroCrew(
+            f"{repo} is not a Kiro Crew checkout; Pull+Build, pods and Make Live " "only run in one"
+        )
+    return repo
+
+
+def _is_git_checkout(path: str) -> bool:
+    """Whether *path* is the top of a git checkout (primary or linked). Stats only."""
+    if not path:
+        return False
+    try:
+        return (Path(path) / ".git").exists()
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _own_source_checkout() -> str | None:
@@ -244,7 +280,7 @@ def _repo_source_hint() -> str:
     if isinstance(configured, str) and configured.strip():
         return "It is set by dev_fleet.repo_path in config.json."
     return (
-        "Point Dev Fleet at your Kiro Crew checkout with the "
+        "Point Dev Fleet at the repository to manage with the "
         "KIROCREW_DEVFLEET_REPO environment variable, or with "
         "dev_fleet.repo_path in config.json."
     )
@@ -312,7 +348,47 @@ def _default_main_repo_state() -> tuple[str, bool]:
 
 # Startup replaces this stat-only hint after the complete discovery chain runs.
 MAIN_REPO, MAIN_REPO_INFERRED = _default_main_repo_state()
-BASE_BRANCH = "main"
+#: Whether the managed checkout carries the Kiro Crew markers. False for a generic
+#: repository the operator configured; ``_kirocrew_repo()`` gates on it.
+MAIN_REPO_KIROCREW = _is_kirocrew_checkout(_default_main_repo())
+_DEFAULT_BASE_BRANCH = "main"
+BASE_BRANCH = _DEFAULT_BASE_BRANCH
+
+
+#: A branch name git accepts and no argv can read as an option.
+_BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+
+def _configured_base_branch() -> str:
+    """``dev_fleet.base_branch`` when it is a plausible branch name, else ``""``.
+
+    Blocking (reads the config files) — executor only.
+    """
+    raw = _load_dev_fleet_cfg().get("base_branch")
+    if not isinstance(raw, str):
+        return ""
+    name = raw.strip()
+    if not _BRANCH_NAME_RE.fullmatch(name) or ".." in name or name.endswith((".lock", "/")):
+        return ""
+    return name
+
+
+async def _detect_base_branch(repo: str) -> str:
+    """The branch ``origin/HEAD`` names in *repo*, or ``""`` when git has none.
+
+    The configured value wins; this is how a repository whose trunk is not
+    ``main`` (``development``, ``master``) works with no configuration.
+    """
+    rc, out, _ = await runtime._run_cmd(
+        ["git", "-C", repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        timeout=5,
+    )
+    ref = out.strip() if rc == 0 else ""
+    name = ref.split("/", 1)[1] if ref.startswith("origin/") else ""
+    if not _BRANCH_NAME_RE.fullmatch(name) or ".." in name:
+        return ""
+    return name
+
 
 # --- full discovery: once per process, or once per attempt while unresolved ---
 _DISCOVERY_DONE = False
@@ -394,7 +470,7 @@ async def ensure_main_repo_discovered() -> None:
     often still unresolved) cannot consume it unnoticed.
     """
     global _DISCOVERY_DONE, _DISCOVERY_LOCK, MAIN_REPO, MAIN_REPO_INFERRED, _REPO_INVALID_MSG
-    global _LATCHED_CONFIGURED
+    global _LATCHED_CONFIGURED, MAIN_REPO_KIROCREW, BASE_BRANCH, _UPSTREAM_REMOTE
     # A latched VALID resolution is final and returns here with no await at all, so an
     # install that has a fleet to serve pays nothing for the per-poll retry. Only the
     # latched-INVALID state falls through, and it settles under the lock so concurrent
@@ -439,6 +515,7 @@ async def ensure_main_repo_discovered() -> None:
             # the page until a restart -- the failure this whole attempt exists to end.
             MAIN_REPO = ""
             MAIN_REPO_INFERRED = False
+            MAIN_REPO_KIROCREW = False
             _REPO_INVALID_MSG = None
             _DISCOVERY_DONE = False
             return
@@ -446,6 +523,7 @@ async def ensure_main_repo_discovered() -> None:
             subprocess_executor(), _discover_main_repo, configured
         )
         invalid_msg: str | None = None
+        is_kirocrew = False
         if discovered:
             discovered = await loop.run_in_executor(
                 subprocess_executor(), _resolve_primary_checkout, discovered
@@ -459,20 +537,44 @@ async def ensure_main_repo_discovered() -> None:
             # rather than per call, so no request or refresher cycle pays the stats;
             # the message is composed here too because it embeds the config-derived
             # source hint, which reads files.
-            valid, hint = await loop.run_in_executor(
+            #
+            # A path the operator NAMED may be any git checkout: worktree operations
+            # are plain git and run there, while `_kirocrew_repo()` keeps the build,
+            # pod and cutover steps to a checkout carrying the markers. An INFERRED
+            # path never reaches this branch without the markers, because every
+            # inferred tier is marker-tested during discovery.
+            is_kirocrew, is_git, hint = await loop.run_in_executor(
                 subprocess_executor(),
-                lambda: (_is_kirocrew_checkout(discovered), _repo_source_hint()),
+                lambda: (
+                    _is_kirocrew_checkout(discovered),
+                    _is_git_checkout(discovered),
+                    _repo_source_hint(),
+                ),
             )
+            valid = is_kirocrew or (bool(configured) and is_git)
             invalid_msg = (
                 None
                 if valid
                 else (
-                    f"not a Kiro Crew checkout: {discovered} exists but does not carry the "
-                    f"markers (.git, src/kiro_crew/, pyproject.toml). {hint}"
+                    f"not a git checkout: {discovered} has no .git to manage worktrees of. "
+                    f"{hint}"
                 )
             )
         MAIN_REPO = discovered
         MAIN_REPO_INFERRED = bool(discovered and not configured)
+        MAIN_REPO_KIROCREW = invalid_msg is None and is_kirocrew
+        base = _DEFAULT_BASE_BRANCH
+        if discovered and invalid_msg is None:
+            # Kiro Crew's own trunk is `main`, so only a generic repository pays
+            # the detection subprocess; a configured name wins for either.
+            base = await loop.run_in_executor(subprocess_executor(), _configured_base_branch)
+            if not base and not is_kirocrew:
+                base = await _detect_base_branch(discovered)
+            base = base or _DEFAULT_BASE_BRANCH
+        if base != BASE_BRANCH:
+            # The cached remote was resolved for the previous trunk.
+            _UPSTREAM_REMOTE = None
+        BASE_BRANCH = base
         # Assigned on BOTH branches. An attempt that found nothing must not inherit
         # an earlier attempt's invalid-path message, or `_repo()` would raise
         # RepoUnreadable against a path this process does not hold.
@@ -921,7 +1023,33 @@ async def _git_info(path: str) -> dict:
     ct = await _git(path, "log", "-1", "--format=%ct")
     if ct and ct.isdigit():
         info["last_updated_at"] = int(ct)
+    git_dir = await _git(path, "rev-parse", "--absolute-git-dir")
+    if git_dir:
+        touched = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _git_dir_last_touched, git_dir
+        )
+        if touched is not None and touched > (info["last_updated_at"] or 0):
+            info["last_updated_at"] = touched
     return info
+
+
+def _git_dir_last_touched(git_dir: str) -> int | None:
+    """Latest mtime of the per-worktree files git rewrites on use. Stats only.
+
+    A checkout, commit, rebase, reset or pull rewrites ``HEAD`` or appends to the
+    HEAD reflog, so this is "last used" where the commit date is only "last
+    committed": a worktree just switched to an old branch would otherwise sort as
+    stale. ``index`` is deliberately not read: the fleet's own ``git status``
+    refreshes it, so every polled row would look used a moment ago.
+    """
+    latest: int | None = None
+    for rel in ("HEAD", "logs/HEAD"):
+        try:
+            mtime = int(os.stat(os.path.join(git_dir, rel)).st_mtime)
+        except (OSError, ValueError):
+            continue
+        latest = mtime if latest is None else max(latest, mtime)
+    return latest
 
 
 async def _git_ahead(path: str) -> int | None:
@@ -1309,7 +1437,9 @@ __all__ = (
     "BASE_BRANCH",
     "MAIN_REPO",
     "MAIN_REPO_INFERRED",
+    "MAIN_REPO_KIROCREW",
     "RepoNotConfigured",
+    "RepoNotKiroCrew",
     "RepoUnavailable",
     "RepoUnreadable",
     "_CHECKOUT_DIR_NAMES",
@@ -1340,8 +1470,12 @@ __all__ = (
     "_git",
     "_git_ahead",
     "_git_info",
+    "_configured_base_branch",
+    "_detect_base_branch",
     "_invalid_resolution_is_stale",
+    "_is_git_checkout",
     "_is_kirocrew_checkout",
+    "_kirocrew_repo",
     "_load_dev_fleet_cfg",
     "_load_dev_fleet_cfg_checked",
     "_load_fallback_repos",

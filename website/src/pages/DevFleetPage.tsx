@@ -763,7 +763,7 @@ interface Worktree {
   pod_resources?: PodResources | null
 }
 interface UndoTarget { name: string; path: string }
-interface FleetData { worktrees: Worktree[]; error?: string; needs_setup?: boolean; main_repo?: string; main_repo_inferred?: boolean; base_branch?: string; sync_run_id?: string; build_pending?: boolean; gateway_service_active?: boolean; gateway_service_reason?: string | null; pods_available?: boolean; pods_unavailable_reason?: string | null; serving_install_reason?: string | null; staged_target?: string | null; staged_cancel_available?: boolean; undo_target?: UndoTarget | null; live_state_known?: boolean; manual_restart?: string; fleet_totals?: FleetTotals }
+interface FleetData { worktrees: Worktree[]; error?: string; needs_setup?: boolean; main_repo?: string; main_repo_inferred?: boolean; main_repo_kirocrew?: boolean; base_branch?: string; sync_run_id?: string; build_pending?: boolean; gateway_service_active?: boolean; gateway_service_reason?: string | null; pods_available?: boolean; pods_unavailable_reason?: string | null; serving_install_reason?: string | null; staged_target?: string | null; staged_cancel_available?: boolean; undo_target?: UndoTarget | null; live_state_known?: boolean; manual_restart?: string; fleet_totals?: FleetTotals }
 // `lastIsCause` distinguishes the two things `last` can hold. A gateway-composed
 // diagnosis is decision-critical prose ending in the action to take, so it must
 // not render in the muted 11.5px monospace the raw log tail uses.
@@ -1807,7 +1807,10 @@ export default function DevFleetPage() {
   const error = fleetError ? (fleetError as Error).message : fleet?.error || null
   // Whether pods can run on this host. Default TRUE when the field is absent so
   // a dashboard talking to an older dev-fleet backend keeps its pod controls.
-  const podsAvailable = fleet?.pods_available !== false
+  // A non-Kiro-Crew main checkout supports only the git operations: Pull+Build,
+  // Make live, provisioning and pods all build or run Kiro Crew itself.
+  const kirocrewRepo = fleet?.main_repo_kirocrew !== false
+  const podsAvailable = kirocrewRepo && fleet?.pods_available !== false
   const podsReason = fleet?.pods_unavailable_reason || null
   // Why Restart / Make live are unavailable, when they are. Rendered rather
   // than swallowed: hiding these controls with no explanation is what left a
@@ -1875,6 +1878,7 @@ export default function DevFleetPage() {
   function stateDot(w: Worktree) {
     let variant: 'ok' | 'err' | 'warn' | 'aim' | 'muted', label: string, title: string
     if (w.is_main) { variant = 'aim'; label = 'main'; title = i18nT('pages.devFleetPage.the_primary_checkout_this_fleet_is_discovered_fr') }
+    else if (!kirocrewRepo) return null
     else if (w.running) {
       // 200 = open; 401/403 = serving but auth-gated — all mean the pod is up
       // (matches pod/runtime.py health() contract; anonymous probes get 403).
@@ -1891,11 +1895,13 @@ export default function DevFleetPage() {
 
   function rowButtons(w: Worktree): ReactNode[] {
     if (w.is_main) {
-      const out: ReactNode[] = [
+      const out: ReactNode[] = []
+      if (!kirocrewRepo) return out
+      out.push(
         <ConfirmBtn key="sync" title={i18nT('pages.devFleetPage.pull_build_main')} desc={fleet?.gateway_service_active ? i18nT('pages.devFleetPage.pulls_main_rebuilds_then_restarts_keep_page_open') : i18nT('pages.devFleetPage.pulls_main_and_rebuilds_6_min_does_not_restart')} confirmLabel={i18nT('pages.devFleetPage.start')} onConfirm={() => syncMain()} btn={{ disabled: !!busy['__syncmain'] || syncRun?.status === 'running' || gatewayMutating }}>
           {iconLabel(<RefreshCw size={13} className="lucide-inline" />, busy['__syncmain'] || syncRun?.status === 'running' ? i18nT('pages.devFleetPage.building') : i18nT('pages.devFleetPage.pull_build_2'))}
         </ConfirmBtn>,
-      ]
+      )
       const showRestart = !!fleet?.gateway_service_active
       const showCancel = !!w.is_live && !!stagedWorktree
       if (showRestart && showCancel) {
@@ -1959,7 +1965,9 @@ export default function DevFleetPage() {
       return out
     }
     const out: ReactNode[] = []
-    if (!w.has_dist) {
+    if (!kirocrewRepo) {
+      // Nothing to provision or open: the checkout is not a Kiro Crew build.
+    } else if (!w.has_dist) {
       // Active/failed provisioning is rendered as a row-spanning stepper (see
       // renderProvStepper), so this branch only offers the entry-point button.
       out.push(<Btn key="prov" onClick={() => provision(w.name)}>{i18nT('pages.devFleetPage.provision')}</Btn>)
@@ -1977,7 +1985,7 @@ export default function DevFleetPage() {
       // hide it on exactly the hosts it exists to serve.
       // Hidden on the already-staged row: there it only re-stages, and next
       // to Cancel staged cutover it misreads as "complete the cutover now".
-      !w.is_live && !w.is_staged ? { label: i18nT('pages.devFleetPage.make_live'), icon: <Rocket size={13} className="lucide-inline" />, onClick: () => makeLive(w), disabled: gatewayMutating || liveStateUnknown, title: liveStateUnknown ? i18nT('pages.devFleetPage.live_state_unknown') : i18nT('pages.devFleetPage.repoint_the_live_gateway_at_this_worktree_restar') } : null,
+      kirocrewRepo && !w.is_live && !w.is_staged ? { label: i18nT('pages.devFleetPage.make_live'), icon: <Rocket size={13} className="lucide-inline" />, onClick: () => makeLive(w), disabled: gatewayMutating || liveStateUnknown, title: liveStateUnknown ? i18nT('pages.devFleetPage.live_state_unknown') : i18nT('pages.devFleetPage.repoint_the_live_gateway_at_this_worktree_restar') } : null,
       // The cancel counterpart: only while THIS row is live and a cutover is
       // staged onto another worktree. Ungated on podsAvailable for the same
       // reason as Make live — cancelling touches only the live-target pointer.

@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
+from kiro_crew import worktree_layout
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.platform_compat import RENAME_NOREPLACE_AVAILABLE, rename_noreplace
@@ -2246,7 +2247,7 @@ async def _rollback_worktree_if_ours(
 
     ``was_ours`` is the identity-pinned index pop's own answer. A False pop means
     the name does not refer to our create, and the worktree path is derived
-    from the name (``<repo>-wt-<name>``), so it is not ours to remove either.
+    from the name (``<root>/<repo>/spec-<name>``), so it is not ours to remove either.
     Leaving it is the safe failure: an orphaned worktree is recoverable by hand,
     deleted work is not.
 
@@ -2273,7 +2274,7 @@ async def _remove_worktree(repo_root: str, worktree_path: str, branch: str = "")
     leaves an orphaned worktree + branch behind for the user to clean up by
     hand. Prunes before deleting the branch, since a leftover registration
     keeps the branch checked-out from git's point of view. ``branch`` is passed
-    in rather than derived: the worktree dir is ``<repo>-wt-<name>`` while the
+    in rather than derived: the worktree dir is ``<root>/<repo>/spec-<name>`` while the
     branch is ``spec/<name>``, so deriving one from the other is wrong.
     """
     if not repo_root or not worktree_path:
@@ -2291,11 +2292,15 @@ async def _create_worktree(repo_root: str, spec_name: str) -> tuple[str, str] | 
     """Create a dedicated worktree + branch for a spec off the repo's default base.
 
     Returns (worktree_path, branch) on success, or an error string. The worktree
-    lands as a SIBLING of the repo (``<repo>-wt-<spec>``), branch ``spec/<name>``,
-    mirroring the worktree-per-feature convention.
+    lands under the shared worktrees root (``<root>/<repo>/spec-<spec>``, see
+    ``kiro_crew.worktree_layout``), branch ``spec/<name>``. A name that cannot form
+    a safe path segment falls back to the sibling ``<repo>-wt-<spec>``.
     """
     root = Path(repo_root)
-    wt_path = root.parent / f"{root.name}-wt-{spec_name}"
+    try:
+        wt_path = await asyncio.to_thread(worktree_layout.worktree_path, root, f"spec-{spec_name}")
+    except ValueError:
+        wt_path = root.parent / f"{root.name}-wt-{spec_name}"
     branch = f"spec/{spec_name}"
     # Off-loop: a stat against a caller-chosen repo root, which can sit on a
     # stalled network mount. It is the last filesystem call in this module that

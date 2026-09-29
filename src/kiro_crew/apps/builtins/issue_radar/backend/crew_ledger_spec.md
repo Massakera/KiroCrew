@@ -323,7 +323,7 @@ pre-projection state.
 | `auto_merge` | bool | default true |
 | `unattended` | bool | default true → per-slot trust, re-established each cycle |
 | `max_open` | int | default 3 |
-| `worktree_root` | str | one worktree per issue lives under here |
+| `worktree_root` | str | one worktree per issue lives under here; empty → `<dev_fleet.worktrees_root>/<repo>` (the nudge's `Worktree root:` line) |
 | `slot_key` | str | `crew-<id>`. ASCII, no colon — already normalization-safe |
 | `enabled` / `paused_reason` | bool / str | a self-pause records why |
 | `created_at` / `retired_at` | ISO8601 Z | retiring keeps the record so the name stays taken |

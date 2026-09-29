@@ -3208,6 +3208,7 @@ def _isolate_kirocrew_home(request, _isolation_dirs, _floor_monkeypatch):
     monkeypatch.setenv("KIROCREW_WORKSPACE", str(_isolation_dirs("workspace")))
     monkeypatch.setenv("KIROCREW_POD_ROOT", str(_isolation_dirs("pod-root")))
     monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(_isolation_dirs("pods")))
+    monkeypatch.setenv("KIROCREW_WORKTREES_ROOT", str(_isolation_dirs("worktrees")))
     # Cleared for the test AND removed again at teardown. ``monkeypatch.delenv`` on a
     # variable that is absent records no undo, so a value the code under test WRITES
     # -- ``_export_bound_port`` publishing KIROCREW_BOUND_PORT when a server boots,
