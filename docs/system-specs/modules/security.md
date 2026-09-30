@@ -29,6 +29,38 @@ files and helpers need approval. Scratch analysis writes are allowed in the run'
 scratch directory. Existing sandbox and governance ceilings remain authoritative.
 Target account/API-server checks precede dispatch, and the classifier receives
 the selected service context. Cancellation during review revokes its result.
+Every refusal logs its reason (unbound run, redacted or missing input, review
+failure, verdict) at INFO, never the arguments.
+
+Run access. An enforced harness masks `~/.aws` and `~/.kube/config` from its
+child, so the gateway, which is unsandboxed, provisions each run's access
+instead of widening that mask. It exports temporary role credentials for the
+service's profile (`aws configure export-credentials`), writes them with a
+profile-only config and a kubeconfig holding just the service's context under
+`<app data>/access/<run id>/` (owner-only `atomic_write`, a symlinked
+directory refused). The account is verified from the exported values in the
+environment, with the config files pointed at the null device, never from the
+written files: agents can reach that directory, and an unsandboxed CLI reading a
+swapped config would run its `credential_process` outside every sandbox. A
+profile that exports no session token or expiry (long-term keys) is refused, and
+so is a kube user other than an `aws` exec plugin, because either would hand a
+static secret to the agent. The agent gets only the paths, as
+`access_environment`. Before the classifier runs, a call that names the access
+files other than as those exact assignments, or a command whose output is a
+credential (`configure export-credentials|get|list`, `eks get-token`, STS token
+calls), always goes to the card; the classifier treats the assignments as the
+configured target. Only CLI output (`LocalCommandError`) can classify a failure
+as `waiting_auth`. Credentials are refreshed within ten minutes of expiry for as
+long as the turn that prepared them runs, and are deleted when a run is
+cancelled, fails, is interrupted or waits for sign-in, on extension shutdown and
+on gateway start. Otherwise they live until they expire (the permission set's
+session duration).
+
+Residual, carried knowingly: the directory is a VISIBLE crew-home location, so
+while a run holds credentials any sandboxed session of the same user can read
+them, not only the investigator. Closing that needs a hidden leaf lifted only for
+the investigator's spawn, which is a sandbox scope change for the operator to
+decide.
 
 ## Overview
 

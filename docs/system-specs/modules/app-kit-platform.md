@@ -46,6 +46,9 @@ Investigations are on demand. V1 adds no scheduled monitoring, release babysit,
 automatic remediation, IAM/RBAC provisioning or cloud-hosted runtime.
 The gateway must stay running. AWS device sign-in exposes a local sign-in prompt
 without opening a browser automatically, then re-verifies identity before resume.
+The agent never reads `~/.aws` or `~/.kube` directly: the gateway provisions
+short-lived, account-verified credentials per run and passes their paths in the
+prompt (see "Run access" in [security](security.md)).
 Execution requires the Kiro CLI backend or pi in managed mode; other harnesses
 are refused without switching the configured backend. The app uses a dedicated investigator spec with
 harness pre-approvals removed, leaving the operator's normal agent unchanged.

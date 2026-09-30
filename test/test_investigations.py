@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -635,3 +637,251 @@ async def test_native_followup_waits_for_identity_verification(policy_run):
     with pytest.raises(InvestigationError, match="identity verification"):
         await engine.prepare_turn(slot)
     assert not await diagnostic_read(engine.state, slot, event)
+
+
+def _access_commands(account="111111111111", kube_user=None, expiration="2099-01-01T00:00:00Z"):
+    kube_user = kube_user or {
+        "exec": {
+            "command": "aws",
+            "args": ["eks", "get-token", "--cluster-name", "apps"],
+            "env": [{"name": "AWS_PROFILE", "value": "other"}, {"name": "KEEP", "value": "1"}],
+        }
+    }
+    seen = []
+
+    async def command(argv, **kwargs):
+        seen.append((argv, kwargs.get("env")))
+        if argv[1:3] == ["configure", "export-credentials"]:
+            exported = {"Version": 1, "AccessKeyId": "AKIATEST", "SecretAccessKey": "s3cret"}
+            if expiration:
+                exported |= {"SessionToken": "tok", "Expiration": expiration}
+            return json.dumps(exported)
+        if argv[1:3] == ["configure", "get"]:
+            return "sa-east-1\n"
+        if argv[1:3] == ["sts", "get-caller-identity"]:
+            return json.dumps({"Account": account})
+        if argv[0] == "kubectl":
+            return json.dumps(
+                {
+                    "clusters": [{"name": "c", "cluster": {"server": "https://expected"}}],
+                    "users": [{"name": "u", "user": kube_user}],
+                    "contexts": [{"name": "prod", "context": {"cluster": "c", "user": "u"}}],
+                }
+            )
+        raise AssertionError(argv)
+
+    return command, seen
+
+
+def _access_row(engine):
+    service = service_config(
+        {
+            "name": "API",
+            "aws_profile": "prod",
+            "aws_account": "111111111111",
+            "kube_context": "prod",
+            "kube_server": "https://expected",
+        }
+    )
+    return {"id": "c" * 32, "service": service}
+
+
+@pytest.mark.asyncio
+async def test_access_is_scoped_verified_and_private(engine, monkeypatch):
+    monkeypatch.setattr("kiro_crew.platform_compat.trusted_aws_bin", lambda: "/usr/bin/aws")
+    engine.command, seen = _access_commands()
+    row = _access_row(engine)
+    await engine.provision_access(row)
+    env = row["access"]["env"]
+    assert set(env) == {"AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "KUBECONFIG"}
+    credentials = Path(env["AWS_SHARED_CREDENTIALS_FILE"]).read_text()
+    assert "[prod]" in credentials and "aws_session_token = tok" in credentials
+    assert Path(env["AWS_CONFIG_FILE"]).read_text() == "[profile prod]\nregion = sa-east-1\n"
+    if os.name == "posix":
+        assert all(Path(path).stat().st_mode & 0o077 == 0 for path in env.values())
+    # Verification never reads the agent-reachable files: a swapped config there
+    # could run a credential_process in the unsandboxed gateway.
+    sts_index, sts = next(
+        (i, call) for i, call in enumerate(seen) if call[0][1:3] == ["sts", "get-caller-identity"]
+    )
+    assert "--profile" not in sts[0]
+    assert sts[1]["AWS_CONFIG_FILE"] == sts[1]["AWS_SHARED_CREDENTIALS_FILE"] == os.devnull
+    assert sts[1]["AWS_SESSION_TOKEN"] == "tok" and sts[1]["AWS_PROFILE"] is None
+    assert not any(env["AWS_CONFIG_FILE"] in str(call) for call in seen[: sts_index + 1])
+    kubectl = next(call for call in seen if call[0][0] == "kubectl")
+    assert "--flatten" in kubectl[0]
+    kube = json.loads(Path(env["KUBECONFIG"]).read_text())
+    assert kube["current-context"] == "prod"
+    exec_env = {e["name"]: e["value"] for e in kube["users"][0]["user"]["exec"]["env"]}
+    assert exec_env["AWS_PROFILE"] == "prod" and exec_env["KEEP"] == "1"
+    assert exec_env["AWS_SHARED_CREDENTIALS_FILE"] == env["AWS_SHARED_CREDENTIALS_FILE"]
+    assert "s3cret" not in json.dumps(row["access"])
+    engine.drop_access(row)
+    assert "access" not in row and not Path(env["AWS_CONFIG_FILE"]).parent.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"account": "222222222222"}, "mismatch"),
+        ({"expiration": ""}, "temporary session"),
+        ({"kube_user": {"token": "static"}}, "AWS CLI"),
+        ({"kube_user": {"exec": {"command": "gke-gcloud-auth-plugin"}}}, "AWS CLI"),
+    ],
+)
+async def test_access_refusals_leave_nothing_behind(engine, monkeypatch, kwargs, match):
+    monkeypatch.setattr("kiro_crew.platform_compat.trusted_aws_bin", lambda: "/usr/bin/aws")
+    engine.command, _ = _access_commands(**kwargs)
+    row = _access_row(engine)
+    with pytest.raises(InvestigationError, match=match):
+        await engine.provision_access(row)
+    assert "access" not in row
+    assert not (engine.directory / "access" / row["id"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_access_refreshes_only_near_expiry(engine, monkeypatch):
+    monkeypatch.setattr("kiro_crew.platform_compat.trusted_aws_bin", lambda: "/usr/bin/aws")
+    engine.command, seen = _access_commands()
+    row = _access_row(engine)
+    await engine.ensure_access(row)
+    exports = len(seen)
+    await engine.ensure_access(row)
+    assert len(seen) == exports
+    row["access"]["expires_at"] = time.time() + 60
+    await engine.ensure_access(row)
+    assert len(seen) == 2 * exports
+
+
+@pytest.mark.asyncio
+async def test_restart_and_cancel_discard_access(engine, monkeypatch):
+    monkeypatch.setattr("kiro_crew.platform_compat.trusted_aws_bin", lambda: "/usr/bin/aws")
+    monkeypatch.setattr(engine, "launch", Mock())
+    monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.stop_slot_turn", AsyncMock())
+    engine.command, _ = _access_commands()
+    service = engine.save_service(_access_row(engine)["service"])
+    row = engine.runs[(await engine.start(service["id"], "Check"))["id"]]
+    await engine.provision_access(row)
+    engine.save("run", row["id"], row)
+    restored = Engine(State(), engine.directory)
+    assert "access" not in restored.runs[row["id"]]
+    assert not (engine.directory / "access").exists()
+    await engine.provision_access(row)
+    await engine.cancel(row)
+    assert "access" not in row and not (engine.directory / "access" / row["id"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_classifier_sees_access_environment_and_logs_refusals(
+    policy_run, monkeypatch, caplog
+):
+    engine, row, slot, event = policy_run
+    row["access"] = {"env": {"KUBECONFIG": "/runs/test/kubeconfig"}, "expires_at": 0}
+    review = AsyncMock(return_value='{"decision":"unknown"}')
+    monkeypatch.setattr("kiro_crew.llm_helpers.run_bg_oneliner", review)
+    with caplog.at_level("INFO", logger="kiro_crew.investigation_policy"):
+        assert not await diagnostic_read(engine.state, slot, event)
+    assert "/runs/test/kubeconfig" in review.call_args.args[1]
+    assert "verdict unknown" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_symlinked_access_directory_is_refused(engine, monkeypatch, tmp_path):
+    if os.name != "posix":
+        pytest.skip("symlink creation needs privileges on Windows")
+    monkeypatch.setattr("kiro_crew.platform_compat.trusted_aws_bin", lambda: "/usr/bin/aws")
+    engine.command, _ = _access_commands()
+    row = _access_row(engine)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (engine.directory / "access").mkdir()
+    (engine.directory / "access" / row["id"]).symlink_to(elsewhere)
+    with pytest.raises(InvestigationError, match="plain directory"):
+        await engine.provision_access(row)
+    assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        ("LocalCommandError('Error loading SSO Token: Token has expired')", "waiting_auth"),
+        ("InvestigationError('Use an SSO or assumed-role profile.')", "failed"),
+        ("OSError('cannot write .../aws-credentials')", "failed"),
+    ],
+)
+async def test_only_cli_output_sends_the_operator_to_sign_in(engine, monkeypatch, error, status):
+    from kiro_crew.investigations import LocalCommandError  # noqa: F401 -- used by eval
+
+    monkeypatch.setattr(engine, "preflight", AsyncMock(side_effect=eval(error)))
+    service = engine.save_service({"name": "API"})
+    monkeypatch.setattr(engine, "launch", Mock())
+    row = engine.runs[(await engine.start(service["id"], "Check"))["id"]]
+    await engine.run(row)
+    assert row["status"] == status
+
+
+@pytest.mark.asyncio
+async def test_refresher_follows_the_turn_and_stops_on_cancel(engine, monkeypatch):
+    monkeypatch.setattr("kiro_crew.investigations.ACCESS_CHECK_INTERVAL", 0)
+    refreshed = asyncio.Event()
+
+    async def ensure(row):
+        refreshed.set()
+
+    monkeypatch.setattr(engine, "ensure_access", ensure)
+    row = {"id": "d" * 32}
+    release = asyncio.Event()
+    turn = asyncio.create_task(release.wait())
+    engine.keep_access_during(row, turn)
+    await asyncio.wait_for(refreshed.wait(), 1)
+    refresher = engine.refreshers[row["id"]]
+    release.set()
+    await turn
+    await asyncio.wait_for(asyncio.gather(refresher, return_exceptions=True), 1)
+    await asyncio.sleep(0)  # done callbacks run on the next loop pass
+    assert row["id"] not in engine.refreshers
+    turn = asyncio.create_task(asyncio.Event().wait())
+    engine.keep_access_during(row, turn)
+    refresher = engine.refreshers[row["id"]]
+    engine.drop_access(row)
+    await asyncio.gather(refresher, return_exceptions=True)
+    assert refresher.cancelled()
+    turn.cancel()
+    await asyncio.gather(turn, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "aws configure export-credentials --profile prod",
+        "aws configure get aws_secret_access_key --profile prod",
+        "aws eks get-token --cluster-name apps",
+        "cat /runs/test/aws-credentials",
+        "AWS_CONFIG_FILE=/runs/test/aws-config cp /runs/test/kubeconfig /tmp/x",
+    ],
+)
+async def test_credential_output_is_never_classified(policy_run, monkeypatch, command):
+    engine, row, slot, event = policy_run
+    row["access"] = {
+        "env": {
+            "AWS_CONFIG_FILE": "/runs/test/aws-config",
+            "AWS_SHARED_CREDENTIALS_FILE": "/runs/test/aws-credentials",
+            "KUBECONFIG": "/runs/test/kubeconfig",
+        },
+        "expires_at": 0,
+    }
+    event.shell_command = command
+    event.tool_input = json.dumps({"command": command})
+    review = AsyncMock(return_value='{"decision":"read"}')
+    monkeypatch.setattr("kiro_crew.llm_helpers.run_bg_oneliner", review)
+    assert not await diagnostic_read(engine.state, slot, event)
+    review.assert_not_called()
+    event.shell_command = (
+        "AWS_CONFIG_FILE=/runs/test/aws-config AWS_SHARED_CREDENTIALS_FILE="
+        "/runs/test/aws-credentials KUBECONFIG=/runs/test/kubeconfig kubectl get pods"
+    )
+    event.tool_input = json.dumps({"command": event.shell_command})
+    assert await diagnostic_read(engine.state, slot, event)
