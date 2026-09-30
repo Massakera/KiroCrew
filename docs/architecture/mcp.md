@@ -10,6 +10,11 @@ authorization. `list`, `start`, `status`, `cancel` and `resume` serve eligible
 owner conversations; `report` is confined to the investigator's own live run.
 Service configuration and AWS sign-in are page actions. Disabling the app removes
 its routes/tools and prevents new semantic diagnostic grants.
+The tool requires a loaded calling slot: an ordinary subagent receives
+`investigation_subagent_caller`, and an unloaded caller receives
+`investigation_session_not_live`. These refusals preserve HTTP 403 and include
+instructions for the owning launch/resume flow; a subagent cannot borrow its
+parent's identity to start or report a run.
 
 How MCP (Model Context Protocol) servers are configured, merged, probed and
 loaded, plus the two invariants every new Kiro Crew MCP tool must satisfy: it

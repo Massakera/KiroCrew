@@ -4,6 +4,25 @@
 
 The subagent module (`kiro_crew/subagent.py`) spawns isolated background agents for parallel task execution. Each subagent gets its own LLM session via `SessionManager`, runs a focused task, and announces the result via callback.
 
+Host-published read-only templates are runtime resources for their owning
+features, not delegation targets. Discovery retains them with
+`AgentInfo.spawn_refusal`, identified by the publisher's owner marker rather
+than a name suffix. The service investigator base template also requires its
+Investigation launch flow. Spawn validation returns `agent_requires_feature`
+with launch instructions, and all spawn rosters omit these templates. The app
+SpawnSDK checks the same metadata before marking a request prevalidated.
+`spawn_run` stops repeating a refused template across a task wave on this code.
+When an unnamed spawn inherits an internal template, the existing off-loop
+runtime validation refuses it with the same code before provider allocation;
+the accepted asynchronous run then reports failure through its normal completion
+path. Fresh inherited unknown templates retain their existing behavior, while
+member and continuation validation still require a known template.
+Operator templates named with `--readonly` remain delegatable without the
+host-generated owner marker. Feature-owned chat launch and runtime resolution
+continue to resolve the installed internal templates.
+Warmed project-local names retain precedence over same-named global templates;
+an operator-authored project spec does not inherit a global template's refusal.
+
 Supports `on_tool_approval` callback for interactive tool approval (routed through gateway's approval system in Normal/Trust modes).
 
 Subagent admission captures a frozen `ExecutionContext` before queueing,

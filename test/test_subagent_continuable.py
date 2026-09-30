@@ -580,6 +580,44 @@ class TestContinueConversation:
 class TestContinuationAgentInheritance:
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("runtime_only", [True, False])
+    async def test_fresh_inherited_runtime_template_is_refused_before_provider_allocation(
+        self, runtime_only
+    ):
+        from kiro_crew.agent_discovery import AgentInfo
+        from kiro_crew.investigations import INVESTIGATION_START_HINT
+        from kiro_crew.subagent import AGENT_REQUIRES_FEATURE_CODE
+
+        sessions = _mock_sessions()
+        sessions.get_agent.return_value = "service-investigator--readonly"
+        manager = _manager(sessions)
+        internal = AgentInfo(
+            name="service-investigator--readonly",
+            filename="internal.json",
+            description="Internal investigator",
+            model="auto",
+            spawn_refusal=INVESTIGATION_START_HINT,
+        )
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent._vet_spawn_governance", return_value=None),
+            patch(
+                "kiro_crew.subagent.list_agents", return_value=[internal] if runtime_only else []
+            ),
+        ):
+            info = manager.spawn("check", parent_session_key="dashboard:owner")
+            assert info is not None and not info.error
+            await asyncio.wait_for(manager._tasks[info.id], timeout=10)
+        if runtime_only:
+            assert info.error_code == AGENT_REQUIRES_FEATURE_CODE
+            assert "investigation(action='start'" in info.error
+            sessions.get_or_create.assert_not_awaited()
+        else:
+            assert info.error_code != AGENT_REQUIRES_FEATURE_CODE
+            sessions.get_or_create.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_unknown_initial_template_refuses_allocation(self) -> None:
         sessions = _mock_sessions()
         sessions.get_agent.return_value = None

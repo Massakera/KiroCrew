@@ -88,6 +88,27 @@ class TestSpawnSDK:
         # skip its synchronous on-loop re-scan.
         assert call["_agent_prevalidated"] is True
 
+    def test_runtime_template_cannot_bypass_validation_via_app_prevalidation(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "kiro_crew.apps.spawn_sdk.list_agents",
+            lambda: [
+                types.SimpleNamespace(
+                    name="probe-bg",
+                    filename="probe--probe-bg.json",
+                    spawn_refusal="Start through the owning feature",
+                )
+            ],
+        )
+        manager = _FakeManager()
+        ctx = build_app_context(
+            "probe", tmp_path, permissions={"spawn": True}, spawn_impl=build_spawn_impl(manager)
+        )
+        with pytest.raises(SpawnError, match="owning feature"):
+            asyncio.run(ctx.spawn.run("check", "probe-bg"))
+        assert manager.calls == []
+
     def test_decline_raises_instead_of_returning_a_dead_id(self, tmp_path):
         ctx = build_app_context(
             "probe",

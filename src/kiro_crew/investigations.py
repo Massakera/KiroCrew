@@ -21,6 +21,11 @@ class InvestigationError(ValueError):
 
 
 INVESTIGATOR_AGENT = "service-investigator"
+INVESTIGATION_START_HINT = (
+    "Start a service investigation from the Investigations page, or call "
+    "investigation(action='start', service_id=..., question=...) from a live owner conversation. "
+    "Do not launch the investigator with subagent spawn tools."
+)
 
 
 def backend_refusal(agent_cfg: Any) -> str:

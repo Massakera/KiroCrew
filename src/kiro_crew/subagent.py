@@ -278,6 +278,7 @@ AGENT_NOT_FOUND_CODE = "agent_not_found"
 #: Same single-definition rule: ``mcp_tools.spawn`` imports it for the wave
 #: short-circuit, and the gateway handler forwards the field without naming it.
 AGENT_NOT_AVAILABLE_CODE = "agent_not_available"
+AGENT_REQUIRES_FEATURE_CODE = "agent_requires_feature"
 
 #: Grammar an ``availableAgents`` glob must satisfy to be RENDERED into a refusal:
 #: the agent-name alphabet plus the fnmatch metacharacters. Matching never
@@ -423,12 +424,21 @@ def _validate_agent(requested: str, project_dir: str = "") -> tuple[str, str, st
     """
     if not requested:
         return "", "", ""
-    known = {a.name for a in list_agents()}
-    if project_dir:
-        known |= set(cached_project_agent_names(project_dir) or frozenset())
+    project_names = (
+        set(cached_project_agent_names(project_dir) or frozenset()) if project_dir else set()
+    )
+    if requested in project_names:
+        return requested, "", ""
+    infos = list_agents()
+    for info in infos:
+        if info.name == requested and getattr(info, "spawn_refusal", False):
+            return "", info.spawn_refusal, AGENT_REQUIRES_FEATURE_CODE
+    known = {a.name for a in infos}
+    known |= project_names
     if requested in known:
         return requested, "", ""
-    available = sorted(known - UNADVERTISED_AGENTS)
+    unavailable = {a.name for a in infos if getattr(a, "spawn_refusal", False)} - project_names
+    available = sorted(known - UNADVERTISED_AGENTS - unavailable)
     # REFUSE a named-but-unknown agent rather than silently falling back to the
     # host default: that fallback runs the full default agent (frequently at
     # approval_mode="auto"), so a typo'd — or malicious — agent name was a silent

@@ -15,7 +15,8 @@ from kiro_crew.dashboard.session_control import (
     caller_slot_key,
 )
 from kiro_crew.investigation_policy import APP_NAME
-from kiro_crew.investigations import Engine, InvestigationError
+from kiro_crew.investigations import INVESTIGATION_START_HINT, Engine, InvestigationError
+from kiro_crew.subagent_persistence import subagent_id_from_conversation_key
 
 
 def register_routes(ctx):
@@ -32,10 +33,29 @@ def register_routes(ctx):
             refusal = await private_owner_surface_refusal(request, "investigations")
             if refusal is not None:
                 return refusal
-            key = caller_slot_key(state, request.headers.get("X-Session-Key", ""))
+            session_key = request.headers.get("X-Session-Key", "")
+            if subagent_id_from_conversation_key(session_key):
+                return web.json_response(
+                    {
+                        "error": "A subagent is not an app-bound investigator. "
+                        + INVESTIGATION_START_HINT,
+                        "code": "investigation_subagent_caller",
+                    },
+                    status=403,
+                )
+            key = caller_slot_key(state, session_key)
             caller = state.get_slot(key) if key else None
             if caller is None:
-                raise web.HTTPForbidden(reason="A live calling session is required.")
+                return web.json_response(
+                    {
+                        "error": (
+                            "The calling session is not loaded in this gateway. "
+                            "Reopen its conversation or resume the investigation from its page."
+                        ),
+                        "code": "investigation_session_not_live",
+                    },
+                    status=403,
+                )
         elif not is_owner_dashboard_request(request) and request.get("app") != APP_NAME:
             raise web.HTTPForbidden(reason="Only the owner or this app can use investigations.")
         async with lock:

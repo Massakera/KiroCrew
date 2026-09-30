@@ -59,6 +59,33 @@ def _project_agents_dir(root: Path) -> Path:
     return d
 
 
+@pytest.mark.parametrize(
+    "name,generated,refused",
+    [
+        ("service-investigator", False, True),
+        ("service-investigator--readonly", True, True),
+        ("helper--readonly-a1234567", True, True),
+        ("internal-without-suffix", True, True),
+        ("operator--readonly", False, False),
+        ("scout", False, False),
+    ],
+)
+def test_runtime_templates_remain_discoverable_but_cannot_be_spawned(
+    fake_home, name, generated, refused
+):
+    from kiro_crew.dashboard.side_readonly_spec import OWNER_MARKER
+
+    registry = _agents_dir(fake_home)
+    spec = {"name": name, "description": OWNER_MARKER if generated else "Operator template"}
+    (registry / f"{name}.json").write_text(json.dumps(spec))
+    clear_list_agents_cache()
+    agents = list_agents(agents_dir=registry)
+    assert [agent.name for agent in agents] == [name]
+    assert bool(agents[0].spawn_refusal) is refused
+    if name == "service-investigator":
+        assert "investigation(action='start'" in agents[0].spawn_refusal
+
+
 class TestProjectScopeDiscovery:
     """Project-local ``<project>/.kiro`` agents, mirroring kiro-cli's workspace scope."""
 

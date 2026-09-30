@@ -22,12 +22,64 @@ import asyncio
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from kiro_crew import subagent as sa
+from kiro_crew.agent_discovery import AgentInfo
 from kiro_crew.mcp_tools import spawn as spawn_tools
 
 
 def _agents(*names: str) -> list[types.SimpleNamespace]:
     return [types.SimpleNamespace(name=n) for n in names]
+
+
+def test_feature_template_is_refused_and_hidden_from_every_spawn_roster():
+    from kiro_crew.investigations import INVESTIGATION_START_HINT
+
+    internal = AgentInfo(
+        name="service-investigator--readonly",
+        filename="internal.json",
+        description="Internal investigator",
+        model="auto",
+        spawn_refusal=INVESTIGATION_START_HINT,
+    )
+    agents = [*_agents("scout"), internal]
+    with (
+        patch.object(sa, "list_agents", return_value=agents),
+        patch.object(spawn_tools.mcp_core, "list_agents", return_value=agents),
+        patch.object(spawn_tools.mcp_core, "_get", return_value={"agents": []}),
+    ):
+        assert sa._validate_agent(internal.name) == (
+            "",
+            INVESTIGATION_START_HINT,
+            sa.AGENT_REQUIRES_FEATURE_CODE,
+        )
+        assert sa._validate_agent("scout") == ("scout", "", "")
+        _, unknown_error, _ = sa._validate_agent("missing")
+        outputs = [
+            unknown_error,
+            spawn_tools._agent_roster_hint(with_purposes=True),
+            spawn_tools.spawn_list("spawn_list", {}),
+        ]
+    assert all("scout" in output for output in outputs)
+    assert all(internal.name not in output for output in outputs)
+
+
+def test_operator_project_template_shadows_refused_global_template():
+    internal = AgentInfo(
+        name="helper--readonly",
+        filename="internal.json",
+        description="Internal template",
+        model="auto",
+        spawn_refusal="Use the owning feature",
+    )
+    with (
+        patch.object(sa, "list_agents", return_value=[internal]),
+        patch.object(sa, "cached_project_agent_names", return_value=frozenset({internal.name})),
+    ):
+        assert sa._validate_agent(internal.name, "/project") == (internal.name, "", "")
+        _, unknown_error, _ = sa._validate_agent("missing", "/project")
+    assert internal.name in unknown_error
 
 
 class TestRefusalCarriesTheRoster:
@@ -142,6 +194,25 @@ class TestPredicateReadsTheWireCode:
 
 
 class TestWaveStopsAfterTheFirstRefusal:
+    @pytest.mark.parametrize(
+        "refusal_code", [sa.AGENT_NOT_FOUND_CODE, sa.AGENT_REQUIRES_FEATURE_CODE]
+    )
+    def test_name_refusal_is_not_reposted_for_each_task(self, refusal_code):
+        posts = []
+
+        def post(path, body):
+            if path == "/api/spawn":
+                posts.append(body)
+                return {"error": "Use the owning feature", "code": refusal_code}
+            return {}
+
+        with (
+            patch.object(spawn_tools.mcp_core, "_post", side_effect=post),
+            patch.object(spawn_tools.mcp_core, "_resolve_session_key", return_value="chat-1"),
+        ):
+            spawn_tools.spawn_run("spawn_run", {"tasks": ["a", "b", "c"], "agent": "internal"})
+        assert len(posts) == 1
+
     def _run(self, args: dict, error: str) -> tuple[str, list[tuple[str, dict]]]:
         posts: list[tuple[str, dict]] = []
 

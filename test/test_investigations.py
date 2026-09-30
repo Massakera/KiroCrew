@@ -260,9 +260,81 @@ async def test_routes_refuse_foreign_app_and_unknown_internal_session(tmp_path, 
     handler = register_routes(ctx)[1].handler
     with pytest.raises(web.HTTPForbidden):
         await handler(Request(State(), {"action": "list"}, app="other-app"), ctx)
-    with pytest.raises(web.HTTPForbidden):
-        await handler(Request(State(), {"action": "start"}, internal_auth=True), ctx)
+    response = await handler(Request(State(), {"action": "start"}, internal_auth=True), ctx)
+    assert response.status == 403
+    assert json.loads(response.text)["code"] == "investigation_session_not_live"
     assert not (tmp_path / "investigations.sqlite3").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["list", "start", "report"])
+async def test_subagent_cannot_use_parent_slot_or_initialize_investigations(
+    tmp_path, monkeypatch, action
+):
+    monkeypatch.setattr(
+        "kiro_crew.investigation_routes.private_owner_surface_refusal", AsyncMock(return_value=None)
+    )
+    state = State()
+    parent = SimpleNamespace(key="owner-chat")
+    state._slots[parent.key] = parent
+    ctx = SimpleNamespace(data_dir=tmp_path)
+    request = Request(state, {"action": action}, internal_auth=True)
+    request.headers["X-Session-Key"] = "subagent:99519ef1a5b4bfb4"
+    handler = register_routes(ctx)[1].handler
+    response = await handler(request, ctx)
+    assert response.status == 403
+    body = json.loads(response.text)
+    assert body["code"] == "investigation_subagent_caller"
+    assert "investigation(action='start'" in body["error"]
+    assert not (tmp_path / "investigations.sqlite3").exists()
+
+
+@pytest.mark.asyncio
+async def test_live_owner_starts_and_only_bound_investigator_reports(engine, monkeypatch):
+    monkeypatch.setattr(
+        "kiro_crew.investigation_routes.private_owner_surface_refusal", AsyncMock(return_value=None)
+    )
+    eligible = Mock()
+    monkeypatch.setattr("kiro_crew.investigation_routes._refuse_ineligible_creator", eligible)
+    monkeypatch.setattr("kiro_crew.investigation_routes.Engine", lambda state, directory: engine)
+    monkeypatch.setattr(engine, "launch", Mock())
+    service = engine.save_service({"name": "SBX"})
+    owner = SimpleNamespace(key="owner-chat")
+    engine.state._slots[owner.key] = owner
+    ctx = SimpleNamespace(data_dir=engine.directory)
+    handler = register_routes(ctx)[1].handler
+
+    async def call(slot, body):
+        request = Request(engine.state, body, internal_auth=True)
+        request.headers["X-Session-Key"] = f"dashboard:{slot.key}"
+        return await handler(request, ctx)
+
+    response = await call(owner, {"action": "start", "service_id": service["id"], "question": "Q"})
+    assert response.status == 200
+    row = engine.runs[json.loads(response.text)["id"]]
+    assert row["origin"] == owner.key
+    eligible.assert_called_once_with(engine.state, owner)
+    engine.launch.assert_called_once_with(row)
+    report = {"action": "report", "id": row["id"], "report": {"summary": "Verified"}}
+    with pytest.raises(web.HTTPForbidden, match="active investigator"):
+        await call(owner, report)
+
+    investigator = SimpleNamespace(
+        key=row["slot_key"], _app="service-investigations", running=False
+    )
+    engine.state._slots[investigator.key] = investigator
+    engine.slots[row["id"]] = investigator
+    engine.update(row, "running")
+    assert (await call(investigator, report)).status == 200
+    assert row["report"]["summary"] == "Verified"
+    assert (await call(investigator, {"action": "status", "id": row["id"]})).status == 200
+    with pytest.raises(web.HTTPForbidden, match="own run"):
+        await call(investigator, {"action": "list"})
+    with pytest.raises(web.HTTPNotFound):
+        await call(investigator, {**report, "id": "foreign-run"})
+    engine.update(row, "cancelled")
+    with pytest.raises(web.HTTPForbidden, match="active investigator"):
+        await call(investigator, report)
 
 
 @pytest.mark.asyncio
@@ -470,6 +542,11 @@ def test_installed_agent_derives_with_mcp_mounted_and_no_grants(tmp_path, monkey
     assert "@kirocrew-investigations" in spec["tools"]
     assert "kirocrew-investigations" in spec["mcpServers"]
     assert all("autoApprove" not in server for server in spec["mcpServers"].values())
+    from kiro_crew.agent_discovery import list_agents
+
+    discovered = {a.name: a for a in list_agents(agents_dir=registry)}
+    assert published.name in discovered
+    assert "investigation(action='start'" in discovered[published.name].spawn_refusal
 
 
 def test_effective_agent_cannot_override_investigation_binding(policy_run):

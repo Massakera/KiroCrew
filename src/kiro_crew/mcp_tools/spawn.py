@@ -47,6 +47,7 @@ from kiro_crew.solo_spawn import (
 from kiro_crew.subagent import (
     AGENT_NOT_AVAILABLE_CODE,
     AGENT_NOT_FOUND_CODE,
+    AGENT_REQUIRES_FEATURE_CODE,
     agent_matches_allowlist,
     parent_spawn_allowlists,
     resolve_max_subagents,
@@ -267,7 +268,9 @@ def _agent_roster_hint(*, with_purposes: bool = False) -> str:
         # rather than re-sorted into a different slot. Names the parent agent's
         # spec forbids spawning are dropped FIRST: advertising them would send
         # the model straight into the gate's refusal.
-        infos = _roster_order(mcp_core.list_agents())
+        infos = _roster_order(
+            a for a in mcp_core.list_agents() if not getattr(a, "spawn_refusal", False)
+        )
         names, restricted = _parent_allowlist_filter(a.name for a in infos)
         shown, withheld = visible_agent_names(names, limit=_MAX_ROSTER_NAMES)
         purposes = (
@@ -798,7 +801,8 @@ def _is_unknown_agent_refusal(resp: Mapping[str, Any], agent: str) -> bool:
 
     Reads the response's machine-readable ``code`` (``AGENT_NOT_FOUND_CODE`` for a
     name it cannot load, ``AGENT_NOT_AVAILABLE_CODE`` for one the parent agent's
-    spec forbids -- both spelled once in ``subagent`` and imported here), not its prose. The
+    spec forbids, or ``AGENT_REQUIRES_FEATURE_CODE`` for an internal template
+    requiring its owning feature), not its prose. The
     refusal text is advisory and free to be reworded; before this it WAS the
     contract, so any rewording silently disabled the wave short-circuit until a
     test caught it.
@@ -814,7 +818,11 @@ def _is_unknown_agent_refusal(resp: Mapping[str, Any], agent: str) -> bool:
     client newer than the gateway simply loses the short-circuit -- while using it
     to REJECT a spawn would not be.
     """
-    return bool(agent) and resp.get("code") in (AGENT_NOT_FOUND_CODE, AGENT_NOT_AVAILABLE_CODE)
+    return bool(agent) and resp.get("code") in (
+        AGENT_NOT_FOUND_CODE,
+        AGENT_NOT_AVAILABLE_CODE,
+        AGENT_REQUIRES_FEATURE_CODE,
+    )
 
 
 def _collapse_effort_verdicts(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -1354,7 +1362,7 @@ def spawn_list(name: str, args: dict[str, Any]) -> str:
     # elsewhere because it is reached by omitting ``agent`` -- but it is still a
     # name the gateway accepts, so a full listing shows it.
     try:
-        infos = list(mcp_core.list_agents())
+        infos = [a for a in mcp_core.list_agents() if not getattr(a, "spawn_refusal", False)]
         declared, restricted = _parent_allowlist_filter(a.name or "" for a in infos)
         names, _ = visible_agent_names(declared, exclude=())
         if names:

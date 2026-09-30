@@ -24,6 +24,17 @@ Services are configured through the page; investigators report only on their
 own live run. Eligible owner conversations may start, inspect, resume and cancel
 runs. Private/member and ineligible cross-session callers retain host refusals.
 
+The investigator is launched through the page or `investigation(action='start',
+service_id=..., question=...)` from a live eligible owner conversation. Selecting
+its template in ordinary subagent spawn does not create an app-bound run and is
+refused. The base investigator and host-generated read-only templates remain
+discoverable for runtime binding, but carry `AgentInfo.spawn_refusal` and are
+omitted from the spawn rosters. App SDK prevalidation also respects this refusal.
+Internal route calls from subagents return `investigation_subagent_caller` with
+the correct launch instructions; a caller with no loaded slot returns
+`investigation_session_not_live` with reopen/resume instructions. Neither path
+initializes the investigation engine or substitutes the parent's identity.
+
 Investigations are on demand. V1 adds no scheduled monitoring, release babysit,
 automatic remediation, IAM/RBAC provisioning or cloud-hosted runtime.
 The gateway must stay running. AWS device sign-in exposes a local sign-in prompt

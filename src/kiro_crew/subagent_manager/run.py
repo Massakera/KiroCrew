@@ -27,6 +27,7 @@ if TYPE_CHECKING:
         _SYSTEM_PREFIX,
         _TRANSIENT_CONTINUE_MSG,
         _TURN_LIMIT,
+        AGENT_REQUIRES_FEATURE_CODE,
         EVENT_COMPLETE,
         EVENT_PERMISSION_REQUEST,
         EVENT_TEXT_CHUNK,
@@ -1269,11 +1270,17 @@ class RunEventCoordinator(ManagerComponent):
                 resources=f"subagent_id={info.id},inherited_agent={agent}",
             )
         effective_cwd = info.cwd or str(getattr(self._manager._sessions, "_pool_cwd", "") or "")
-        if agent and (kind == "member" or (info.conversation_key and not info.agent)):
-            agent, error, code = await asyncio.to_thread(_validate_agent, agent, effective_cwd)
-            if error:
+        if agent and (kind == "member" or not info.agent):
+            resolved_agent, error, code = await asyncio.to_thread(
+                _validate_agent, agent, effective_cwd
+            )
+            if error and (
+                kind == "member" or info.conversation_key or code == AGENT_REQUIRES_FEATURE_CODE
+            ):
                 info.error_code = code
                 raise RuntimeError(error)
+            if not error:
+                agent = resolved_agent
         await self._await_identity_write(
             info,
             asyncio.ensure_future(

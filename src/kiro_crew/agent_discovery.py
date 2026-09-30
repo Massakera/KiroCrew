@@ -199,6 +199,8 @@ class AgentInfo:
     # standalone template deserving its own agent.
     forked_from: str = ""
     private_to: str = ""
+    # Installed runtime templates remain resolvable, but cannot be delegated.
+    spawn_refusal: str = ""
 
     def __post_init__(self) -> None:
         """Make the annotations above TRUE, at every construction site.
@@ -235,6 +237,7 @@ class AgentInfo:
             ("scope", SCOPE_GLOBAL),
             ("forked_from", ""),
             ("private_to", ""),
+            ("spawn_refusal", ""),
         ):
             if not isinstance(getattr(self, name), str):
                 setattr(self, name, fallback)
@@ -1835,7 +1838,23 @@ def _global_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
         package=package,
         scope=SCOPE_GLOBAL,
         kirocrew_owned=f.name in OWNED_KIRO_AGENT_FILES,
+        spawn_refusal=_spec_spawn_refusal(agent_name, data),
     )
+
+
+def _spec_spawn_refusal(name: str, data: dict[str, Any]) -> str:
+    from kiro_crew.dashboard.side_readonly_spec import is_owned_readonly_spec
+    from kiro_crew.investigations import INVESTIGATION_START_HINT, INVESTIGATOR_AGENT
+
+    if name == INVESTIGATOR_AGENT:
+        return INVESTIGATION_START_HINT
+    if is_owned_readonly_spec(data):
+        reason = "Generated read-only templates must be started through their owning feature."
+        tools = data.get("tools")
+        if isinstance(tools, list) and "@kirocrew-investigations" in tools:
+            reason += " " + INVESTIGATION_START_HINT
+        return reason
+    return ""
 
 
 def _project_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:

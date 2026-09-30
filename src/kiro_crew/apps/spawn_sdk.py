@@ -184,6 +184,10 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
             )
             _audit_spawn_denied(app, agent, reason)
             raise SpawnError(reason)
+        for template in agents:
+            if template.name == agent and getattr(template, "spawn_refusal", False):
+                _audit_spawn_denied(app, agent, template.spawn_refusal)
+                raise SpawnError(template.spawn_refusal)
         # ``app`` is forwarded so SubagentManager.spawn can resolve the calling
         # app's per-app governance profile — a profile that denies
         # ``capabilities.spawn`` for this app must win even when the policy
