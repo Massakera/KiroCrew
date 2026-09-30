@@ -1032,6 +1032,38 @@ class TestApiSpawnDelete:
         assert _payload(_run(mod.api_spawn_delete, req))["cancelled"] is False
         mgr.settle_before_delete.assert_awaited_once_with("a1", "")
 
+    def test_finished_agent_answers_with_its_terminal_frame(self) -> None:
+        """A card that missed the live ``subagent_done`` converges from the reply.
+
+        Stop and Cancel find nothing to stop on an ended run, so without the
+        frame in the answer the card stays on its running label for good. It is
+        returned, never broadcast: "Dismiss done" deletes through this route, and
+        a broadcast terminal frame would rebuild the cards it just cleared.
+        """
+        from kiro_crew.subagent import SubagentInfo
+
+        info = SubagentInfo(
+            id="a1",
+            task="verify the PR",
+            done=True,
+            parent_session_key="dashboard:chat-1",
+            user_stopped=True,
+        )
+        info.elapsed = 12.0
+        mgr = _mgr(_agents={"a1": info}, cancel=AsyncMock(return_value=False))
+        mgr.get.return_value = info
+        state = _state(subagents=mgr)
+        req = _Req(state, None, match_info={"agent_id": "a1"})
+
+        body = _payload(_run(mod.api_spawn_delete, req))
+
+        assert body["ok"] is True and body["cancelled"] is False
+        assert body["done"]["id"] == "a1"
+        assert body["done"]["slot"] == "chat-1"
+        assert body["done"]["outcome"] == info.outcome == "stopped"
+        assert body["done"]["elapsed"] == 12.0
+        state.broadcast_ws.assert_not_called()
+
     def test_preserves_finished_agent_when_boundary_redelivery_fails(self) -> None:
         from kiro_crew.dashboard.state import StageBoundary
 

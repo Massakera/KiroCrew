@@ -4049,6 +4049,15 @@ function applyChildUsage(row: SubagentActivity, payload: ChildUsageFrame): void 
   if (cost !== undefined) row.costUsd = cost
 }
 
+/** A card that has ENDED. Only a lifecycle frame (`subagent_done`, or a new
+ *  `subagent_spawn`) may move it; an incremental tool/stall/retry/chunk frame or
+ *  a running snapshot that lands after the end is stale. Letting one through
+ *  flipped the card back to "Running Tool", and nothing ever ended it again:
+ *  the run is over, so Stop and Cancel find nothing to stop and emit nothing. */
+export function isTerminalSubagent(a: SubagentActivity | undefined): boolean {
+  return a?.status === 'done' || a?.status === 'error' || a?.status === 'stopped'
+}
+
 function upsertSlotSub(state: ChatState, slot: string, id: string): SubagentActivity | undefined {
   if (isUnsafeKey(slot) || isUnsafeKey(id)) return undefined
   const existing = getSlotSub(state, slot, id)
@@ -5421,7 +5430,7 @@ const chatSlice = createSlice({
       // Prototype-pollution guard is centralized in upsertSlotSub, which also
       // creates the entry when this is the first frame naming the agent.
       const a = upsertSlotSub(state, slot, id)
-      if (a) {
+      if (a && !isTerminalSubagent(a)) {
         a.lastTool = action.payload.tool; a.status = 'tool'
         if (typeof action.payload.tool_count === 'number') a.toolCount = action.payload.tool_count
         a.stalled = false
@@ -5438,14 +5447,14 @@ const chatSlice = createSlice({
       // Through the shared accessor, so this call site carries no hand-written
       // copy of the poisoned-key list that could drift from `isUnsafeKey`.
       const a = upsertSlotSub(state, slot, id)
-      if (a) { a.retrying = true; a.stalled = false; a.idleSecs = undefined; a.stalledAt = undefined }
+      if (a && !isTerminalSubagent(a)) { a.retrying = true; a.stalled = false; a.idleSecs = undefined; a.stalledAt = undefined }
     },
     sseSubagentStalled(state, action: PayloadAction<{ slot: string; id: string; stalled: boolean; idle_secs?: number }>) {
       const { slot, id } = action.payload
       // Prototype-pollution guard is centralized in upsertSlotSub, which also
       // creates the entry when this is the first frame naming the agent.
       const a = upsertSlotSub(state, slot, id)
-      if (!a) return
+      if (!a || isTerminalSubagent(a)) return
       a.stalled = action.payload.stalled
       // Keep the idle span with the flag it justifies, and clear it on the
       // un-stall frame so a resumed agent cannot keep showing a stale
@@ -5462,7 +5471,7 @@ const chatSlice = createSlice({
     sseSubagentBatchUpdate(state, action: PayloadAction<{ updates: { id: string; slot: string; tool?: string; tool_count?: number; stalled?: boolean; idle_secs?: number; attempt?: number }[] }>) {
       for (const u of action.payload.updates || []) {
         const a = upsertSlotSub(state, u.slot, u.id)
-        if (!a) continue
+        if (!a || isTerminalSubagent(a)) continue
         // Order matters: retrying (attempt) applies FIRST so a tool field in
         // the same merged entry — meaning work resumed — clears it last.
         if (typeof u.attempt === 'number') { a.retrying = true; a.stalled = false; a.idleSecs = undefined; a.stalledAt = undefined }
@@ -5481,7 +5490,7 @@ const chatSlice = createSlice({
     sseSubagentBatchChunks(state, action: PayloadAction<{ chunks: { id: string; slot: string; text: string }[] }>) {
       for (const c of action.payload.chunks || []) {
         const a = upsertSlotSub(state, c.slot, c.id)
-        if (!a) continue
+        if (!a || isTerminalSubagent(a)) continue
         a.retrying = false
         a.streaming += c.text
         if (a.streaming.length > 50_000) {
@@ -5503,8 +5512,7 @@ const chatSlice = createSlice({
         : state.subagents
       if (!subs) return
       for (const id of Object.keys(subs)) {
-        const st = subs[id]?.status
-        if (st === 'done' || st === 'error' || st === 'stopped') delete subs[id]
+        if (isTerminalSubagent(subs[id])) delete subs[id]
       }
     },
     sseSubagentDone(state, action: PayloadAction<SubagentRunContext & { slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; requested_model?: string; child_session?: string; result?: string; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; total_tokens?: number; cost_usd?: number }>) {
@@ -5847,7 +5855,7 @@ const chatSlice = createSlice({
       const existing = subs[d.id]
       // Live events can interleave with replay because subscription starts before
       // snapshots are sent. Never let a stale running snapshot demote a terminal card.
-      if (existing?.status === 'done' || existing?.status === 'error') return
+      if (isTerminalSubagent(existing)) return
       const stalled = d.stalled ?? false
       subs[safeKey(d.id)] = {
         id: d.id, task: d.task, agent: d.agent || 'kirocrew',

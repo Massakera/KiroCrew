@@ -220,12 +220,15 @@ context rather than as config — `context.py`'s `_skills_injection_plan` return
 `bool(globs) or not is_custom`, with no backend condition, so Crew injects the
 mapped set on every backend, as a bounded directory plus each `always: true`
 body. The `file://` steering
-block is the half that reaches nothing: it is gated on `is_cc`, which is
-`is_claude_code(provider_type)`, true only for `provider=claude_code` and never for
-an `acp_backend`. `claude_code.py`, `codex.py` and `opencode.py` give `withheld`
-the reason that STEERING FILES are injected as context text instead, which is the
-one thing that does not happen here; `goose.py`'s reason is already right, and says
-no channel is advertised for them.
+block is the half that reaches a custom agent nothing: `_load_steering_resources`
+reads the DEFAULT spec's `resources` only, and the block is sent only for the
+default agent, on every harness outside `ACP_BACKENDS_NATIVE_SPEC_STEERING`
+(kiro-cli and KAS load it themselves). So the operator's global steering reaches a
+`kirocrew` session on every harness, while a custom spec's own `file://` glob
+still reaches no mirrored one. `claude_code.py`, `codex.py` and `opencode.py`
+give `withheld` the reason that STEERING FILES are injected as context text
+instead, which holds for the default agent only; `goose.py`'s reason is already
+right, and says no channel is advertised for them.
 Correcting those three strings, and deciding whether a spec author should be
 WARNED rather than left to read this page, is tracked in
 [#12215](https://github.com/kirodotdev/KiroCrew/issues/12215). The ruling stays
@@ -304,9 +307,10 @@ is the part worth knowing before you switch:
   `no-channel` on all four. Neither URI scheme is loaded natively, but a mapped
   `skill://` still arrives as Crew's injected skill directory, per the note above,
   so an agent whose skills come from its spec keeps them on a mirrored harness. A
-  `file://` steering glob is the one that silently reaches nothing
-  ([#12215](https://github.com/kirodotdev/KiroCrew/issues/12215)). `prompt`
-  survives as context text.
+  custom spec's `file://` steering glob is the one that silently reaches nothing
+  ([#12215](https://github.com/kirodotdev/KiroCrew/issues/12215)); the default
+  agent's global steering arrives as Crew's injected block. `prompt` survives as
+  context text.
 
 So a spec written for kiro-cli degrades predictably rather than silently, as long
 as you read `per_tool_deny`, the `hooks` ruling and the `resources` note first.
@@ -493,9 +497,10 @@ there, and on KAS the wire projection forwards the array while Crew's own direct
 stays the bounded one.
 
 The `file://` steering block does NOT follow that shape. It is still gated on the
-backend: injected only on the Claude Code backend, and only for the default agent,
-because kiro-cli and KAS read `resources` from the spec themselves and injecting
-would duplicate what the backend already loaded.
+backend: injected only for the default agent, and only on a harness outside
+`ACP_BACKENDS_NATIVE_SPEC_STEERING` (Claude Code, Codex, OpenCode, pi, Goose,
+DeepSeek, Droid), because kiro-cli and KAS read `resources` from the spec
+themselves and injecting would duplicate what the backend already loaded.
 
 One more skill mapping exists and is edition-specific: a `builder-mcp` server
 entry whose `args` carry `--skill-name-filter a,b`. `_extract_skills` unions it

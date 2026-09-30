@@ -1640,6 +1640,56 @@ class TestLoadSteeringResources:
             "resources natively via --agent"
         )
 
+    def test_steering_reaches_every_harness_exactly_once(self, tmp_path):
+        """A harness handed no spec gets the injection; a native loader does not.
+
+        pi, codex and the other spec-less harnesses read no ``resources``, so the
+        operator's global steering reaches them only through this block. Gating it
+        on the Claude Code seam alone left every one of them without it.
+        """
+        import json
+
+        from kiro_crew.acp.types import (
+            ACP_BACKEND_KAS,
+            ACP_BACKEND_PI,
+            ACP_BACKENDS_KNOWN,
+            PROVIDER_LABEL_BY_BACKEND,
+        )
+        from kiro_crew.acp_backends import ACP_BACKENDS_NATIVE_SPEC_STEERING
+
+        steering_dir = tmp_path / ".kiro" / "steering"
+        steering_dir.mkdir(parents=True)
+        (steering_dir / "rules.md").write_text("# My Rules\nSTEERING_MARKER_XYZ")
+        agents_dir = tmp_path / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "kirocrew.json").write_text(
+            json.dumps({"resources": ["file://.kiro/steering/**/*.md"]})
+        )
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+
+        assert ACP_BACKEND_PI not in ACP_BACKENDS_NATIVE_SPEC_STEERING
+        assert ACP_BACKEND_KAS in ACP_BACKENDS_NATIVE_SPEC_STEERING
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            for backend in sorted(ACP_BACKENDS_KNOWN):
+                label = PROVIDER_LABEL_BY_BACKEND[backend]
+                ctx = builder.build_session_context(provider_type=label)
+                expected = backend not in ACP_BACKENDS_NATIVE_SPEC_STEERING
+                assert ("STEERING_MARKER_XYZ" in ctx) is expected, (
+                    f"{backend or 'kiro'} ({label}): steering injected={not expected}, "
+                    f"want {expected}"
+                )
+            custom_ctx = builder.build_session_context(
+                provider_type=PROVIDER_LABEL_BY_BACKEND[ACP_BACKEND_PI], agent="reviewer"
+            )
+            unknown_ctx = builder.build_session_context(provider_type="not-a-harness")
+
+        assert "STEERING_MARKER_XYZ" not in custom_ctx, "custom agents bring their own context"
+        assert "STEERING_MARKER_XYZ" not in unknown_ctx
+
 
 class TestLessonsCap:
     def test_over_cap_preserves_complete_explicit_rules(self, tmp_path):

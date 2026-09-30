@@ -32,6 +32,7 @@ import { CrewLogTab } from './CrewLogPanel'
 import SessionSummaryTab from './SessionSummaryTab'
 import { i18nT } from '../../i18n/t'
 import { queuedWaitText } from './subagentQueuedReason'
+import { cancelSubagentCard } from './subagentCancel'
 import GitPanel from '../../components/GitPanel'
 import { fmtDateFields } from '../../i18n/format'
 import { isModelDowngrade } from './subagentCompletion'
@@ -190,10 +191,11 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
   const onCancel = useCallback((e: React.MouseEvent) => {
     e.stopPropagation()
     setActionError(null)
-    // The card converges through the spawn/done stream on success; a refused
-    // delete leaves it running, so say so instead of letting the press vanish.
-    api.spawnDelete(a.id).catch(() => setActionError(i18nT('pages.chat.activityViewer.cancel_failed')))
-  }, [a.id])
+    // A running card converges through the spawn/done stream; one whose run
+    // already ended converges from the reply. A refused delete leaves it
+    // running, so say so instead of letting the press vanish.
+    cancelSubagentCard(dispatch, a, slot).catch(() => setActionError(i18nT('pages.chat.activityViewer.cancel_failed')))
+  }, [a, slot, dispatch])
 
   const displayElapsed = isRunning ? elapsed : Math.round(a.elapsed || 0)
   const fmtElapsed = displayElapsed >= 60 ? `${Math.floor(displayElapsed / 60)}m ${displayElapsed % 60}s` : `${displayElapsed}s`

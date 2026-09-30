@@ -78,6 +78,7 @@ from kiro_crew.dashboard.state import (
     stage_boundary_for,
 )
 from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot
+from kiro_crew.dashboard.ws import build_subagent_done_frame
 from kiro_crew.effort import PI_ONLY_EFFORT_LEVELS
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink
@@ -1707,6 +1708,14 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
                     "code": "completion_delivery_pending",
                 },
                 status=409,
+            )
+        if info.done:
+            # Returned rather than broadcast: "Dismiss done" deletes through this
+            # same route, and a broadcast terminal frame would rebuild the cards
+            # it just cleared. A Cancel press on a card that missed the live
+            # frame applies this to converge.
+            return web.json_response(
+                {"ok": True, "cancelled": False, "done": build_subagent_done_frame(info)}
             )
     return web.json_response({"ok": True, "cancelled": cancelled})
 

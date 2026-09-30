@@ -120,6 +120,11 @@ with no row here.
        is gated before the spawn -- the activation guard that runs after
        ``session/new`` reads it through the harness, only on its refusal
        branch, to explain a markdown-only agent the host did not load)
+   * - ``ACP_BACKENDS_NATIVE_SPEC_STEERING``
+     - pre-session registry query (whether the harness serving a session loads
+       the default spec's ``file://`` steering itself, asked by context assembly
+       about the backend the session's provider label names before the first
+       prompt; a non-member receives Crew's ``[Steering resources]`` block)
    * - ``ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE``
      - driver-internal (whether the agent spec's own ``mcpServers`` reach the
        session by a channel other than the ``session/new`` array, so the
@@ -1498,6 +1503,21 @@ ACP_BACKENDS_MARKDOWN_AGENT_SPECS = frozenset({ACP_BACKEND_KAS})
 # governance. Read through the runtime's own scope helper, never as "is KAS": a
 # host added later that reads the user level alone joins here.
 ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY = frozenset({ACP_BACKEND_KAS})
+
+# Backends that load the default agent spec's ``file://`` steering resources
+# (``~/.kiro/steering/**/*.md`` on the shipped spec) THEMSELVES. kiro-cli reads
+# ``resources`` when spawned with ``--agent``; KAS is handed the spec and loads
+# them natively too. Every other harness is handed no spec, so for them the
+# operator's global steering reaches the model only when Crew injects it as the
+# ``[Steering resources]`` block (``context.build_session_context``).
+#
+# Membership grants the SKIP, like ``ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD``: a
+# member is trusted to have delivered the documents, so Crew does not send them
+# again. A harness that has not demonstrated the native load stays out and gets
+# the injection, so a new harness cannot silently lose the operator's steering
+# the way pi, codex, opencode, goose, deepseek and droid did while the injection
+# was gated on the Claude Code seam alone.
+ACP_BACKENDS_NATIVE_SPEC_STEERING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 
 def overlay_project_scope(backend: str, work_dir: Any) -> dict[str, Any]:

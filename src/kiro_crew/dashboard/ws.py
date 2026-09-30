@@ -142,6 +142,38 @@ def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
     return data
 
 
+def build_subagent_done_frame(a: Any) -> dict:
+    """Build the ``subagent_done`` frame's ``data`` for a FINISHED managed agent.
+
+    Used by the reconnect replay and by ``DELETE /api/spawn/{id}`` on a run
+    that has already ended: a card that missed the live terminal frame has no
+    other way to leave its running state, because Stop and Cancel find nothing
+    left to stop and emit nothing.
+    """
+
+    def _r(t: str) -> str:
+        t, _ = redact_exfiltration_urls(t)
+        t, _ = redact_credentials(t)
+        return t
+
+    return {
+        "id": a.id,
+        # Same slot mapping as the live frames — a raw prefix-strip tags the
+        # card with a slot no tab reads.
+        "slot": subagent_event_slot(a.parent_session_key),
+        "child_session": getattr(a, "conversation_key", "") or f"subagent:{a.id}",
+        "elapsed": a.elapsed,
+        "error": _r(a.error) if a.error else None,
+        "stopped": a.user_stopped,
+        "outcome": a.outcome,
+        "task": _r(a.task),
+        "agent": _r(a.agent),
+        "model": a.resolved_model,
+        "requested_model": _r(a.requested_model),
+        **workspace_event_fields(a),
+    }
+
+
 def _audit_grant_quietly(app: str, event: str) -> None:
     """Record a WS grant made on a path that bypasses the broadcast chokepoint.
 
@@ -1018,30 +1050,11 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                             for a in state.subagents.all_agents:
                                 if not a.done:
                                     continue
-                                # Same slot mapping as the live frames — a raw
-                                # prefix-strip tags replayed cards with a slot
-                                # no tab reads, so the panel rehydrated empty
-                                # after every reconnect for cron/channel tabs.
-                                slot = subagent_event_slot(a.parent_session_key)
                                 try:
                                     _replay.append(
                                         {
                                             "type": "subagent_done",
-                                            "data": {
-                                                "id": a.id,
-                                                "slot": slot,
-                                                "child_session": getattr(a, "conversation_key", "")
-                                                or f"subagent:{a.id}",
-                                                "elapsed": a.elapsed,
-                                                "error": _r(a.error) if a.error else None,
-                                                "stopped": a.user_stopped,
-                                                "outcome": a.outcome,
-                                                "task": _r(a.task),
-                                                "agent": _r(a.agent),
-                                                "model": a.resolved_model,
-                                                "requested_model": _r(a.requested_model),
-                                                **workspace_event_fields(a),
-                                            },
+                                            "data": build_subagent_done_frame(a),
                                         }
                                     )
                                 except Exception:

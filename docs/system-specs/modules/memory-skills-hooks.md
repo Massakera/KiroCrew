@@ -5170,7 +5170,7 @@ A spawning parent decides which of three groups its sub-agent inherits, via `inc
 | `lessons` | `[Learned corrections]` (global + workspace), `[USER PROFILE]` | yes |
 | `project` | `[DOCUMENTATION]` pointer, steering resources (CC backend only), `[PROJECT]` directory line | yes |
 
-The steering row carries a backend caveat: the steering block is injected only on the Claude Code backend (`is_cc`), because on the ACP/kiro backend `kiro-cli --agent` loads the agent's own `resources` natively. `include_project=false` therefore suppresses steering on CC only — an ACP sub-agent still receives it, and nothing in Kiro Crew can prevent that from this call site.
+The steering row carries a backend caveat: the steering block is injected only on a harness outside `ACP_BACKENDS_NATIVE_SPEC_STEERING`, because kiro-cli (`--agent`) and KAS load the agent's own `resources` natively. `include_project=false` therefore suppresses steering only where Crew injects it — a kiro-cli or KAS sub-agent still receives it, and nothing in Kiro Crew can prevent that from this call site.
 
 conduct is not switchable because it supplies the output contract and capability
 entry points. Default skill discovery is a small name/purpose list plus

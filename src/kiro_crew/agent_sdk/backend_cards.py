@@ -479,6 +479,13 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "whether an advertised <model>[<effort>] id is applied as two writes. The "
         "model switch either lands or is refused, which its own line already says"
     ),
+    "ACP_BACKENDS_NATIVE_SPEC_STEERING": (
+        "who delivers the operator's global steering -- the harness, from the spec it "
+        "was handed, or Crew, as an injected block. Every harness receives it one way "
+        "or the other, so both states are correct behaviour and there is no loss a "
+        "reader choosing a harness could act on. A wrong membership is a defect either "
+        "way: the documents sent twice, or not at all"
+    ),
     "ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY": (
         "which directory a host resolves its agent specs from, and therefore "
         "whether the session's project checkout scopes the broker-overlay lookup. "

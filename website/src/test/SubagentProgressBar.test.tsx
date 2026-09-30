@@ -66,6 +66,34 @@ describe('SubagentProgressBar — in-chat stop controls', () => {
     expect(api.spawnDelete).not.toHaveBeenCalled()
   })
 
+  it('"Stop all" ends a card whose run the gateway no longer runs', async () => {
+    // a1 missed its live done frame; a2 is genuinely still running. Stop all has
+    // nothing to stop for a1 and emits nothing for it, so without the read that
+    // follows, a1 kept its running label for good.
+    const store = makeStore(['a1', 'a2'])
+    vi.mocked(api.spawnList).mockResolvedValueOnce({
+      agents: [
+        { id: 'a1', done: true, parent: `dashboard:${SLOT}` },
+        { id: 'a2', done: false, parent: `dashboard:${SLOT}` },
+      ],
+    } as never)
+    renderBar(store)
+    fireEvent.click(screen.getByLabelText('Stop all'))
+    await waitFor(() => expect(store.getState().chat.subagents['a1'].status).toBe('error'))
+    expect(api.spawnList).toHaveBeenCalledTimes(1)
+    expect(store.getState().chat.subagents['a2'].status).toBe('running')
+  })
+
+  it('a per-row stop on an ended run applies the terminal frame the gateway returns', async () => {
+    const store = makeStore(['a1'])
+    vi.mocked(api.spawnDelete).mockResolvedValueOnce({
+      ok: true, cancelled: false, done: { id: 'a1', slot: SLOT, elapsed: 4, outcome: 'completed' },
+    })
+    renderBar(store)
+    fireEvent.click(screen.getAllByLabelText(/^Stop subagent/)[0])
+    await waitFor(() => expect(store.getState().chat.subagents['a1'].status).toBe('done'))
+  })
+
   it('labels the header stop control "Stop" (not "Stop all") when exactly one agent is stoppable', () => {
     renderBar(makeStore(['a1']))
     expect(screen.getByLabelText('Stop running subagent')).toBeInTheDocument()

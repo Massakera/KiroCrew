@@ -57,9 +57,8 @@ def test_steering_is_still_the_backend_gated_half(doc_text: str) -> None:
     """The `file://` half IS backend-gated, so the page must keep saying so.
 
     The whole gate expression is matched as one contiguous block, ending at the
-    ``_load_steering_resources()`` call it guards. ``is_cc`` is read at four sites in
-    that module, so a token match anywhere would keep this green with the steering
-    gate's own condition dropped.
+    ``_load_steering_resources()`` call it guards, so a token match elsewhere in the
+    module cannot keep this green with the steering gate's own condition dropped.
     """
     source = (Path(__file__).parent.parent / "src" / "kiro_crew" / "context.py").read_text(
         encoding="utf-8"
@@ -67,15 +66,15 @@ def test_steering_is_still_the_backend_gated_half(doc_text: str) -> None:
     gate = (
         "            not essentials\n"
         "            and not is_custom\n"
-        "            and is_cc\n"
+        "            and _crew_injects_spec_steering(provider_type)\n"
         "            and _group_included(context_groups, CONTEXT_GROUP_PROJECT)\n"
         "        ):\n"
         "            steering_ctx = _load_steering_resources()\n"
     )
     assert gate in source, (
-        "the steering block's gate no longer reads is_cc together with the default-agent "
-        "and project-group conditions, so the page's 'steering is the backend-gated half' "
-        "is stale"
+        "the steering block's gate no longer reads the native-steering backend set "
+        "together with the default-agent and project-group conditions, so the page's "
+        "'steering is the backend-gated half' is stale"
     )
     assert "The `file://` steering block does NOT follow that shape." in doc_text
 

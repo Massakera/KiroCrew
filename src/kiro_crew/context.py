@@ -2220,6 +2220,23 @@ def _load_steering_resources() -> str:
         return ""
 
 
+def _crew_injects_spec_steering(provider_type: str) -> bool:
+    """Whether the ``[Steering resources]`` block must be sent for *provider_type*.
+
+    *provider_type* is a provider label (``providers.acp.provider_label``). A
+    harness in ``ACP_BACKENDS_NATIVE_SPEC_STEERING`` loads the default spec's
+    ``file://`` resources itself, so injecting would duplicate them; every other
+    harness is handed no spec and receives the operator's global steering only
+    through this block. A label no harness answers to is not injected, which
+    keeps a caller that names no provider on the answer it always had.
+    """
+    from kiro_crew.acp.types import PROVIDER_LABEL_BY_BACKEND
+    from kiro_crew.acp_backends import ACP_BACKENDS_NATIVE_SPEC_STEERING
+
+    backends = {b for b, label in PROVIDER_LABEL_BY_BACKEND.items() if label == provider_type}
+    return bool(backends) and not backends & ACP_BACKENDS_NATIVE_SPEC_STEERING
+
+
 def _project_steering_delivered(
     provider_type: str, native_steering: bool, project: str | None
 ) -> bool:
@@ -2234,9 +2251,12 @@ def _project_steering_delivered(
     seam receives the explicit ``[Steering resources]`` load in
     ``build_message`` (gated on ``is_cc``); KAS reports ``native_steering`` on
     its session provider. Every other harness -- Codex, OpenCode, Pi, Goose,
-    DeepSeek -- has NO path for those trees today, so a folder that declares one
+    DeepSeek -- has NO path for the PROJECT tree, so a folder that declares one
     of them must deliver its documents itself rather than skip them as "already
-    delivered" with nothing arriving in their place. The opt-out is read only
+    delivered" with nothing arriving in their place. Those harnesses do receive
+    the ``[Steering resources]`` block (:func:`_crew_injects_spec_steering`), but
+    it carries only the global tree and only for the default agent, so it is
+    deliberately not counted here: counting it would drop the project tree. The opt-out is read only
     on the kiro-cli disjunct: a kiro-cli setting changes nothing on another
     harness. The driver is asked directly, with no admission check on
     *project*: this path also serves non-member sessions and must not raise.
@@ -3970,13 +3990,15 @@ class ContextBuilder:
         behave identically across providers.
 
         *provider_type* is consumed again for the steering gate only: the
-        steering block below is injected solely on the CC backend
-        (``is_claude_code(provider_type)``). kiro-cli loads an agent's
+        steering block below is injected on every harness that does not load
+        the default spec's ``file://`` resources itself
+        (:func:`_crew_injects_spec_steering`). kiro-cli loads an agent's
         ``resources`` natively when spawned with ``--agent`` (acp/client.py
-        ``_spawn``), so re-injecting steering on the ACP/kiro backend would
-        duplicate what kiro already loaded; the CC backend (claude-agent-acp)
-        does NOT read agent ``resources`` and still needs the explicit load.
-        Everything else stays at CC/ACP parity.
+        ``_spawn``) and KAS does the same from the spec it is handed, so
+        re-injecting there would duplicate what the harness already loaded;
+        Claude Code, Codex, OpenCode, pi, Goose, DeepSeek and Droid read no
+        agent ``resources`` and need the explicit load. Everything else stays
+        at parity across harnesses.
 
         *context_groups* selects which switchable groups are injected (see
         ``SWITCHABLE_CONTEXT_GROUPS``). ``None`` — every caller except a
@@ -4268,17 +4290,14 @@ class ContextBuilder:
         lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))
         max_context_chars = caps.max_context
 
-        # Steering files from agent config resources.
-        # kiro-cli loads an agent's ``resources`` natively when spawned with
-        # ``--agent`` (see acp/client.py ``_spawn``) — the same mechanism that
-        # lets us skip this for custom agents above. The CC backend
-        # (claude-agent-acp) does NOT read agent ``resources``, so only it needs
-        # the explicit load. Injecting on the ACP/kiro backend would duplicate
-        # what kiro-cli already loaded.
+        # Steering files from agent config resources. kiro-cli and KAS load the
+        # default spec's ``resources`` natively (ACP_BACKENDS_NATIVE_SPEC_STEERING),
+        # so injecting there would duplicate them; every other harness is handed
+        # no spec and needs the explicit load.
         if (
             not essentials
             and not is_custom
-            and is_cc
+            and _crew_injects_spec_steering(provider_type)
             and _group_included(context_groups, CONTEXT_GROUP_PROJECT)
         ):
             steering_ctx = _load_steering_resources()

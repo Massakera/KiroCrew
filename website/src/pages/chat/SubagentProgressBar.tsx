@@ -10,6 +10,7 @@ import type { SubagentActivity } from '../../types'
 
 import { i18nT } from '../../i18n/t'
 import { queuedWaitText } from './subagentQueuedReason'
+import { cancelSubagentCard } from './subagentCancel'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 const EMPTY_SUBAGENTS: Record<string, SubagentActivity> = {}
 
@@ -175,15 +176,33 @@ const SubagentProgressBar = memo(function SubagentProgressBar({ slot }: { slot: 
   const [actionError, setActionError] = useState<string | null>(null)
   // Cancel a running subagent. A refused spawnDelete used to be swallowed with a
   // console breadcrumb; it now surfaces on the chip.
-  const stopAgent = useCallback((id: string, name: string) => {
+  const stopAgent = useCallback((card: SubagentActivity, name: string) => {
     setActionError(null)
-    api.spawnDelete(id).catch(() => {
+    cancelSubagentCard(dispatch, card, slot ?? '').catch(() => {
       setActionError(i18nT('pages.chat.subagentProgressBar.stop_failed', { name }))
     })
-  }, [])
+  }, [dispatch, slot])
+  // End every card the gateway no longer runs for this slot. A card that missed
+  // its `subagent_done` frame is otherwise never ended: Stop all finds nothing
+  // to stop for it and emits nothing.
+  const reconcileWithBackend = useCallback((targetSlot: string, isCancelled: () => boolean = () => false) => {
+    api.spawnList().then((d: SpawnListResponse) => {
+      if (isCancelled()) return
+      const backendIds = new Set((d.agents || []).filter((a) => !a.done && a.parent === `dashboard:${targetSlot}`).map((a) => a.id))
+      activeListRef.current.forEach(a => {
+        if (!backendIds.has(a.id)) dispatch(sseSubagentDone({ slot: targetSlot, id: a.id, elapsed: Math.round((Date.now() - a.startedAt) / 1000), error: 'reconciliation: agent no longer tracked by backend' }))
+      })
+    }).catch(() => {
+      // Deliberately silent: this read only ever REMOVES phantom cards. A
+      // refused read leaves the cards exactly as they were, the 30s loop
+      // retries, and the Stop all it may follow already succeeded -- so there
+      // is no failed action to report on the chip.
+    })
+  }, [dispatch])
   const stopAllMutation = useMutation({
     mutationFn: (targetSlot: string) => api.spawnStopAll(targetSlot),
     onMutate: () => setActionError(null),
+    onSuccess: (_reply, targetSlot) => reconcileWithBackend(targetSlot),
     onError: () => {
       setActionError(i18nT('pages.chat.subagentProgressBar.stop_all_failed'))
     },
@@ -232,22 +251,9 @@ const SubagentProgressBar = memo(function SubagentProgressBar({ slot }: { slot: 
     if (!hasActive || !slot) return
     let cancelled = false
     const t = setInterval(() => setTick(n => 1 - n), 1000)
-    const reconcile = setInterval(() => {
-      api.spawnList().then((d: SpawnListResponse) => {
-        if (cancelled) return
-        const backendIds = new Set((d.agents || []).filter((a) => !a.done && a.parent === `dashboard:${slot}`).map((a) => a.id))
-        activeListRef.current.forEach(a => {
-          if (!backendIds.has(a.id)) dispatch(sseSubagentDone({ slot, id: a.id, elapsed: Math.round((Date.now() - a.startedAt) / 1000), error: 'reconciliation: agent no longer tracked by backend' }))
-        })
-      }).catch(() => {
-        // Deliberately silent: this is a background poll that only ever REMOVES
-        // phantom cards. A refused poll leaves the cards exactly as they were,
-        // the next tick retries in 30s, and the person asked for none of it —
-        // so there is no failed action to report on the chip.
-      })
-    }, 30_000)
+    const reconcile = setInterval(() => reconcileWithBackend(slot, () => cancelled), 30_000)
     return () => { cancelled = true; clearInterval(t); clearInterval(reconcile) }
-  }, [hasActive, slot, dispatch])
+  }, [hasActive, slot, reconcileWithBackend])
   if (!hasActive) return null
   return (
     // `relative z-[46]` lifts the wave chip above every theme-experience
@@ -426,7 +432,7 @@ const SubagentProgressBar = memo(function SubagentProgressBar({ slot }: { slot: 
                 {stoppable && (
                   <button
                     className="shrink-0 flex items-center text-[11px] px-1 py-0.5 rounded border border-danger/40 text-danger/70 hover:bg-danger-subtle hover:text-danger cursor-pointer transition-all bg-transparent"
-                    onClick={() => stopAgent(a.id, sanitizeLlmOutput(a.agent || a.id))}
+                    onClick={() => stopAgent(a, sanitizeLlmOutput(a.agent || a.id))}
                     aria-label={i18nT('pages.chat.subagentProgressBar.stop_subagent', { name: sanitizeLlmOutput(a.agent || a.id) })}
                     title={i18nT('pages.chat.subagentProgressBar.stop_this_subagent')}
                   >
