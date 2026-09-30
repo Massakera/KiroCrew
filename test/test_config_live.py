@@ -1348,6 +1348,21 @@ class TestServerAppliers:
         for sub in subs.values():
             assert sub.prefixes, f"{sub.name} would fire on every reload"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", ["worker", "research", "guest"])
+    async def test_native_role_model_changes_rebuild_specs(self, role):
+        apply = self._register(SimpleNamespace())["agent.role_models.background"].callback()
+        cfg = KiroCrewConfig()
+        with patch("kiro_crew.agent.rebuild_agent_config") as rebuild:
+            await apply(
+                ConfigChange(old=cfg, new=cfg, changed=frozenset({f"agent.role_models.{role}"}))
+            )
+            rebuild.assert_called_once()
+            await apply(
+                ConfigChange(old=cfg, new=cfg, changed=frozenset({"agent.role_models.subagent"}))
+            )
+            rebuild.assert_called_once()
+
     def test_the_watcher_is_not_an_on_startup_hook_but_is_stopped_on_cleanup(self) -> None:
         """``no-new-work-on-gateway-boot-path``: ``on_startup`` runs before the socket
         binds, so the watcher is started post-bind by ``_kick_config_watch``; only the

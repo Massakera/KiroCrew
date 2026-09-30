@@ -4471,18 +4471,22 @@ def _register_config_watch(
         task.add_done_callback(state._background_tasks.discard)
 
     async def _apply_background_model(change: ConfigChange) -> None:
-        # The background role model is baked into the lite / heartbeat kiro specs
+        # Role models are baked into the background and native kiro specs
         # at agent-build time, so a change must rewrite them to take effect. The
         # subagent role is read live at spawn and needs no rebuild.
-        if not change.touched("agent.role_models.background"):
+        if not any(
+            change.touched(f"agent.role_models.{role}")
+            for role in ("background", "worker", "research", "guest")
+        ):
             return
         try:
             from kiro_crew.agent import rebuild_agent_config
 
             await asyncio.to_thread(rebuild_agent_config)
-            logger.info("agent.role_models.background changed -- background agent specs rebuilt")
+            logger.info("Role models changed -- agent specs rebuilt")
         except Exception:
-            logger.warning("background-model rebuild failed", exc_info=True)
+            logger.warning("role-model rebuild failed", exc_info=True)
+            raise
 
     default_model_failure_notified = False
 
@@ -4584,6 +4588,9 @@ def _register_config_watch(
         live.subscribe("agent.provider", callback=_apply_provider, name="agent.provider"),
         live.subscribe(
             "agent.role_models.background",
+            "agent.role_models.worker",
+            "agent.role_models.research",
+            "agent.role_models.guest",
             callback=_apply_background_model,
             name="agent.role_models.background",
         ),

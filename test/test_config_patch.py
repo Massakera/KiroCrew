@@ -135,6 +135,22 @@ def _live_state(**overrides) -> SimpleNamespace:
 
 class TestRoleModels:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", ["worker", "research", "guest"])
+    async def test_native_role_accepts_provider_qualified_models(self, tmp_config, role):
+        async with TestClient(TestServer(_make_app())) as client:
+            response = await _patch(client, f"agent.role_models.{role}", "openai-codex/gpt-6-sol")
+            assert response.status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["role_models"][role] == "openai-codex/gpt-6-sol"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", ["/gpt", "openai/", "openai/gpt/extra", "bad; command"])
+    async def test_native_role_rejects_malformed_models(self, tmp_config, model):
+        async with TestClient(TestServer(_make_app())) as client:
+            response = await _patch(client, "agent.role_models.worker", model)
+            assert response.status == 400
+
+    @pytest.mark.asyncio
     async def test_subagent_role_nested_write(self, tmp_config) -> None:
         # 3-level path must nest, not clobber the whole agent section.
         async with TestClient(TestServer(_make_app())) as c:

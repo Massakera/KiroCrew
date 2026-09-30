@@ -142,6 +142,17 @@ class TestSpecEffortTier:
         _write_md(agents_dir, "reviewer", reasoning_effort="high")
         assert self._cfg().resolve_session_effort("reviewer") == "high"
 
+    def test_native_role_effort_uses_the_bound_template_and_defers_to_pins(self, agents_dir):
+        cfg = self._cfg()
+        cfg.agent.role_efforts["research"] = "high"
+        cfg.agents["campaign"] = KiroCrewAgentConfig(kiro_agent="kirocrew-research")
+        assert cfg.resolve_session_effort("campaign") == "high"
+        _write_md(agents_dir, "kirocrew-research", reasoning_effort="medium")
+        assert cfg.resolve_session_effort("campaign") == "medium"
+        cfg.agents["campaign"].reasoning_effort = "max"
+        assert cfg.resolve_session_effort("campaign") == "max"
+        assert cfg.resolve_session_effort("unrelated-template") == "low"
+
     def test_crew_pin_beats_the_spec(self, agents_dir):
         _write_md(agents_dir, "reviewer", reasoning_effort="high")
         cfg = self._cfg()

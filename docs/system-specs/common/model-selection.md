@@ -292,9 +292,17 @@ its own once the cache refreshes with a list that carries it.
   current catalog. Enabling the configured effort default moves the slider thumb to
   that level before the setting write completes.
 - **Pin a cheaper model** only through `agent.role_models.<role>` (`background`,
-  `subagent`), read by `AgentConfig.resolve_model(role)` in `config/sections.py`. Roles
-  default to `"auto"` and deliberately do NOT inherit `agent.model`, so a user's chat
-  model does not silently become the price of every background task.
+  `subagent`, `worker`, `research`, `guest`), normalized in `config/sections.py`.
+  Background and subagent roles default to `"auto"` without inheriting `agent.model`.
+  The native `kirocrew-worker`, `kirocrew-research` and `kirocrew-guest` templates
+  apply their respective role pins when regenerated; unpinned templates retain
+  their existing inherited model. A frozen worker template model still outranks
+  its role pin. Live model changes rebuild the specs, affecting new sessions.
+  Native-role model PATCH fields accept plain and `provider/model` IDs, with the
+  shared provider and entitlement validation.
+  Their `agent.role_efforts.<role>` pins rank below an explicit session override,
+  a crew pin and a spec effort, and above the chat default. No model or effort
+  pin is added by default, and the guest remains tool-less.
 - **Entitlement checks** always use the shared predicate
   `acp.client.model_is_unusable(id, advertised)` together with
   `advertised_model_ids(...)`. It is one predicate on purpose: two spellings of "can

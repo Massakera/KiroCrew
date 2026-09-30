@@ -145,7 +145,7 @@ def normalize_agent_model(model: object) -> str:
 # entitlement-safe on every subscription tier (the provider picks a served
 # model). An operator who deliberately wants a cheaper model for background /
 # sub-agent work pins it here without changing the interactive chat default.
-ROLE_MODEL_KEYS: tuple[str, ...] = ("background", "subagent")
+ROLE_MODEL_KEYS: tuple[str, ...] = ("background", "subagent", "worker", "research", "guest")
 
 # The kiro agents that run the "background" role: auto-titles, memory
 # consolidation, heartbeat polls. Named here rather than inline at the one place
@@ -947,8 +947,9 @@ class AgentConfig:
         metadata=_meta(
             "Per-role models",
             "Optional per-task-class model overrides. Keys: 'background' "
-            "(lite / heartbeat background workers) and 'subagent' (spawned "
-            "sub-agents). An empty value or 'auto' defers to the chat default "
+            "(lite / heartbeat background workers), 'subagent' (spawned "
+            "sub-agents), and 'worker', 'research', 'guest' (native templates). "
+            "An empty value or 'auto' defers to the chat default "
             "(agent.model) and then to the provider default, so an unpinned "
             "role stays usable on every subscription tier. Pin a cheaper model "
             "here to run background / sub-agent work on it without changing the "
@@ -960,7 +961,8 @@ class AgentConfig:
         metadata=_meta(
             "Per-role reasoning effort",
             "Optional per-task-class reasoning effort, paired with role_models "
-            "(keys: 'background', 'subagent'). Empty for a role inherits the chat "
+            "(keys: 'background', 'subagent', 'worker', 'research', 'guest'). "
+            "Empty for a role inherits the chat "
             "default (agent.reasoning_effort) and then the provider/model default. "
             "Only applies on reasoning-capable models.",
         ),

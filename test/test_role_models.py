@@ -184,6 +184,70 @@ class TestResolveEffort:
         assert a.role_efforts == {"background": "low"}
 
 
+@pytest.mark.parametrize("role", ["worker", "research", "guest"])
+def test_native_role_pins_survive_regeneration(tmp_path, monkeypatch, role):
+    import json
+
+    from kiro_crew import agent
+
+    cfg = KiroCrewConfig(
+        agent=AgentConfig(
+            model="chat-model",
+            reasoning_effort="medium",
+            role_models={role: "native-model"},
+            role_efforts={role: "high"},
+        )
+    )
+    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: cfg))
+    monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.config.loader.kiro_agents_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        agent,
+        "build_agent_config",
+        lambda: {"model": "chat-model", "tools": [], "allowedTools": [], "mcpServers": {}},
+    )
+    install = getattr(agent, f"_install_{role}_agent")
+    template = f"kirocrew-{role}"
+    path = tmp_path / f"{template}.json"
+    for model in ("native-model", "changed-native-model"):
+        cfg.agent.role_models[role] = model
+        install()
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        assert spec["model"] == model
+        assert cfg.acp_effective_model(template, None) == model
+        assert cfg.resolve_session_effort(template, crew_agent="") == "high"
+        assert "reasoning_effort" not in spec
+        if role == "guest":
+            assert spec["tools"] == [] and spec["mcpServers"] == {}
+            assert spec["includeMcpJson"] is False
+
+    cfg.agent.role_models.clear()
+    cfg.agent.role_efforts.clear()
+    install()
+    assert json.loads(path.read_text(encoding="utf-8"))["model"] == "chat-model"
+    assert cfg.resolve_session_effort(template, crew_agent="") == "medium"
+
+
+def test_frozen_worker_model_beats_the_role_pin(tmp_path, monkeypatch):
+    import json
+
+    from kiro_crew import agent
+
+    cfg = KiroCrewConfig(agent=AgentConfig(role_models={"worker": "role-model"}))
+    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: cfg))
+    monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+    monkeypatch.setattr(
+        agent,
+        "build_agent_config",
+        lambda: {"model": "auto", "tools": [], "allowedTools": [], "mcpServers": {}},
+    )
+    path = tmp_path / "kirocrew-worker.json"
+    path.write_text(json.dumps({"name": "kirocrew-worker", "model": "frozen-model"}))
+    agent.agent_state.set_model_managed("kirocrew-worker", False)
+    agent._install_worker_agent()
+    assert json.loads(path.read_text(encoding="utf-8"))["model"] == "frozen-model"
+
+
 def test_subagent_effort_helper(monkeypatch) -> None:
     from kiro_crew import subagent
 

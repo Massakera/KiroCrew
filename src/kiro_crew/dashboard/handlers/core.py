@@ -2435,6 +2435,15 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
         "validate_fn": _validate_role_model,
     },
+    **{
+        f"agent.role_models.{role}": {
+            "type": "str",
+            "max_len": 64,
+            "pattern": r"^(?:[A-Za-z0-9._\-\[\]]+(?:/[A-Za-z0-9._\-\[\]]+)?)?$",
+            "validate_fn": _validate_role_model,
+        }
+        for role in ("worker", "research", "guest")
+    },
     # Throttle-exhaustion fallback model. Single value: "auto" (default) defers
     # to the backend's availability-aware routing; a concrete id is tried first
     # with "auto" as the final fallthrough; "" disables the feature. Same
@@ -2462,6 +2471,10 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # default; "" = inherit. Applies only on reasoning-capable models.
     "agent.role_efforts.background": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
     "agent.role_efforts.subagent": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
+    **{
+        f"agent.role_efforts.{role}": {"type": "enum", "values": ["", *EFFORT_LEVELS]}
+        for role in ("worker", "research", "guest")
+    },
     "agent.approval_mode": {"type": "enum", "values": ["auto", "interactive"]},
     # How long an AD-HOC auto-approve grant lasts. Editable from Settings because
     # every value here still ends: the timed ones are capped at the SafetyOverride

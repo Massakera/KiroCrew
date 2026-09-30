@@ -436,6 +436,13 @@ def _background_agent_model() -> str:
         return "auto"
 
 
+def _native_role_model(role: str, inherited: str) -> str:
+    """A configured native-template model, otherwise its existing default."""
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    return KiroCrewConfig.load().agent.role_models.get(role) or inherited
+
+
 def _background_cc_model() -> str:
     """cc_model (claude_code seam) for background agents.
 
@@ -7782,13 +7789,14 @@ def _install_guest_agent() -> None:
 
     Separate from ``kirocrew-lite`` on purpose: the lite agent is the background
     helper (titles, extraction) and may one day need a tool; this one is a trust
-    boundary and never may. Same model as the operator's chat so an admitted
-    sender gets an ordinary answer, never a background worker's minimal default.
+    boundary and never may. Inherits the operator's chat model unless the
+    operator explicitly pins the guest role.
     """
     from kiro_crew.config.loader import KiroCrewConfig
 
     try:
-        model = KiroCrewConfig.load().agent.model or "auto"
+        cfg = KiroCrewConfig.load()
+        model = cfg.agent.role_models.get("guest") or cfg.agent.model or "auto"
     except Exception:
         model = "auto"
     guest_path = kiro_agents_dir_path() / _GUEST_AGENT_FILENAME
@@ -7957,6 +7965,7 @@ def _install_research_agent() -> None:
     """
     config = build_agent_config()
     config["name"] = "kirocrew-research"
+    config["model"] = _native_role_model("research", config.get("model") or "auto")
     config["description"] = (
         "Autonomous research worker — runs one research cycle per turn "
         "in a Research Lab campaign loop."
@@ -9573,6 +9582,7 @@ def _write_worker_spec(config: dict, path: Path, *, template_grants: list[str]) 
     # which nothing reads there. The shared writer version-gates it.
     _write_derived_permissions(config, config["allowedTools"], _WORKER_AGENT_FILENAME)
 
+    config["model"] = _native_role_model("worker", config.get("model") or "auto")
     existing = _read_spec_capped(path)
     if isinstance(existing, dict) and "model" in existing and _worker_model_is_user_pinned():
         # An explicit per-agent pick outranks the mirror, and it has to be read back

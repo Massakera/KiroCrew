@@ -5540,7 +5540,8 @@ class KiroCrewConfig:
         ``reasoning_effort`` (judged for *backend*, the configured default when
         omitted), then the role-aware default: a background
         worker agent (``kirocrew-lite`` / ``kirocrew-heartbeat``) takes the
-        ``background`` role effort, everything else the chat default. A pin the
+        ``background`` role effort; native worker/research/guest templates take
+        their role effort when pinned, otherwise the chat default. A pin the
         operator typed on the crew therefore outranks BOTH defaults, including
         the role one — the pin is a choice, the role effort is a built-in.
 
@@ -5573,6 +5574,9 @@ class KiroCrewConfig:
             return spec_effort
         if template in BACKGROUND_WORKER_AGENTS:
             return self.agent.resolve_effort("background")
+        for role in ("worker", "research", "guest"):
+            if template == f"kirocrew-{role}":
+                return self.agent.resolve_effort(role) or self.agent.reasoning_effort
         return self.agent.reasoning_effort
 
     @classmethod

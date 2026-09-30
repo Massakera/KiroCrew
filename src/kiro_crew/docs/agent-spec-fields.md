@@ -609,6 +609,13 @@ it.
 What you may safely hand-edit: a spec you authored yourself, and in an owned or
 app-generated one, nothing — change `~/.kiro/crew/agent.json` or the Template pane instead.
 
+Native worker, research and guest model preferences can also be persisted at
+`agent.role_models.{worker,research,guest}` in `config.json`, with effort pins at
+`agent.role_efforts.{worker,research,guest}`. Regeneration applies these model
+preferences without changing the templates' prompts or capabilities. The worker's
+explicit frozen model remains higher priority. Effort is resolved by Crew at
+session creation rather than written as an unknown JSON field for kiro-cli.
+
 ## Markdown form and the Template pane
 
 Frontmatter keys map one-to-one onto the JSON fields above; nesting works
