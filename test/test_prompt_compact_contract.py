@@ -20,7 +20,7 @@ CONFIG = ROOT / "src" / "kiro_crew" / "config"
 # to fit; their tests, not a size limit, check the retained text contracts.
 # The execution section includes reason evidence and the capability-dependent
 # parent-work boundary without removing Autopilot's approval/stage contracts.
-PROMPT_BYTE_CEILINGS = {"prompt.md": 40_725, "prompt-orchestrator.md": 23_448}
+PROMPT_BYTE_CEILINGS = {"prompt.md": 40_725, "prompt-orchestrator.md": 24_658}
 
 
 def _read(name: str = "prompt.md") -> str:

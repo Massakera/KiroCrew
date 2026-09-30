@@ -25,6 +25,11 @@ def _list_tools() -> list[dict[str, Any]]:
             "name": "investigation",
             "description": (
                 "Start an independent local service investigation while this conversation continues. "
+                "Use for live environment checks such as sandbox/SBX, staging or production/PROD, "
+                "cluster state, logs, access and deployment readiness. List saved services first; "
+                "select the service matching the requested service and environment, then start a "
+                "read-only investigation preserving the user's scope and restrictions. "
+                "This creates an app-bound investigator; do not use ordinary subagent spawn. "
                 "List saved services and investigations; start with service_id and question; "
                 "status/cancel/resume with id. Returns a durable ID and page URL. "
                 "Investigation agents use report on their own ID with text fields summary, evidence, "

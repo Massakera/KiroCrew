@@ -34,6 +34,13 @@ One function assembles the whole first-turn prompt: `context.py` →
 strings and returns them joined. `context.py` → `build_session_context` builds the
 middle — the part wrapped in `[SESSION CONTEXT …]`, and the only part injected
 once rather than per turn.
+Both shipped coordinator prompts route requests for live service/environment
+evidence through the explicitly assigned investigation tool: list saved services,
+match the requested service and environment, and start a read-only investigation
+with the user's restrictions. They distinguish an ordinary agent's sandbox access
+from the app's configured access and direct an unassigned caller to the app or
+template assignment rather than ordinary subagent spawn. This is model guidance;
+the app's caller, target identity and approval checks remain the enforcement.
 
 ### Block order
 

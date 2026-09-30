@@ -10,6 +10,13 @@ and `kirocrew app enable service-investigations`. Local installation copies the
 built bundle. Reinstall after updating it; the gateway package must also contain
 the matching investigation modules. New agent sessions receive the extension's
 `investigation` MCP tool.
+The default coordinator also needs an explicit template assignment of
+`@kirocrew-investigations` with its managed `mcpServers` entry. This is tool
+availability, not an `allowedTools` or `autoApprove` grant. The shipped normal
+and orchestrator prompts use it for live environment evidence after matching a
+saved service and environment. App enablement alone does not assign the set;
+fresh provider sessions receive a changed template, and managed pi must rebuild
+the gateway's startup overlay after an assignment.
 
 The page and tool share durable IDs, saved service context, findings and native
 app-owned chat slots. Service context stores local repository, AWS profile and

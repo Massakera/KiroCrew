@@ -981,6 +981,26 @@ def test_the_work_server_is_exempt_from_that_exclusion(worker_from_installed_def
     assert "@kirocrew-work" in worker["tools"]
 
 
+def test_assigned_investigations_stay_on_the_coordinator(worker_from_installed_default, tmp_path):
+    path = tmp_path / AGENT_FILENAME
+    default = json.loads(path.read_text(encoding="utf-8"))
+    default["tools"].append("@kirocrew-investigations")
+    default["allowedTools"].append("@kirocrew-investigations/investigation")
+    default["mcpServers"]["kirocrew-investigations"] = {
+        "command": "kirocrew",
+        "args": ["mcp-investigations"],
+    }
+    path.write_text(json.dumps(default), encoding="utf-8")
+
+    worker = worker_from_installed_default()
+
+    assert "kirocrew-investigations" not in worker["mcpServers"]
+    assert "@kirocrew-investigations" not in worker["tools"]
+    assert not [ref for ref in worker["allowedTools"] if "kirocrew-investigations" in ref]
+    assert "kirocrew-investigations" not in json.dumps(worker["permissions"])
+    assert json.loads(path.read_text(encoding="utf-8")) == default
+
+
 def test_the_unassignable_set_is_derived_from_the_registry(monkeypatch):
     """Derived rather than listed, so an opt-in server added tomorrow is withheld by
     default instead of reaching the worker until somebody notices.
@@ -995,7 +1015,13 @@ def test_the_unassignable_set_is_derived_from_the_registry(monkeypatch):
     only refusals; granting it would spend the worker's context on tools that
     cannot answer it."""
     assert agent._worker_unassignable_servers() == frozenset(
-        {"kirocrew-dashboard", "kirocrew-crew-log", "kirocrew-debug", "kirocrew-panel"}
+        {
+            "kirocrew-dashboard",
+            "kirocrew-crew-log",
+            "kirocrew-debug",
+            "kirocrew-panel",
+            "kirocrew-investigations",
+        }
     )
     monkeypatch.setitem(
         agent._MANAGED_MCP_SERVERS,

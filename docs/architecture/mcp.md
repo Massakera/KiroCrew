@@ -15,6 +15,13 @@ The tool requires a loaded calling slot: an ordinary subagent receives
 `investigation_session_not_live`. These refusals preserve HTTP 403 and include
 instructions for the owning launch/resume flow; a subagent cannot borrow its
 parent's identity to start or report a run.
+The coordinator's shipped prompts route live environment checks through
+`kirocrew-investigations::investigation`: list saved targets, match service and
+environment, then start a read-only investigation. This requires an explicit
+template assignment of `@kirocrew-investigations` and its managed server entry;
+enabling the app alone does not mount this opt-in set on the default agent.
+Existing conversations must start a fresh provider session after assignment to
+receive the tool. A managed pi gateway also needs to rebuild its startup overlay.
 
 How MCP (Model Context Protocol) servers are configured, merged, probed and
 loaded, plus the two invariants every new Kiro Crew MCP tool must satisfy: it
@@ -1293,9 +1300,10 @@ server is not one -- so this mount is the only path to it. The operator ceiling
 is `agent.crew_panel`; see the session-control module spec for the grant
 reasoning and the fail-closed behaviour.
 
-`kirocrew-investigations` is opt-in too: only the `service-investigator` app
-agent references it, and `apps.bridges._materialize_managed_refs` copies its
-spec into that agent. On managed pi it reaches the session through the tool
+`kirocrew-investigations` is opt-in too: the `service-investigator` app agent
+and explicitly assigned coordinator templates reference it.
+`apps.bridges._materialize_managed_refs` copies its spec into app agents.
+On managed pi it reaches the session through the tool
 bridge, so it must be named in `mcp_gateway.stub_servers`; the investigator's
 `--readonly` spec is published before the gateway builds its overlay
 (`investigations.prepublish_readonly_spec`), because the overlay and the

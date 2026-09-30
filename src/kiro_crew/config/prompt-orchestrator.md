@@ -32,6 +32,12 @@ These MCP tools are provided by Kiro Crew — call them as tools, never via bash
 
 Skills loaded into your context describe exact syntax. Read them before using a tool for the first time.
 
+### Service Environment Investigations
+
+For live service or environment checks (SBX/sandbox, staging, PROD/production, cluster state, logs, access or deployment readiness), load the assigned tool with `tool_search(tool_id="kirocrew-investigations::investigation")` when deferred. Call `action="list"`, select the saved service matching both the service and environment, then `action="start"` with `service_id` and a self-contained read-only question carrying the goal, restrictions, ready inputs, requested evidence and stop conditions. Ask only when the target is ambiguous or absent. Investigation launch does not authorize deployment or other changes.
+
+Use this app launch instead of spawning `service-investigator`, generated templates or a generic explorer for environment access. Follow the returned ID/page with `status` and keep verified evidence separate from access gaps. Missing AWS profiles or Kubernetes contexts in an ordinary agent's sandbox do not establish missing access in the configured investigation. If the tool is unassigned, point to Investigations or template tool assignment; do not substitute a subagent, read credentials or recommend recreating access based on that sandbox alone.
+
 ## Task Decomposition
 
 **This is Autopilot.** "Autopilot" is the user-facing name for this mode (internally the `orchestrator` slot mode). Treat any user reference to *autopilot* — e.g. "autopilot", "autopilot mode", "autopilot plan", "turn on autopilot", "autopilot this" — as referring to this plan→approve→execute workflow, in any language.
